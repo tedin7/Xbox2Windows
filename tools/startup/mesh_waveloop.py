@@ -9,12 +9,13 @@ BRANCHES = {
     's_cbranch_scc0': '!scc', 's_cbranch_scc1': 'scc',
     's_cbranch_execz': '(exec_lo | exec_hi) == 0u',
     's_cbranch_execnz': '(exec_lo | exec_hi) != 0u',
-    's_cbranch_vccz': '(vcc_lo | vcc_hi) == 0u',
-    's_cbranch_vccnz': '(vcc_lo | vcc_hi) != 0u',
+    's_cbranch_vccz': '(s106 | s107) == 0u',
+    's_cbranch_vccnz': '(s106 | s107) != 0u',
 }
 NO_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause')
 CROSS_LANE = ('v_readfirstlane_b32', 'v_readlane_b32', 'v_writelane_b32')
 MASK_WORDS = {'exec_lo', 'exec_hi', 'vcc_lo', 'vcc_hi'}
+VCC_REGISTERS = {'vcc': 's106', 'vcc_lo': 's106', 'vcc_hi': 's107'}
 UNDEFINED_ENTRY = ('an entry value the mesh model does not define',)
 JOINED = ('a value joined across wave-loop blocks',)
 LANE = '((wb + l) & 127u)'
@@ -122,7 +123,8 @@ def effects(G, name, asm):
         dests, srcs = [], []
     if base.startswith(G.READ_MODIFY_WRITE) or base == 'v_swap_b32':
         srcs = srcs + dests
-    return reads | registers(G, srcs, 'v'), writes | registers(G, dests, 'v')
+    return ({VCC_REGISTERS.get(reg, reg) for reg in reads} | registers(G, srcs, 'v'),
+            {VCC_REGISTERS.get(reg, reg) for reg in writes} | registers(G, dests, 'v'))
 
 
 class ControlFlow:
@@ -324,6 +326,20 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             self.last_v = None
             self.descriptor_block_first = self.descriptor_instruction_index + 1
 
+        def read_vcc(self):
+            # The current block's symbols, rather than Stage's linear VCC flags,
+            # describe which values can reach this instruction.
+            for n in (106, 107):
+                symbol = self.sym.get(n)
+                if symbol and not G.run_time_symbol(symbol):
+                    raise G.Unsupported('wave loop: mask word s%d holds %s' % (n, symbol[0]))
+
+        def descriptor(self, token, *, allow_null=True):
+            # Keep Stage's extended-pair check even after a control-flow join.
+            self.vcc_descriptor_extended = G.reg_range(token) == ('s', 100, 107)
+            self.vcc_descriptor_overwritten = False
+            return super().descriptor(token, allow_null=allow_null)
+
         def one(self, name, asm):
             if name == 'x2w_serial_block':
                 return super().one(name, asm)
@@ -339,10 +355,13 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             self.mask_high.clear()
             getattr(self, 'uniform_cmp_masks', {}).clear()
             try:
-                if registers(G, ops, 's') & {'s106', 's107'}:
-                    raise G.Unsupported('wave loop: explicit s106/s107 operand')
                 reads, writes = self.cfg.effects[index]
                 missing = reads - self.before[index]
+                if any(op in VCC_REGISTERS for op in ops) or real_name.startswith('s_cbranch_vcc'):
+                    for reg in ('s106', 's107'):
+                        symbol = self.sym.get(int(reg[1:]))
+                        if reg in reads and symbol and not G.run_time_symbol(symbol):
+                            raise G.Unsupported('wave loop: mask word %s holds %s' % (reg, symbol[0]))
                 if name.startswith('s_load_') and len(ops) >= 2:
                     base = G.reg_range(ops[1])
                     symbol = self.sym.get(base[1]) if base and base[0] == 's' else None
@@ -372,6 +391,11 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                     super().one(name, self.numeric_mask_sources(name, asm))
                 if missing_error:
                     raise missing_error
+                if real_name.startswith('v_') and real_name not in CROSS_LANE:
+                    for n in (106, 107):
+                        if 's%d' % n in writes:
+                            self.sym.pop(n, None)
+                            self.align4_s.discard(n)
                 for n in mask_operands(G, real_name, ops):
                     if 's%d' % (n + 1) in writes:
                         self.sym.pop(n + 1, None)
@@ -417,7 +441,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 if token.startswith('s'):
                     value = super().S(int(token[1:]))
                     return 'serial_value_' + value if value == token else value
-                return token if token in MASK_WORDS else token + '_lo'
+                return self.word(token)
             return super().u(tok, low16_only=low16_only)
 
         def S(self, n):
@@ -427,6 +451,8 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             return super().S(n)
 
         def word(self, token):
+            if token in VCC_REGISTERS:
+                return self.S(int(VCC_REGISTERS[token][1:]))
             if token in MASK_WORDS:
                 return token
             if token in ('exec', 'vcc'):
@@ -434,8 +460,11 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             return self.u(token)
 
         def pair(self, token, destination=False):
-            if token in ('exec', 'vcc'):
-                return token + '_lo', token + '_hi'
+            if token == 'exec':
+                return 'exec_lo', 'exec_hi'
+            if token == 'vcc':
+                convert = self.destination if destination else self.word
+                return convert('vcc_lo'), convert('vcc_hi')
             r = G.reg_range(token)
             if r and r[0] == 's' and r[2] == r[1] + 1:
                 convert = self.destination if destination else self.word
@@ -445,6 +474,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             raise G.Unsupported('wave loop: invalid scalar pair ' + token)
 
         def destination(self, token):
+            token = VCC_REGISTERS.get(token, token)
             if token in MASK_WORDS:
                 return token
             if token == 'null':
@@ -688,7 +718,7 @@ def lane_instruction(pipe, G, name, asm, lines):
     stage = pipe.vs
     _, ops, _ = G.parse(asm)
     masks = mask_operands(G, name, ops)
-    words = [('lexec', 'exec_lo', 'exec_hi'), ('lvcc', 'vcc_lo', 'vcc_hi')]
+    words = [('lexec', 'exec_lo', 'exec_hi'), ('lvcc', 's106', 's107')]
     words += [('lm%d' % n, 's%d' % n, 's%d' % (n + 1)) for n in masks]
     loop = ['[loop] for (uint l = 0u; l < 64u; ++l) {']
     loop.extend('uint %s = mbit(%s, %s, l);' % pair for pair in words)
@@ -753,8 +783,8 @@ def render(pipe, G):
                 continue
             for n in mask_operands(G, name, G.parse(asm)[1]):
                 hi_words.update((n, n + 1))
-    scalars = sorted(set(scalars) | {'s%d' % n for n in hi_words})
-    words = scalars + ['exec_lo', 'exec_hi', 'vcc_lo', 'vcc_hi', 'm0']
+    scalars = sorted(set(scalars) | {'s%d' % n for n in hi_words | {106, 107}})
+    words = scalars + ['exec_lo', 'exec_hi', 'm0']
     saved = words + ['scc']
     hlsl.extend('    uint %s[128];' % name for name in vgprs)
     hlsl.extend('    %s saved_%s[2];' % ('bool' if name == 'scc' else 'uint', name) for name in saved)

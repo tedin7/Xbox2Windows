@@ -59,12 +59,35 @@ def check_exec_zero_edges():
     assert 's20 may be read before it is written' in status, status
 
 
+def check_exec_zero_symbols():
+    # The table descriptor reaches the join from the active arm only.
+    load = ['f4081909', 'fa000000']
+    use = ['e0301000', '80190600']  # buffer_load_dword v6, v0, s[100:103], 0 offen
+    prefix, suffix = SERIAL_MESH[:8], use + SERIAL_MESH[9:]
+    status, _ = run(prefix + ['bf880002'] + load + suffix, 'force')
+    assert status == 'ok', status
+    # An ordinary scalar branch provides no EXEC-zero guarantee.
+    status, _ = run(prefix + ['bf840002'] + load + suffix, 'force')
+    assert 's100 may be read before it is written' in status, status
+
+
 def check_scalar_uniformity():
     # A scalar copied from m0 still has one value per guest wave.
     program = ['befc0380', 'be98037c', 'f408070d', '30000000']
     status, _ = run(SERIAL_MESH[:6] + HEAP_SETUP + program + SERIAL_MESH[6:],
                     'force', root_blob=heap_root())
     assert status == 'ok', status
+
+
+def check_vcc_descriptor_alias():
+    load = ['f4081a09', 'fa000000']  # s_load_dwordx4 s[104:107], s[18:19], 0
+    use = ['e0301000', '801a0600']  # buffer_load_dword v6, v0, s[104:107], 0 offen
+    prefix, suffix = SERIAL_MESH[:8] + load, use + SERIAL_MESH[9:]
+    status, _ = run(prefix + suffix, 'force')
+    assert status == 'ok', status
+    for overwrite in ('7d840080', 'beea0481', 'beeb0380'):  # v_cmp_eq; s_mov_b64 vcc; s_mov_b32 vcc_hi
+        status, _ = run(prefix + [overwrite] + suffix, 'force')
+        assert 's[104:107] needs four consecutive words' in status, status
 
 
 def main():
@@ -102,7 +125,9 @@ def main():
     reason, _ = run(undefined)
     assert 'wave loop: v0 may be read before it is written' in reason, reason
     check_exec_zero_edges()
+    check_exec_zero_symbols()
     check_scalar_uniformity()
+    check_vcc_descriptor_alias()
     print('ok')
 
 
