@@ -75,9 +75,9 @@ inline constexpr const Layout* find(int kind, int slot)
 }
 
 // The argument that receives a created or queried object, or -1: QueryInterface's on every kind, the device creations
-// the recorder captures with create()/output() (d3d12_record.inl), and the declared wrapper outputs. A call that fails
-// still passes that pointer: the recorder keeps its 8 bytes either way, and the player gives one the file does not hold
-// a buffer of its own instead of the recorded process's (stack) address.
+// the recorder captures with create()/output() (d3d12_record.inl), and the declared wrapper outputs. The player gives
+// one the file does not hold a buffer of its own instead of the recorded process's (stack) address, and does not play
+// such a call when it was recorded as a failure.
 // An argument the stand-in reads as memory (the recorder's declared captures): the player must not pass the recorded
 // process's address for it when the file holds no copy.
 inline constexpr bool declared_input(int kind, int slot, int arg)
