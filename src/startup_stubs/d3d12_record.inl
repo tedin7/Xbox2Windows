@@ -412,11 +412,28 @@ void record_arguments(ArgumentCapture& capture)
         break;
     case list_kind:
         switch (call.slot) {
+        case 16:  // CopyTextureRegion(destination location, x, y, z, source location, box)
+            capture.arg(0, sizeof(D3D12_TEXTURE_COPY_LOCATION));
+            capture.arg(4, sizeof(D3D12_TEXTURE_COPY_LOCATION));
+            capture.arg(5, sizeof(D3D12_BOX));
+            break;
+        case 32:  // SetDescriptorHeaps(count, heaps): the wrappers, which the player translates
+            capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(void*));
+            break;
+        case 39:  // Set{Compute,Graphics}Root32BitConstants(parameter, count, values, offset)
+        case 40: capture.arg(2, static_cast<u64>(static_cast<UINT>(a[1])) * sizeof(UINT)); break;
+        case 47: capture.arg(0, sizeof(D3D12_INDEX_BUFFER_VIEW)); break;  // IASetIndexBuffer(view)
+        case 48:  // IASetVertexBuffers(start, count, views)
+            capture.arg(2, static_cast<u64>(static_cast<UINT>(a[1])) * sizeof(D3D12_VERTEX_BUFFER_VIEW));
+            break;
         case 21: capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(D3D12_VIEWPORT)); break;
         case 22: capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(D3D12_RECT)); break;
         case 50:
             capture.arg(1, (static_cast<BOOL>(a[2]) && static_cast<UINT>(a[0]) ? 1ull : static_cast<UINT>(a[0])) * sizeof(u64));
             capture.arg(3, sizeof(u64));
+            break;
+        case 51:  // ClearDepthStencilView(handle, flags, depth, stencil, rect count, rects)
+            capture.arg(5, static_cast<u64>(static_cast<UINT>(a[4])) * sizeof(D3D12_RECT));
             break;
         case 52:
             capture.arg(1, 4 * sizeof(float));

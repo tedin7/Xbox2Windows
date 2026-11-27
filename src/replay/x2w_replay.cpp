@@ -385,6 +385,9 @@ bool play(Player& p, const Recording& r, const Step& step)
     for (const Output& output : step.outputs)
         if (output.arg < call_args)
             call.sampled[output.arg] = call.read_output(output.arg, call.before[output.arg]);
+    // Map's CPU address is an output too, but not a wrapper, so it has no OUTP: sample it for the mapped dump.
+    if (c.kind == resource_kind && c.slot == resource_map)
+        call.sampled[2] = call.read_output(2, call.before[2]);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     u64 rcx = call.self;
