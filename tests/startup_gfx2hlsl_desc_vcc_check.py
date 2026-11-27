@@ -76,9 +76,60 @@ def xor64(dst, a, b):
 
 
 SWAP = xor64(106, 106, 30) + xor64(30, 106, 30) + xor64(106, 106, 30)
+SWAP_16 = xor64(106, 106, 16) + xor64(16, 106, 16) + xor64(106, 106, 16)
+# Load the descriptor into s[16:19], compare into s16, swap once, and select on VCC.
+SWAP_VS = (struct.pack('<2I', *smem(2, 16, 8, 0x14)) + MASK_VS[12:28]
+           + struct.pack('<I', 0xd4880010) + MASK_VS[32:40] + SWAP_16 + MASK_VS[44:])
+
+
+def swap_controls():
+    decoded = [asm for _, _, _, asm in G.decode(SWAP_VS)]
+    assert decoded[5:9] == ['s_xor_b64 vcc, vcc, s[16:17]',
+                             's_xor_b64 s[16:17], vcc, s[16:17]',
+                             's_xor_b64 vcc, vcc, s[16:17]',
+                             'v_cndmask_b32_e64 v10, 0, 1.0, vcc_lo']
+    pipe = G.Pipeline(MASK_VS, None, TABLE_ROOT)
+    swap_lines = ['vcc = (vcc ^ s16) & 1;', 's16 = (vcc ^ s16) & 1;',
+                  'vcc = (vcc ^ s16) & 1;']
+    for wave in (None, 32, 64):
+        pipe.wave_size = wave
+        stage = G.Stage(pipe, 'vs', SWAP_VS)
+        lines = [line for _, block, _ in stage.blocks for line in block]
+        start = lines.index(swap_lines[0])
+        assert [line for line in lines[start:] if line in swap_lines] == swap_lines
+        assert 'v10 = (vcc & 1) ? 0x3f800000u : 0x00000000u;' in lines
+    # Model each physical 64-bit XOR, including descriptor bits left in s17
+    # in wave32. Compare the resulting per-lane select with the emitted XORs.
+    for wave in (32, 64):
+        for lane in range(wave):
+            a = 0xa5a55a5af00f6996
+            b = 0x123456789abcdef0 if wave == 64 else 0xdeadbeef9abcdef0
+            assert (a ^ b) & ((1 << wave) - 1)  # A missing swap changes a select.
+            vcc, scalar = a, b
+            vcc ^= scalar
+            scalar ^= vcc
+            vcc ^= scalar
+            isa_select = (vcc >> lane) & 1
+            regs = {'vcc': (a >> lane) & 1, 's16': (b >> lane) & 1}
+            for line in swap_lines:
+                dest = line.split(' = ')[0]
+                regs[dest] = (regs['vcc'] ^ regs['s16']) & 1
+            assert regs['vcc'] == isa_select == (b >> lane) & 1
+            assert regs['s16'] == (scalar >> lane) & 1
+    # s17 remains the high word of a mask after the swap, not numeric data.
+    numeric = struct.pack('<I', 0x7e1c0211)  # v_mov_b32 v14, s17
+    code = SWAP_VS[:48] + numeric + SWAP_VS[48:]
+    pipe.wave_size = None
+    try:
+        G.Stage(pipe, 'vs', code)
+    except G.Unsupported as error:
+        assert str(error) == 'v_mov_b32 reads lane mask s17 as numeric data', error
+    else:
+        raise AssertionError('numeric read of s17 translated')
 
 
 def mask_controls():
+    swap_controls()
     pipe = G.Pipeline(MASK_VS, None, TABLE_ROOT)
     source = pipe.hlsl_vs()
     assert hashlib.sha256((source + '\0' + pipe.manifest()).encode()).hexdigest() == (
@@ -157,7 +208,7 @@ def check_mask_draw(dxc, renderer, adapter):
         vs = compile_hlsl(dxc, 'dxc', source, 'vs', 'vs_6_0', directory)
         mutant = compile_hlsl(dxc, 'dxc', source.replace(MASK_MOVE, 'vcc = (~s30) & 1;'),
                               'inverse', 'vs_6_0', directory)
-        swapped_pipe = G.Pipeline(MASK_VS[4:40] + SWAP * 2 + MASK_VS[40:], ps_code, TABLE_ROOT)
+        swapped_pipe = G.Pipeline(SWAP_VS, ps_code, TABLE_ROOT)
         swapped = compile_hlsl(dxc, 'dxc', swapped_pipe.hlsl_vs(), 'vs_swapped', 'vs_6_0', directory)
         ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), 'ps', 'ps_6_0', directory)
         expected = directory / 'expected.bin'

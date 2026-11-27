@@ -157,8 +157,10 @@ std::uint64_t process_ms()
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, desc_word };
+    enum class SnormRefusal { unchecked, other, signed_export };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    SnormRefusal snorm_refusal = SnormRefusal::unchecked;
     bool placeholder = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -601,6 +603,7 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
 
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
+    tr.snorm_refusal = Translation::SnormRefusal::unchecked;
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
@@ -1294,10 +1297,16 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     bool variant = std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
     if (!variant && base->state != 1 &&
         std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_snorm_export_variant)) {
-        wchar_t path[MAX_PATH];
-        std::string failure;
-        variant = cache_path(path, L"", base->key, L".fail") && read_text(path, failure) &&
-                  failure.compare(0, 35, "signed normalized compressed export") == 0;
+        if (base->snorm_refusal == Translation::SnormRefusal::unchecked) {
+            constexpr char signed_export[] = "signed normalized compressed export";
+            wchar_t path[MAX_PATH];
+            std::string failure;
+            const bool matches = cache_path(path, L"", base->key, L".fail") && read_text(path, failure) &&
+                                 failure.compare(0, sizeof(signed_export) - 1, signed_export) == 0;
+            base->snorm_refusal = matches ? Translation::SnormRefusal::signed_export
+                                           : Translation::SnormRefusal::other;
+        }
+        variant = base->snorm_refusal == Translation::SnormRefusal::signed_export;
     }
     if (!variant) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
