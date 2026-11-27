@@ -661,20 +661,6 @@ target_compile_features(startup_view_dimension PRIVATE cxx_std_17)
 add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
 add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
 set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
-add_executable(startup_sampler_desc_check tests/startup_sampler_desc_check.cpp)
-target_include_directories(startup_sampler_desc_check PRIVATE src)
-target_compile_features(startup_sampler_desc_check PRIVATE cxx_std_17)
-add_test(NAME startup_sampler_desc_check COMMAND startup_sampler_desc_check)
-
-add_executable(startup_sampler_device tests/startup_sampler_device.cpp)
-target_compile_features(startup_sampler_device PRIVATE cxx_std_17)
-target_link_libraries(startup_sampler_device PRIVATE d3d12_xs_shim d3d12 dxgi)
-foreach(backend IN ITEMS warp hardware)
-    add_test(NAME startup_sampler_device_${backend} COMMAND startup_sampler_device ${backend})
-    set_tests_properties(startup_sampler_device_${backend} PROPERTIES TIMEOUT 60
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
-endforeach()
-set_tests_properties(startup_sampler_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(startup_view_desc tests/startup_view_desc_check.cpp)
 target_include_directories(startup_view_desc PRIVATE src)
@@ -2309,6 +2295,21 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp tests/mesh_heap_sampler_draw.cpp)
+add_executable(startup_sampler_desc_check tests/startup_sampler_desc_check.cpp)
+target_include_directories(startup_sampler_desc_check PRIVATE src)
+target_compile_features(startup_sampler_desc_check PRIVATE cxx_std_17)
+add_test(NAME startup_sampler_desc_check COMMAND startup_sampler_desc_check)
+
+add_executable(startup_sampler_device tests/startup_sampler_device.cpp)
+target_compile_features(startup_sampler_device PRIVATE cxx_std_17)
+target_link_libraries(startup_sampler_device PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_sampler_device_${backend} COMMAND startup_sampler_device ${backend})
+    set_tests_properties(startup_sampler_device_${backend} PROPERTIES TIMEOUT 60
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+set_tests_properties(startup_sampler_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 # Sampler word decoding, manifest lines and title sampler snapshots behind those draws
 # (src/startup_stubs/translated_sampler_bindings.h), without a device. The mutated run is the negative control.
 add_executable(startup_translated_sampler_bindings_check tests/startup_translated_sampler_bindings_check.cpp)
