@@ -106,8 +106,11 @@ bool compute_texture_srv_range_fits(const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
     }
 }
 
-const char* compute_raw_uav_token(Wrapper* self, const std::uint32_t* words, Wrapper*& wrapper,
-                                  ID3D12Resource*& resource, u64& offset, u64& bytes)
+// An output given as the token of an unordered access view of a buffer: bind the token's own desktop resource over the
+// view's range and give the program the descriptor words 1 to 3 the hardware descriptor would have held (stride, records
+// and the unified FORMAT with identity channel selection), so a program that reads them runs too.
+const char* compute_uav_token(Wrapper* self, const std::uint32_t* words, Wrapper*& wrapper,
+                              ID3D12Resource*& resource, u64& offset, u64& bytes, std::uint32_t (&out)[4])
 {
     ViewRecord record{};
     bool materialized = false;
@@ -122,9 +125,8 @@ const char* compute_raw_uav_token(Wrapper* self, const std::uint32_t* words, Wra
     std::memcpy(&desc, record.desc, sizeof(desc));
     if (desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
         return "an output unordered access view token describes a texture, but the shader needs a buffer";
-    if (desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.Buffer.Flags != D3D12_BUFFER_UAV_FLAG_RAW ||
-        desc.Buffer.StructureByteStride || record.counter || desc.Buffer.CounterOffsetInBytes)
-        return "an output unordered access view token is not a raw buffer view without a counter";
+    if (record.counter || desc.Buffer.CounterOffsetInBytes)
+        return "an output unordered access view token has a counter";
 
     wrapper = as_wrapper(reinterpret_cast<const void*>(record.resource));
     if (!wrapper || wrapper->own().kind != resource_kind || !wrapper->own().real)
@@ -139,13 +141,27 @@ const char* compute_raw_uav_token(Wrapper* self, const std::uint32_t* words, Wra
         native_device.Get() != device_of(self->own().list_device))
         return "an output unordered access view token needs a desktop UAV buffer created in common state on this device";
 
-    constexpr u64 element = 4;
+    const DXGI_FORMAT format = desktop_format(desc.Format);
+    const UINT stride = desc.Buffer.StructureByteStride;
+    const bool raw = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW && !stride && format == DXGI_FORMAT_R32_TYPELESS;
+    const bool structured = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && stride && format == DXGI_FORMAT_UNKNOWN;
+    const bool typed = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && !stride && format != DXGI_FORMAT_UNKNOWN;
+    const UINT element = raw ? 4 : structured ? stride : typed ? x2w_startup::typed_buffer_format_bytes(format) : 0;
+    if (!element || element > 0x3fff)
+        return "an output unordered access view token is not a raw, structured or typed buffer view of a known element size";
+    const UINT code = typed ? x2w_startup::buffer_format_code(format) : 0;
+    if (typed && !code) return "an output typed buffer view has a format with no decoded buffer FORMAT";
     if (desc.Buffer.FirstElement > native.Width / element)
         return "an output unordered access view token starts outside its desktop buffer";
     offset = desc.Buffer.FirstElement * element;
     bytes = u64{desc.Buffer.NumElements} * element;
-    if (!bytes || bytes > (16u << 20) || bytes > native.Width - offset || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
-        return "an output unordered access view token has an invalid raw buffer range";
+    if (!bytes || bytes > (16u << 20) || bytes % 4 || bytes > native.Width - offset || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+        return "an output unordered access view token has an invalid buffer range";
+
+    out[0] = 0;
+    out[1] = raw ? 0 : element << 16;
+    out[2] = raw ? static_cast<std::uint32_t>(bytes) : desc.Buffer.NumElements;
+    out[3] = 0xfacu | (raw ? 3u << 28 : 0) | (code ? (1u << 24) | (code << 12) : 0);
     return nullptr;
 }
 
@@ -630,7 +646,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (words[0] == view_token_magic && compute_view_tokens_enabled()) {
             auto& view = views[i];
-            reason = compute_raw_uav_token(self, words, view.wrapper, view.resource, view.offset, view.bytes);
+            reason = compute_uav_token(self, words, view.wrapper, view.resource, view.offset, view.bytes, view.words);
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].resource == view.resource)
                     reason = "an output unordered access view token names a buffer that is also an input";
@@ -673,10 +689,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
         const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
-        if (ud.source >= ComputeTranslation::output_word3 && view.wrapper) {
-            reason = "an output unordered access view token has no native buffer descriptor words";
-            break;
-        }
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
         case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;

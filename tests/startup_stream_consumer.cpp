@@ -281,6 +281,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     void* title_readback = nullptr;
     void* title_placement = nullptr;
     void* title_upload = nullptr;
+    void* uav_source = nullptr;
+    void* uav_staging = nullptr;
     unsigned char* source = nullptr;
     if (title_input || view_tokens) {
         const D3D12_RESOURCE_DESC output_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(input), 1, 1, 1,
@@ -462,7 +464,32 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             view.Buffer.FirstElement = mode == "dispatch-input-view-tokens-shifted" ? 12 : 8;
             view.Buffer.NumElements = 4;
             view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            if (mode == "dispatch-input-view-tokens-structured") {
+                // Eight-byte records: the program reads the stride and record count the descriptor would have held.
+                view.Format = DXGI_FORMAT_UNKNOWN;
+                view.Buffer.FirstElement = 4;
+                view.Buffer.StructureByteStride = 8;
+                view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+            }
             invoke(device, 19, word(placed[1]), 0, word(&view), cpu);
+        }
+        if (mode == "dispatch-input-view-tokens-uav-input") {
+            // A GPU-filled buffer the title bound through an unordered access view where the program reads a shader resource.
+            const D3D12_RESOURCE_DESC source_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(input), 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+            const D3D12_RESOURCE_DESC staging_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(input), 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+            uav_source = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, source_desc, D3D12_RESOURCE_STATE_COMMON);
+            uav_staging = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, staging_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* staged = nullptr;
+            if (!uav_source || !uav_staging || FAILED(static_cast<HRESULT>(invoke(uav_staging, 8, 0, 0, word(&staged)))) || !staged) return 71;
+            for (UINT i = 0; i < words; ++i) static_cast<UINT*>(staged)[i] = 0xa0000000u + i * 0x101u;
+            invoke(uav_staging, 9, 0, 0);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC read{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+            read.Buffer.FirstElement = 4;  // 16 bytes in
+            read.Buffer.NumElements = 8;
+            read.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            invoke(device, 19, word(uav_source), 0, word(&read), cpu + 64);
         }
     }
     if (mode == "dispatch-input-null-token") {
@@ -644,6 +671,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         }
     } else if (formatted_heap) invoke(list, 14, 1, 1, 1);
     else if (view_tokens) {
+        if (uav_source) invoke(list, 15, word(uav_source), 0, word(uav_staging), 0, sizeof(input));
         invoke(list, 14, 1, 1, 1);
         invoke(list, 15, word(title_readback), 0, word(placed[1]), 0, sizeof(input));
     } else if (title_input) {

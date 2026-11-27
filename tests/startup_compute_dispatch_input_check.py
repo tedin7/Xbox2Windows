@@ -195,6 +195,46 @@ void main() {
     else:
         raise AssertionError('wrong-offset UAV unexpectedly passed the CPU comparison')
 
+    def program(name, hlsl, manifest):
+        source = directory / f'{name}.hlsl'
+        source.write_text(hlsl)
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', source], check=True)
+        (cache / f'{key}.txt').write_text(manifest)
+
+    # The program stores the descriptor words 1 to 3 of its output (stride, records, FORMAT word) and a texel. A raw view
+    # has stride 0, a byte count of records and the bounds bits; a structured view has its stride and element count.
+    program('view_token_words', """\
+Texture2D<float4> source : register(t0);
+RWByteAddressBuffer target : register(u0);
+cbuffer entry : register(b0) { uint ud0; uint ud1; uint ud2; };
+[numthreads(1, 1, 1)]
+void main() {
+    uint4 rgba = uint4(round(source.Load(int3(0, 0, 0)) * 255.0));
+    target.Store4(0, uint4(ud0, ud1, ud2, rgba.x + 257 * rgba.y));
+}
+""", 'x2w-manifest 2\nstage cs\nud 3\nudsrc 0 uav_descword3 0\nudsrc 1 uav_stride 0\nudsrc 2 uav_numrecords 0\n'
+        'srv 0 tex2d table 1 64\nuav 0 table 1 0\n')
+    for suffix, at, words in (('', 8, [0x30000fac, 0, 16]), ('-structured', 8, [0xfac, 8, 4])):
+        got = run(suffix)
+        expected = untouched.copy()
+        expected[at:at + 4] = words + [rgba[0] + 257 * rgba[1]]
+        assert got == expected, f'output descriptor words{suffix}: read {got[at:at + 4]}, expected {expected[at:at + 4]}'
+
+    # An input the title bound through an unordered access view of a GPU-filled buffer is read from that buffer's range.
+    program('view_token_uav_input', """\
+ByteAddressBuffer source : register(t0);
+RWByteAddressBuffer target : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    target.Store4(0, source.Load4(0));
+}
+""", 'x2w-manifest 2\nstage cs\nud 0\nsrv 0 buf table 1 64\nuav 0 table 1 0\n')
+    got = run('-uav-input')
+    expected = untouched.copy()
+    expected[8:12] = [0xa0000000 + i * 0x101 for i in range(4, 8)]
+    assert got == expected, f'UAV-token input: read {got[8:12]}, expected {expected[8:12]}'
+    print('view tokens: raw and structured output words, UAV-token input and null view match the CPU reference')
+
 
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
@@ -266,6 +306,10 @@ def main(consumer, dxc, adapter):
         zero_expected += untouched[written:]
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got == zero_expected, 'null-token output differs from the CPU reference for zero input'
+        # The view token switch reads a null buffer view as zeros too, without X2W_NULL_TOKEN_ZERO.
+        got, result = dispatch(directory, consumer, dict(env, X2W_COMPUTE_VIEW_TOKENS='1'), 'dispatch-input-null-token')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert got == zero_expected, 'a null buffer view token with the view token switch must read zeros'
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
         got, result = dispatch(directory, consumer, env, 'dispatch-input-memory-view')

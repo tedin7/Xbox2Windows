@@ -2919,16 +2919,38 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             std::memcpy(&address, record.desc, 8);
             std::memcpy(&size, record.desc + 8, 4);
             bytes = size;
-        } else if (record.slot == 18 && record.desc_bytes >= 40) {
+        } else if ((record.slot == 18 && record.desc_bytes >= 40) ||
+                   (describe_token && record.slot == 19 && record.desc_bytes >= sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-            std::memcpy(&view, record.desc, 40);
+            if (record.slot == 19) {
+                // A program that reads a buffer the title bound through an unordered access view: the same range of the
+                // same desktop resource is read as a shader resource.
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                std::memcpy(&uav, record.desc, sizeof(uav));
+                if (uav.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+                    return refuse("an input unordered access view token describes a texture, but the shader needs a buffer");
+                view.Format = uav.Format;
+                view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                view.Buffer.FirstElement = uav.Buffer.FirstElement;
+                view.Buffer.NumElements = uav.Buffer.NumElements;
+                view.Buffer.StructureByteStride = uav.Buffer.StructureByteStride;
+                view.Buffer.Flags = uav.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+            } else {
+                std::memcpy(&view, record.desc, 40);
+            }
             if (compute_input && !record.resource && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
                 static const bool enabled = x2w_local::env_on("X2W_NULL_TOKEN_ZERO");
-                if (enabled) return {nullptr, 0, 0, 0, false, 0, true};
+                // A null buffer view reads zeros; the view token switch asks for that too.
+                if (enabled || describe_token) return {nullptr, 0, 0, 0, false, 0, true};
             }
             if (describe_token && view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
                 return refuse("an input shader resource view token describes a texture, but the shader needs a buffer");
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+            if (describe_token) {
+                if (!owner || owner->own().kind != resource_kind)
+                    return refuse("an input view token names no desktop resource wrapper");
+                if (!owner->own().real) return refuse("an input view token's resource has no desktop copy");
+            }
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
                 view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
             const bool raw = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && !view.Buffer.StructureByteStride &&
@@ -2955,6 +2977,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 if (!own_memory) address = base + offset;
             }
         } else {
+            if (describe_token && record.slot == 19)
+                return refuse("an input unordered access view token has no materialized description");
             return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {
@@ -3025,7 +3049,24 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         }
         const auto placed = placed_buffer_range(device, address, bytes);
         if (placed.reject) return refuse("an input range crosses the end of a placed buffer");
-        if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
+        if (owner && owner != placed.owner) {
+            // The view range lies outside the token's own resource, or the resource is not in the placement index at its
+            // address. Name which, once per few calls, so the next census says why (the range is not read from another resource).
+            if (compute_input && compute_view_tokens_enabled()) {
+                static LONG range_logged;
+                if (first_calls(range_logged, 24)) {
+                    const auto* own_info = resource_info(owner);
+                    log("x2w-draw compute view token range: address %llx bytes %llu, token resource title memory %p width %llu placement %d, "
+                        "placed owner %p (%s)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes),
+                        owner->own().title_memory, own_info ? static_cast<unsigned long long>(own_info->bytes) : 0ull,
+                        own_info ? static_cast<int>(own_info->placement) : -1, static_cast<const void*>(placed.owner),
+                        placed.owner ? "another resource holds the range" : "none at that address");
+                }
+                return refuse(placed.owner ? "an input buffer view token's range is held by another placed resource"
+                                           : "an input buffer view token's resource is not in the placement index at its address");
+            }
+            return refuse("an input buffer view token's resource does not hold its range");
+        }
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
             const auto alias = (allow_address_alias || title_inputs) && !in_upload && bytes <= compute_input_chunk_bytes
