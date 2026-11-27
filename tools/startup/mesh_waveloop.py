@@ -173,21 +173,36 @@ class ControlFlow:
             empty, active = self.successors[start]
             if name == 's_cbranch_execnz':
                 empty, active = active, empty
-            if empty == active:
+            # An EXECNZ fallthrough can contain a branch-only block that
+            # skips the active arm. Follow it while the edge stays exclusive.
+            edge = (start, empty)
+            target, skipped = empty, {start}
+            while (target not in skipped and self.predecessors[target] == [edge[0]]
+                   and self.blocks[target] == target + 1 and instructions[target][2] == 's_branch'):
+                skipped.add(target)
+                edge = (target, self.successors[target][0])
+                target = edge[1]
+            if active == target or target in skipped:
                 continue
-            # The skipped region's definitions stand in for undef on the
-            # empty edge. The emitter leaves the skipped registers untouched.
-            seen, todo, writes = {empty, start}, [active], set()
+            # Only definitions on active paths that rejoin the empty successor
+            # can stand in for undef there. Stop both searches at this branch.
+            rejoins, pending = {target}, [target]
+            while pending:
+                for predecessor in self.predecessors[pending.pop()]:
+                    if predecessor not in skipped and predecessor not in rejoins:
+                        rejoins.add(predecessor)
+                        pending.append(predecessor)
+            seen, todo, writes = skipped | {target}, [active], set()
             while todo:
                 block = todo.pop()
-                if block in seen:
+                if block in seen or block not in rejoins:
                     continue
                 seen.add(block)
                 for index in range(block, self.blocks[block]):
                     writes.update(reg for reg in self.effects[index][1]
                                   if re.fullmatch(r'[sv]\d+', reg))
                 todo.extend(self.successors[block])
-            self.exec_zero_edges[start, empty] = writes
+            self.exec_zero_edges[edge] = writes
 
     def definedness(self, entry, elided_scc=()):
         def transfer(state, index):
@@ -223,7 +238,7 @@ class ControlFlow:
         return before
 
 
-def meet(states, exec_zero=()):
+def meet(G, states, exec_zero=()):
     keys = set().union(*(state.keys() for state in states))
     result = {}
     for key in keys:
@@ -239,7 +254,11 @@ def meet(states, exec_zero=()):
             result[key] = first
         elif STUB_RESULT in values:
             result[key] = STUB_RESULT
-        elif any(value is not None and (value[0] != 'const' or len(value) != 2) for value in values):
+        # Definedness checks for missing writes separately. A fixed-buffer
+        # load and a plain scalar write both leave the value in the SGPR.
+        # Entry user data, by contrast, is read directly from the cbuffer.
+        elif any(value is not None and (value[0] == 'ud' or not G.run_time_symbol(value))
+                 for value in values):
             result[key] = JOINED
     return result
 
@@ -313,7 +332,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             exec_zero = {i for i, p in enumerate(predecessors) if (p, start) in self.cfg.exec_zero_edges}
             if start == 0:
                 states.append(self.entry_symbols)
-            return meet(states, exec_zero) if states else {}
+            return meet(G, states, exec_zero) if states else {}
 
         def op_x2w_serial_block(self, ops, mods):
             if self.current_block is not None:
@@ -364,7 +383,10 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 for reg in sorted(reads):
                     if re.fullmatch(r's\d+', reg) and self.sym.get(int(reg[1:])) == STUB_RESULT:
                         raise G.Unsupported('wave loop: %s holds %s' % (reg, STUB_RESULT[0]))
-                if any(op in VCC_REGISTERS for op in ops) or real_name.startswith('s_cbranch_vcc'):
+                vcc_copy = (real_name == 's_mov_b64' and ops[1] == 'vcc'
+                            and (ops[0] == 'vcc' or G.reg_range(ops[0]) is not None))
+                if not vcc_copy and (any(op in VCC_REGISTERS for op in ops)
+                                     or real_name.startswith('s_cbranch_vcc')):
                     for reg in ('s106', 's107'):
                         symbol = self.sym.get(int(reg[1:]))
                         if reg in reads and symbol and not G.run_time_symbol(symbol):
@@ -592,7 +614,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             raise G.Unsupported('wave loop: unsupported scalar ' + name)
 
         def symbolic_move(self, ops):
-            dst, src = map(G.reg_range, ops)
+            dst, src = (G.reg_range('s[106:107]' if op == 'vcc' else op) for op in ops)
             if not dst or dst[0] != 's' or dst[2] != dst[1] + 1:
                 return False
             if src is None and (re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', ops[1]) or ops[1] in G.FLOATS):
@@ -605,8 +627,20 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             symbols = [self.sym.get(n) for n in range(src[1], src[2] + 1)]
             if JOINED in symbols:
                 raise G.Unsupported('wave loop: symbolic pair is joined across blocks')
-            if any(sym and not G.run_time_symbol(sym) for sym in symbols):
-                super().one('s_mov_b64', 's_mov_b64 ' + ', '.join(ops))
+            symbolic = [sym for sym in symbols if sym and not G.run_time_symbol(sym)]
+            if symbolic:
+                if 'vcc' not in ops:
+                    super().one('s_mov_b64', 's_mov_b64 ' + ', '.join(ops))
+                    return True
+                if any(sym[0] != 'desc' for sym in symbolic):
+                    raise G.Unsupported('wave loop: VCC pair copy needs descriptor or runtime words')
+                # A descriptor word is represented by provenance only. Copy
+                # that provenance through VCC as through any other SGPR pair.
+                values = [self.S(n) if sym is None or G.run_time_symbol(sym) else None
+                          for n, sym in zip(range(src[1], src[2] + 1), symbols)]
+                for n, sym, value in zip(range(dst[1], dst[2] + 1), symbols, values):
+                    kept = sym if value is None or (sym and sym[0] == 'const') else None
+                    self.set_s(n, value, kept)
                 return True
             self.write_pair(ops[0], self.vector_pair(ops[1]))
             for n, sym in zip(range(dst[1], dst[2] + 1), symbols):
