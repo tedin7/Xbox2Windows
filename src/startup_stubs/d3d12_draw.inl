@@ -1182,9 +1182,11 @@ BoundPipeline* translation_for(Wrapper* pipeline)
                 static_cast<long>(seen), own ? own->path : 0);
         if (first_calls(chosen.applied ? logged_applied : logged_refused, 256)) {
             if (chosen.applied)
-                log("x2w-draw pipeline %p (own path %d): depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
+                log("x2w-draw pipeline %p (own path %d): depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x (front func %d read mask 0x%x write mask 0x%x fail %d depth-fail %d pass %d)%s%s",
                     static_cast<void*>(pipeline), own ? own->path : 0, chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
-                    chosen.desc.StencilEnable, chosen.stencil_ref, chosen.depth_bounds ? "; depth bounds not applied" : "",
+                    chosen.desc.StencilEnable, chosen.stencil_ref, chosen.desc.FrontFace.StencilFunc, chosen.desc.StencilReadMask,
+                    chosen.desc.StencilWriteMask, chosen.desc.FrontFace.StencilFailOp, chosen.desc.FrontFace.StencilDepthFailOp,
+                    chosen.desc.FrontFace.StencilPassOp, chosen.depth_bounds ? "; depth bounds not applied" : "",
                     chosen.masks_differ ? "; back-face masks or reference differ, front used" : "");
             else
                 log("x2w-draw pipeline %p: depth-stencil registers not used (%s); keeping the desktop state", static_cast<void*>(pipeline),
