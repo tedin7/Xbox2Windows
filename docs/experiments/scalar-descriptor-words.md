@@ -41,3 +41,28 @@ The three new probes reproduce the respective refusals on the parent
 revision. A comparison of the vertex HLSL, pixel HLSL and manifest for 19
 existing synthetic pipelines gives 57 byte-identical outputs. The Windows
 readbacks and their mutants are pending.
+
+## Descriptor-derived texel limits
+
+The pixel fixture loads a fixed eight-word descriptor, computes two limits
+with scalar field extraction and shift-add, selects on the zero-word compare,
+and keeps the selected scalars across a forward SCC branch. A 4×2 texture
+provides distinct texels for the CPU comparison of all 64 output pixels.
+The second draw binds a null SRV and passes eight zero descriptor words.
+The adjacent-size-word and swapped-select controls must first differ at
+`(1,0)` and `(2,0)` respectively.
+
+On Linux with Python 3.14.8, the synthetic fixture translates with manifest
+version 3. The merged prerequisite `af9f12757` refuses its shift-add.
+Four existing synthetic pipelines produced byte-identical vertex HLSL,
+pixel HLSL and manifests against that revision. The descriptor controls
+also exercise unavailable, advanced and modified words, writes to lane masks,
+and ambiguous SCC definitions.
+
+```bash
+python -B tests/startup_gfx2hlsl_desc_ptr_prop_check.py
+python -B tests/startup_gfx2hlsl_desc_vcc_check.py
+```
+
+Windows WARP readback remains pending. Run the existing registered test with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_desc_ptr_prop_warp$'`.

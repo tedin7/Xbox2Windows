@@ -1502,6 +1502,31 @@ bool validate_raster_args(int argc, char** argv)
 
 static std::vector<std::uint32_t> parse_hex_words(std::string_view text);
 
+// --startup-descriptor-limits <vs> <ps> <expected.bin> <entry words> <bound 0|1>
+OperationResult run_startup_descriptor_limits(const OperationContext& ctx)
+{
+    const auto entry = parse_hex_words(ctx.argv[6]);
+    const std::string_view bound = ctx.argv[7];
+    if (entry.empty() || entry.size() > 32 || (bound != "0" && bound != "1"))
+        return {OutcomeKind::fail, "invalid descriptor limits entry or binding"};
+    std::uint32_t expected[256]{}, actual[256]{};
+    std::ifstream file(ctx.argv[5], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected), sizeof(expected));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold 64 RGBA pixels"};
+    check_startup_image_load_d16(ctx.device, ctx.argv[3], ctx.argv[4], false, actual,
+                                false, false, false, false, entry.data(), static_cast<UINT>(entry.size()), bound == "1");
+    for (unsigned i = 0; i < 64; ++i) {
+        if (std::memcmp(expected + i * 4, actual + i * 4, 4 * sizeof(std::uint32_t)) == 0)
+            continue;
+        std::fprintf(stderr, "descriptor limits pixel (%u,%u) mismatch: expected R=%08x actual R=%08x\n",
+                     i % 8, i / 8, expected[i * 4], actual[i * 4]);
+        return {OutcomeKind::fail, "descriptor limits readback differs"};
+    }
+    std::printf("descriptor limits: all 64 pixels matched\n");
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
 // width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
@@ -1776,6 +1801,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
