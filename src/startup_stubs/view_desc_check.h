@@ -217,7 +217,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         mips(view.Texture3D);
         break;
     case D3D12_SRV_DIMENSION_TEXTURECUBE:
-        fits = tex2d && single_sample && slices == 6 && resource.Width == resource.Height;
+        fits = tex2d && single_sample && slices >= 6 && resource.Width == resource.Height;
         mips(view.TextureCube);
         break;
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:

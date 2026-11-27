@@ -294,7 +294,7 @@ def check_cube(directory, consumer, backend):
             assert rgba == expected, f"{case} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
     # Slot 18 records the title view. These diagnostics must come from the
     # real draw binder, including for the cube view whose dimension matches.
-    mismatches = re.findall(r"srv 0: view dimension (\d+) does not match the shader; binding null", result.stderr)
+    mismatches = re.findall(r"srv 0: the shader declares view dimension \d+; the slot \d+ view has (\d+) ", result.stderr)
     assert mismatches == ["5", "9"], f"expected array then cube mismatch, got {mismatches}\n{result.stderr[-5000:]}"
     print(f"{backend}: six cube faces, array-view null and twelve-slice null match the CPU reference")
     return 0
