@@ -4564,6 +4564,21 @@ def mesh_mbcnt_high(ins, low, base, token, targets):
     return None
 
 
+def mesh_full_exec_reset(ins, floor, compare, edges):
+    """Prove full EXEC at the compare following an explicit reset."""
+    # AMD RDNA 2 Instruction Set Architecture Reference Guide, §3.3 “EXECute Mask”:
+    # EXEC predicates VALU per lane. A VALU select reading VCC leaves EXEC unchanged.
+    for reset in range(compare - 1, floor - 1, -1):
+        _, _, name, asm = ins[reset]
+        if asm == 's_mov_b64 exec, -1':
+            # Reject edges that bypass the reset or re-enter its forward path.
+            return not any(reset < dest <= compare and not reset <= source < dest
+                           for source, dest in edges.items())
+        if writes_exec(name, parse(asm)[1]) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_exec\w*)\b', asm):
+            return False
+    return False
+
+
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
                   mask_arm_sites=None, standalone_selects=None, pixel_writes=False, count_rewrites=None,
                   uniform_bounds=None, coherent_sites=None):
@@ -4874,10 +4889,12 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                              or (extra and ins[i][2].startswith('s_')
                                  and scalar_effects(*ins[i][2:])[0] & VCC_KEYS)
                              for i in scalar))) if failed]
-                    coherent = (coherent_sites is not None and full_reset and (prefix or vector_limit)
-                                and compare > a_end and not entries and ins[target][3] == 's_mov_b64 exec, -1'
-                                and any(ins[i][2] in MESH_EXEC_BRANCHES + MESH_VCC_BRANCHES
-                                        for i in range(source + 1, target)))
+                    coherent_candidate = (coherent_sites is not None and (prefix or vector_limit)
+                                          and compare > a_end and not entries
+                                          and ins[target][3] == 's_mov_b64 exec, -1'
+                                          and any(ins[i][2] in MESH_EXEC_BRANCHES + MESH_VCC_BRANCHES
+                                                  for i in range(source + 1, target)))
+                    coherent = coherent_candidate and full_reset
                     if coherent and any(source < i < target or source < j < target for i, j in backward):
                         raise mesh_wave_block_error('a backward branch inside the block')
                     arm_refusal = None
@@ -4933,7 +4950,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                             scalar = [i for i in scalar if i not in memory]
                             if mask_arm_sites is not None:
                                 mask_arm_sites.update(ins[i][0] for i in memory)
-                    if causes and coherent:
+                    # Retry the reset proof only after the existing lowering paths have refused.
+                    if causes and (coherent or (coherent_candidate and not full_reset
+                                               and mesh_full_exec_reset(ins, a_end, compare, edges))):
                         try:
                             votes, mask_ops, uniform = mesh_coherent_block(
                                 ins, source, target, edges, backward, live_at_join)
