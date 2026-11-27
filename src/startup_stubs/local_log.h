@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <memory>
+#include <new>
 
 namespace x2w_local {
 
@@ -66,22 +68,143 @@ inline volatile LONG faults_avoided = 0;
 struct MappedSpan {
     std::uintptr_t begin, end;
 };
-struct MappedCache {
+struct LegacyMappedCache {
     MappedSpan spans[16];
     int next;
 };
-inline thread_local MappedCache mapped_cache;
+inline thread_local LegacyMappedCache legacy_mapped_cache;
+
+inline bool mapped_cache_enabled() noexcept
+{
+    static const bool enabled = env_on("X2W_MAPPED_SPAN_TABLE");
+    return enabled;
+}
+
+inline constexpr std::size_t mapped_span_capacity = 4096;
+
+struct MappedCache {
+    MappedSpan spans[mapped_span_capacity];
+    std::size_t size;
+
+    // First span whose end is greater than address (or equal when merging).
+    std::size_t lower(std::uintptr_t address, bool merge = false) const noexcept
+    {
+        std::size_t lo = 0, hi = size;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (spans[mid].end < address || (!merge && spans[mid].end == address)) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    const MappedSpan* find(std::uintptr_t address) const noexcept
+    {
+        const auto i = lower(address);
+        return i < size && spans[i].begin <= address ? &spans[i] : nullptr;
+    }
+
+    void remember(MappedSpan span, std::size_t capacity) noexcept
+    {
+        auto first = lower(span.begin, true);
+        auto last = first;
+        while (last < size && spans[last].begin <= span.end) {
+            if (spans[last].begin < span.begin) span.begin = spans[last].begin;
+            if (spans[last].end > span.end) span.end = spans[last].end;
+            ++last;
+        }
+        if (first == last && size == capacity) {
+            // Start a new working set when the table fills.
+            size = first = last = 0;
+        }
+        if (last != first + 1 && last < size)
+            std::memmove(spans + first + 1, spans + last, (size - last) * sizeof(MappedSpan));
+        spans[first] = span;
+        size = first + 1 + size - last;
+    }
+};
+
+struct MappedTables {
+    MappedCache mapped;
+    // Trim can skip a query only for known committed, readable pages.
+    // Reserved extents must be checked again in case the title committed them.
+    MappedCache readable;
+};
+
+inline MappedTables* mapped_span_tables() noexcept
+{
+    if (!mapped_cache_enabled()) return nullptr;
+    static thread_local const std::unique_ptr<MappedTables> tables(new (std::nothrow) MappedTables{});
+    return tables.get();
+}
+
+inline LONG64 mapped_queries, mapped_hits, mapped_forgets;
+
+inline bool query_mapped_span(MappedTables& tables, const void* address, MEMORY_BASIC_INFORMATION* info) noexcept
+{
+    static const std::size_t capacity = env_on("X2W_TEST_MAPPED_SPAN_ONE") ? 1 : mapped_span_capacity;
+    InterlockedIncrement64(&mapped_queries);
+    if (VirtualQuery(address, info, sizeof(*info)) != sizeof(*info)) return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(info->BaseAddress);
+    const auto end = begin + info->RegionSize;
+    if (info->State != MEM_FREE && end > reinterpret_cast<std::uintptr_t>(address)) {
+        tables.mapped.remember({begin, end}, capacity);
+        if (info->State == MEM_COMMIT && !(info->Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (info->Protect & 0xFF))
+            tables.readable.remember({begin, end}, capacity);
+    }
+    return true;
+}
+
+// Query adapter for committed_extent_with. The caller must still touch the returned range.
+inline bool query_readable_mapped_span(const void* address, MEMORY_BASIC_INFORMATION* info) noexcept
+{
+    auto* tables = mapped_span_tables();
+    if (!tables) return VirtualQuery(address, info, sizeof(*info)) == sizeof(*info);
+    if (const auto* span = tables->readable.find(reinterpret_cast<std::uintptr_t>(address))) {
+        InterlockedIncrement64(&mapped_hits);
+        info->BaseAddress = reinterpret_cast<void*>(span->begin);
+        info->RegionSize = span->end - span->begin;
+        info->State = MEM_COMMIT;
+        info->Protect = PAGE_READONLY;
+        return true;
+    }
+    return query_mapped_span(*tables, address, info);
+}
 // Forgets the spans this thread has found (a span can be freed later; a failed touch or copy calls this).
-inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
+inline void forget_mapped_spans() noexcept
+{
+    if (auto* tables = mapped_span_tables()) {
+        tables->mapped.size = tables->readable.size = 0;
+        InterlockedIncrement64(&mapped_forgets);
+    } else {
+        legacy_mapped_cache = LegacyMappedCache{};
+    }
+}
 
 inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexcept
 {
     if (bytes == 0 || start + bytes < start) return bytes;
     const std::uintptr_t end = start + bytes;
     std::uintptr_t at = start;
+    if (auto* tables = mapped_span_tables()) {
+        while (at < end) {
+            if (const auto* span = tables->mapped.find(at)) {
+                InterlockedIncrement64(&mapped_hits);
+                at = span->end < end ? span->end : end;
+                continue;
+            }
+            MEMORY_BASIC_INFORMATION info{};
+            if (!query_mapped_span(*tables, reinterpret_cast<const void*>(at), &info)) return bytes;
+            if (info.State == MEM_FREE) return static_cast<std::size_t>(at - start);
+            const auto region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            if (region_end <= at) return bytes;
+            at = region_end < end ? region_end : end;
+        }
+        return bytes;
+    }
     while (at < end) {
         bool hit = false;
-        for (const MappedSpan& span : mapped_cache.spans) {
+        for (const MappedSpan& span : legacy_mapped_cache.spans) {
             if (span.begin <= at && at < span.end) {
                 at = span.end < end ? span.end : end;
                 hit = true;
@@ -93,8 +216,8 @@ inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexce
         if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) return bytes;  // unknown: let the touch decide
         if (info.State == MEM_FREE) return static_cast<std::size_t>(at - start);
         const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
-        mapped_cache.spans[mapped_cache.next] = {begin, begin + info.RegionSize};
-        mapped_cache.next = (mapped_cache.next + 1) % 16;
+        legacy_mapped_cache.spans[legacy_mapped_cache.next] = {begin, begin + info.RegionSize};
+        legacy_mapped_cache.next = (legacy_mapped_cache.next + 1) % 16;
         at = begin + info.RegionSize < end ? begin + info.RegionSize : end;
     }
     return bytes;

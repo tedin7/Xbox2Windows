@@ -425,10 +425,14 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     char identifier_format[8]{};
     const bool identifiers = GetEnvironmentVariableA("X2W_TEST_IDENTIFIER_SRV", identifier_format, sizeof(identifier_format)) != 0;
+    char frame_copy_mode[16]{};
+    const bool frame_copy = GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0) != 0;
+    if (frame_copy) GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", frame_copy_mode, sizeof(frame_copy_mode));
+    const bool mapped_spans = !std::strcmp(frame_copy_mode, "mapped-spans");
     const bool single = typed;
     const bool legacy = !single;
-    const UINT width = identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
@@ -611,12 +615,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
-    } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
+    } else if (frame_copy) {
         extern int draw_frame_copies(ID3D12Device*, void*, StreamTarget&, void*, UINT, UINT, const char*, const char*);
-        char mode[16]{};
-        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
-        const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, mode);
-        if (result || !std::strcmp(mode, "once-mirror") || !std::strcmp(mode, "ring-pressure")) return result;
+        const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, frame_copy_mode);
+        if (result || mapped_spans || !std::strcmp(frame_copy_mode, "once-mirror") ||
+            !std::strcmp(frame_copy_mode, "ring-pressure")) return result;
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
