@@ -6899,6 +6899,8 @@ class Stage:
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
+            if entry_proof and loaded_regs and self.kind == 'ps' and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in self.ins):
+                self.firstlane_v.update(loaded_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
@@ -10575,15 +10577,15 @@ class Stage:
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
     def op_buffer_store_format_xyzw(self, ops, mods):
-        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+        """Lower MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
 
         FORMAT, stride and num_records are read at dispatch from the same entry constants as
         buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
         name = 'buffer_store_format_xyzw'
-        if self.kind != 'cs':
-            raise Unsupported(name)  # the unknown-op refusal
+        if self.kind != 'cs' and not (self.kind == 'ps' and self.pipe.pixel_formatted_stores):
+            raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
         if raw and pc is not None and pc + 8 <= len(raw):
@@ -10625,9 +10627,32 @@ class Stage:
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        if self.kind == 'ps':
+            if int(ops[3], 0) or (imm_offset or 0):
+                raise Unsupported(name + ' pixel store requires zero offsets')
+            stores = [i for i, item in enumerate(self.ins) if item[2] == name]
+            indices = []
+            for pos in stores:
+                prior = self.ins[pos - 1] if pos else None
+                args = parse(prior[3])[1] if prior else []
+                store_args = parse(self.ins[pos][3])[1]
+                if (not prior or len(store_args) < 2 or re.sub(r'_e(32|64)$', '', prior[2]) != 'v_mov_b32'
+                        or len(args) != 2 or args[0] != store_args[1]
+                        or not re.fullmatch(r'0x[0-9a-f]+|[0-9]+', args[1])):
+                    raise Unsupported(name + ' index is not an immediately preceding constant move')
+                indices.append(int(args[1], 0))
+            if len(indices) != len(set(indices)):
+                raise Unsupported(name + ' pixel stores have overlapping indices')
+            if (not self.firstlane_cfg or not self.uniform_cf or not self.uniform_entry_exec()
+                    or not all(n in self.firstlane_v for n in range(src[1], src[2] + 1))):
+                raise Unsupported(name + ' data not proven wave-uniform')
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        if self.kind == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
+            raise Unsupported('%s shares a vertex UAV' % name)
         uav = self.pipe.uav(key, 'raw')
+        if self.kind == 'ps':
+            self.pipe.uavs[key]['pixel_format'] = True
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
@@ -10635,7 +10660,8 @@ class Stage:
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
             uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
-        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+        # D3D pixel helper invocations have no UAV side effects. Also honor the guest's per-lane EXEC bit.
+        self.emit(call if self.kind == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -14883,6 +14909,7 @@ class Pipeline:
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
+    pixel_formatted_stores = False
     srv_formats = ()
     integer_texture_srvs = False
     typed_srvs = False  # a Texture2DArray input (compute gather) needs the runtime's typed-SRV binding
@@ -14941,10 +14968,11 @@ class Pipeline:
         try:
             stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
         except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
+            if str(reason) not in (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform'):
                 raise
         else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+            retry_reasons = (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform')
+            if refusals is None or not any((reason, 'ps') in refusals[before:] for reason in retry_reasons):
                 return stage
         self.__dict__.clear()
         self.__dict__.update(state)
@@ -14975,6 +15003,7 @@ class Pipeline:
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), *, pixel_refusal=None):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
+        self.pixel_formatted_stores = self.vertex_kind == 'vs'
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
@@ -17085,6 +17114,7 @@ LIFTED_REASONS = (
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),
+    ('pixel-formatted-store', r'^buffer_store_format_xyzw$'),
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),

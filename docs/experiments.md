@@ -323,12 +323,28 @@ to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on ha
 
 ## Offline vertex buffer stores
 
-`tools/startup/gfx2hlsl.py` lowers vertex-stage `buffer_store_dword`, `dwordx2`, `dwordx3` and `dwordx4` in the `off` form to `RWByteAddressBuffer.Store*`. The descriptor must come from a root-table slot, and the manifest becomes version 2 with a `uav <slot> table <param> <byte offset>` line. This is offline only: the shipped runtime refuses the `raw` uav line by name (it binds only pixel-stage `tex2d` stores), so no buffer store runs in a game. Refused forms: `glc`, `slc`, `offen`, `idxen`, pixel stage, a descriptor also used for a load, a descriptor whose base was changed, and an immediate or inline offset that is not a multiple of four. A register offset is rounded down to a multiple of four.
+`tools/startup/gfx2hlsl.py` lowers vertex-stage `buffer_store_dword`, `dwordx2`, `dwordx3` and `dwordx4` in the `off` form to `RWByteAddressBuffer.Store*`. The descriptor must come from a root-table slot, and the manifest becomes version 2 with a `uav <slot> raw table <param> <byte offset>` line. This remains offline. The draw runtime refuses raw UAV manifests that lack the three pixel formatted-store entry sources. Refused forms: `glc`, `slc`, `offen`, `idxen`, pixel stage, a descriptor also used for a load, a descriptor whose base was changed, and an immediate or inline offset that is not a multiple of four. A register offset is rounded down to a multiple of four.
 
 The descriptor modifications that compute buffer stores accept are accepted here too, with the same checks: the stride clear of DW1 and the structured-to-raw conversion (stride DW1[29:16] extracted, optionally clamped to at least 1, DW2 NUM_RECORDS scaled by it, DW3 OOB_SELECT set to 3, stride cleared), all four words from one descriptor load. The store and manifest are those of the unmodified descriptor. In the vertex stage, as in compute, a descriptor load through a pointer other than the untouched pair is tagged with the constant high word of a 32-bit table pointer, or otherwise with its own load, so the conversion cannot mix words of two loads. Any other modification stays refused. As for compute, matching out-of-range behavior would need a UAV view sized to the converted byte count; the runtime binds no vertex-stage UAV yet.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_buffer_store$' --output-on-failure
+```
+
+## Pixel texture reads and formatted stores
+
+The pixel retry uses the existing uniform image proof for fixed-table texel reads
+and explicit level-zero samples. Pixel stores require uniform data and distinct
+constant indices; unsupported descriptor formats and layouts are refused at draw time. The draw runtime binds the formatted store as a
+raw UAV and sources word 3, stride and record count from the same table descriptor.
+
+The synthetic WARP fixture compares all four logical buffer records and all 16
+render-target pixels with a CPU reference. Two extra backing records expose a
+mutant that omits the descriptor's record-count check. The fixture also detects
+swapped indices and a different input texel.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_buffer_store|startup_pixel_store_format_xyzw_(controls|warp)|startup_compute_store_format_xyzw_controls)$'
 ```
 
 ## Shared-exponent target stand-in
