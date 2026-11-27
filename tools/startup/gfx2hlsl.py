@@ -840,7 +840,7 @@ def reg_range(tok):
 # operand both, so a write of one half never counts as writing the other.
 SCALAR_TOKEN = re.compile(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b|\b(vcc|exec)(_lo|_hi)?\b|\b(m0)\b|\bsrc_(scc)\b')
 EXEC_KEYS = {'exec', 'exec_hi'}
-NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch', 's_round_mode')
 # Forms that print no destination: every printed scalar operand is read. v_cmpx writes EXEC implicitly; its e32 and
 # SDWA forms print only sources, and the repository decoder prints the e64 form's unused SDST field first.
 # s_setpc reads its address; s_movrel* address a register through m0, so their printed operand is not a plain write.
@@ -1036,7 +1036,7 @@ def scalar_effects(name, asm):
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
 # symbolic tracking does not hold).
 NO_SCALAR_DESTINATION = ('s_cbranch', 's_branch', 's_waitcnt', 's_nop', 's_endpgm', 's_cmp', 's_bitcmp', 's_setpc',
-                         's_barrier', 's_sendmsg', 's_inst_prefetch', 's_clause', 's_setprio', 's_sleep', 's_setreg',
+                         's_barrier', 's_sendmsg', 's_inst_prefetch', 's_round_mode', 's_clause', 's_setprio', 's_sleep', 's_setreg',
                          's_code_end', 's_dcache', 's_icache', 's_ttrace', 'exp', 'ds_write', 'v_cmpx')
 TWO_SCALAR_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
 # Symbols whose register also holds the value at run time: constants are assigned when set, entry root constants are
@@ -3498,6 +3498,7 @@ class Stage:
     # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
     # (a class default keeps probes built without __init__ working).
     interp_scanned = False
+    round_modes = None
     defined_uniform_s = None
     bad_sgprs = None
     _uniform_written = None
@@ -6534,7 +6535,7 @@ class Stage:
                 continue
             if not (self.vector_only_instruction(name, asm)
                     or name.startswith(('image_', 'buffer_', 'tbuffer_', 'global_', 'flat_', 'exp'))
-                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt')):
+                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt', 's_round_mode')):
                 return False
         return True
 
@@ -7608,11 +7609,20 @@ class Stage:
                 self.scc_uniform = False  # the hardware SCC result is not modelled
             self.scc_verified = False
             return None
+        if self.round_modes is None:
+            self.round_modes = self.round_mode_flow()
+        mode = self.round_modes.get(pc, 1)  # bit 0: nearest even; bit 1: toward zero
+        if base == 's_round_mode':
+            self.round_mode_immediate(ops, mods)
+            return None
+        if mode & 2:
+            self.check_half_round_mode(base, mode)
         if base == 's_setreg_imm32_b32':
-            # The write itself changes nothing the lowering models, except MODE[1:0] (the binary32 rounding mode):
-            # v_cvt_pk_u8_f32 and the other conversions are lowered for round-to-nearest-even, and the hardware
-            # follows MODE.round (round toward zero truncates). s_round_mode and s_setreg_b32 are refused already.
+            # Keep the existing binary32 check for standalone MODE writes. A second writer of MODE[3:0]
+            # would invalidate the rounding dataflow proved for s_round_mode.
             field = re.fullmatch(r'hwreg\((HW_REG_MODE|1)(?:,\s*(\d+),\s*(\d+))?\)', ops[0].strip()) if ops else None
+            if field and self.round_modes and int(field.group(2) or 0) < 4:
+                raise Unsupported('s_setreg_imm32_b32 writes MODE rounding bits in a program with s_round_mode')
             if field and int(field.group(2) or 0) < 2:   # shortcut: an offset >= 2 cannot reach MODE[1:0]
                 # The immediate is known: the write is harmless when it leaves MODE[1:0] at 0 (nearest even).
                 offset, width = int(field.group(2) or 0), int(field.group(3) or 32)
@@ -12752,108 +12762,383 @@ class Stage:
                 op, ops[1], 'I' if op == 'v_interp_p1ll_f16' else 'J', want))
         return base
 
-    def interp_f16_scan(self):
-        """Whole-program proof for the f16 interpolation pair (no fixed-point analysis: any doubt is a refusal).
+    def instruction_successors(self):
+        """Instruction successors, including proven calculated targets."""
+        index = {off: i for i, (off, *_) in enumerate(self.ins)}
+        calculated = getattr(self, 'calculated_pc', {})
+        for i, (off, _, name, asm) in enumerate(self.ins):
+            target = calculated.get(off)
+            if name.startswith('s_cbranch') or name == 's_branch':
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+            successors = []
+            if i + 1 < len(self.ins) and name not in (
+                    's_branch', 's_setpc_b64', 's_swappc_b64', 's_endpgm'):
+                successors.append(i + 1)
+            if target in index:
+                successors.append(index[target])
+            yield successors
 
-        The lowering reads the rasterizer's interpolant, so it is only faithful if (1) the entry I/J registers are
-        never written (they still hold the entry barycentrics wherever the pair reads them), (2) v_interp_p1ll_f16,
-        which emits nothing, has no consumer but the v_interp_p2_f16 that follows it in the same straight-line run
-        and nothing reads the destination it leaves stale when p2 writes elsewhere, and (3) nothing reads the
-        upper 16 bits of a plain p2 destination: whether gfx10 keeps or clears them is not established by a source
-        (LLVM 15 SIInstrInfo/VOP3Instructions.td model the result as f16 only; the encoding states no
-        high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it, until a p2 with
-        op_sel 0x8 writes the high half of that register (Mesa ACO keeps the other half, see check_encoding).
-        """
+    @staticmethod
+    def round_mode_immediate(ops, mods):
+        # RDNA 2 ISA PDF pp.45, 55, 137: MODE[1:0] is binary32, MODE[3:2] is binary16/binary64.
+        if len(ops) != 1 or mods:
+            raise Unsupported('s_round_mode requires one immediate')
+        try:
+            value = int(ops[0], 0) & 0xf
+        except ValueError:
+            raise Unsupported('s_round_mode requires one immediate') from None
+        if value & 3:
+            raise Unsupported('s_round_mode changes binary32 rounding from nearest even')
+        if value in (4, 8):
+            raise Unsupported('s_round_mode uses directed binary16/binary64 rounding other than toward zero')
+        return 2 if value == 12 else 1
+
+    @staticmethod
+    def check_half_round_mode(base, mode):
+        narrow_name = re.sub(r'_(?:sdwa|dpp)$', '', base)
+        if narrow_name.startswith(('v_cmp', 'v_cvt_pkrtz_')) or narrow_name == 'v_interp_p1ll_f16':
+            return  # p1ll's output is binary32 (RDNA 2 ISA PDF p.188)
+        if narrow_name.startswith('v_cvt_'):
+            narrow_result = re.match(r'v_cvt_(?:pk_)?f(?:16|64)_', narrow_name)
+        else:
+            narrow_result = narrow_name.endswith(('_f16', '_f64'))
+        if narrow_result:
+            if mode == 3:
+                raise Unsupported('%s with mixed binary16/binary64 rounding modes' % base)
+            if base not in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+                raise Unsupported('%s with binary16/binary64 rounding toward zero' % base)
+
+    def round_mode_flow(self):
+        ins = getattr(self, 'ins', ())
+        if not any(name == 's_round_mode' for _, _, name, _ in ins):
+            return {}
+        successors = list(self.instruction_successors())
+        modes = {ins[0][0]: 1}
+        work = [0]
+        while work:
+            i = work.pop()
+            off, _, name, asm = ins[i]
+            mode = modes[off]
+            if name == 's_round_mode':
+                _, ops, mods = parse(asm)
+                mode = self.round_mode_immediate(ops, mods)
+            if name.startswith(('s_setpc', 's_swappc')) and not successors[i]:
+                raise Unsupported('s_round_mode across an unresolved indirect jump')
+            for j in successors[i]:
+                target = ins[j][0]
+                previous = modes.get(target, 0)
+                if mode & ~previous:
+                    modes[target] = previous | mode
+                    work.append(j)
+        return modes
+
+    def red_only_export(self, target):
+        formats = getattr(getattr(self, 'pipe', None), 'rtv_formats', ())
+        return (re.fullmatch(r'mrt[0-7]', target) is not None and int(target[3:]) < len(formats)
+                and formats[int(target[3:])] in (41, 54, 56, 58, 61, 63))
+
+    @staticmethod
+    def interp_write_halves(name, mods):
+        # The f32 p1 lowering emits no value. Its p2 is the modeled whole write.
+        if name.endswith('_dpp') or name.startswith(('v_mac', 'v_fmac', 'v_writelane', 'v_movrel',
+                                                     'v_swap', 'v_pk_', 'v_interp_p1_f32',
+                                                     'v_readlane', 'v_readfirstlane', 'v_cmp')):
+            return 0
+        if name in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+            return 1 if name == 'v_fma_mixlo_f16' else 2
+        if name == 'v_interp_p2_f16':
+            return 2 if INTERP_DST_HIGH in mods else 1
+        if name.endswith('_sdwa'):
+            if 'dst_sel:DWORD' not in mods:
+                if 'dst_unused:UNUSED_PRESERVE' in mods:
+                    if 'dst_sel:WORD_0' in mods:
+                        return 1
+                    if 'dst_sel:WORD_1' in mods:
+                        return 2
+                return 0
+            name = name[:-5]
+        if (name.startswith(('image_load', 'image_sample', 'image_gather4'))
+                or re.fullmatch(r'(?:buffer|global|flat|scratch)_load_dword(?:x[234])?', name)):
+            return 0 if set(mods) & {'d16', 'tfe', 'lwe', 'lds'} else 3
+        if name.startswith('v_cvt_'):
+            return 3 if re.match(r'v_cvt_[fiu](?:32|64)_', name) or name == 'v_cvt_pkrtz_f16_f32' else 0
+        return 3 if name.startswith('v_') and name.endswith(
+            ('_b32', '_i32', '_u32', '_f32', '_b64', '_i64', '_u64', '_f64')) else 0
+
+    @staticmethod
+    def interp_scalar_pair(token):
+        span = reg_range(token)
+        if span and span[0] == 's' and span[2] == span[1] + 1 and span[2] < 106:
+            return frozenset(span[1:])
+
+    @staticmethod
+    def interp_live_pairs(pairs, writes):
+        return frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
+
+    def interp_exec_entry_facts(self, successors, effects, indirect):
+        """At each reachable instruction, pairs equal to EXEC or a proven superset of it."""
+        empty = frozenset()
+        if not successors:
+            return {}
+        facts = {0: (empty, empty)}
+        work = [0]
+        while work:
+            i = work.pop()
+            if i in indirect:
+                return {}  # An unknown incoming edge can invalidate facts at any origin.
+            writes, save, restore, exec_write, bounds = effects[i]
+            equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in facts[i])
+            if restore is not None:
+                if restore not in equal:
+                    equal = superset = frozenset({restore})
+                # A proven no-op restore keeps the other aliases of unchanged EXEC.
+            elif exec_write:
+                if 'exec' in bounds:
+                    superset |= equal
+                    if save is not None:
+                        superset |= {save}
+                    equal = empty
+                else:
+                    equal = superset = empty
+            elif save is not None:
+                equal |= {save}
+                superset |= {save}
+
+            for j in successors[i]:
+                previous = facts.get(j)
+                merged = ((equal & previous[0], superset & previous[1])
+                          if previous is not None else (equal, superset))
+                if merged != previous:
+                    facts[j] = merged
+                    work.append(j)
+        return facts
+
+    @staticmethod
+    def interp_lane_local(name):
+        if name == 'exp' or name.startswith(('image_load', 'image_store', 'image_atomic')):
+            return True
+        if name.startswith(('image_sample', 'image_gather4')):
+            # Implicit LOD and bias can observe coordinates from other lanes in the quad.
+            return re.fullmatch(r'image_(?:sample|gather4)(?:_c)?_l(?:z)?(?:_o)?', name) is not None
+        if name.startswith(('buffer_', 'tbuffer_', 'global_')):
+            return name.split('_', 2)[1] in ('load', 'store', 'atomic')
+        return name.startswith('v_') and not (
+            name.endswith('_dpp') or name.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane',
+                                                      'v_movrel', 'v_permlane')))
+
+    def interp_exec_step(self, identity, effects):
+        """Advance EXEC identity and coverage for one omitted half."""
+        same, superset, masked, current, at_same, at_superset, covered = identity
+        # 'masked' pairs may name different subsets of the lanes covered by the write.
+        # Only 'current' records equality with the entire current mask.
+        writes, save, restore, exec_write, bounds = effects
+        # Operands of saveexec describe the mask before it writes D, even when D aliases S.
+        narrows_to_covered = any(covered if token == 'exec' else self.interp_scalar_pair(token) in masked
+                                 for token in bounds)
+        same, superset, masked, current = (self.interp_live_pairs(pairs, writes)
+                                           for pairs in (same, superset, masked, current))
+        if save is not None:
+            if at_same:
+                same |= {save}
+            if at_superset:
+                superset |= {save}
+            if covered:
+                masked |= {save}
+            current |= {save}
+        if restore is not None:
+            at_same, at_superset, covered = restore in same, restore in superset, restore in masked
+            if at_same:
+                current = same
+            elif restore not in current:
+                current = frozenset({restore})
+        elif exec_write:
+            at_same = at_superset = False
+            current = frozenset()
+            covered = narrows_to_covered
+        return same, superset, masked, current, at_same, at_superset, covered
+
+    def interp_exec_effects(self, name, asm, ops, exec_write):
+        writes = scalar_destinations(name, asm)
+        save = restore = None
+        if name == 's_mov_b64' and len(ops) == 2:
+            if ops[1] == 'exec':
+                save = self.interp_scalar_pair(ops[0])
+            if ops[0] == 'exec':
+                restore = self.interp_scalar_pair(ops[1])
+        bounds = ()
+        if name.startswith('v_cmpx'):
+            bounds = ('exec',)
+        elif len(ops) == 3 and ops[0] == 'exec':
+            if name == 's_and_b64':
+                bounds = tuple(ops[1:])
+            elif name == 's_andn2_b64':
+                bounds = (ops[1],)
+        elif len(ops) == 2 and name in ('s_and_saveexec_b64', 's_or_saveexec_b64',
+                                       's_andn1_saveexec_b64', 's_andn2_saveexec_b64'):
+            save = self.interp_scalar_pair(ops[0])
+            if name in ('s_and_saveexec_b64', 's_andn1_saveexec_b64'):
+                bounds = ('exec',)
+            elif name == 's_andn2_saveexec_b64':
+                bounds = (ops[1],)
+        return writes, save, restore, exec_write, bounds
+
+    def interp_read_halves(self, name, asm, sources, mods):
+        halves = [3] * len(sources)
+        if name == 'v_cvt_f32_f16' and not mods and len(sources) == 1:
+            halves[0] = 1
+        elif name in ('v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+            half, high, _ = self.mix_selections(mods)
+            if len(sources) == len(half) == len(high) == 3:
+                halves = [1 << h if f else 3 for f, h in zip(half, high)]
+        elif name.endswith('_sdwa') and not name.startswith(READ_MODIFY_WRITE):
+            for mod in mods:
+                select = re.fullmatch(r'src([01])_sel:(WORD_[01]|BYTE_[0-3])', mod)
+                if select and (src := int(select[1])) < len(sources):
+                    halves[src] = 1 if select[2] in ('WORD_0', 'BYTE_0', 'BYTE_1') else 2
+        elif name == 'exp':
+            target, vals, flags = export_operands(asm)
+            if len(vals) == 4 and 'compr' in flags and self.red_only_export(target):
+                return zip(vals, (1, 1, 3, 3))
+        return zip(sources, halves)
+
+    def interp_f16_scan(self):
+        """Prove uses of omitted partial interpolants and preservation of entry barycentrics."""
         if self.interp_scanned:
             return
-        pair = None
-        targets = set()
+
+        def regs(tokens):
+            result = set()
+            for token in tokens:
+                for register in re.findall(r'\bv(?:\[\d+:\d+\]|\d+\b)', token):
+                    _, lo, hi = reg_range(register)
+                    result.update(range(lo, hi + 1))
+            return result
+
+        successors = list(self.instruction_successors())
+        targets = {j for i, edges in enumerate(successors) for j in edges
+                   if j != i + 1 or self.ins[i][2].startswith(('s_branch', 's_cbranch', 's_setpc'))}
         rows = []
-        for off, _, name, asm in self.ins:
-            n, ops, mods = parse(asm)
-            n = re.sub(r'_e(32|64)$', '', n)
-            rows.append((off, n, ops, mods))
-            target = getattr(self, 'calculated_pc', {}).get(off)
-            if n.startswith('s_cbranch') or n == 's_branch':
-                target = int(ops[0].split('_')[1], 16)
-            if target is not None:
-                # A backward branch needs no refusal of its own: every branch instruction is a boundary below, where
-                # the scan requires that no p1ll result is pending, no p2 result is stale and no destination has an
-                # undefined upper half. Nothing the scan tracks therefore travels along a back edge, and the loop head
-                # (also a boundary, entered with the same empty state) starts clean on every iteration.
-                targets.add(target)
-
-        def regs(tok):
-            r = reg_range(tok)
-            return set(range(r[1], r[2] + 1)) if r and r[0] == 'v' else set()
-
-        pending, stale, high_undefined = {}, set(), set()
-        for off, n, ops, mods in rows:
-            branch_boundary = off in targets or n.startswith('s_cbranch') or n in ('s_branch', 's_setpc_b64')
-            if branch_boundary and pending:
+        barycentrics = {}
+        base = getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0)
+        pending, omitted, exec_effects = {}, [], []
+        empty = frozenset()
+        for i, (_, _, _, asm) in enumerate(self.ins):
+            name, ops, mods = parse(asm)
+            name = re.sub(r'_e(32|64)$', '', name)
+            interp = name in ('v_interp_p1ll_f16', 'v_interp_p2_f16')
+            if interp and (len(ops) != (3 if name == 'v_interp_p1ll_f16' else 4) or
+                           not all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:])):
+                return  # the instruction handler rejects the malformed pair member
+            written = lds_vgpr_writes(name, ops)
+            _, sources = effect_destinations(name, ops)
+            if name == 'exp' or name.startswith(INTERP_STORE_PREFIXES + ('v_swap', 'v_movrel')) or '_atomic' in name:
+                sources = ops
+            elif name.startswith(READ_MODIFY_WRITE):
+                sources = ops
+            if name == 'v_interp_p2_f16':
+                sources = ops[1:2]  # p1's result is consumed symbolically
+            read = {}
+            for token, halves in self.interp_read_halves(name, asm, sources, mods):
+                for reg in regs([token]):
+                    read[reg] = read.get(reg, 0) | halves
+            # Relative reads may access any VGPR, including ones absent from the printed operands.
+            if name.startswith('v_movrel'):
+                read.update(dict.fromkeys(range(256), 3))
+            exec_write = writes_exec(name, ops)
+            effects = self.interp_exec_effects(name, asm, ops, exec_write)
+            exec_effects.append(effects)
+            rows.append((name, read, written, self.interp_write_halves(name, mods), self.interp_lane_local(name)))
+            if interp:
+                self.interp_f16_pair(name, ops)
+            if base is not None and name in ('v_interp_p1_f32', 'v_interp_p2_f32',
+                                             'v_interp_p1ll_f16', 'v_interp_p2_f16'):
+                for reg in regs(ops[1:2]) & {base, base + 1}:
+                    barycentrics.setdefault(reg, []).append(i)
+            if name == 's_endpgm':
+                pending.clear()
+            boundary = i in targets or name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_swappc'))
+            if boundary and pending:
                 raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
                                   'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
-            if branch_boundary and (stale or high_undefined):
-                raise Unsupported('unmodelled v_interp_p2_f16 result across a branch')
-            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
-            # A malformed pair member is refused by its own handler; the scan models only the plain spelling.
-            interp = (n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and len(ops) == (3 if n[10] == '1' else 4) and
-                      all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:]))
-            if n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and not interp:
-                return  # its own handler refuses the program; nothing after it is worth proving
-            written = regs(ops[0]) if ops and not store else set()
-            if interp:
-                read = regs(ops[1])
-                pair = self.interp_f16_pair(n, ops)
-            else:
-                read = set().union(*(regs(o) for o in ops)) if ops else set()
-            low_reader = (n == 'v_cvt_f32_f16' and not mods and len(ops) == 2 and
-                          all(re.fullmatch(r'v\d+', o) for o in ops))
-            for r in sorted(read):
-                if r in pending:
-                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
-                                      'the matching v_interp_p2_f16' % (r, n))
-                if r in stale:
-                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
-                                      'a v_interp_p2_f16 that wrote another register' % (r, n))
-                if r in high_undefined and not (low_reader and r == int(ops[1][1:])):
-                    raise Unsupported('%s reads the upper 16 bits of the v_interp_p2_f16 result v%d: not modelled' %
-                                      (n, r))
-            if n == 'v_interp_p1ll_f16' and interp:
+            if exec_write and pending:
+                raise Unsupported('EXEC changes between v_interp_p1ll_f16 and its v_interp_p2_f16')
+            if name == 'v_interp_p2_f16' and pending.get(int(ops[3][1:])) != (ops[2], 'high' in mods):
+                raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' %
+                                  (ops[3], ops[2]))
+            for reg in sorted((read.keys() | written) & pending.keys()):
+                if name == 'v_interp_p2_f16' and reg == int(ops[3][1:]) and reg not in read:
+                    continue
+                raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
+                                  'the matching v_interp_p2_f16' % (reg, name))
+            if name == 'v_interp_p1ll_f16':
                 pending[int(ops[0][1:])] = (ops[2], 'high' in mods)
-            elif n == 'v_interp_p2_f16' and interp:
-                d, out = int(ops[3][1:]), int(ops[0][1:])
-                if pending.get(d) != (ops[2], 'high' in mods):
-                    raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' %
-                                      (ops[3], ops[2]))
-                del pending[d]
-                if out in pending:
-                    raise Unsupported('v_interp_p2_f16 overwrites the pending v_interp_p1ll_f16 result v%d' % out)
-                stale.discard(out)
-                if out != d:
-                    stale.add(d)
-                if INTERP_DST_HIGH in mods:
-                    # Completes a 16-bit pair: the low half it keeps must be a plain p2 result still waiting for its
-                    # upper half (no other writer is modelled), after which every reader sees defined halves.
-                    if out not in high_undefined:
-                        raise Unsupported('v_interp_p2_f16 op_sel 0x8 into v%d, which holds no v_interp_p2_f16 low '
-                                          'half: the half it keeps is not modelled' % out)
-                    high_undefined.discard(out)
-                else:
-                    high_undefined.add(out)
-            elif low_reader:
-                high_undefined.discard(int(ops[0][1:]))
-                stale.discard(int(ops[0][1:]))
-        # I and J: never written anywhere
-        base = pair if pair is not None else (getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0) or 0)
-        for off, n, ops, mods in rows:
-            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
-            if ops and not store and regs(ops[0]) & {base, base + 1}:
-                raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
-                                  'where v_interp_p1ll_f16 / v_interp_p2_f16 read them' % (n, min(
-                                      regs(ops[0]) & {base, base + 1})))
-            if n == 'v_swap_b32' and len(ops) == 2 and regs(ops[1]) & {base, base + 1}:
-                raise Unsupported('v_swap_b32 writes the entry barycentric registers')
+            elif name == 'v_interp_p2_f16':
+                partial = int(ops[3][1:])
+                del pending[partial]
+                # RDNA 2 ISA PDF p.190: p2 updates one half and preserves the other. If p2 aliases p1ll,
+                # that other half is part of the omitted binary32 result (PDF p.188).
+                halves = 3
+                if partial == int(ops[0][1:]):
+                    halves = 1 if INTERP_DST_HIGH in mods else 2
+                omitted.append((i, partial, halves))
+
+        predecessors = [[] for _ in rows]
+        for i, edges in enumerate(successors):
+            for j in edges:
+                predecessors[j].append(i)
+        indirect = {i for i, (name, *_) in enumerate(rows)
+                    if name.startswith(('s_setpc', 's_swappc')) and not successors[i]}
+        for reg, readers in barycentrics.items():
+            work = [p for i in readers for p in predecessors[i]] + list(indirect)
+            seen = set()
+            while work:
+                i = work.pop()
+                if i in seen:
+                    continue
+                seen.add(i)
+                name, _, written, _, _ = rows[i]
+                if reg in written:
+                    raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
+                                      'where interpolation reads them' % (name, reg))
+                work.extend(predecessors[i])
+
+        entry_facts = self.interp_exec_entry_facts(successors, exec_effects, indirect)
+        work = []
+        for i, reg, halves in omitted:
+            # EXEC cannot change between p1ll and p2. Using facts at p2 also drops pairs
+            # clobbered since p1ll and includes any intervening copies of that same EXEC.
+            equal, superset = entry_facts.get(i, (empty, empty))
+            identity = equal, superset | equal, empty, equal, True, True, False
+            work.extend((j, reg, half, halves != 3, identity)
+                        for half in (1, 2) if halves & half for j in successors[i])
+        seen = set()
+        while work:
+            state = work.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > 65536:
+                raise Unsupported('v_interp_p1ll_f16 liveness state budget exceeded')
+            i, reg, half, alias, identity = state
+            name, read, written, written_halves, lane_local = rows[i]
+            if read.get(reg, 0) & half and not (identity[-1] and lane_local):
+                if alias:
+                    raise Unsupported('%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' %
+                                      (name, reg))
+                raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+                                  'a v_interp_p2_f16 that wrote another register' % (reg, name))
+            identity = self.interp_exec_step(identity, exec_effects[i])
+            same, superset, masked, current, _, at_superset, _ = identity
+            if reg in written and written_halves & half:
+                if at_superset:
+                    continue
+                identity = same, superset, masked | current, current, False, False, True
+            if name.startswith(('s_setpc', 's_swappc')):
+                raise Unsupported('unmodelled v_interp_p2_f16 result across an indirect jump')
+            for j in successors[i]:
+                if j <= i:
+                    raise Unsupported('unmodelled v_interp_p2_f16 result across a backward branch')
+                work.append((j, reg, half, alias, identity))
         self.interp_scanned = True
 
     def op_v_interp_p1ll_f16(self, ops, mods):
@@ -12868,10 +13153,7 @@ class Stage:
         self.interp_p1[int(ops[0][1:])] = (attr, field, high)
 
     def op_v_interp_p2_f16(self, ops, mods):
-        # P1 + J * P20, converted to binary16 into one half of the destination, the other half kept (LLVM: the
-        # result is f16, the high bit selects the attribute half only). The plain form writes the low half; with
-        # op_sel 0x8 (ACO's v_interp_p2_hi_f16) the high half. interp_f16_scan refuses every consumer of a half the
-        # pair has not written, so a half that is never written is never observed.
+        # RDNA 2 ISA PDF p.190: op_sel[3] selects the destination half; the other half is preserved.
         attr, field, high = self.interp_f16('v_interp_p2_f16', ops, mods, 1, 4)
         self.interp_f16_pair('v_interp_p2_f16', ops)
         self.interp_f16_scan()
@@ -12880,9 +13162,11 @@ class Stage:
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
         if INTERP_DST_HIGH in mods:
+            # A low half still belonging to an omitted p1ll is tracked by interp_f16_scan.
             self.set_v(d, '(v%d & 0xffffu) | (f32tof16(i.%s) << 16)' % (d, field))
         else:
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field))
+            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field),
+                       low16_only=d in self.low16_only_v)
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
@@ -12898,12 +13182,8 @@ class Stage:
         self.attrs.setdefault(attr, set()).add(how)
         return attr, component
 
-    def mix(self, ops, mods, dest):
-        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of sources that are binary32 words or binary16 halves.
-
-        Per source (LLVM 15 SelectVOP3PMadMixModsImpl): op_sel_hi set means the source is binary16, and
-        op_sel set picks its high half. abs, then neg, apply after widening. dest is 'f32', 'lo' or 'hi'.
-        """
+    @staticmethod
+    def mix_selections(mods):
         half, hi, clamp = [0, 0, 0], [0, 0, 0], False
         for m in mods:
             if m.startswith('op_sel_hi:['):
@@ -12914,6 +13194,15 @@ class Stage:
                 clamp = True
             else:
                 raise Unsupported('fma_mix modifier %s' % m)
+        return half, hi, clamp
+
+    def mix(self, ops, mods, dest):
+        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of sources that are binary32 words or binary16 halves.
+
+        Per source (LLVM 15 SelectVOP3PMadMixModsImpl): op_sel_hi set means the source is binary16, and
+        op_sel set picks its high half. abs, then neg, apply after widening. dest is 'f32', 'lo' or 'hi'.
+        """
+        half, hi, clamp = self.mix_selections(mods)
 
         def operand(tok, is_half, is_hi):
             if not is_half and is_hi:
@@ -12964,11 +13253,14 @@ class Stage:
             self.set_v(d, 'U(%s)' % expr)
             return
         self.used_v.add(d)
+        convert = 'f16rz' if (self.round_modes or {}).get(getattr(self, 'pc', None)) == 2 else 'f32tof16'
+        if convert == 'f16rz' and getattr(self, 'pipe', None) is not None:
+            self.pipe.uses_f16rz = True
         if dest == 'hi':
-            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
+            self.set_v(d, '(v%d & 0xffffu) | (%s(%s) << 16)' % (d, convert, expr))
         else:
             keep_low16 = d in self.low16_only_v
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr), low16_only=keep_low16)
+            self.set_v(d, '(v%d & 0xffff0000u) | %s(%s)' % (d, convert, expr), low16_only=keep_low16)
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
@@ -13681,9 +13973,8 @@ class Stage:
             if mask != 0xF and not name.startswith('mrt'):
                 raise Unsupported('partial compressed export to %s' % name)
             pairs = []
-            # R32_FLOAT uses R only. G cannot contribute to R through blending, and A
-            # is handled separately. Require the explicit format of the primary target.
-            red_only = name == 'mrt0' and tuple(self.pipe.rtv_formats[:1]) == (41,)  # DXGI_FORMAT_R32_FLOAT
+            # G cannot contribute to an R-only target. A can still affect blending.
+            red_only = self.red_only_export(name)
             for c in (0, 2):
                 v = vals[c]
                 r = self.u(v, low16_only=red_only and c == 0) if v != 'off' else None
@@ -14386,6 +14677,17 @@ VEC_F = {
 }
 # v_fma_mix*: precise keeps the sign of a zero result; mad still lets a backend fuse or round the product.
 MIX32 = 'float mix32(float a, float b, float c) { precise float result = mad(a, b, c); return result; }'
+# Truncate the binary32 significand, saturating finite overflow to the largest finite half.
+F16RZ = """uint f16rz(float value) {
+    uint bits = asuint(value), sign = (bits >> 16) & 0x8000u, magnitude = bits & 0x7fffffffu;
+    if (magnitude > 0x7f800000u) return sign | 0x7e00u;
+    if (magnitude == 0x7f800000u) return sign | 0x7c00u;
+    if (magnitude >= 0x47800000u) return sign | 0x7bffu;
+    if (magnitude >= 0x38800000u) return sign | ((magnitude - 0x38000000u) >> 13);
+    if (magnitude < 0x33800000u) return sign;
+    uint shift = 126u - (magnitude >> 23);
+    return sign | (((magnitude & 0x7fffffu) | 0x800000u) >> shift);
+}"""
 # 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
 # binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
 # i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
@@ -15264,6 +15566,8 @@ class Pipeline:
                'uint ldu(ByteAddressBuffer b, uint a) { ' +
                unaligned_dword_body('b.Load(a & ~3u)', 'b.Load((a & ~3u) + 4)'),
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds) + len(twins)))]
+        if getattr(self, 'uses_f16rz', False):
+            out.insert(-1, F16RZ)
         if self.uses_dynamic_heap:
             constants = ['uint ud%d;' % i for i in range(len(self.uds) + len(twins))]
             out[-1] = 'cbuffer entry : register(b0) { %s };' % ' '.join(
