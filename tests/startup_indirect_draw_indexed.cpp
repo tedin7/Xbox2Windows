@@ -12,6 +12,7 @@
 #include "startup_indirect_mesh_amplified_mesh.h"
 #include "startup_indirect_mesh_pixel.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -65,6 +66,12 @@ void consume_retained_compute_root() {
 [numthreads(1, 1, 1)]
 void write_left() {
     data.Store4(4, uint4(3, 1, 1, 0));
+    data.Store(20, 0);
+}
+
+[numthreads(1, 1, 1)]
+void write_plain_indices() {
+    data.Store4(4, uint4(3, 1, 2, 0));
     data.Store(20, 0);
 }
 
@@ -765,13 +772,42 @@ void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT wo
                  converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
 }
 
+struct PlainIndexDraw {
+    D3D12_INDEX_BUFFER_VIEW view;
+    std::array<UINT, 3> triangle;
+    bool* clear_mismatch = nullptr;
+};
+
+bool plain_index_cpu_covers(const PlainIndexDraw& draw, UINT x, UINT y)
+{
+    // In NDC, the source fixture's three corners cover the viewport. The
+    // pixel shader additionally clips to the half selected by the first index.
+    constexpr float corners[3][2]{{-1, -1}, {-1, 3}, {3, -1}};
+    const float px = 2 * (x + 0.5f) / width - 1;
+    const float py = 1 - 2 * (y + 0.5f) / height;
+    for (UINT i = 0; i < draw.triangle.size(); ++i) {
+        const auto& a = corners[draw.triangle[i] % 3];
+        const auto& b = corners[draw.triangle[(i + 1) % 3] % 3];
+        if ((b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]) > 0)
+            return false;
+    }
+    return (x >= width / 2) == (draw.triangle.front() >= 3);
+}
+
+struct ShadowIndexDraw {
+    D3D12_INDEX_BUFFER_VIEW view;
+    std::array<std::uint16_t, 3> reference;
+    bool matched_previous_frame = false;
+};
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
+         const PlainIndexDraw* plain_index = nullptr, ShadowIndexDraw* shadow = nullptr)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -799,7 +835,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     std::optional<PlacedBuffer> arguments, index_buffer;
     if (!external_arguments)
         arguments.emplace(device, guest, static_cast<UINT>(sizeof(initial_words)), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (indexed && !upload_index && !alias_index) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    if (indexed && !upload_index && !alias_index && !plain_index && !shadow) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
     ComPtr<ID3D12Resource> upload, arg_readback;
     void* memory = nullptr;
     const D3D12_RANGE untouched{0, 0};
@@ -1020,6 +1056,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                                          draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         slot<Index>(wrapped, 47)(wrapped, &view);
     }
+    if (plain_index) slot<Index>(wrapped, 47)(wrapped, &plain_index->view);
+    if (shadow) slot<Index>(wrapped, 47)(wrapped, &shadow->view);
     ComPtr<ID3D12CommandAllocator> foreign_allocator;
     ComPtr<IUnknown> foreign_list;
     std::array<std::uint32_t, 4> unregistered{};
@@ -1178,7 +1216,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                            : refusal == Refusal::rect_bad_count ? 4
                            : !translated && !indexed && draw_right ? 6 : 3;
             expected[word + 1] = 1;
-            if (indexed) expected[word + 2] = draw_right && !translated_indexed ? 4 : 1;
+            if (indexed) expected[word + 2] = plain_index ? 2 : draw_right && !translated_indexed ? 4 : 1;
             if (translated_indexed && draw_right) {
                 expected[word + 3] = refusal == Refusal::indexed_base_overrun ? 5 : 3;
                 expected[word + 4] = 0;
@@ -1211,6 +1249,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const D3D12_RANGE pixel_range{0, static_cast<SIZE_T>(bytes)};
         check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
         UINT painted = 0;
+        bool previous_frame_matches = true;
         bool pixels_match = true;
         for (UINT y = 0; y < height; ++y)
             for (UINT x = 0; x < width; ++x) {
@@ -1226,6 +1265,16 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
                 auto wanted = drawn ? (cached_depth_only ? depth_word :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (plain_index)
+                    wanted = refusal == Refusal::none && plain_index_cpu_covers(*plain_index, x, y) ? red : black;
+                if (shadow) {
+                    // Each group of three vertex IDs covers the target. The pixel shader
+                    // selects its half using the group of the first (flat-shaded) vertex.
+                    const UINT side = shadow->reference[0] / 3;
+                    wanted = refusal == Refusal::none && right_half == (side == 1)
+                        ? (side == 1 ? green : red) : black;
+                    previous_frame_matches &= actual == (right_half ? black : red);
+                }
                 if (leased) wanted = right_half ? leased->expected_right.value_or(leased->expected) : leased->expected;
                 if (rect) {
                     // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
@@ -1239,10 +1288,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
                 pixels_match = false;
             }
+        if (shadow) shadow->matched_previous_frame = previous_frame_matches;
         pixel_readback->Unmap(0, &untouched);
         std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
                     external_arguments ? "" : ", argument guards intact");
         if (!pixels_match) {
+            if (plain_index && plain_index->clear_mismatch) *plain_index->clear_mismatch = painted == 0;
             if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
             return false;
         }
@@ -1271,7 +1322,7 @@ void refuse_each_reason(ID3D12Device* guest, ID3D12CommandSignature* draw_indexe
 }
 
 // 300 empty console presents (queue slot 32) reach the render-totals heartbeat; nothing is shown.
-std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
+void empty_presents(ID3D12Device* guest, int count)
 {
     const D3D12_COMMAND_QUEUE_DESC desc{};
     ComPtr<IUnknown> queue;
@@ -1280,7 +1331,13 @@ std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
     using Present = HRESULT (WINAPI*)(IUnknown*, UINT, const void*, const void*);
     const std::array<unsigned char, 0x50> planes{};
     const std::array<unsigned char, 0x40> present{};
-    for (int frame = 0; frame < 300; ++frame) slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data());
+    for (int frame = 0; frame < count; ++frame)
+        slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data());
+}
+
+std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
+{
+    empty_presents(guest, 300);
     std::ifstream file(log_path, std::ios::binary);
     std::string line, found;
     while (std::getline(file, line))
@@ -2029,9 +2086,23 @@ int main(int argc, char** argv) try
     const bool root_fix = root_fix_control || (argc == 3 && std::strcmp(argv[2], "translated-root") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
+    const bool shadow_off = argc == 3 && std::strcmp(argv[2], "index-shadow-off") == 0;
+    const bool shadow_stale = argc == 3 && std::strcmp(argv[2], "index-shadow-stale") == 0;
+    const bool shadow_index = shadow_off || shadow_stale ||
+        (argc == 3 && std::strcmp(argv[2], "index-shadow-on") == 0);
+    if (shadow_index)
+        check(SetEnvironmentVariableA("X2W_INDIRECT_INDEX_SHADOW", shadow_off ? "0" : "1") &&
+              SetEnvironmentVariableA("X2W_INDIRECT_INDEX_COPY", "0") &&
+              SetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_SHADOW_STALE", shadow_stale ? "1" : "0")
+              ? S_OK : E_FAIL, "configure indirect index shadow");
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
-    const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
+    const bool index_copy_off = argc == 3 && std::strcmp(argv[2], "index-copy-off") == 0;
+    const bool index_copy_late = argc == 3 && std::strcmp(argv[2], "index-copy-late") == 0;
+    const bool index_copy_wide = argc == 3 && std::strcmp(argv[2], "index-copy-wide") == 0;
+    const bool index_copy = index_copy_off || index_copy_late || index_copy_wide ||
+        (argc == 3 && std::strcmp(argv[2], "index-copy") == 0);
+    const bool translated_indexed = index_copy || alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
@@ -2040,7 +2111,7 @@ int main(int argc, char** argv) try
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
-    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer && !null_census) return 2;
+    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer && !null_census && !shadow_index) return 2;
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
     const bool fixed_create_fixture = mesh && GetEnvironmentVariableA("X2W_FIXED_MESH_CREATE_FIXTURE", nullptr, 0);
@@ -2430,6 +2501,85 @@ int main(int argc, char** argv) try
                     kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr,
                     upload_index, alias_index, 0, false, restore_compute);
             };
+            if (index_copy) {
+                check(SetEnvironmentVariableA("X2W_INDIRECT_INDEX_COPY", index_copy_off ? "0" : "1") &&
+                      SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS", "0") &&
+                      SetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_COPY", index_copy_late ? "late" : index_copy_wide ? "wide" : "none")
+                      ? S_OK : E_FAIL, "configure index copy case");
+                const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_plain_indices");
+                SYSTEM_INFO sys{};
+                GetSystemInfo(&sys);
+                const std::unique_ptr<void, FreeMemory> memory(VirtualAlloc(nullptr, 2 * sys.dwPageSize,
+                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!memory) return 1;
+                auto* const source = static_cast<unsigned char*>(memory.get()) + 64;
+                bool clear_mismatch = false;
+                PlainIndexDraw draw{{reinterpret_cast<UINT64>(source), 0, DXGI_FORMAT_R16_UINT},
+                    {1, 2, 0}, &clear_mismatch};
+                const auto verify_copy = [&](Refusal refusal, const char* label) {
+                    return run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), pso.Get(),
+                        signature.Get(), kind, false, refusal, label, &red_binding, false, nullptr, false, false,
+                        0, false, false, nullptr, nullptr, false, &draw);
+                };
+                const auto set_indices = [&](auto index_word, DXGI_FORMAT format) {
+                    using IndexWord = decltype(index_word);
+                    const IndexWord words[]{17, 23, static_cast<IndexWord>(draw.triangle[0]),
+                        static_cast<IndexWord>(draw.triangle[1]), static_cast<IndexWord>(draw.triangle[2]), 31, 37, 41, 47};
+                    std::memcpy(source, words, sizeof(words));
+                    draw.view = {reinterpret_cast<UINT64>(source), 8 * sizeof(IndexWord), format};
+                };
+                const auto report_contains = [](const char* reason) {
+                    std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+                    x2w_d3d12_census_report(report.data(), report.size());
+                    return report.find(reason) != std::string::npos;
+                };
+                set_indices(std::uint16_t{}, DXGI_FORMAT_R16_UINT);
+                if (index_copy_off) {
+                    const bool ok = verify_copy(Refusal::index_unregistered, "index copy off") &&
+                        report_contains("reason=index_no_desktop_range calls=1");
+                    if (ok) std::filesystem::remove_all(cache);
+                    return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+                }
+                const bool narrow_ok = verify_copy(Refusal::none, "plain R16 first frame");
+                if (index_copy_late || index_copy_wide) {
+                    if (!narrow_ok && clear_mismatch && !report_contains("indirect-other refusal") &&
+                        !report_contains("indirect-draw refusal") && (!info || !info->GetNumStoredMessages())) {
+                        std::filesystem::remove_all(cache);
+                        std::puts("index copy mutant rejected by WARP pixel readback");
+                    }
+                    return narrow_ok ? 0 : 1;
+                }
+                if (!narrow_ok) return 1;
+                // A new recording in this frame reuses the original staged bytes.
+                std::memset(source, 0xff, draw.view.SizeInBytes);
+                if (!verify_copy(Refusal::none, "plain R16 reused within frame")) return 1;
+                set_indices(std::uint32_t{}, DXGI_FORMAT_R32_UINT);
+                if (!verify_copy(Refusal::none, "plain R32 first frame")) return 1;
+
+                empty_presents(guest.Get(), 1);
+                draw.triangle = {5, 3, 4};
+                set_indices(std::uint16_t{}, DXGI_FORMAT_R16_UINT);
+                if (!verify_copy(Refusal::none, "rewritten R16 second frame")) return 1;
+                set_indices(std::uint32_t{}, DXGI_FORMAT_R32_UINT);
+                if (!verify_copy(Refusal::none, "rewritten R32 second frame")) return 1;
+
+                constexpr UINT over_limit = (16u << 20) + 4;
+                const std::unique_ptr<void, FreeMemory> large_range(
+                    VirtualAlloc(nullptr, over_limit, MEM_RESERVE, PAGE_NOACCESS));
+                if (!large_range) return 1;
+                draw.view = {reinterpret_cast<UINT64>(large_range.get()), over_limit, DXGI_FORMAT_R32_UINT};
+                if (!verify_copy(Refusal::index_unregistered, "index copy over limit") ||
+                    !report_contains("reason=index_over_copy_limit calls=1")) return 1;
+                DWORD previous = 0;
+                auto* const second_page = static_cast<unsigned char*>(memory.get()) + sys.dwPageSize;
+                check(VirtualProtect(second_page, sys.dwPageSize, PAGE_NOACCESS, &previous) ? S_OK : E_FAIL,
+                      "protect second index page");
+                draw.view = {reinterpret_cast<UINT64>(second_page - 4), 8, DXGI_FORMAT_R32_UINT};
+                if (!verify_copy(Refusal::index_unregistered, "index copy crosses unreadable page") ||
+                    !report_contains("reason=index_unreadable calls=1")) return 1;
+                std::filesystem::remove_all(cache);
+                return !info || !info->GetNumStoredMessages() ? 0 : 1;
+            }
             if (alias_index) {
                 const bool ok = alias_disabled
                     ? verify(left.Get(), false, Refusal::alias_off, "unregistered spans refused when alias route is off")
@@ -2691,6 +2841,56 @@ int main(int argc, char** argv) try
         return run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
                    kind, draw_right, refusal, label);
     };
+    if (shadow_index) {
+        // No guest resource is registered for this allocation. Use a halfword-aligned
+        // R16 view, with one unused prefix index before the GPU-written start index.
+        const std::unique_ptr<void, FreeMemory> memory(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!memory) return 1;
+        auto* const source = static_cast<unsigned char*>(memory.get()) + 2;
+        const std::array<std::uint16_t, 5> first{11, 0, 1, 2, 13}, next{19, 3, 4, 5, 23};
+        ShadowIndexDraw draw{{reinterpret_cast<UINT64>(source), sizeof(first), DXGI_FORMAT_R16_UINT}, {}};
+        const auto draw_with_reference = [&](const auto& words, Refusal refusal, const char* label) {
+            std::copy_n(words.begin() + 1, draw.reference.size(), draw.reference.begin());
+            draw.matched_previous_frame = false;
+            return run(device.Get(), guest.Get(), writer.Get(), left.Get(), graphics.Get(), pso.Get(), signature.Get(),
+                       kind, false, refusal, label, nullptr, false, nullptr, false, false,
+                       0, false, false, nullptr, nullptr, false, nullptr, &draw);
+        };
+        std::memcpy(source, first.data(), sizeof(first));
+        if (shadow_off) {
+            if (!draw_with_reference(first, Refusal::index_unregistered, "shadow off: clear target")) return 1;
+            std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+            x2w_d3d12_census_report(report.data(), report.size());
+            if (report.find("reason=index_no_desktop_range calls=1") == std::string::npos) return 1;
+        } else {
+            if (!draw_with_reference(first, Refusal::none, "shadow first frame")) return 1;
+            std::memcpy(source, next.data(), sizeof(next));
+            if (!draw_with_reference(first, Refusal::none, "shadow reused in the same frame")) return 1;
+            draw.view.SizeInBytes = sizeof(next) - sizeof(next.back());
+            if (!draw_with_reference(next, Refusal::none, "shadow uses a distinct slice for a shorter view")) return 1;
+            draw.view.SizeInBytes = sizeof(next);
+            const D3D12_COMMAND_QUEUE_DESC desc{};
+            ComPtr<IUnknown> queue;
+            check(guest->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                            reinterpret_cast<void**>(queue.GetAddressOf())), "create shadow fixture queue");
+            using Present = HRESULT (WINAPI*)(IUnknown*, UINT, const void*, const void*);
+            const std::array<unsigned char, 0x50> planes{};
+            const std::array<unsigned char, 0x40> present{};
+            check(slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data()), "advance shadow frame");
+
+            const bool refreshed = draw_with_reference(next, Refusal::none, "shadow refreshed after Present");
+            if (shadow_stale) {
+                // Accept the control only if every pixel matches the old image.
+                if (refreshed || !draw.matched_previous_frame || (info && info->GetNumStoredMessages())) return 1;
+                std::puts("stale index mutant failed the WARP pixel comparison");
+                DeleteFileW(log_path.c_str());
+                return 1;
+            }
+            if (!refreshed) return 1;
+        }
+        DeleteFileW(log_path.c_str());
+        return !info || !info->GetNumStoredMessages() ? 0 : 1;
+    }
     const char* left_label = indexed ? "left writer" : "one triangle";
     const char* right_label = indexed ? "right writer" : "two triangles";
     if (kind == DrawKind::rect) {
