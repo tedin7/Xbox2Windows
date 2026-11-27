@@ -51,24 +51,29 @@ def pre_install_device():
     for seq, result in ((5, 0), (6, 0x80004002)):
         data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, 0, DEVICE, riid, out, *([0] * 9), result, 0.0, 0, 0))
         data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 0, 0, riid, 16, 0x51D))
+        if seq == 5:
+            # Succeeded when recorded (its OUTP names 0xABC0) but fails here (the IID is unknown): a later call on that
+            # object is a dependent of a failed create, not an unknown object.
+            data += chunk(b"OUTP", struct.pack("<QIIQ", 5, 1, 0, 0xABC0))
     data += chunk(b"BLOB", struct.pack("<QQ", 0x51D, 16), bytes(range(1, 17)))
     # A pipeline creation whose description is an address in the title's image the file does not hold: skipped.
     data += chunk(b"CALL", CALL[3].pack(7, 1, 0, 57, DEVICE, 0x7FF6C51306B8, riid, out, *([0] * 8), 0, 0.0, 0, 0))
     # A call on a resource no OUTP named: skipped.
     data += chunk(b"CALL", CALL[3].pack(8, 1, 7, 8, 0x9999, *([0] * 11), 0, 0.0, 0, 0))
-    # The QueryInterface at seq 5 succeeded when recorded (its OUTP names 0xABC0) but fails here (the IID is unknown):
-    # a call on that object is a dependent of a failed create, not an unknown object.
-    data += chunk(b"OUTP", struct.pack("<QIIQ", 5, 1, 0, 0xABC0))
+    # A call on the object of seq 5's failed QueryInterface.
     data += chunk(b"CALL", CALL[3].pack(9, 1, 7, 8, 0xABC0, *([0] * 11), 0, 0.0, 0, 0))
     # Two calls whose argument points at a 16-byte struct whose first word points at the same 4 KiB of bytes: the
     # nested leaf is copied once and shared.
     top, leaf = 0x7253F700, 0x7253E000
+    # As the recorder writes them, a blob right after the first ARGM that names it: a call's chunks run to the next CALL.
     for seq in (10, 11):
         data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, 15, DEVICE, 2, top, *([0] * 9), 32, 0.0, 0, 0))
         data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 1, 1, top, 16, 0x70F))
+        if seq == 10:
+            data += chunk(b"BLOB", struct.pack("<QQ", 0x70F, 16), struct.pack("<QQ", leaf, 0))
         data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 0x101, 0, leaf, 4096, 0x1EAF))
-    data += chunk(b"BLOB", struct.pack("<QQ", 0x70F, 16), struct.pack("<QQ", leaf, 0))
-    data += chunk(b"BLOB", struct.pack("<QQ", 0x1EAF, 4096), bytes(range(256)) * 16)
+        if seq == 10:
+            data += chunk(b"BLOB", struct.pack("<QQ", 0x1EAF, 4096), bytes(range(256)) * 16)
     return data
 
 
@@ -114,6 +119,11 @@ def main(player):
             code, text, _ = play(player, directory, f"bad-{version}-{wire}-{slot}",
                                  recording(version, wire_version=wire, slot=slot))
             assert code == 2 and message in text, (code, text[-2500:])
+        # A call's ARGM, OUTP, HPLC, DARR and DHPM follow its CALL (the player reads them from there when it plays it).
+        misplaced = recording(3) + chunk(b"CALL", CALL[3].pack(2, 1, 0, 15, DEVICE, 2, *([0] * 10), 32, 0.0, 0, 0))
+        misplaced += chunk(b"ARGM", struct.pack("<QIIQQQ", 1, 1, 0, 0x7253F000, 1, 1))
+        code, text, _ = play(player, directory, "misplaced", misplaced)
+        assert code == 2 and "ARGM not after its CALL" in text, (code, text[-2500:])
 
         for version in (2, 3):
             code, text, out = play(player, directory, f"v{version}", recording(version, tail=version == 3))
@@ -136,6 +146,7 @@ def main(player):
         # Copies: the riid of seq 5 (seq 6 is skipped first) and both 16-byte structs, plus the 4 KiB leaf once: the
         # second call shares it.
         assert (summary["argument_bytes"], summary["shared_argument_bytes"]) == (3 * 16 + 4096, 4096), summary
+        assert summary["peak_private_bytes"] > 0, summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
         for line in ("x2w-replay: skip census: ", "skip census 0:0 recorded failure: 1",
                      "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1",

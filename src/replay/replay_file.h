@@ -1,6 +1,7 @@
 // Reads a replay recording (docs/startup-runtime.md#d3d12-replay-record, written by
 // src/startup_stubs/d3d12_record.inl): the chunk framing <4s tag><u32 header bytes><u64 data bytes>, then the header,
-// then the data. The file is mapped, not copied: blobs are read in place.
+// then the data. The file is mapped, not copied: blobs are read in place, and a call is read from the mapping when it is
+// played (16 bytes per call stay in memory).
 #pragma once
 
 #include <windows.h>
@@ -55,6 +56,8 @@ struct HeapPlacement {
     u64 id, base, bytes, offset;
 };
 
+// One call with everything the file holds for it. The player builds it from the mapping when it plays the call
+// (Recording::load): a recording keeps only a StepRef per call in memory.
 struct Step {
     CallRecord call;
     HeapPlacement placement{};
@@ -63,6 +66,121 @@ struct Step {
     const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
     u64 descriptor_address = 0, descriptor_bytes = 0;   // DHPM: caller-supplied CPU backing for slot 14
 };
+
+// A call in the file: its sequence number and where its CALL chunk starts. The recorder writes a call's ARGM, BLOB,
+// OUTP, HPLC, DARR and DHPM chunks right after its CALL, before the next call's.
+struct StepRef {
+    u64 seq, at;
+};
+
+struct ChunkHead {
+    char tag[5]{};
+    std::uint32_t header_bytes = 0;
+    u64 data_bytes = 0, header_at = 0, data_at = 0;
+};
+
+// The chunk at `at` of a mapping of `size` bytes, or false when its head or body runs past the end.
+inline bool chunk_at(const unsigned char* base, u64 size, u64 at, ChunkHead& c)
+{
+    if (at > size || size - at < 16) return false;
+    std::memcpy(c.tag, base + at, 4);
+    std::memcpy(&c.header_bytes, base + at + 4, 4);
+    std::memcpy(&c.data_bytes, base + at + 8, 8);
+    c.header_at = at + 16;
+    c.data_at = c.header_at + c.header_bytes;
+    return c.data_bytes <= size && c.data_at <= size - c.data_bytes;
+}
+
+// A CALL header; format 2 has seven argument words, then ret, seconds, present (rcx's memory is ARGM 7, moved to 15).
+inline CallRecord read_call(const unsigned char* h, std::uint32_t version)
+{
+    CallRecord call{};
+    if (version == file_version) {
+        std::memcpy(&call, h, sizeof(CallRecord));
+    } else {
+        std::memcpy(&call, h, call_v2_prefix);
+        std::memcpy(reinterpret_cast<unsigned char*>(&call) + offsetof(CallRecord, ret), h + call_v2_prefix, call_trailer_bytes);
+    }
+    return call;
+}
+
+// Adds a chunk that belongs to `step` (ARGM, OUTP, HPLC, DARR, DHPM) to it: "" when `c` is none of those or was added,
+// else what is wrong. `heaps` (the recording's HPLC heaps) is filled while the file is read, null when a call is loaded.
+inline std::string add_to_step(const unsigned char* base, std::uint32_t version, const ChunkHead& c, u64 at, Step& step,
+                               std::unordered_map<u64, HeapPlacement>* heaps)
+{
+    const std::string name(c.tag);
+    const unsigned char* h = base + c.header_at;
+    const auto owner = [&](u64 seq) { return seq == step.call.seq; };
+    if (name == "ARGM" && c.header_bytes >= 40) {
+        u64 seq;
+        ArgMemory m{};
+        std::memcpy(&seq, h, 8);
+        std::memcpy(&m.arg, h + 8, 4);
+        std::memcpy(&m.depth, h + 12, 4);
+        std::memcpy(&m.address, h + 16, 8);
+        std::memcpy(&m.bytes, h + 24, 8);
+        std::memcpy(&m.hash, h + 32, 8);
+        if (version == 2 && (m.arg & 0xffu) == 7) m.arg = (m.arg & ~0xffu) | 15u;  // format 2's rcx index
+        if (!owner(seq)) return "ARGM not after its CALL at " + std::to_string(at);
+        step.memory.push_back(m);
+    } else if (name == "HPLC") {
+        u64 seq;
+        HeapPlacement placement;
+        if (c.header_bytes != sizeof(seq) + sizeof(placement) || c.data_bytes) return "invalid HPLC size at " + std::to_string(at);
+        std::memcpy(&seq, h, sizeof(seq));
+        std::memcpy(&placement, h + sizeof(seq), sizeof(placement));
+        if (!owner(seq)) return "HPLC not after its CALL at " + std::to_string(at);
+        constexpr u64 granule = 0x10000, address_limit = 1ull << 47;
+        if (step.call.kind != 0 || step.call.slot != 133 || step.placement.id || !placement.id ||
+            !placement.base || placement.base >= address_limit || (placement.base & (granule - 1)) ||
+            placement.bytes > address_limit - placement.base || placement.offset >= placement.bytes ||
+            (placement.offset & (granule - 1)))
+            return "invalid HPLC placement at " + std::to_string(at);
+        if (heaps) {
+            const auto& heap = heaps->emplace(placement.id, placement).first->second;
+            if (heap.base != placement.base || heap.bytes != placement.bytes)
+                return "inconsistent HPLC heap at " + std::to_string(at);
+        }
+        step.placement = placement;
+    } else if (name == "DARR" && c.header_bytes == 8) {
+        u64 seq;
+        std::memcpy(&seq, h, 8);
+        if (!owner(seq)) return "DARR not after its CALL at " + std::to_string(at);
+        if (step.call.kind != 0 || step.call.slot != 23 || step.descriptor_arrays) return "invalid DARR call at " + std::to_string(at);
+        const auto& args = step.call.args;
+        u64 expected = 0;
+        for (const unsigned arg : {1u, 2u, 4u, 5u})
+            if (args[arg]) expected += u64{static_cast<std::uint32_t>(args[arg < 3 ? 0 : 3])} * ((arg == 1 || arg == 4) ? 8 : 4);
+        if (c.data_bytes != expected) return "DARR size mismatch at " + std::to_string(at);
+        step.descriptor_arrays = base + c.data_at;
+    } else if (name == "DHPM") {
+        u64 backing[3];
+        if (c.header_bytes != sizeof(backing) || c.data_bytes) return "invalid DHPM at " + std::to_string(at);
+        std::memcpy(backing, h, sizeof(backing));
+        if (!owner(backing[0])) return "DHPM not after its CALL at " + std::to_string(at);
+        if (step.call.kind != 0 || step.call.slot != 14 || step.descriptor_bytes || backing[1] < 0x10000 ||
+            backing[1] >= 0x800000000000ull || !backing[2] || backing[2] > 0x800000000000ull - backing[1])
+            return "invalid descriptor backing at " + std::to_string(at);
+        step.descriptor_address = backing[1];
+        step.descriptor_bytes = backing[2];
+    } else if (name == "OUTP" && c.header_bytes >= 24) {
+        u64 seq;
+        Output o{};
+        std::memcpy(&seq, h, 8);
+        std::memcpy(&o.arg, h + 8, 4);
+        std::memcpy(&o.value, h + 16, 8);
+        if (!owner(seq)) return "OUTP not after its CALL at " + std::to_string(at);
+        step.outputs.push_back(o);
+    }
+    return {};
+}
+
+inline bool step_chunk(const ChunkHead& c)
+{
+    return !std::memcmp(c.tag, "ARGM", 4) || !std::memcmp(c.tag, "HPLC", 4) || !std::memcmp(c.tag, "DARR", 4) ||
+           !std::memcmp(c.tag, "DHPM", 4) || !std::memcmp(c.tag, "OUTP", 4);
+}
 
 struct Blob {
     const unsigned char* data;
@@ -89,7 +207,8 @@ struct Recording {
     std::uint32_t version = 0;
     u64 frequency = 0;
     std::unordered_map<u64, HeapPlacement> placement_heaps;  // HPLC heap ID -> allocation bounds
-    std::vector<Step> steps;  // sorted by seq
+    std::vector<StepRef> steps;  // sorted by seq
+    std::vector<StepRef> placed_steps, backed_steps;  // the calls with an HPLC placement / a DHPM descriptor backing
     std::unordered_map<u64, Blob> blobs;
     std::vector<std::string> settings;
     std::vector<std::pair<std::uint32_t, u64>> live_objects;  // XOBJ: (kind, wrapper) made outside the recorded slots
@@ -98,6 +217,25 @@ struct Recording {
     std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
+
+    // The CALL of a step.
+    CallRecord call_of(const StepRef& ref) const { return read_call(base + ref.at + 16, version); }
+
+    // Fills `step` with the call at `ref` and the chunks the recorder wrote for it (validated when the file was read).
+    void load(const StepRef& ref, Step& step) const
+    {
+        step.call = call_of(ref);
+        step.placement = {};
+        step.memory.clear();
+        step.outputs.clear();
+        step.descriptor_arrays = nullptr;
+        step.descriptor_address = step.descriptor_bytes = 0;
+        ChunkHead c;
+        if (!chunk_at(base, size, ref.at, c)) return;
+        for (u64 at = c.data_at + c.data_bytes; chunk_at(base, size, at, c) && std::memcmp(c.tag, "CALL", 4);
+             at = c.data_at + c.data_bytes)
+            if (step_chunk(c)) add_to_step(base, version, c, at, step, nullptr);
+    }
 
     ~Recording()
     {
@@ -119,18 +257,16 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
     if (!out.mapping) return "cannot map the recording";
     out.base = static_cast<const unsigned char*>(MapViewOfFile(out.mapping, FILE_MAP_READ, 0, 0, 0));
     if (!out.base) return "cannot map the recording";
-    std::unordered_map<u64, std::size_t> by_seq;
+    Step current;  // the last CALL: the chunks that follow it until the next CALL are its own
+    bool have_call = false;
     for (u64 at = 0; at < out.size;) {
         if (out.size - at < 16) return "cut chunk head at " + std::to_string(at);
-        char tag[5]{};
-        std::uint32_t header_bytes;
-        u64 data_bytes;
-        std::memcpy(tag, out.base + at, 4);
-        std::memcpy(&header_bytes, out.base + at + 4, 4);
-        std::memcpy(&data_bytes, out.base + at + 8, 8);
-        const u64 header_at = at + 16, data_at = header_at + header_bytes;
-        if (data_bytes > out.size || data_at > out.size - data_bytes) return std::string("cut chunk ") + tag + " at " + std::to_string(at);
-        const unsigned char* h = out.base + header_at;
+        ChunkHead chunk;
+        if (!chunk_at(out.base, out.size, at, chunk)) return std::string("cut chunk ") + chunk.tag + " at " + std::to_string(at);
+        const char* tag = chunk.tag;
+        const std::uint32_t header_bytes = chunk.header_bytes;
+        const u64 data_bytes = chunk.data_bytes, data_at = chunk.data_at;
+        const unsigned char* h = out.base + chunk.header_at;
         const std::string name(tag);
         if (at == 0 && name != "XREC") return "not a replay recording (no XREC first)";
         if (name == "XREC") {
@@ -145,89 +281,19 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
         } else if (name == "CALL") {
             if (header_bytes != (out.version == 2 ? call_v2_bytes : sizeof(CallRecord)))
                 return "unexpected CALL size at " + std::to_string(at);
-            Step step{};
-            if (out.version == file_version) {
-                std::memcpy(&step.call, h, sizeof(CallRecord));
-            } else {
-                // Format 2: seven argument words, then ret, seconds, present; rcx's memory is ARGM 7 (moved to 15 below).
-                std::memcpy(&step.call, h, call_v2_prefix);
-                auto* trailer = reinterpret_cast<unsigned char*>(&step.call) + offsetof(CallRecord, ret);
-                std::memcpy(trailer, h + call_v2_prefix, call_trailer_bytes);
-            }
-            if (step.call.slot >= x2w_replay_slots::slot_count)
+            current = Step{};
+            current.call = read_call(h, out.version);
+            if (current.call.slot >= x2w_replay_slots::slot_count)
                 return "CALL slot out of range at " + std::to_string(at);
-            by_seq[step.call.seq] = out.steps.size();
-            out.steps.push_back(step);
-        } else if (name == "ARGM" && header_bytes >= 40) {
-            u64 seq;
-            ArgMemory m{};
-            std::memcpy(&seq, h, 8);
-            std::memcpy(&m.arg, h + 8, 4);
-            std::memcpy(&m.depth, h + 12, 4);
-            std::memcpy(&m.address, h + 16, 8);
-            std::memcpy(&m.bytes, h + 24, 8);
-            std::memcpy(&m.hash, h + 32, 8);
-            if (out.version == 2 && (m.arg & 0xffu) == 7) m.arg = (m.arg & ~0xffu) | 15u;  // format 2's rcx index
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "ARGM before its CALL at " + std::to_string(at);
-            out.steps[found->second].memory.push_back(m);
-        } else if (name == "HPLC") {
-            u64 seq;
-            HeapPlacement placement;
-            if (header_bytes != sizeof(seq) + sizeof(placement) || data_bytes)
-                return "invalid HPLC size at " + std::to_string(at);
-            std::memcpy(&seq, h, sizeof(seq));
-            std::memcpy(&placement, h + sizeof(seq), sizeof(placement));
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "HPLC before its CALL at " + std::to_string(at);
-            Step& step = out.steps[found->second];
-            constexpr u64 granule = 0x10000, address_limit = 1ull << 47;
-            if (step.call.kind != 0 || step.call.slot != 133 || step.placement.id || !placement.id ||
-                !placement.base || placement.base >= address_limit || (placement.base & (granule - 1)) ||
-                placement.bytes > address_limit - placement.base || placement.offset >= placement.bytes ||
-                (placement.offset & (granule - 1)))
-                return "invalid HPLC placement at " + std::to_string(at);
-            const auto& heap = out.placement_heaps.emplace(placement.id, placement).first->second;
-            if (heap.base != placement.base || heap.bytes != placement.bytes)
-                return "inconsistent HPLC heap at " + std::to_string(at);
-            step.placement = placement;
-        } else if (name == "DARR" && header_bytes == 8) {
-            u64 seq;
-            std::memcpy(&seq, h, 8);
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "DARR before its CALL at " + std::to_string(at);
-            Step& step = out.steps[found->second];
-            if (step.call.kind != 0 || step.call.slot != 23 || step.descriptor_arrays)
-                return "invalid DARR call at " + std::to_string(at);
-            const auto& args = step.call.args;
-            u64 expected = 0;
-            for (const unsigned arg : {1u, 2u, 4u, 5u})
-                if (args[arg]) expected += u64{static_cast<std::uint32_t>(args[arg < 3 ? 0 : 3])} *
-                                          ((arg == 1 || arg == 4) ? 8 : 4);
-            if (data_bytes != expected) return "DARR size mismatch at " + std::to_string(at);
-            step.descriptor_arrays = out.base + data_at;
-        } else if (name == "DHPM") {
-            u64 backing[3];
-            if (header_bytes != sizeof(backing) || data_bytes) return "invalid DHPM at " + std::to_string(at);
-            std::memcpy(backing, h, sizeof(backing));
-            const auto found = by_seq.find(backing[0]);
-            if (found == by_seq.end()) return "DHPM before its CALL at " + std::to_string(at);
-            auto& step = out.steps[found->second];
-            if (step.call.kind != 0 || step.call.slot != 14 || step.descriptor_bytes ||
-                backing[1] < 0x10000 || backing[1] >= 0x800000000000ull ||
-                !backing[2] || backing[2] > 0x800000000000ull - backing[1])
-                return "invalid descriptor backing at " + std::to_string(at);
-            step.descriptor_address = backing[1];
-            step.descriptor_bytes = backing[2];
-        } else if (name == "OUTP" && header_bytes >= 24) {
-            u64 seq;
-            Output o{};
-            std::memcpy(&seq, h, 8);
-            std::memcpy(&o.arg, h + 8, 4);
-            std::memcpy(&o.value, h + 16, 8);
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "OUTP before its CALL at " + std::to_string(at);
-            out.steps[found->second].outputs.push_back(o);
+            out.steps.push_back({current.call.seq, at});
+            have_call = true;
+        } else if (step_chunk(chunk)) {
+            if (!have_call) return name + " before its CALL at " + std::to_string(at);
+            const bool placed = current.placement.id, backed = current.descriptor_bytes;
+            if (std::string problem = add_to_step(out.base, out.version, chunk, at, current, &out.placement_heaps); !problem.empty())
+                return problem;
+            if (!placed && current.placement.id) out.placed_steps.push_back(out.steps.back());
+            if (!backed && current.descriptor_bytes) out.backed_steps.push_back(out.steps.back());
         } else if (name == "BLOB" && header_bytes >= 16) {
             u64 hash, bytes;
             std::memcpy(&hash, h, 8);
@@ -268,7 +334,7 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
         at = data_at + data_bytes;
     }
     if (!out.version) return "no XREC header";
-    std::sort(out.steps.begin(), out.steps.end(), [](const Step& a, const Step& b) { return a.call.seq < b.call.seq; });
+    std::sort(out.steps.begin(), out.steps.end(), [](const StepRef& a, const StepRef& b) { return a.seq < b.seq; });
     std::stable_sort(out.maps.begin(), out.maps.end(), [](const PageMap& a, const PageMap& b) { return a.seq < b.seq; });
     return {};
 }

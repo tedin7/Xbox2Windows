@@ -26,6 +26,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <psapi.h>
 #include <wrl/client.h>
 
 #include <cerrno>
@@ -634,6 +635,15 @@ bool play(Player& p, const Recording& r, const Step& step)
     return true;
 }
 
+// The process's peak private bytes (commit charge) so far, or 0.
+u64 peak_private_bytes()
+{
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    return GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))
+               ? static_cast<u64>(counters.PeakPagefileUsage) : 0;
+}
+
 // The skip census: every (kind:slot, reason) the player skipped, most frequent first.
 void print_skip_census(const Player& p)
 {
@@ -787,9 +797,9 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.*f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"shared_argument_bytes\": %llu, \"stopped_at_max_seconds\": %s, ",
+                        "\"shared_argument_bytes\": %llu, \"peak_private_bytes\": %llu, \"stopped_at_max_seconds\": %s, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, timing ? 9 : 3, wall, fps,
-                     p.arena_bytes, p.shared_bytes, stopped ? "true" : "false");
+                     p.arena_bytes, p.shared_bytes, peak_private_bytes(), stopped ? "true" : "false");
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
@@ -949,10 +959,10 @@ int run(const Options& o)
     {
         std::unordered_map<u64, u64> votes;
         u64 device = 0, best = 0;
-        for (const Step& s : r.steps)
-            if (s.call.kind == device_kind && !accepts_buffer_first(s.call) && ++votes[s.call.object] > best) {
-                best = votes[s.call.object];
-                device = s.call.object;
+        for (const StepRef& ref : r.steps)
+            if (const CallRecord c = r.call_of(ref); c.kind == device_kind && !accepts_buffer_first(c) && ++votes[c.object] > best) {
+                best = votes[c.object];
+                device = c.object;
             }
         if (device) p.objects[device] = reinterpret_cast<u64>(p.device);
         // XOBJ: devices the recorder saw made outside the recorded slots (D3D12XboxCreateDevice) are the player's device.
@@ -965,7 +975,9 @@ int run(const Options& o)
     if (time_slots) timing.emplace().next_report = started + std::chrono::seconds(1);
     const auto elapsed = [&] { return std::chrono::duration<double>(ReplayClock::now() - started).count(); };
     bool stopped = false;
-    for (const Step& s : r.steps) {
+    Step s;  // the call being played, loaded from the mapping
+    for (const StepRef& ref : r.steps) {
+        r.load(ref, s);
         if (o.max_seconds > 0 && elapsed() >= o.max_seconds) {
             stopped = true;
             break;
@@ -1000,6 +1012,8 @@ int run(const Options& o)
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
+    say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",
+        static_cast<unsigned long long>(peak_private_bytes() >> 20), r.steps.size(), sizeof(StepRef));
     print_skip_census(p);
     write_summary(o, p, r, wall, stopped, timing ? &*timing : nullptr);
     if (stopped) return 5;
