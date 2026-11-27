@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_v_sat_pk_u8_i16_check.py
