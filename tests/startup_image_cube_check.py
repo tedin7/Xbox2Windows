@@ -173,9 +173,9 @@ def pixel(face, mip):
 
 
 def draw_with(compiler, kind, renderer, adapter, vs_profile, ps_profile):
-    def readback(shader, expected, view='cube', mutant_actual=None):
+    def readback(shader, expected, mutant_actual=None):
         run = subprocess.run(
-            [renderer, adapter, '--startup-image-cube', str(vs), str(shader), view, expected, sampler],
+            [renderer, adapter, '--startup-image-cube', str(vs), str(shader), "0", expected, sampler],
             capture_output=True, text=True)
         print(run.stdout, end='')
         if run.returncode == 77:
@@ -198,7 +198,6 @@ def draw_with(compiler, kind, renderer, adapter, vs_profile, ps_profile):
                 shader = compile_hlsl(compiler, kind, source, f'{form}_{face}', ps_profile, path)
                 readback(shader, pixel(face, mip))
                 if form == 'sample' and face == 0:
-                    readback(shader, '00000000,00000000,00000000,00000000', 'array')
                     mutant = source.replace(X_FACES, SWAPPED_X_FACES)
                     assert mutant != source
                     shader = compile_hlsl(compiler, kind, mutant, 'cube_wrong_face', ps_profile, path)

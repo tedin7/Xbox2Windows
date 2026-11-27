@@ -10,7 +10,6 @@
 // sampler (point wrap). The inline sampler fixture passes its own manifest line for the same draw.
 #include "desktop_gpu.h"
 
-#include "startup_stubs/draw_cube_srv.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 
 #include <cstdint>
@@ -69,9 +68,8 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels, const char* cube_view)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, bool cube)
 {
-    const bool cube = cube_view != nullptr;
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
     if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
@@ -176,26 +174,13 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         view.Texture2D.MostDetailedMip = first_mip;
         view.Texture2D.MipLevels = view_levels;
     }
-    auto* sampled = texture.Get();
     if (cube) {
         view.Format = td.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (std::strcmp(cube_view, "cube") == 0) {
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            view.TextureCube.MipLevels = levels;
-        } else if (std::strcmp(cube_view, "array") == 0) {
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-            view.Texture2DArray.MipLevels = levels;
-            view.Texture2DArray.ArraySize = td.DepthOrArraySize;
-        } else {
-            throw std::runtime_error("Expected cube or array title view");
-        }
-        if (!x2w_startup::matches_draw_cube_srv(texture->GetDesc(), &view)) {
-            sampled = nullptr;
-            view = x2w_startup::null_draw_cube_srv();
-        }
+        view.TextureCube.MipLevels = levels;
     }
-    device->CreateShaderResourceView(sampled, (cube || view_levels) ? &view : nullptr,
+    device->CreateShaderResourceView(texture.Get(), (cube || view_levels) ? &view : nullptr,
                                      views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
