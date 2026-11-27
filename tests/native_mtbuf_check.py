@@ -28,14 +28,8 @@ def program(unsigned, window=False):
     # With window, every MTBUF load reads the byte window of the SRV (same raw view, same expected values).
     words = [sop1(3, 20, 4), sop1(3, 21, 128), sop1(3, 22, 5), sop1(3, 23, 128),
              0xf4080000 | 32 << 6 | 10, 0xfa000020, 0xf4080000 | 36 << 6 | 11, 0xfa000020,
-<<<<<<< HEAD
              *(BYTE_WINDOW if window else ()),
-             scalar(0x1e, 7, 6, 135), vmove(8, 7), sop1(3, 126, 129)]
-||||||| ca6593968
-             scalar(0x1e, 7, 6, 135), vmove(8, 7), sop1(3, 126, 129)]
-=======
              scalar(0x1e, 7, 6, 137), vmove(8, 7), sop1(3, 126, 129)]
->>>>>>> a48d39dc1
     pos = 0
     for index, (fmt, channels, disp) in enumerate(CASES):
         if unsigned and index == 0:

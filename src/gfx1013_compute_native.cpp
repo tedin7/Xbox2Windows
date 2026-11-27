@@ -592,36 +592,17 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
-<<<<<<< HEAD
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
+               i.enc == Encoding::QuadCompare ||
                i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
                i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
-||||||| ca6593968
-    } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
-=======
-    } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
->>>>>>> a48d39dc1
     {
         set(i.dst, {});
-<<<<<<< HEAD
-        if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+        if ((wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
              i.name.substr(i.name.size() - 4) == "_u64") &&
             i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
-||||||| ca6593968
-        if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
-            i.name.size() >= 4 && (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64")) ||
-            i.name == "s_bitreplicate_b64_b32")
-=======
-        if ((wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
-            i.name.size() >= 4 && (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64")) ||
-            i.name == "s_bitreplicate_b64_b32")
->>>>>>> a48d39dc1
             set(i.dst + 1, {});
     }
     return s;
@@ -829,17 +810,9 @@ struct Emit {
         if (sym.value == compute_sampler_heap)
             refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
-<<<<<<< HEAD
                                  (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
                                   (i.name == "buffer_store_raw" ||
                                    (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
-||||||| ca6593968
-                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
-=======
-                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
-                                  (i.name == "buffer_store_raw" ||
-                                   (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x3000))) &&
->>>>>>> a48d39dc1
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
@@ -1639,19 +1612,13 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
     if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
         initial[next] = {Symbol::Type::table, compute_resource_heap};
-<<<<<<< HEAD
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    const bool wave64 = stage && !stage->wave32;
-||||||| ca6593968
-    const bool wave64 = stage && !stage->wave32;
-=======
     // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
     // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
     const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
                               word(request.sa,4)==0x6c090102;
     const bool wave64 = stage ? !stage->wave32 : packed_state && !(word(request.sa,16)&(1u<<20));
->>>>>>> a48d39dc1
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);

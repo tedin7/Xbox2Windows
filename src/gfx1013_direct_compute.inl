@@ -769,7 +769,6 @@ struct DirectCompute {
                 select_float(is_y, major, nv),
                 select_float(is_x, select_float(negative, u, nu), select_float(is_y, select_float(negative, nv, v), major))};
     }
-<<<<<<< HEAD
     string texture_dimensions(const string &handle, const string &mip) {
         return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
                          {{"%dx.types.Handle", handle}, {"i32", mip}}, "nounwind readonly");
@@ -848,10 +847,6 @@ struct DirectCompute {
             vector_write(256 + i.dst + j, select(have_view, ir.value("bitcast float " + value + " to i32"), "0"));
         }
     }
-    void image_io(const Inst &i, const State &s) {
-||||||| ca6593968
-    void image_io(const Inst &i, const State &s) {
-=======
     string pixel_heap_texture(const Inst &i, const State &s, unsigned base, unsigned dim,
                               std::optional<PixelHeapIndex> selected) {
         const auto sym = s.at(base);
@@ -887,7 +882,6 @@ struct DirectCompute {
         return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
     }
     void image_io(const Inst &i, const State &s, std::optional<PixelHeapIndex> selected = {}) {
->>>>>>> a48d39dc1
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
         // With a different texture in neighboring lanes, compute the quad's
         // derivatives on the original coordinates, independently of the
@@ -911,17 +905,9 @@ struct DirectCompute {
         constexpr unsigned dx_kind[]{1, 2, 4, 5, 6, 7, 3, 8};
         constexpr unsigned coord_count[]{1, 2, 3, 3, 2, 3, 2, 3};
         const unsigned coords = coord_count[dim];
-<<<<<<< HEAD
+        const bool indexed = pixel_stage && !store && s.at(base).type == Symbol::Type::indexed_descriptor;
         if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
             (i.b & 0x3c000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
-||||||| ca6593968
-        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
-            (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
-=======
-        const bool indexed = pixel_stage && !store && s.at(base).type == Symbol::Type::indexed_descriptor;
-        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
-            (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
->>>>>>> a48d39dc1
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
             (compare_gather && dim == 3) ||
@@ -1010,25 +996,6 @@ struct DirectCompute {
         if (!store) {
             string r;
             if (sample || gather) {
-<<<<<<< HEAD
-                const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
-                                                                implicit || gradient, compare);
-                if (i.op == 64 && !sampler_ref.heap &&
-                    (analysis.result.samplers.at(sampler_ref.index - analysis.first_sampler).words[1] & 0xffffff))
-                    refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
-                string sampler;
-                if (sampler_ref.heap) {
-                    ir.features |= 0x80000000;
-                    sampler = ir.sampler_heap_handle(to_string(sampler_ref.index));
-                } else
-                    sampler = ir.handle({3, sampler_ref.index, 14, 0, 0, 0, 1, compare});
-||||||| ca6593968
-                auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
-                                                          implicit || gradient, compare);
-                if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
-                    refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
-                auto sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
-=======
                 string sampler;
                 const unsigned sampler_base = ((i.b >> 21) & 31) * 4;
                 const auto &first = s.at(sampler_base);
@@ -1041,13 +1008,17 @@ struct DirectCompute {
                     analysis.result.sampler_heap = true;
                     sampler = ir.handle({3, 0, 14, 0, 0, 0, 2048, false, 1}, read(sampler_base));
                 } else {
-                    auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
-                                                          implicit || gradient, compare);
-                    if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
+                    const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                                                                    implicit || gradient, compare);
+                    if (i.op == 64 && !sampler_ref.heap &&
+                        (analysis.result.samplers.at(sampler_ref.index - analysis.first_sampler).words[1] & 0xffffff))
                         refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
-                    sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
+                    if (sampler_ref.heap) {
+                        ir.features |= 0x80000000;
+                        sampler = ir.sampler_heap_handle(to_string(sampler_ref.index));
+                    } else
+                        sampler = ir.handle({3, sampler_ref.index, 14, 0, 0, 0, 1, compare});
                 }
->>>>>>> a48d39dc1
                 using Arg = std::pair<string, string>;
                 std::vector<Arg> args{{"%dx.types.Handle", h}, {"%dx.types.Handle", sampler}};
                 const auto size = (i.a & 0x1000u) ? texture_dimensions(h, "0") : string{};
@@ -1652,15 +1623,9 @@ struct DirectCompute {
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
-<<<<<<< HEAD
         const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" || n == "v_mac_legacy_f32";
         if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && !unfused_mad &&
             n != "v_mul_legacy_f32" &&
-||||||| ca6593968
-        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
-=======
-        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" && n != "v_mac_f32" && n != "v_mad_legacy_f32" &&
->>>>>>> a48d39dc1
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -1765,7 +1730,6 @@ struct DirectCompute {
                 auto c = n == "v_fmac_f32" ? as_float(read(i.dst)) : n == "v_fmaak_f32" ? as_float(to_string(i.literal)) :
                          n == "v_fmamk_f32" ? fp(1) : fp(2);
                 result = ir.invoke("float", "tertiary.f32", 46, {{"float", a}, {"float", b}, {"float", c}}, "nounwind readnone");
-<<<<<<< HEAD
             } else if (unfused_mad) {
                 // gfx2hlsl.py mad32 and pixel_aot (#3005): flush denormal inputs to signed zero, round the product on
                 // its own (the legacy form makes 0 * anything 0), add the flushed addend and flush the sum. Plain
@@ -1789,15 +1753,6 @@ struct DirectCompute {
                 }
                 result = ftz(ir.value("fadd float " + ftz(product) + ", " + ftz(c)));
             } else if (n == "v_mul_legacy_f32") {
-||||||| ca6593968
-            } else if (n == "v_mul_legacy_f32") {
-=======
-            } else if (n == "v_mac_f32") {
-                const auto product=ir.value("fmul float "+a+", "+fp(1));
-                const auto acc=ir.value("bitcast i32 "+read(i.dst)+" to float");
-                result=ir.value("fadd float "+product+", "+acc);
-            } else if (n == "v_mul_legacy_f32" || n == "v_mad_legacy_f32") {
->>>>>>> a48d39dc1
                 auto b = fp(1);
                 auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + a + ", 0.0") + ", " +
                                      ir.value("fcmp oeq float " + b + ", 0.0"));
@@ -1977,18 +1932,10 @@ struct DirectCompute {
                 // SRC_SCC operand still takes precedence below.
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
                     n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
-<<<<<<< HEAD
                     n == "s_quadmask_b32" || n == "s_quadmask_b64" ||
-                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
+                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64" || n == "s_andn2_wrexec_b64";
                 const bool overwrites = mask_scc || n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
                     inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
-||||||| ca6593968
-                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
-                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
-=======
-                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64" || n == "s_andn2_wrexec_b64";
-                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
->>>>>>> a48d39dc1
                     n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||

@@ -131,13 +131,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-<<<<<<< HEAD
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_sampler)));
-||||||| ca6593968
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_buffer_srv)));
-=======
         auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::indexed_raw_srv)));
->>>>>>> a48d39dc1
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -370,42 +364,9 @@ NativeComputeShader prepare_direct_compute(const fs::path &input, unsigned entry
     Bytes identity = X2W_NATIVE_SHADER_REVISION "/container/cs_6_6";
     word(identity, 0);
     if (heap_view != HeapViewContract::none)
-<<<<<<< HEAD
         identity += heap_view == HeapViewContract::raw_buffer    ? "/heap-view/raw_buffer"
                     : heap_view == HeapViewContract::typed_dword ? "/heap-view/typed_dword"
                                                                  : "/heap-view/other";
-    if (container) {
-        packed = read_compute_container(input);
-        identity += shader_digest(packed.bytes) + shader_digest(packed.root);
-    } else {
-        request = read_compute_request(input);
-        for (auto *part : {&request.code, &request.data, &request.root, &request.description, &request.sa, &request.sb})
-            identity += shader_digest(*part);
-    }
-    const auto key = shader_digest(identity);
-    const auto path = cache / (key + ".csir");
-    NativeComputeShader program{};
-    Bytes payload;
-    cache_hit = lookup(path, key, payload);
-    if (cache_hit) {
-||||||| ca6593968
-        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
-    if (container) {
-        packed = read_compute_container(input);
-        identity += shader_digest(packed.bytes) + shader_digest(packed.root);
-    } else {
-        request = read_compute_request(input);
-        for (auto *part : {&request.code, &request.data, &request.root, &request.description, &request.sa, &request.sb})
-            identity += shader_digest(*part);
-    }
-    const auto key = shader_digest(identity);
-    const auto path = cache / (key + ".csir");
-    NativeComputeShader program{};
-    Bytes payload;
-    cache_hit = lookup(path, key, payload);
-    if (cache_hit) {
-=======
-        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
     identity += shader_digest(packed.bytes) + shader_digest(packed.root);
     return cached_compute_ir(cache, shader_digest(identity), cache_hit,
                              [&] { return translate_compute_container(std::move(packed), heap_view); });
@@ -423,7 +384,6 @@ ComputePackCounts build_compute_frontend_pack(const fs::path &requests, const fs
     word(pack, 0);
     ComputePackCounts counts;
     for (const auto &marker : markers) {
->>>>>>> a48d39dc1
         try {
             const auto request = read_compute_request(marker);
             const auto digest = slot67_digest(request, entry);

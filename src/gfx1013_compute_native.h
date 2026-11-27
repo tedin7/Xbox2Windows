@@ -36,20 +36,14 @@ enum class ComputeViewKind {
     indexed_atomic_uav,
     d16_sample_srv,
     byte_window_srv,
-<<<<<<< HEAD
     heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
     heap_typed_srv, // A one-channel 32-bit typed buffer read the same way (HeapViewContract::typed_dword).
     // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
     // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
     // fallback and never read.
-    heap_sampler
-||||||| ca6593968
-    heap_buffer_srv // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
-=======
-    heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    heap_sampler,
     packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
     indexed_raw_srv // Fixed-stride record read. required_bytes is one complete record and its checked stride.
->>>>>>> a48d39dc1
 };
 inline bool accepts_cbv_window(ComputeViewKind kind) {
     return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
