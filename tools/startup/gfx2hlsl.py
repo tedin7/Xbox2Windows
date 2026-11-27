@@ -31,6 +31,8 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+WAVE_SCC_UNPROVEN = 'wave-wide read in a program with a branch (s_cbranch_scc'
+WAVE_REDUCTION_MASKED = 'wave reduction: EXEC may hold lanes outside the entry mask on some path'
 WAVE_REDUCTION_ENTRY = 'wave reduction: EXEC is not proven to be the entry mask on every incoming path'
 WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at '
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
@@ -4965,6 +4967,11 @@ class Stage:
         self.retry_mask_joins = False
         # Both retries follow a refusal so the original lowering remains byte-identical.
         self.retry_paired_exec = False
+        self.retry_masked_reduction = False
+        # A retry for a loop laid out latch first (see latch_only_targets), only after a refusal at a join there.
+        self.retry_latch = False
+        self.retry_uniform_readlane = False  # after a scalar branch refusal: reduction results are wave-uniform
+        self.latch_mask_keep = {}  # latch -> marks a back edge into it still carries (verified, from earlier passes)
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
@@ -5012,7 +5019,8 @@ class Stage:
                     continue
                 if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
                         or self.retry_lane_mask_joins(str(reason)) or self.retry_scc_edge_proof(str(reason))
-                        or self.retry_loop_uniform(str(reason)) or self.retry_heap_image_number(str(reason))):
+                        or self.retry_loop_uniform(str(reason)) or self.retry_heap_image_number(str(reason))
+                        or self.retry_latch_join(str(reason))):
                     # If another unsupported instruction prevents completing the
                     # proof, retain the refusal that caused this retry.
                     if (self.retry_odd_d16_paths and self.odd_d16_first_refusal is not None and
@@ -5029,10 +5037,16 @@ class Stage:
                 continue
             reasons = [reason for reason, stage in refusals[first_refusal:] if stage == kind] if refusals is not None else []
             if (any(self.retry_reduction_exec(reason) or self.retry_join(reason)
-                    or self.retry_lane_mask_joins(reason) or self.retry_scc_edge_proof(reason) for reason in reasons)
+                    or self.retry_lane_mask_joins(reason) or self.retry_scc_edge_proof(reason)
+                    or self.retry_latch_join(reason) for reason in reasons)
                     or any(self.retry_loop_uniform(reason) for reason in reasons)
                     or any(self.retry_heap_image_number(reason) for reason in reasons)):
                 del refusals[first_refusal:]
+                continue
+            if self.retry_latch and self.latch_grown:
+                # A back edge brought a mark the latch had dropped: translate again with that mark kept there.
+                if refusals is not None:
+                    del refusals[first_refusal:]
                 continue
             if self.retry_join_phi and self.phi_new != self.phi_regs:
                 # The joins that became phis are known only now: translate again so every incoming edge assigns them.
@@ -5058,6 +5072,33 @@ class Stage:
         return True
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
+    LATCH_REFUSALS = re.compile(r"(descriptor operand s\[\d+:\d+\] holds \('joined at a branch target',\)"
+                                r"|descriptor operand \S+: s\d+ holds a word joined at a branch target"
+                                r"|s_load through s\d+ holding \('joined at a branch target',\)"
+                                r"|s_ff1_i32_b32 on a lane mask)")
+
+    def latch_only_targets(self):
+        """Back-edge targets that nothing else enters: no fall-through (the instruction before is s_branch, s_endpgm or
+        s_setpc) and no forward branch. Compiled loops are often laid out `s_branch H / L: ... / H:` with the back
+        edge to L; the program-order state at L then belongs to the code before the s_branch, not to any path into L."""
+        branches = [(off, int(parse(asm)[1][0].split('_')[1], 16)) for off, _n, name, asm in self.ins
+                    if name.startswith('s_cbranch') or name == 's_branch']
+        before = {}
+        for (_off, _n, name, _asm), (nxt, *_rest) in zip(self.ins, self.ins[1:]):
+            before[nxt] = name
+        return {t for pc, t in branches if t <= pc and before.get(t) in ('s_branch', 's_endpgm', 's_setpc_b64')
+                and not any(t == to and src < to for src, to in branches)}
+
+    def retry_latch_join(self, reason):
+        """Retry once a join refusal of a program with a latch-first loop (latch_only_targets); see the two rules at
+        the join in translate (retry_latch). Without such a latch the refusal stands and every output is unchanged."""
+        if (self.retry_latch or not self.LATCH_REFUSALS.fullmatch(reason)
+                or any(name.startswith(('s_setpc', 's_swappc')) for _o, _n, name, _a in self.ins)
+                or not self.latch_only_targets()):
+            return False
+        self.retry_latch = True
+        self.latch_mask_keep = {}
+        return True
 
     def retry_heap_image_number(self, reason):
         if (self.retry_heap_dimensions or not re.fullmatch(
@@ -5120,6 +5161,13 @@ class Stage:
         elif (self.retry_wave_reduction and not self.retry_paired_exec
               and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
             self.retry_paired_exec = True
+        elif (self.retry_paired_exec and not self.retry_masked_reduction
+              and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
+            self.retry_masked_reduction = True
+        elif (self.retry_wave_reduction and not getattr(self, 'retry_uniform_readlane', False)
+              and reason.startswith(WAVE_SCC_UNPROVEN)):
+            # A scalar branch on a reduction result: retry with that result wave-uniform (lower_wave_readlane).
+            self.retry_uniform_readlane = True
         else:
             return False
         self.force_joined.clear()
@@ -5865,10 +5913,36 @@ class Stage:
         target (so it runs on every path into the target) replaces it."""
         index, block_of, _succ, dom, _writes, _reached = self.flow
         target_block = block_of[index[target]]
+        if getattr(self, 'retry_latch', False):
+            return any(self.write_reaches_block(write, reg, target_block)
+                       for write in self.__dict__.get('bad_write_pcs', {}).get(reg, ()))
         proven = self.__dict__.get('uniform_write_pcs', {}).get(reg, ())
         return any(write < target and not any(write < later < target and block_of[index[later]] in dom[target_block]
                                               for later in proven)
                    for write in self.__dict__.get('bad_write_pcs', {}).get(reg, ()))
+
+    def write_reaches_block(self, write, reg, target_block):
+        """Reaching definitions over the CFG, loops included: True if the write of reg at offset `write` can be the
+        value of reg on entry to target_block, i.e. some CFG path from just after the write enters target_block
+        without passing another write of reg (a write later in the write's own block, or any block that writes reg)."""
+        index, block_of, succ, _dom, writes, _reached = self.flow
+        at = index[write]
+        start = block_of[at]
+        i = at + 1
+        while i < len(self.ins) and block_of[i] == start:
+            if reg in scalar_destinations(*self.ins[i][2:]) or 'any' in scalar_destinations(*self.ins[i][2:]):
+                return False
+            i += 1
+        seen, todo = set(), list(succ[start])
+        while todo:
+            b = todo.pop()
+            if b == target_block:
+                return True
+            if b in seen or reg in writes[b]:
+                continue
+            seen.add(b)
+            todo.extend(succ[b])
+        return False
 
     def record_scalar_uniformity(self, n, uniform):
         if uniform:
@@ -7038,6 +7112,149 @@ class Stage:
                     pending.add(target)
         return known
 
+    def boolean_word_sites(self, cfg):
+        """Words equal to zero or all ones on every incoming CFG path."""
+        bounds, _, succ, _ = cfg
+        if not bounds:
+            return {}
+        before, pending, sites = {0: set()}, {0}, {}
+        while pending:
+            block = pending.pop()
+            words = before[block].copy()
+            lo, hi = bounds[block]
+            for off, _, name, asm in self.ins[lo:hi]:
+                sites[off] = words.copy()
+                _, ops, _ = parse(asm)
+                writes = scalar_destinations(name, asm)
+                if 'any' in writes:
+                    words.clear()
+                else:
+                    words.difference_update(writes)
+                if name == 's_cselect_b32' and len(ops) == 3 and set(ops[1:]) == {'0', '-1'}:
+                    r = reg_range(ops[0])
+                    if r and r[0] == 's' and r[1] == r[2]:
+                        words.add(r[1])
+            for target in succ[block]:
+                merged = before[target] & words if target in before else words.copy()
+                if target not in before or before[target] != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return sites
+
+    def masked_reduction_exec_sites(self, cfg):
+        """Must-analysis of exact masks contained in the entry EXEC, including loop edges."""
+        bounds, _, succ, _ = cfg
+        wave = getattr(self.pipe, 'wave_size', None)
+        if not bounds or not (wave == 32 or wave is None and wave32_exec_proof(self.ins)):
+            return set()
+        # A 64-bit scalar op (address pairs, s_bfm_b64) only makes its destination words N in transfer() below:
+        # it never yields G, and writes_exec catches a 64-bit EXEC write. vcc_hi is plain data in wave32.
+        for _, _, name, asm in self.ins:
+            _, ops, _ = parse(asm)
+            if name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe')) or ops and ops[0] == 'exec_hi':
+                return set()
+
+        # RDNA 2 ISA 3.9: VOPC clears inactive lanes; after widening those
+        # active lanes may include lanes outside the entry EXEC.
+        # N=0, exact mask possibly outside entry=1, exact subset of entry=2.
+        def key(token):
+            if token in ('exec', 'exec_lo'):
+                return 'exec'
+            if token in ('vcc', 'vcc_lo'):
+                return 'vcc'
+            r = reg_range(token)
+            return r[1] if r and r[0] == 's' and r[1] == r[2] else None
+
+        def value(token, state):
+            k = key(token)
+            if k is not None:
+                return state.get(k, 0)
+            try:
+                n = int(token, 0) & 0xffffffff
+                return 2 if n == 0 else 1 if n == 0xffffffff else 0
+            except ValueError:
+                return 0
+
+        def calc(op, args):
+            if op == 'mov':
+                return args[0]
+            if op == 'cselect':
+                return min(args)
+            if not all(args):
+                return 0
+            if op == 'and':
+                return max(args)
+            if op == 'andn2':
+                return args[0]
+            if op in ('or', 'xor'):
+                return min(args)
+            if op in ('orn2', 'nand', 'nor', 'xnor', 'not', 'wqm'):
+                return 1
+            return 0
+
+        def transfer(state, discarded, name, asm):
+            _, ops, mods = parse(asm)
+            old = state.copy()
+            writes = scalar_destinations(name, asm)
+            if 'any' in writes:
+                state.clear()
+            else:
+                for reg in writes:
+                    state.pop(reg, None)
+            if writes_exec(name, ops):
+                state.pop('exec', None)
+            # scalar_effects includes implicit VCC writes; wave32 compares define it.
+            if 'vcc' in scalar_effects(name, asm)[2]:
+                state.pop('vcc', None)
+            if name.startswith('v_cmpx'):
+                state['exec'] = old.get('exec', 0)
+            elif name.startswith('v_cmp'):
+                dst = key(ops[0]) if ops else None
+                if dst is not None:
+                    # A compare under widened EXEC may itself include outside lanes.
+                    state[dst] = old.get('exec', 0)
+            elif name.startswith('s_') and ops:
+                match = re.fullmatch(r's_(mov|cselect|and|andn2|or|xor|orn2|nand|nor|xnor|not|wqm)(?:_saveexec)?_b32', name)
+                if match:
+                    op = match.group(1)
+                    save = '_saveexec_' in name
+                    dest = key(ops[0])
+                    args = [value(t, old) for t in ops[1:]]
+                    if save:
+                        if dest is not None:
+                            state[dest] = old.get('exec', 0)
+                        args.append(old.get('exec', 0))
+                        state['exec'] = calc(op, args)
+                    elif dest is not None and args:
+                        state[dest] = calc(op, args)
+            # RDNA 2 ISA section 3.3: EXEC does not disable scalar instructions.
+            # A VM export discards a host lane; SM 6.7 WaveOpsIncludeHelperLanes
+            # excludes that helper from later wave operations.
+            return state, discarded or name.startswith('exp') and 'vm' in asm.split()
+
+        before = {0: ({'exec': 2}, False)}
+        pending = {0}
+        sites = set()
+        while pending:
+            block = pending.pop()
+            state, discarded = before[block]
+            state = state.copy()
+            lo, hi = bounds[block]
+            for off, _, name, asm in self.ins[lo:hi]:
+                (sites.add if state.get('exec', 0) == 2 and not discarded else sites.discard)(off)
+                state, discarded = transfer(state, discarded, name, asm)
+            for target in succ[block]:
+                if target in before:
+                    prev, flag = before[target]
+                    merged = ({k: min(prev.get(k, 0), state.get(k, 0)) for k in prev.keys() | state.keys()},
+                              flag or discarded)
+                else:
+                    merged = (state.copy(), discarded)
+                if target not in before or before[target] != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return sites
+
     def paired_reduction_exec_sites(self, cfg):
         """Track the outstanding save-and-narrow pairs along every CFG edge."""
         bounds, _, succ, _ = cfg
@@ -7334,11 +7551,14 @@ class Stage:
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.odd_d16_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                    if getattr(self, 'retry_odd_d16_paths', False) else set())
+        self.boolean_words_at = self.boolean_word_sites(self.spill_cfg)
         self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
             self.reduction_restores = set()
             self.reduction_widens = set()
+            self.masked_reduction_sites = (self.masked_reduction_exec_sites(self.spill_cfg)
+                                           if self.retry_masked_reduction else set())
             self.reduction_entry_exec = (
                 self.paired_reduction_exec_sites(self.spill_cfg) if self.retry_paired_exec
                 else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
@@ -7452,6 +7672,9 @@ class Stage:
             self.mask_high = set()
             self.uses_mask_ballot = False
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
+            self.latch_assumed = {}   # retry_latch: latch -> marks dropped there, checked at every back edge into it
+            self.latch_grown = False
+            latch_targets = self.latch_only_targets() if getattr(self, 'retry_latch', False) else set()
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
             self.used_s, self.used_v = set(init_used_s), set(init_used_v)
@@ -7637,6 +7860,14 @@ class Stage:
                             self.used_s.add(reg)
                             continue
                         if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
+                            if (getattr(self, 'retry_latch', False) and force is None and isinstance(reg, int)
+                                    and all(p == paths[0] for p in paths) and not self.unjoined(off, last_write, {reg})):
+                                # retry_latch, rule 1: a path that did not write reg since its last join still holds
+                                # the value of reg's last write, because that write's block dominates this target and
+                                # no block on a path from it to here writes reg again (the proof unjoined() gives for
+                                # constants and lane-mask marks). The paths that wrote reg bring that same symbol.
+                                self.sym[reg] = kept[off][reg] = paths[0]
+                                continue
                             self.sym[reg] = ('joined at a branch target',)
                             continue
                         if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
@@ -7658,6 +7889,16 @@ class Stage:
                         if falls and off in execz_targets and reg in arriving[0][1] and arriving[0][0][reg] is None})
                     clobber = here if off in joined else every_sgpr
                     self.join_masks |= self.unjoined(off, last_write, self.masks)
+                    if off in latch_targets and not falls and not incoming.get(off):
+                        # retry_latch, rule 2: only back edges enter this latch, so the program-order marks belong to
+                        # the code before the s_branch. A mark whose last write is not proven here is dropped: the
+                        # register is a plain word on entry. Every back edge into the latch checks that it carries no
+                        # mark for it (else the next pass keeps the mark, latch_mask_keep).
+                        dropped = (self.masks & self.join_masks) - self.latch_mask_keep.get(off, set())
+                        self.masks -= dropped
+                        self.mask_high -= dropped
+                        self.join_masks -= dropped
+                        self.latch_assumed[off] = (dropped, self.masks & self.join_masks)
                     fwd_clobber = forward_splits.get(off, clobber)
                     blocked = force_unproven | force_at.get(off, set())
                     kept_u = {
@@ -7675,6 +7916,17 @@ class Stage:
                         loop_heads[off] = head
                         kept_u = (kept_u - clobber) | head
                         self.varying_s.difference_update(head)
+                    if getattr(self, 'retry_latch', False) and self.wave_exec:
+                        # retry_latch with every branch a wave decision (wave_exec; any other branch makes the stage
+                        # wave_unsound and refuses): all threads of the wave take one path, so a register is uniform
+                        # at a join when no unproven write reaches it over the CFG (bad_write_reaches, loops
+                        # included), whatever arm wrote it. Kept tentatively, refuted by bad_sgprs on a rerun. A latch
+                        # entered only by back edges has no program-order state at all: every plain register.
+                        kept_u |= (pre_uniform & clobber) - blocked
+                        if off in self.latch_assumed:
+                            latch_kept = {r for r in clobber if isinstance(r, int) and r <= 105} - blocked - self.masks
+                            kept_u |= latch_kept
+                            self.varying_s -= latch_kept
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
@@ -7793,6 +8045,18 @@ class Stage:
                             firstlane_edges.setdefault(b_target, []).append(
                                 (self.firstlane_v.copy(), scalar_facts - self.varying_s - self.masks))
                     else:
+                        if b_target in self.latch_assumed:
+                            # retry_latch, rule 2 at the back edge: a dropped mark must not come back here, and a
+                            # kept one must still be a mark (one representation per register on every path).
+                            dropped, marked = self.latch_assumed[b_target]
+                            carried = dropped & (self.masks | self.mask_high)
+                            if carried:
+                                self.latch_mask_keep.setdefault(b_target, set()).update(carried)
+                                self.latch_grown = True
+                            lost = sorted(marked - self.masks - self.mask_high)
+                            if lost:
+                                raise Unsupported('s%d is a lane mask at the loop latch +0x%x and a plain word on the '
+                                                  'back edge from +0x%x' % (lost[0], b_target, off))
                         for reg in there & written:
                             back, sym = self.sym.get(reg), kept.get(b_target, {}).get(reg)
                             if back and not run_time_symbol(back) and back != sym:
@@ -7999,9 +8263,11 @@ class Stage:
                     self.descriptor_block_first = instruction_index + 1
 
             new_bad = self.bad_sgprs - force_unproven
-            if (not back_targets and getattr(self, 'flow', None) is not None and
-                    (getattr(self, 'kind', None) == 'ps' or
-                     (getattr(self, 'kind', None) == 'vs' and getattr(self, 'retry_scc_edges', False)))):
+            if (getattr(self, 'flow', None) is not None and (
+                    (getattr(self, 'kind', None) == 'ps' and (not back_targets or getattr(self, 'retry_latch', False)))
+                    or (not back_targets and getattr(self, 'kind', None) == 'vs'
+                        and getattr(self, 'retry_scc_edges', False)))):
+                # retry_latch: bad_write_reaches follows reaching definitions over the CFG, so loops are fine.
                 # No loop can bring a later write back to an earlier join: block a register only at the joins its
                 # unproven write can still reach, so a proven rewrite further down lets it be trusted again.
                 for reg in [r for r in new_bad if isinstance(r, int) and r in self.__dict__.get('bad_write_pcs', {})]:
@@ -8019,8 +8285,16 @@ class Stage:
                     del refusals[first_refusal:]
                 continue
             if retry_wave and raised_unsupported is None and self.wave_unsound is None:
-                if self.lane_exec_breaks:
+                # The masked stage drops the program-wide participation refusal, so each host-wave vote must see
+                # what the guest wave sees too: EXEC exact and inside the entry mask there (helpers never vote).
+                masked_votes = sorted(
+                    pc for pc in self.wave_voted_branches | set(self.scc_voted_branches)
+                    if pc not in self.masked_reduction_sites) if self.retry_masked_reduction else ()
+                if self.lane_exec_breaks and not self.retry_masked_reduction:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_PARTICIPATION + self.lane_exec_breaks[0][1])
+                elif masked_votes:
+                    self.wave_unsound = Unsupported('%s (a wave vote at +0x%x)' % (WAVE_REDUCTION_MASKED,
+                                                                                  masked_votes[0]))
                 elif self.reduction_widens - self.recognized_reductions:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_ENTRY)
                 else:
@@ -10673,13 +10947,22 @@ class Stage:
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
                          if base in ('s_mul_hi_u32', 's_mul_hi_i32')
                          else self.is_lane_mask(dname))
-            # Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask the lane's
-            # bit of the result is exact. Only an SGPR destination is taken; a mixed mask and plain word is not.
+            # Bit i depends only on bit i of each source. A zero/all-ones word
+            # has the same bit in every lane, so its low bit is exact too.
             def mask_source(tok):
                 r = reg_range(tok)
-                return tok in ('vcc', 'vcc_lo', 'exec', 'exec_lo') or bool(
-                    r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks)
+                if tok in ('0', '-1', '0xffffffff'):
+                    return hasattr(self, 'boolean_words_at')
+                if tok in ('vcc', 'vcc_lo', 'exec', 'exec_lo'):
+                    return True
+                if r and r[0] == 's' and r[1] == r[2]:
+                    n = r[1]
+                    sym = self.sym.get(n)
+                    return (n in self.masks or n in getattr(self, 'boolean_words_at', {}).get(getattr(self, 'pc', None), set())
+                            or bool(sym and sym[0] == 'const' and sym[1] in (0, 0xffffffff)))
+                return False
             lane_complement = (word_complement and bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
+                               and any(self.is_lane_mask(t) for t in srcs)
                                and all(mask_source(t) for t in srcs))
             if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):
                 raise Unsupported('%s on a lane mask' % base)
@@ -16900,7 +17183,10 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if retry_wave and pc not in self.reduction_entry_exec:
+        if retry_wave and getattr(self, 'retry_masked_reduction', False):
+            if pc not in self.masked_reduction_sites:
+                raise Unsupported(WAVE_REDUCTION_MASKED)
+        elif retry_wave and pc not in self.reduction_entry_exec:
             raise Unsupported(WAVE_REDUCTION_ENTRY)
         if not getattr(self, 'wave_exec', False):
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
@@ -17037,9 +17323,11 @@ class Stage:
         operand = self.u(source)
         if (getattr(self, 'retry_paired_exec', False)
                 or not self.exec_known and not getattr(self, 'retry_wave_reduction', False)):
-            # Use the chain's identity fill on the paired path, where runtime
-            # EXEC comes from the join. The proof guarantees the entry lanes pass it.
-            # The legacy masked case also gives inactive lanes the identity.
+            # RDNA 2 ISA 3.3, SOP1 saveexec and 6.9 DPP16: the chain fills
+            # disabled guest lanes with the identity before reducing. LLVM
+            # Convergence And Uniformity: voted branches bring the wave together.
+            # HLSL Shader Model 6.6 IsHelperLane and WaveOpsIncludeHelperLanes
+            # exclude helpers; the masked proof excludes them from guest EXEC.
             operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
         value = self.WAVE_REDUCE[op][0].format(operand)
         self.needs_sm6 = True
@@ -17061,7 +17349,10 @@ class Stage:
         if claim is not None and not claim[0]:
             raise Unsupported('wave reduction: the later readlane of the v_min_u32 chain is not carried by a v_max_u32 '
                               'chain')
-        self.set_s(sd, self.u('v%d' % vt), uniform=False)
+        # retry_uniform_readlane: the WaveActive* result is the same in every lane that takes part, every non-helper
+        # lane of the converged host wave (helpers never take part and get no defined value: the contract of the host
+        # votes, which also exclude them). A scalar branch on it is then a wave decision like a vote.
+        self.set_s(sd, self.u('v%d' % vt), uniform=bool(getattr(self, 'retry_uniform_readlane', False)))
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
