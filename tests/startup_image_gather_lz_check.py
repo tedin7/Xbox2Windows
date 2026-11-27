@@ -1,4 +1,4 @@
-"""Check gfx1013 mip-zero gathers through the startup pixel translator."""
+"""Check gfx1013 mip-zero gathers through the startup pixel and vertex translators."""
 
 import argparse
 import math
@@ -9,6 +9,7 @@ import sys
 import tempfile
 
 from pixel_gather_check import SIDE, texel, write_case
+from startup_compute_gather_l_check import s_mov_word, v_mov_word
 from startup_sampler_heap_check import VS_WORDS, assemble, root_blob
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'startup'))
@@ -35,6 +36,118 @@ SUFFIX = bytes.fromhex('703f8cbf0f1800f804050607000081bf')
 CHANNELS = ('Red', 'Green', 'Blue', 'Alpha')
 
 
+VERTEX_SOURCE = """\
+s_load_dwordx8 s[32:39], s[8:9], 0
+s_mov_b32 s40, {word0:#x}
+s_mov_b32 s41, 0
+s_mov_b32 s42, {word2:#x}
+s_mov_b32 s43, 0
+v_mov_b32 v12, {u}
+v_mov_b32 v13, {v}
+s_waitcnt lgkmcnt(0)
+image_gather4_lz v[20:23], v[12:13], s[32:39], s[40:43] dmask:{mask:#x} dim:SQ_RSRC_IMG_2D{unorm}
+s_waitcnt vmcnt(0)
+v_mov_b32 v8, 0
+v_mov_b32 v9, 1.0
+v_mov_b32 v10, 3.0
+v_cmp_eq_u32 vcc_lo, 1, v0
+v_cndmask_b32 v6, -1.0, v10, vcc_lo
+v_mov_b32 v10, -3.0
+v_cmp_eq_u32 vcc_lo, 2, v0
+v_cndmask_b32 v7, 1.0, v10, vcc_lo
+exp pos0 v6, v7, v8, v9
+exp param0 v20, v21, v22, v23 done
+s_endpgm
+"""
+VERTEX_TAIL = bytes.fromhex(
+    '703f8cbf 8002107e f202127e ff02147e00004040 8100847d f3140c02'
+    ' ff02147e000040c0 8200847d f2140e02 cf0000f806070809 0f0a00f814151617 000081bf'
+)
+PASS_SOURCE = '\n'.join(
+    f'v_interp_mov_f32 v{12 + i}, p0, attr0.{lane}' for i, lane in enumerate('xyzw')
+) + '\nexp mrt0 v12, v13, v14, v15 done vm\ns_endpgm\n'
+PASS_WORDS = bytes.fromhex(
+    '020032c8 020136c8 02023ac8 02033ec8 0f1800f80c0d0e0f 000081bf'
+)
+
+# Coordinate pairs are in view-mip-zero texel units, before normalization.
+VERTEX_CASES = (
+    ('centre', (3.5, 5.5), 0, False, False, False),
+    ('edge', (3, 5), 2, False, False, False),
+    ('clamp', (0, SIDE), 2, False, False, False),
+    ('wrap', (0, SIDE), 2, True, False, False),
+    ('unorm', (3.5, 5.5), 0, False, True, False),
+    ('force_unnormalized', (3, 5), 2, False, False, True),
+)
+
+
+def coord_token(value):
+    if value in (0, 0.5, 1, 2):
+        return '0' if value == 0 else f'{value:.1f}'
+    return f'{struct.unpack("<I", struct.pack("<f", value))[0]:#x}'
+
+
+def vertex_fixture(xy, component, wrap, unorm, force, *, dim=1, opcode=0x47, bias=0):
+    word0 = (0 if wrap else 0x12) | (int(force) << 15)
+    word2 = 0x04500000 | bias
+    u, v = (coord_token(c if unorm or force else c / SIDE) for c in xy)
+    mask = 1 << component
+    code = (bytes.fromhex('04080cf4000000fa')
+            + b''.join(s_mov_word(40 + i, word) for i, word in enumerate((word0, 0, word2, 0)))
+            + v_mov_word(12, u) + v_mov_word(13, v) + bytes.fromhex('7fc08cbf')
+            + struct.pack('<II', 0xf0000000 | (opcode << 18) | (int(unorm) << 12) | (mask << 8) | (dim << 3),
+                          0x0148140c)
+            + VERTEX_TAIL)
+    source = VERTEX_SOURCE.format(word0=word0, word2=word2, u=u, v=v, mask=mask, unorm=' unorm' if unorm else '')
+    return code, source
+
+
+def vertex_pipeline(code):
+    return G.Pipeline(code, PASS_WORDS, root_blob(flags=0))
+
+
+def vertex_controls(llvm_mc):
+    if llvm_mc:
+        assert PASS_WORDS == assemble(llvm_mc, PASS_SOURCE)
+    for name, xy, component, wrap, unorm, force in VERTEX_CASES:
+        code, source = vertex_fixture(xy, component, wrap, unorm, force)
+        if llvm_mc:
+            assert code == assemble(llvm_mc, source), name
+        pipe = vertex_pipeline(code)
+        vs = pipe.hlsl_vs()
+        assert f'.Gather{CHANNELS[component]}(q0, float2(F(v12), F(v13))' in vs, vs
+        assert (' / float2(gw, gh)' in vs) == (unorm or force), vs
+        assert all(f'v{20 + i} = U(t.{lane});' in vs for i, lane in enumerate('xyzw')), vs
+        assert 'srv 0 tex2d table 0 0\n' in pipe.manifest(), pipe.manifest()
+        word0 = (0 if wrap else 0x12) | (int(force) << 15)
+        assert f'smp 0 {word0:#x} 0x0 0x4500000 0x0\n' in pipe.manifest(), pipe.manifest()
+        assert 'o.fparam0 = uint4(v20, v21, v22, v23);' in vs, vs
+        assert 'i.fparam0.w' in pipe.hlsl_ps()
+
+    for overrides, reason in (
+        ({'opcode': 0x40}, 'requires the guest implicit mip level'),
+        ({'opcode': 0x45}, 'image_gather4_b'),
+        ({'opcode': 0x44}, 'requires a pixel or compute stage and four operands'),
+        ({'opcode': 0x4f}, 'requires a pixel stage and four operands'),
+        ({'dim': 3}, 'requires a 2D texture'),
+        ({'dim': 5}, 'requires a 2D texture'),
+        ({'bias': 1}, 'unsupported filter, LOD or descriptor flags'),
+    ):
+        code, _ = vertex_fixture(*VERTEX_CASES[0][1:], **overrides)
+        refused(code, reason, translate=vertex_pipeline)
+
+    # Binary MIMG instructions always encode four operands. Exercise the arity guard directly.
+    stage = vertex_pipeline(vertex_fixture(*VERTEX_CASES[0][1:])[0]).vs
+    for operands in (['v20'] * 3, ['v20'] * 5):
+        try:
+            stage.op_image_gather4_lz(operands, [])
+        except G.Unsupported as error:
+            assert str(error) == 'image_gather4_lz requires four operands', error
+        else:
+            raise AssertionError(f'Vertex gather accepted {len(operands)} operands')
+    print('Six vertex mip-zero gather cases and refusal controls passed')
+
+
 def shader(mask=1, dim=1, opcode=0x47, flags=0, high=0, prefix=PREFIX, nsa=False, dst=4):
     first = 0xf0000000 | (opcode << 18) | (mask << 8) | (dim << 3) | flags
     if nsa:
@@ -47,9 +160,9 @@ def pipeline(code):
     return G.Pipeline(VS_WORDS, code, root_blob(flags=0))
 
 
-def refused(code, reason):
+def refused(code, reason, *, translate=pipeline):
     try:
-        pipeline(code)
+        translate(code)
     except G.Unsupported as error:
         assert reason in str(error), error
     else:
@@ -95,6 +208,7 @@ def controls(llvm_mc):
     check_clamp_z()
     check_point_xy()
     check_mip_point_preclamp()
+    vertex_controls(llvm_mc)
     print('Four fixed-mip gather channels and unsupported encodings checked')
 
 
@@ -179,11 +293,53 @@ def check_mip_point_preclamp():
         G.gather_2d_profile_words = profile
 
 
-def expected_taps(mip, component, uv):
+def expected_taps(mip, component, uv, *, wrap=False):
     extent = SIDE >> mip
     x, y = (math.floor(coord * extent - 0.5) for coord in uv)
-    return tuple(texel(mip, min(max(i, 0), extent - 1), min(max(j, 0), extent - 1), component)
+    def address(coord):
+        return coord % extent if wrap else min(max(coord, 0), extent - 1)
+
+    return tuple(texel(mip, address(i), address(j), component)
                  for i, j in ((x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y)))
+
+
+def draw_vertex(dxc, renderer, adapter, directory):
+    source = directory / 'vertex_gather.hlsl'
+    vs = directory / 'vertex_gather.vs.dxil'
+    ps = directory / 'vertex_gather.ps.dxil'
+    case = directory / 'vertex_gather.case'
+
+    def compile_stage(text, profile, output):
+        source.write_text(text, encoding='ascii')
+        subprocess.run([dxc, '-WX', '-T', profile, '-E', 'main', '-Fo', output, source], check=True)
+
+    for i, (name, xy, component, wrap, unorm, force) in enumerate((*VERTEX_CASES, VERTEX_CASES[1])):
+        mutant = i == len(VERTEX_CASES)
+        code, _ = vertex_fixture(xy, component, wrap, unorm, force)
+        pipe = vertex_pipeline(code)
+        text = pipe.hlsl_vs()
+        if mutant:
+            export = 'uint4(v20, v21, v22, v23)'
+            assert text.count(export) == 1
+            text = text.replace(export, 'uint4(v21, v20, v22, v23)')
+        if i == 0:
+            compile_stage(pipe.hlsl_ps(), 'ps_6_0', ps)
+        compile_stage(text, 'vs_6_0', vs)
+        expected = expected_taps(0, component, tuple(c / SIDE for c in xy), wrap=wrap)
+        # Distinct mip data and a view starting at physical mip 1 expose an incorrect view LOD.
+        write_case(case, 3, 1, [expected] * SIDE**2)
+        sampler, = (line for line in pipe.manifest().splitlines() if line.startswith('smp '))
+        proc = subprocess.run([renderer, adapter, '--check-pixel-gather', ps, case, sampler, vs],
+                              capture_output=True, text=True)
+        output = proc.stdout + proc.stderr
+        print(f'vertex {name}, mutant {mutant}\n{output}', end='', flush=True)
+        if proc.returncode == 77:
+            raise SystemExit(77)
+        if mutant:
+            assert expected[0] != expected[1]
+            assert proc.returncode == 1 and 'pixel_mismatch x=0 y=0' in output, output
+        else:
+            assert proc.returncode == 0 and 'pixels=64 channels=256 max_absolute_error=0' in output, output
 
 
 def draw(dxc, renderer, adapter):
@@ -229,6 +385,7 @@ def draw(dxc, renderer, adapter):
         # The full sampler state of those pipelines, MIP_POINT_PRECLAMP included.
         run(3, 1, 1, uv, shader(2, prefix=with_word2(0x14000000, with_word0(0x92))))
         run(3, 1, 2, uv, shader(4), mutant=True)
+        draw_vertex(dxc, renderer, adapter, directory)
 
 
 if __name__ == '__main__':

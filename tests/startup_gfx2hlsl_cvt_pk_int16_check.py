@@ -678,8 +678,13 @@ def check_snorm_draw(dxc, renderer, adapter):
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         directory = Path(tmp)
-        vertex = """float4 main(uint id : SV_VertexID) : SV_Position {
-    return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+        # The translated pixel stage takes PARAM0 and SV_Position, in that order.
+        vertex = """struct Out { float4 param0 : PARAM0; float4 pos : SV_Position; };
+Out main(uint id : SV_VertexID) {
+    Out o;
+    o.param0 = float4(0, 0, 0, 0);
+    o.pos = float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+    return o;
 }
 """
         vs = compile_hlsl(dxc, 'dxc', vertex, 'vs', 'vs_6_0', directory)

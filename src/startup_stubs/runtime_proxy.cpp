@@ -1477,6 +1477,7 @@ HRESULT __stdcall storage_get_path(StorageObject*, std::size_t size, char* buffe
     if (used) *used = need;
     if (!buffer || size < need) return static_cast<HRESULT>(0x8007007A);
     std::memcpy(buffer, storage_path(), need);
+    x2w_local::log_low_address_margin();
     {
         // Whether the root exists on this PC: the title writes its settings below it itself, and a missing drive makes those writes fail.
         const DWORD attributes = GetFileAttributesA(storage_path());
