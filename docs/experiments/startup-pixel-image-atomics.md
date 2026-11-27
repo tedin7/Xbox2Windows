@@ -23,6 +23,12 @@ active pixel's contribution into shared texels and checks all remaining
 texels for unchanged sentinels. One fixture narrows EXEC with `v_cmpx`.
 Another fixture restores EXEC after whole-quad mode, narrows it with a
 scalar mask, and uses the same data register in both atomic blocks.
+The discard variant removes the second column and bottom two rows from
+the saved live mask before restoring EXEC. Only the top two pixels in
+the first column contribute. Removing the two updates to that mask
+must produce a mismatch. The translation controls refuse both a reversed
+`s_andn2_b64` that treats the saved mask as the complemented operand and
+an atomic reached directly from whole-quad mode.
 Controls substitute wrong operations, use signed min, split OR into a
 load and a store, and remove EXEC guards. Each control requires a texel
 mismatch.

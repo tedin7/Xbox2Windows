@@ -47,13 +47,21 @@ EXPORT = words(0xf800180f, 0x0f0f0f0f, 0xbf810000)  # exp mrt0 v15, v15, v15, v1
 WHITE = words(0x7e1e02f2)  # v_mov_b32 v15, 1.0
 SAVE_EXEC = words(0xbe8c047e)  # s_mov_b64 s[12:13], exec
 WQM = words(0xbefe0a7e)  # s_wqm_b64 exec, exec
+WQM_SAVED = words(0xbefe0a0c)  # s_wqm_b64 exec, s[12:13]
 RESTORE_EXEC = words(0xbefe040c)  # s_mov_b64 exec, s[12:13]
 NARROW_EXEC = words(0x87fe7e0a)  # s_and_b64 exec, s[10:11], exec
 SKIP_ATOMIC = words(0xbf880002)  # s_cbranch_execz +2 dwords
 WAIT_VMEM = words(0xbf8c3f70)
 
+# The compares set VCC for x == 1, then y >= 2. Remove those pixels from the live mask
+# and re-enter whole-quad mode for the remaining quads after each discard.
+REMOVE_FROM_SAVED = words(0x8a8c6a0c)  # s_andn2_b64 s[12:13], s[12:13], vcc
+DISCARDS = (words(0x7d840881) + REMOVE_FROM_SAVED + WQM_SAVED
+            + words(0x7d860682) + REMOVE_FROM_SAVED + WQM_SAVED)
+DISCARD_LINE = 's12 = (s12 & ~vcc) & 1;'
 
-def requested_shape():
+
+def requested_shape(*, discards=b'', min_exec=RESTORE_EXEC + NARROW_EXEC):
     # Packed SV_Position in v2. Compare x < 2 into s[10:11] and keep v3 = y for both halves.
     setup = words(vop2(0x1b, 4, 255, 2), 0xffff, vop2(0x16, 3, 144, 2),
                   0xd4c1000a, (256 + 4) | (130 << 9))
@@ -62,8 +70,8 @@ def requested_shape():
     clamp = words(0xd5038005, 242 | (240 << 9))
     minimum = atomic('umin')
     # The second texel address starts at v2, now holding unpacked x followed by y.
-    return (descriptor(16, 32) + descriptor(24, 0) + WAIT + setup + SAVE_EXEC + WQM + coords + clamp
-            + RESTORE_EXEC + NARROW_EXEC + SKIP_ATOMIC + minimum
+    return (descriptor(16, 32) + descriptor(24, 0) + WAIT + setup + SAVE_EXEC + WQM + discards + coords + clamp
+            + min_exec + SKIP_ATOMIC + minimum
             + RESTORE_EXEC + words(vop2(0x1b, 2, 255, 2), 0xffff)
             + NARROW_EXEC + SKIP_ATOMIC + atomic('or', addr=2, desc=16)
             + RESTORE_EXEC + WHITE + EXPORT)
@@ -95,6 +103,42 @@ def runtime_words():
             + atomic('umin') + WAIT_VMEM + WHITE + EXPORT)
 
 
+def discard_controls():
+    code = requested_shape(discards=DISCARDS)
+    decoded = [asm for _, _, _, asm in G.decode(code)]
+    first = decoded.index('v_cmp_eq_u32_e32 vcc_lo, 1, v4')
+    assert decoded[first:first + 6] == [
+        'v_cmp_eq_u32_e32 vcc_lo, 1, v4',
+        's_andn2_b64 s[12:13], s[12:13], vcc',
+        's_wqm_b64 exec, s[12:13]',
+        'v_cmp_le_u32_e32 vcc_lo, 2, v3',
+        's_andn2_b64 s[12:13], s[12:13], vcc',
+        's_wqm_b64 exec, s[12:13]',
+    ], decoded
+    ps = translate(code).hlsl_ps()
+    assert ps.count(DISCARD_LINE) == 2, ps
+    assert 'if (exec & 1) InterlockedMin(w0[uint2(v6, v7)], v5);' in ps, ps
+    assert 'if (exec & 1) InterlockedOr(w1[uint2(v2, v3)], v5);' in ps, ps
+
+    # A saved pair can be narrowed in place through either AND operand.
+    for in_place in (words(0x878c0a0c), words(0x878c0c0a)):
+        translate(requested_shape(discards=DISCARDS + in_place))
+    # Restore directly to a subset of the saved pair through either AND operand or the first ANDN2 operand.
+    for into_exec in (words(0x87fe7e0c), words(0x87fe0c7e), words(0x8afe7e0c)):
+        translate(requested_shape(discards=DISCARDS, min_exec=into_exec))
+    # After a restore, AND, ANDN2 and AND_SAVEEXEC can narrow EXEC against an unproven mask.
+    for narrow in (words(0x87fe0a7e), words(0x8afe0a7e), words(0xbea0240a)):
+        translate(requested_shape(discards=DISCARDS, min_exec=RESTORE_EXEC + narrow))
+    # An ANDN2 bounded only by its complemented operand may turn on helpers.
+    reversed_saved = words(0x8a8c0c6a)  # s_andn2_b64 s[12:13], vcc, s[12:13]
+    reversed_exec = words(0x8afe0c7e)   # s_andn2_b64 exec, exec, s[12:13]
+    helper = 'image_atomic_umin: EXEC may include helper lanes'
+    refused(code.replace(REMOVE_FROM_SAVED, reversed_saved, 1), helper)
+    refused(requested_shape(discards=DISCARDS, min_exec=reversed_exec), helper)
+    refused(code.replace(WQM_SAVED, WQM_SAVED + atomic('umin'), 1), helper)
+    print('two discards preserve the saved live mask; reversed ANDN2 and widened EXEC are refused')
+
+
 def controls():
     shape = requested_shape()
     decoded = [asm for _, _, _, asm in G.decode(shape)]
@@ -109,6 +153,7 @@ def controls():
     ps = translate(shape).hlsl_ps()
     assert 'if (exec & 1) InterlockedMin(w0[uint2(v6, v7)], v5);' in ps, ps
     assert 'if (exec & 1) InterlockedOr(w1[uint2(v2, v3)], v5);' in ps, ps
+    discard_controls()
 
     for name, (_, intrinsic, _) in OPS.items():
         code = draw_words(name)
@@ -166,6 +211,10 @@ def controls():
 
     assert reference('umin')[1][0] == 0x4000ffff
     assert reference('umin', narrow=True)[1][0] == 0x4000cccc
+    initial_min, initial_or = initial_texels()
+    discard_min, discard_or = reference('umin', shape=True, discards=True)
+    assert [i for i in range(SIDE * SIDE) if discard_min[i] != initial_min[i]] == [0]
+    assert [i for i in range(SIDE * SIDE) if discard_or[i] != initial_or[i]] == [0, SIDE]
     for op, mutant in WRONG_OP.items():
         assert reference(op)[0] != reference(mutant)[0], (op, mutant)
     print('7 pixel image atomics, no VDATA write, 2 unsigned views, WQM restore and refusal controls')
@@ -180,12 +229,12 @@ def initial_texels():
     return primary, bits
 
 
-def reference(op, *, narrow=False, shape=False):
+def reference(op, *, narrow=False, shape=False, discards=False):
     primary, bits = initial_texels()
     for y in range(SIDE):
         for x in range(SIDE):
             if shape:
-                if x < 2:
+                if x < 2 and (not discards or (x != 1 and y < 2)):
                     data = 0x3f800000  # binary32 bits of saturate(1.0 + 0.5)
                     address = (x // 2) + SIDE * (y // 2)
                     primary[address] = min(primary[address], data)
@@ -259,7 +308,11 @@ def check_draw(dxc, offscreen):
 
         shape = translate(requested_shape()).hlsl_ps()
         draw('wqm_restore', shape, reference('umin', shape=True))
-        print('WARP readback: nine fixtures and ten controls')
+        discarded = translate(requested_shape(discards=DISCARDS)).hlsl_ps()
+        expected = reference('umin', shape=True, discards=True)
+        draw('wqm_discard', discarded, expected)
+        draw('wqm_discard_ignored', discarded.replace(DISCARD_LINE, ''), expected, mismatch=0)
+        print('WARP readback: ten fixtures and eleven controls')
 
 
 if __name__ == '__main__':

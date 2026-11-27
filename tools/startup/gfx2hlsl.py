@@ -6286,7 +6286,12 @@ class Stage:
         return None
 
     def pixel_nonhelper_atomic_sites(self, cfg):
-        """Prove that the atomic's EXEC is a subset of entry EXEC on every incoming path."""
+        """Prove that the atomic's EXEC is a subset of entry EXEC on every incoming path.
+
+        Discards shrink the saved live mask. Whole-quad mode can re-enable those lanes for derivatives.
+        D3D suppresses UAV writes and atomics from discarded and helper invocations (D3D11.3 §16.13).
+        After the shader restores the live mask, the translated EXEC guard also skips those lanes.
+        """
         bounds, _, successors, _ = cfg
         incoming = {0: (True, frozenset())}
         sites = set()
@@ -6299,21 +6304,28 @@ class Stage:
                 _, ops, mods = parse(asm)
                 if name in PIXEL_IMAGE_ATOMICS:
                     (sites.add if exact else sites.discard)(pc)
-                source = reg_range(ops[1]) if len(ops) >= 2 else None
+                # AND is bounded by either input. ANDN2 is bounded only by its uncomplemented input.
+                limits = []
+                if name == 's_and_b64' and len(ops) == 3:
+                    limits = ops[1:]
+                elif name == 's_andn2_b64' and len(ops) == 3:
+                    limits = ops[1:2]
+                pairs = {reg_range(tok) for tok in limits}
                 if writes_exec(name, ops, mods) or scalar_effects(name, asm)[2] & EXEC_KEYS:
-                    restore = name == 's_mov_b64' and ops[0] == 'exec' and source in saved
+                    restore = ops[:1] == ['exec'] and (
+                        bool(pairs & saved) or
+                        (name == 's_mov_b64' and len(ops) == 2 and reg_range(ops[1]) in saved))
                     narrow = self.exec_write_only_narrows(name, ops)
-                    # AND can name the pre-WQM copy directly, or put current EXEC second.
-                    if name == 's_and_b64' and len(ops) == 3 and ops[0] == 'exec':
-                        restore = any(reg_range(tok) in saved for tok in ops[1:])
-                        narrow = 'exec' in ops[1:]
+                    narrow |= ops[:1] == ['exec'] and 'exec' in limits
                     exact = restore or (exact and narrow)
                 dest = reg_range(ops[0]) if ops else None
+                shrinks_saved = dest in saved and dest in pairs
                 writes = scalar_destinations(name, asm)
                 saved = (frozenset() if 'any' in writes else
                          frozenset(r for r in saved if not writes.intersection(range(r[1], r[2] + 1))))
-                if (exact and name == 's_mov_b64' and len(ops) == 2 and ops[1] == 'exec'
-                        and dest and dest[0] == 's' and dest[2] == dest[1] + 1 and dest[2] <= 105):
+                save_exec = (exact and name == 's_mov_b64' and ops[1:] == ['exec']
+                             and dest and dest[0] == 's' and dest[2] == dest[1] + 1 and dest[2] <= 105)
+                if shrinks_saved or save_exec:
                     saved |= {dest}
                 if name.startswith(('s_swappc', 's_call')):
                     exact, saved = False, frozenset()

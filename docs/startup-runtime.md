@@ -2549,8 +2549,9 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Pixel-stage image atomics.** A 2D image atomic with `dmask:0x1` and GLC clear uses a
   `RWTexture2D<uint>` and a manifest line `uav N tex2du table P O`. This covers unsigned min
   and max, add, sub, and, or and xor. The instruction reads one VGPR and leaves it unchanged.
-  Every path into the instruction must prove that EXEC excludes helper lanes. A mask saved
-  before whole-quad mode can restore that property, and narrowing the restored EXEC preserves it.
+  Every path into the instruction must prove that EXEC excludes helper lanes. A saved live
+  mask still proves this after discards shrink it in place. The atomic can run after EXEC
+  is restored from that mask or set to a subset of it.
   Returning atomics, signed min and max, and SRV or float UAV access through the same descriptor
   are refused. [RDNA 2 ISA §§8.1.10, 8.2, 12.16](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
 - **Binding pixel-stage image writes.** A translated draw binds each `uav N tex2d|tex2da|tex2du table P O` line
