@@ -61,6 +61,8 @@ def controls():
             assert f'v{regs[0]} = 0x3ea80000u + v0;' in hlsl
             assert f'v{regs[1]} = 0x3f300000u + v0;' in hlsl
             assert 'int2 offset = int2(asint(packed_offset << 26u)' in hlsl
+            if dynamic and nsa:
+                assert hashlib.sha256(hlsl.encode()).hexdigest() == '8e99b7223c1b404b71ae4cacbd7374e7eccdedb8e30c891f0429935c12122b41'
     for coord, size in zip(UV, (WIDTH >> 1, HEIGHT >> 1)):
         scaled = coord * size - 0.5
         assert abs(scaled - round(scaled)) >= 1 / 16

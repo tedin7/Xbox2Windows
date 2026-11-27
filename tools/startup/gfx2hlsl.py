@@ -127,6 +127,43 @@ def gather_2d_profile_words(words):
     return (w0 & ~(7 << 6), w1, w2 & ~(1 << 28), w3)
 
 
+def gather_2d_lod_helper(with_offset):
+    """HLSL for the shared explicit-LOD footprint, optionally shifted by a packed offset."""
+    if with_offset:
+        offset_lines = (
+            '            int2 offset = int2(asint(packed_offset << 26u) >> 26, asint(packed_offset << 18u) >> 26);',
+            '            int2 origin = int2(floor(clamp(scaled, float2(-33.0f, -33.0f), float2(width + 32u, height + 32u)))) + offset;',
+        )
+    else:
+        offset_lines = (
+            '            int2 origin = int2(floor(clamp(scaled, float2(-1.0f, -1.0f), float2(width, height))));',
+        )
+    return (
+        'float4 gather_2d_lod%s(Texture2D<float4> tex, float2 uv, float lod, %suint component, float max_lod) {' %
+        ('_offset' if with_offset else '', 'uint packed_offset, ' if with_offset else ''),
+        '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
+        '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
+        '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
+        '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
+        '        uint width, height, levels;',
+        '        tex.GetDimensions(0u, width, height, levels);',
+        '        if (levels != 0u) {',
+        '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
+        '            tex.GetDimensions(mip, width, height, levels);',
+        '            int2 edge = int2(width, height) - 1;',
+        '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
+        *offset_lines,
+        '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
+        '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
+        '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
+        '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
+        '        }',
+        '    }',
+        '    return result;',
+        '}',
+    )
+
+
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
     # A call (s_swappc_b64) just before the prefetch is the program's first instruction, not header: keep it.
@@ -15360,54 +15397,9 @@ class Pipeline:
                 '    return float3(-sc, -tc, -1.0f);',
                 '}'))
         if self.uses_gather_2d_lod:
-            out.extend((
-                'float4 gather_2d_lod(Texture2D<float4> tex, float2 uv, float lod, uint component, float max_lod) {',
-                '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
-                '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
-                '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
-                '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
-                '        uint width, height, levels;',
-                '        tex.GetDimensions(0u, width, height, levels);',
-                '        if (levels != 0u) {',
-                '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
-                '            tex.GetDimensions(mip, width, height, levels);',
-                '            int2 edge = int2(width, height) - 1;',
-                '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
-                '            int2 origin = int2(floor(clamp(scaled, float2(-1.0f, -1.0f), float2(width, height))));',
-                '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
-                '        }',
-                '    }',
-                '    return result;',
-                '}',
-            ))
+            out.extend(gather_2d_lod_helper(with_offset=False))
         if self.uses_gather_2d_lod_offset:
-            out.extend((
-                'float4 gather_2d_lod_offset(Texture2D<float4> tex, float2 uv, float lod, uint packed_offset, uint component, float max_lod) {',
-                '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
-                '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
-                '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
-                '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
-                '        uint width, height, levels;',
-                '        tex.GetDimensions(0u, width, height, levels);',
-                '        if (levels != 0u) {',
-                '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
-                '            tex.GetDimensions(mip, width, height, levels);',
-                '            int2 edge = int2(width, height) - 1;',
-                '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
-                '            int2 offset = int2(asint(packed_offset << 26u) >> 26, asint(packed_offset << 18u) >> 26);',
-                '            int2 origin = int2(floor(clamp(scaled, float2(-33.0f, -33.0f), float2(width + 32u, height + 32u)))) + offset;',
-                '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
-                '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
-                '        }',
-                '    }',
-                '    return result;',
-                '}',
-            ))
+            out.extend(gather_2d_lod_helper(with_offset=True))
         if self.uses_store_d16_x:
             out.extend((
                 'uint d16_to_unorm16(uint h) {',
