@@ -3864,6 +3864,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_vertex_image_address COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_address_check.py")
     set_tests_properties(startup_vertex_image_address PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_vertex_image_getpc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_getpc_check.py")
+    set_tests_properties(startup_vertex_image_getpc PROPERTIES TIMEOUT 120)
     # Image instructions with fewer than three operands (#2360 follow-up): the handler refused
     # them as an index error before it checked the count.
     add_test(NAME startup_gfx2hlsl_image_arity COMMAND "${INTAKE_PYTHON}" -B

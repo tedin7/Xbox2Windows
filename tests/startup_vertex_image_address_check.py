@@ -62,14 +62,14 @@ def graphics_program(*, before_exports=b'', **kwargs):
 
 
 
-def multi_graphics_program():
+def multi_graphics_program(*, nwords=765, unbounded=False):
     """Three adjacent table words per UNORM8 index, with separate VADDR pairs."""
     code = words(0xf4080400, 0xfa000010)
     code += encode_mtbuf(vdata=9, offen=1, vaddr=0)
     code += words(0xbeb2047e)  # s_mov_b64 s[50:51], exec
     code += b''.join(encode_vop1(1, reg, 128) for reg in (4, 5, 6))
     code += words(0xd54b000f, 255 | (268 << 9) | (240 << 18), 0x437f0000)
-    code += encode_vop1(7, 15, 271)
+    code += encode_vop1(7, 15, 270 if unbounded else 271)
     code += words(0x7c000000 | (0xd5 << 17) | (15 << 9) | 255, 255)
     branch_pc = len(code)
     code += words(0xbf880000)  # s_cbranch_execz, fixed up at the join
@@ -94,7 +94,7 @@ def multi_graphics_program():
     code += export(32, (4, 5, 6, 4)) + export(33, (4, 5, 6, 4), done=True)
     code += words(0xbf810000)
     code = code[:getpc + 8] + words(len(code) - getpc - 4) + code[getpc + 12:]
-    return code + b''.join(words(0x10000000 + i) for i in range(765))
+    return code + b''.join(words(0x10000000 + i) for i in range(nwords))
 
 
 def pipeline(code):
@@ -112,6 +112,15 @@ def translator_controls():
     multi = pipeline(multi_graphics_program()).hlsl_vs()
     assert multi.count('static const uint x2w_image_table[') == 1
     assert multi.count('x2w_image_table[x2w_image_index_') == 3
+    plan = G.vertex_image_plan(multi_graphics_program())
+    assert sorted(bound for _, _, bound in plan['loads'].values()) == [762, 763, 764]
+    for kwargs in ({'nwords': 764}, {'unbounded': True}):
+        try:
+            pipeline(multi_graphics_program(**kwargs))
+        except G.Unsupported as error:
+            assert 'program image load index not proven in range' in str(error), error
+        else:
+            raise AssertionError('unproven three-word image load accepted')
     table_words = [0x10000000 + i for i in range(765)]
     for byte in range(255):
         actual = [table_words[3 * byte + channel] for channel in range(3)]

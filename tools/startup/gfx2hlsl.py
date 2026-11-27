@@ -1868,7 +1868,7 @@ def vertex_image_address_proof(ins, getpc):
     for pc, size, name, asm in ins:
         base = re.sub(r'_e(32|64)$', '', name)
         _, ops, mods = parse(asm)
-        if pc in targets or writes_exec(name, ops):
+        if pc in targets or writes_exec(name, ops) or 'movrel' in name or 'swaprel' in name:
             signs.clear()
             shifts.clear()
             addresses.clear()
