@@ -430,7 +430,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                             mode == "dispatch-texel-sint" ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
         if (!bind_identifier_fixture(device, list, cpu + 64, format, identifier_fixture_dimension())) return 80;
     }
-    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || view_tokens) {
+    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || view_tokens || mode == "dispatch-indirect-texture") {
         const UINT width = view_tokens || mode == "dispatch-sampled-2x1" ? 2 : 1;
         const UINT16 mips = view_tokens ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
