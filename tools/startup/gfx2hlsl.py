@@ -8154,6 +8154,7 @@ class Stage:
             self.fetched = False
             self.uniform_v = set()
             self.firstlane_v = set()
+            self.firstlane_masks = set()
             self.firstlane_ps_load_v = set()
             firstlane_edges = {}
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
@@ -9520,6 +9521,11 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        masks = getattr(self, 'firstlane_masks', None)
+        cfg = getattr(self, 'spill_cfg', None)
+        ins = getattr(self, 'ins', ())
+        if masks and cfg and any(lo < len(ins) and ins[lo][0] == getattr(self, 'pc', None) for lo, _ in cfg[0]):
+            masks.clear()
         if writes_exec(name, ops, mods):
             self.exec_generation += 1
         vertex_image = getattr(self, 'vertex_image', None)
@@ -9532,9 +9538,13 @@ class Stage:
                 return None
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
+            if masks is not None:
+                masks.clear()
             return self.lower_image_instruction(image, name, asm, ops, mods)
         pixel_table = getattr(self, 'pixel_table', None)
         if pixel_table and self.pc == pixel_table[1]:
+            if masks is not None:
+                masks.clear()
             _, _, first, words = pixel_table
             for reg, word in enumerate(words, first):
                 self.set_s(reg, '0x%08xu' % word, ('const', word))
@@ -9625,10 +9635,39 @@ class Stage:
         extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
         extra_regs = ()
         ps_load_regs = ()
+        # AMD RDNA 2 ISA guide, 3.9 VCC, p.19: compares produce a lane mask. Equal inputs give equal active bits.
+        # Keep these facts within one basic block, and invalidate them on any overlapping scalar write.
+        masks = getattr(self, 'firstlane_masks', None)
+        mask_enabled = (masks is not None and getattr(self, 'kind', None) == 'ps'
+                        and getattr(self, 'firstlane_cfg', False)
+                        and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ())))
+        def mask_key(token):
+            if token in ('vcc', 'vcc_lo'):
+                return 'vcc'
+            reg = reg_range(token)
+            if reg and reg[0] == 's' and reg[2] - reg[1] in (0, 1):
+                return 's%d' % reg[1]
+            return None
+        next_mask = None
         entry_proof = (extra_proof and self.uniform_entry_exec()
                        and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec))
         pixel_full = extra_proof and self.pc in getattr(self, 'firstlane_ps_full_exec', ())
+        if mask_enabled and entry_proof:
+            if (base.startswith('v_cmp_') and not mods and len(ops) == 3
+                    and mask_key(ops[0]) is not None
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
+            elif (base == 's_or_b64' and not mods and len(ops) == 3
+                  and mask_key(ops[0]) is not None
+                  and all(mask_key(tok) in masks for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
         if entry_proof or pixel_full:
+            if (entry_proof and mask_enabled and base == 'v_cndmask_b32' and not mods
+                    and len(ops) in (3, 4) and mask_key(ops[3] if len(ops) == 4 else 'vcc') in masks
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:3])):
+                dest = reg_range(ops[0])
+                if dest and dest[0] == 'v' and dest[1] == dest[2]:
+                    extra_regs = (dest[1],)
             # Table-driven VALU operations use only their explicit operands and, for the
             # accumulator forms, the old destination. No lane selectors or mask operands.
             if entry_proof and (base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU):
@@ -9674,12 +9713,30 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if mask_enabled:
+            _, _, written_masks = scalar_effects(name, asm)
+            if writes_exec(name, ops) or 'any' in scalar_destinations(name, asm):
+                masks.clear()
+            else:
+                for key in tuple(masks):
+                    if key == 'vcc':
+                        overlaps = bool({'vcc', 'vcc_hi'} & written_masks)
+                    else:
+                        reg = int(key[1:])
+                        overlaps = bool({'s%d' % reg, 's%d' % (reg + 1)} & written_masks)
+                    if overlaps:
+                        masks.discard(key)
+            if next_mask is not None:
+                masks.add(next_mask)
         if extra_proof:
             for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
+            if (entry_proof and loaded_regs and getattr(self, 'kind', None) == 'ps'
+                    and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ()))):
+                self.firstlane_v.update(loaded_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods)):
@@ -13501,16 +13558,55 @@ class Stage:
             uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
+    def pixel_store_constant_index(self, position):
+        """Prove the last index write within this store's basic block."""
+        name = 'buffer_store_format_xyzw'
+        ins = getattr(self, 'ins', ())
+        cfg = getattr(self, 'spill_cfg', None)
+        if not cfg or not 0 <= position < len(ins) or position not in cfg[1]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        args = parse(ins[position][3])[1]
+        index = reg_range(args[1]) if len(args) > 1 else None
+        if not index or index[0] != 'v' or index[1] != index[2]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        bounds, block_of, _, _ = cfg
+        lo, _ = bounds[block_of[position]]
+        for _, _, op, asm in reversed(ins[lo:position]):
+            _, operands, mods = parse(asm)
+            if writes_exec(op, operands) or op.startswith(('v_movrel', 'v_accvgpr_write')):
+                break
+            if op.startswith(INTERP_STORE_PREFIXES) or op.startswith(('v_cmp', 'exp')):
+                continue
+            dest = operands[:2] if op.startswith('v_swap_b32') else destinations(op, operands)
+            for token in dest:
+                reg = reg_range(token)
+                if not reg or reg[0] != 'v':
+                    continue
+                hi = reg[2]
+                if reg[1] == hi and re.search(r'(?:b|i|u|f)64(?:_|$)', op):
+                    hi += 1
+                if reg[1] <= index[1] <= hi:
+                    if (re.sub(r'_e(32|64)$', '', op) == 'v_mov_b32' and not mods
+                            and len(operands) == 2 and operands[0] == args[1]):
+                        literal = operands[1]
+                        if re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', literal):
+                            return int(literal, 0) & 0xffffffff
+                        if literal in FLOATS:
+                            return fbits(FLOATS[literal])
+                    raise Unsupported(name + ' index not proven constant in the same basic block')
+        raise Unsupported(name + ' index not proven constant in the same basic block')
+
     def op_buffer_store_format_xyzw(self, ops, mods):
-        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+        """Lower MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
 
         FORMAT, stride and num_records are read at dispatch from the same entry constants as
         buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
         name = 'buffer_store_format_xyzw'
-        if self.kind != 'cs':
-            raise Unsupported(name)  # the unknown-op refusal
+        if getattr(self, 'kind', None) != 'cs' and not (
+                getattr(self, 'kind', None) == 'ps' and getattr(getattr(self, 'pipe', None), 'pixel_formatted_stores', False)):
+            raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
         if raw and pc is not None and pc + 8 <= len(raw):
@@ -13552,9 +13648,23 @@ class Stage:
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        if getattr(self, 'kind', None) == 'ps':
+            if int(ops[3], 0) or (imm_offset or 0):
+                raise Unsupported(name + ' pixel store requires zero offsets')
+            stores = [i for i, item in enumerate(getattr(self, 'ins', ())) if item[2] == name]
+            indices = [self.pixel_store_constant_index(pos) for pos in stores]
+            if len(indices) != len(set(indices)):
+                raise Unsupported(name + ' pixel stores have overlapping indices')
+            if (not getattr(self, 'firstlane_cfg', False) or not getattr(self, 'uniform_cf', False) or not self.uniform_entry_exec()
+                    or not all(n in getattr(self, 'firstlane_v', ()) for n in range(src[1], src[2] + 1))):
+                raise Unsupported(name + ' data not proven wave-uniform')
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        if getattr(self, 'kind', None) == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
+            raise Unsupported('%s shares a vertex UAV' % name)
         uav = self.pipe.uav(key, 'raw')
+        if getattr(self, 'kind', None) == 'ps':
+            self.pipe.uavs[key]['pixel_format'] = True
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
@@ -13562,7 +13672,8 @@ class Stage:
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
             uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
-        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+        # D3D pixel helper invocations have no UAV side effects. Also honor the guest's per-lane EXEC bit.
+        self.emit(call if getattr(self, 'kind', None) == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -18437,6 +18548,7 @@ class Pipeline:
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
+    pixel_formatted_stores = False
     srv_formats = ()
     integer_texture_srvs = False
     typed_srvs = False  # a Texture2DArray input (compute gather) needs the runtime's typed-SRV binding
@@ -18495,10 +18607,11 @@ class Pipeline:
         try:
             stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
         except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
+            if str(reason) not in (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform'):
                 raise
         else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+            retry_reasons = (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform')
+            if refusals is None or not any((reason, 'ps') in refusals[before:] for reason in retry_reasons):
                 return stage
         self.__dict__.clear()
         self.__dict__.update(state)
@@ -18529,6 +18642,7 @@ class Pipeline:
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), *, pixel_refusal=None):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
+        self.pixel_formatted_stores = self.vertex_kind == 'vs'
         self.rect = self.ud(('rect',))
         if self.vertex_kind == 'ms':
             self.mesh_pixel_writes = ps_code is not None and mesh_pixel_memory_writes(
@@ -20673,6 +20787,7 @@ LIFTED_REASONS = (
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),
+    ('pixel-formatted-store', r'^buffer_store_format_xyzw$'),
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),

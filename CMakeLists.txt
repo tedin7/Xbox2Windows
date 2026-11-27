@@ -4791,6 +4791,13 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    add_test(NAME startup_pixel_store_format_xyzw_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_store_format_xyzw_check.py")
+    set_tests_properties(startup_pixel_store_format_xyzw_controls PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_pixel_store_format_xyzw_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_store_format_xyzw_check.py" "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_pixel_store_format_xyzw_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).
     add_test(NAME startup_gfx2hlsl_compute_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py")

@@ -39,6 +39,8 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
                               const std::uint32_t expected[4]);
 int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const char* fixture_path, bool signed_view);
+int check_startup_pixel_formatted_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                        const char* sampler_line, const char* fixture_path);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
