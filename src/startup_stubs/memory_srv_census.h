@@ -50,7 +50,7 @@ constexpr const char* memory_srv_reasons[] = {
     "alias_ineligible_shape", "alias_existing_texture", "alias_unsupported_desktop_format",
     "format_plane_count", "format_view_support", "format_storage_support",
     "format_dimension_support", "format_mip_support", "texture_1d_layout_unmapped",
-    "texture_1d_shape_unsupported", "texture_1d_footprint_unavailable",
+    "texture_1d_shape_unsupported", "texture_1d_footprint_unavailable", "texture_1d_linear_mips_or_slices",
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
 
