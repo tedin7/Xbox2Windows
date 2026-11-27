@@ -474,6 +474,14 @@ void record_arguments(ArgumentCapture& capture)
         case 25:  // GetResourceAllocationInfo(mask, count, descs), returned by value: the descriptions
             if (static_cast<UINT>(a[2]) <= 64) capture.arg(3, static_cast<u64>(static_cast<UINT>(a[2])) * sizeof(D3D12_RESOURCE_DESC));
             break;
+        case 108:  // GetResourceAllocationInfo1(mask, count, descs, info1), returned by value: the descriptions and the
+                   // per-resource array the stand-in writes (the title's stack otherwise)
+            if (static_cast<UINT>(a[2]) <= 64) {
+                const u64 count = static_cast<UINT>(a[2]);
+                capture.arg(3, count * sizeof(D3D12_RESOURCE_DESC));
+                if (a[4]) capture.arg(4, count * sizeof(D3D12_RESOURCE_ALLOCATION_INFO1));
+            }
+            break;
         case 55:  // CreateDerivedPipelineStateX(base, patch count, patches, IID, out)
             if (static_cast<UINT>(a[1]) <= 64) capture.arg(2, static_cast<u64>(static_cast<UINT>(a[1])) * x2w_derived_blend::record_size);
             capture.arg(3, sizeof(GUID));

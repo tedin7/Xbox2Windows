@@ -141,6 +141,17 @@ int create_scene(void* device, Scene& s)
                                                   arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
     }
+    // X2W_TEST_REPLAY_ALLOC108=1: device slot 108 (GetResourceAllocationInfo1) in the title's form: the return buffer
+    // first, the device second, two descriptions and the per-resource array the slot writes, all on this stack.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_ALLOC108", nullptr, 0)) {
+        using Info1 = void* (*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+        const auto info1 = reinterpret_cast<Info1>((*static_cast<void***>(device))[108]);
+        const D3D12_RESOURCE_DESC descs[2] = {desc, desc};
+        D3D12_RESOURCE_ALLOCATION_INFO1 each[2]{};
+        D3D12_RESOURCE_ALLOCATION_INFO total{};
+        info1(&total, device, 0, 2, descs, each);
+        if (!total.SizeInBytes || total.SizeInBytes == ~0ull || !each[1].SizeInBytes) return 34;
+    }
     const bool descriptor_window = GetEnvironmentVariableA("X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", nullptr, 0) != 0;
     const bool null_views = GetEnvironmentVariableA("X2W_TEST_REPLAY_NULL_VIEWS", nullptr, 0) != 0;
     constexpr UINT ranges = 40;  // handle array is larger than the recorder's generic 256-byte argument capture

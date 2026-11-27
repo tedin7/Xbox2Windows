@@ -90,6 +90,7 @@ inline constexpr bool declared_input(int kind, int slot, int arg)
     case 57: case 67: return arg == 0 || arg == 1;
     case 55: return arg == 2 || arg == 3;
     case 25: return arg == 3;
+    case 108: return arg == 3 || arg == 4;
     case 133: return arg == 1 || arg == 4;
     default: return false;
     }
