@@ -8,6 +8,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 import bisect
 from collections import Counter
 from contextlib import suppress
+from copy import deepcopy
 import functools
 import hashlib
 import math
@@ -4731,6 +4732,10 @@ class Stage:
         # while still selecting the same value for every lane at a join.
         self.firstlane_cfg = (getattr(getattr(self, 'pipe', None), 'retry_firstlane', False)
                               and not back_targets)
+        # The PS retry needs entry EXEC on every incoming path, not just in
+        # instruction order. Keep this proof local to the new lowering.
+        self.firstlane_ps_exec = (self.entry_exec_sites(self.spill_cfg)
+                                  if self.firstlane_cfg and self.kind == 'ps' else None)
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
             self.scc_data_reads = {}
@@ -4913,7 +4918,9 @@ class Stage:
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
-                    self.since_join, self.scc_uniform = kept_u, False
+                    self.since_join = kept_u
+                    self.scc_uniform = (self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
+                                        and self.scc_def is not None)
                     self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
@@ -4941,8 +4948,14 @@ class Stage:
                         if paths:
                             self.firstlane_v = set.intersection(*(v for v, _ in paths))
                             scalar_phi = set.intersection(*(u for _, u in paths))
-                            self.since_join.update(scalar_phi)
-                            self.defined_uniform_s.update(scalar_phi)
+                            if self.kind == 'ps':
+                                # Program order may still hold a write from a sibling arm.
+                                # Only the incoming edges establish a definition at this join.
+                                self.since_join = scalar_phi
+                                self.defined_uniform_s = scalar_phi.copy()
+                            else:
+                                self.since_join.update(scalar_phi)
+                                self.defined_uniform_s.update(scalar_phi)
                             self.varying_s.difference_update(scalar_phi)
                         else:
                             self.firstlane_v.clear()
@@ -5671,7 +5684,8 @@ class Stage:
                 shifted = None
         extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
         extra_regs = ()
-        if extra_proof and self.uniform_entry_exec():
+        if (extra_proof and self.uniform_entry_exec()
+                and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec)):
             # Table-driven VALU operations use only their explicit operands and, for the
             # accumulator forms, the old destination. No lane selectors or mask operands.
             if base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU:
@@ -5681,7 +5695,17 @@ class Stage:
                         and all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods)
                         and all(self.firstlane_source(tok, base) for tok in inputs)):
                     extra_regs = (dst_reg[1],)
-            elif base in UNIFORM_LOADS and len(ops) == 4:
+            elif (getattr(self, 'kind', None) == 'ps' and base in UNIFORM_LOADS
+                  and base.startswith('buffer_load_format_') and len(ops) == 4):
+                data, desc = reg_range(ops[0]), reg_range(ops[2])
+                first = self.sym.get(desc[1]) if desc else None
+                # MUBUF lowering checks the four descriptor words and, outside the entry block,
+                # proves that the table pointer and descriptor load reach this use.
+                if (data and first and first[0] == 'desc' and first[1][0] == 'table'
+                        and ops[1] == 'off' and self.scalar_const(ops[3]) is not None
+                        and self.firstlane_source(ops[3], base)):
+                    extra_regs = range(data[1], data[2] + 1)
+            elif getattr(self, 'kind', None) == 'cs' and base in UNIFORM_LOADS and len(ops) == 4:
                 data = reg_range(ops[0])
                 if (data and data[0] == 'v' and data[2] - data[1] + 1 == UNIFORM_LOAD_WORDS[base]
                         and (ops[1] == 'off' or self.firstlane_source(ops[1], base))
@@ -10430,10 +10454,11 @@ class Stage:
             raise Unsupported(READFIRSTLANE_UNIFORM)
         if not uniform:
             if getattr(getattr(self, 'pipe', None), 'retry_firstlane', False):
-                if self.firstlane_cfg and self.uniform_cf and src[1] in self.firstlane_v:
+                if (self.firstlane_cfg and self.uniform_cf and src[1] in self.firstlane_v
+                        and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec)):
                     self.set_s(dst[1], self.u(ops[1]), uniform=True)
                     return
-                if self.firstlane_wave_allowed(src):
+                if getattr(self, 'kind', None) == 'cs' and self.firstlane_wave_allowed(src):
                     x, y, _ = self.pipe.group
                     # Elect by guest lane order. The winning host lane supplies its value
                     # even when host lane numbering differs or guest EXEC is empty.
@@ -12812,6 +12837,26 @@ class Pipeline:
         self.lod_unvalidated = set()  # image_sample forms read through a heap sampler (LOD fields unchecked, #2221)
         self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
 
+    def _build_pixel_stage(self, code, refusals=None, decoded=None):
+        # Translation can allocate bindings before refusing. Restore the state left
+        # by the vertex stage so the retry allocates only the bindings it uses.
+        state = deepcopy(self.__dict__, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+        before = len(refusals) if refusals is not None else 0
+        try:
+            stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+        except Unsupported as reason:
+            if str(reason) != READFIRSTLANE_UNIFORM:
+                raise
+        else:
+            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+                return stage
+        self.__dict__.clear()
+        self.__dict__.update(state)
+        self.retry_firstlane = True
+        if refusals is not None:
+            del refusals[before:]
+        return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
@@ -12819,11 +12864,11 @@ class Pipeline:
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
-            self.ps = Stage(self, 'ps', ps_code) if ps_code is not None else None
+            self.ps = self._build_pixel_stage(ps_code) if ps_code is not None else None
         else:
             decoded = {} if decoded is None else decoded
             self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
-            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps')) if ps_code is not None else None
+            self.ps = self._build_pixel_stage(ps_code, refusals, decoded.get('ps')) if ps_code is not None else None
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
             if 'pos' not in self.vs.exports:
@@ -13740,7 +13785,7 @@ class MeshPixelStage(Pipeline):
             clean_params.append(p)
         self.params = sorted(set(clean_params))
         self.mesh_plain_params = frozenset(self.params)
-        self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded)
+        self.ps = self._build_pixel_stage(ps_code, refusals, decoded)
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         for a, how in self.ps.attrs.items():
             if 'f16' not in how:
