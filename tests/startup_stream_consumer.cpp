@@ -1034,6 +1034,107 @@ static int present_gray(void* device, const std::string& mode)
     return show(presents, 0);
 }
 
+static bool supports_direct_heap(ID3D12Device* desktop)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) &&
+        SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+        model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 && options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3)
+        return true;
+    std::puts("direct heap indexing requires Shader Model 6.6 and resource binding tier 3");
+    return false;
+}
+
+static int draw_heap_texture(IDXGIAdapter* adapter, void* device, void* pso, const char* pixels,
+                             const char* texels, bool raw_buffer)
+{
+    ComPtr<ID3D12Device> desktop;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    if (!supports_direct_heap(desktop.Get())) return 77;
+    constexpr UINT record_bytes = 32;
+    if (desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) != record_bytes) {
+        std::puts("the stream fixture requires 32-byte view heap slots");
+        return 77;
+    }
+
+    constexpr UINT side = 4, row_bytes = side * 4, pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    constexpr UINT slice_bytes = side * pitch, raw_offset = 2 * slice_bytes;
+    constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr UINT width = 2;
+    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1,
+        format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN};
+    D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, raw_offset + 16, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    buffer_desc.Width = 16;
+    void* const raw = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, buffer_desc, D3D12_RESOURCE_STATE_COMMON);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    const auto arg = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    void* heap = nullptr;
+    if (!upload || !raw || FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&heap_desc),
+        arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heap))))) return 71;
+    const StreamWord cpu = invoke(heap, 9);
+    if (!cpu || !invoke(heap, 10)) return 72;
+    std::memset(reinterpret_cast<void*>(cpu), 0, 4 * record_bytes);
+
+    std::ifstream input(texels, std::ios::binary);
+    void* address = nullptr;
+    if (!input || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, arg(&address)))) || !address) return 73;
+    auto* memory = static_cast<char*>(address);
+    for (UINT row = 0; row < 2 * side; ++row) input.read(memory + row * pitch, row_bytes);
+    const float ones[4]{1.0f, 1.0f, 1.0f, 1.0f};
+    std::memcpy(memory + raw_offset, ones, sizeof(ones));
+    invoke(upload, 9, 0, 0);
+    if (!input || input.peek() != std::char_traits<char>::eof()) return 73;
+
+    StreamTarget frame;
+    if (const int rc = open_stream_target(desktop.Get(), device, pso, width, 1, format, width, frame)) return rc;
+    auto* list = frame.list;
+    D3D12_SHADER_RESOURCE_VIEW_DESC image_view{format, D3D12_SRV_DIMENSION_TEXTURE2D,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    image_view.Texture2D.MipLevels = 1;
+    for (UINT i = 0; i < 2; ++i) {
+        void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!texture) return 74;
+        invoke(device, 18, arg(texture), arg(&image_view), cpu + (2 * i + 1) * record_bytes);
+        D3D12_TEXTURE_COPY_LOCATION dest{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        source.PlacedFootprint = {UINT64{i} * slice_bytes, {format, side, side, 1, pitch}};
+        invoke(list, 16, arg(&dest), 0, 0, 0, arg(&source), 0);
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC buffer_view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    buffer_view.Buffer = {0, 4, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    invoke(device, 18, arg(raw), arg(&buffer_view), cpu + 2 * record_bytes);
+    invoke(list, 15, arg(raw), 0, arg(upload), raw_offset, sizeof(ones));
+    invoke(list, 32, 1, arg(&heap));
+    invoke(list, 34, arg(stream_root_signature()));
+    if (raw_buffer) {
+        const UINT offset = 2 * record_bytes;
+        invoke(list, 40, 0, 1, arg(&offset), 0);
+        invoke(list, 12, 3, 1);
+    } else {
+        for (LONG x = 0; x < 2; ++x) {
+            const D3D12_RECT pixel{x, 0, x + 1, 1};
+            const UINT offset = (2 * x + 1) * record_bytes;
+            invoke(list, 22, 1, arg(&pixel));
+            invoke(list, 40, 0, 1, arg(&offset), 0);
+            invoke(list, 12, 3, 1);
+        }
+    }
+    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+    invoke(frame.queue, 10, 1, arg(&list));
+    if (FAILED(static_cast<HRESULT>(invoke(frame.queue, 14, arg(frame.fence), 1)))) return 76;
+    const ULONGLONG deadline = GetTickCount64() + 10000;
+    while (invoke(frame.fence, 8) == 0 && GetTickCount64() < deadline) Sleep(1);
+    if (invoke(frame.fence, 8) != 1) return 78;
+    return read_stream_target(desktop.Get(), frame, pixels);
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 4 && argc != 5 && (argc < 6 || argc > 9) && argc != 10) return 2;
@@ -1069,16 +1170,8 @@ int main(int argc, char** argv)
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
         if (std::strncmp(argv[8], "dispatch-heap-dynamic", 21) == 0) {
             ComPtr<ID3D12Device> desktop;
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
             if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop))) ||
-                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
-                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
-                model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
-                options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3) {
-                std::puts("direct heap indexing requires Shader Model 6.6 and resource binding tier 3");
-                return 77;
-            }
+                !supports_direct_heap(desktop.Get())) return 77;
         }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
@@ -1105,6 +1198,12 @@ int main(int argc, char** argv)
     if (argc == 5 && std::strncmp(argv[4], "present-", 8) == 0) return present_gray(device, argv[4]);
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (argc == 4) return 0;
+    char heap_texture[8]{};
+    if (GetEnvironmentVariableA("X2W_TEST_HEAP_TEXTURE_DRAW", heap_texture, sizeof(heap_texture))) {
+        const bool raw = std::strcmp(heap_texture, "buffer") == 0;
+        if (argc != 7 || (!raw && std::strcmp(heap_texture, "image") != 0)) return 2;
+        return draw_heap_texture(adapter.Get(), device, pso, argv[5], argv[6], raw);
+    }
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
     bool two_targets = false;

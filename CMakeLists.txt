@@ -5301,6 +5301,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_small_texture_4k_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
         set_tests_properties(startup_small_texture_4k_draw_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_heap_texture_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
+        set_tests_properties(startup_heap_texture_draw_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         # A big sampled texture loses its top mip level (opt-in, src/startup_stubs/texture_drop_mips.h): the draw reads the
         # next level; texel-addressed, hint-less and under-threshold textures keep every level.
         add_test(NAME startup_texture_drop_mips_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B

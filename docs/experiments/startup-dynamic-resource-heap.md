@@ -15,6 +15,24 @@ views in the snapshot use null descriptors. This lowering covers direct
 draws and dispatches, four-word descriptors, raw reads, and straight-line
 shaders.
 
+## Texture records
+
+Graphics draws mirror texture SRV tokens from 32-byte image records at their
+original heap indices. The snapshot retains the sampled resources until the
+recording retires. A texture that cannot be bound, including a render target
+or writable depth attachment of the same draw, gets a null SRV of the token's
+dimension. The shader and the indexed view must agree on the resource type.
+Empty slots have no texture dimension, so the image lowering's slot-zero
+fallback requires an explicitly populated, matching view at that slot.
+
+Run `python3 -B tests/startup_heap_texture_draw_check.py` for the translation
+and CPU reference checks. On Windows, use `ctest --preset dev --no-tests=error
+-R '^startup_heap_texture_draw_(warp|hardware)$'` for readback at byte offsets
+32 and 96 and a raw buffer control at 64. The WARP run also disables texture
+mirroring and requires a pixel mismatch at both image indices.
+The stream fixture requires Shader Model 6.6, resource binding tier 3 and
+32-byte descriptor slots.
+
 ## Reproduce
 
 On Linux, run the translation fixtures and the compatibility checks:
