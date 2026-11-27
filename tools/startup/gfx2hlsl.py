@@ -4535,7 +4535,61 @@ class Stage:
     def is_lane_mask(self, tok):
         reg = reg_range(tok)
         return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
-                or bool(reg and reg[0] == 's' and reg[1] in getattr(self, 'masks', ())))
+                or bool(reg and reg[0] == 's' and (
+                    reg[1] in getattr(self, 'masks', ()) or self.group_vote and
+                    any(n in self.mask_high for n in range(reg[1], reg[2] + 1)))))
+
+    def group_has_high_lanes(self):
+        return math.prod(self.pipe.group) > 32
+
+    def group_mask_bit(self, name, tok, pair, *, implicit_pair=False):
+        """Project a whole scalar word (or pair) onto this thread's guest lane."""
+        error = 'group vote: %s uses an unproven lane mask operand %s' % (name, tok)
+        high_lanes = self.group_has_high_lanes()
+        if tok in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
+            if tok.endswith('_lo') and high_lanes and not implicit_pair:
+                raise Unsupported(error)
+            return self.u(tok)
+        if tok in ('exec_hi', 'vcc_hi'):
+            raise Unsupported(error)
+        r = reg_range(tok)
+        if r:
+            if r[0] != 's' or r[1] > 105:
+                raise Unsupported(error)
+            lo, hi = r[1:]
+            if pair and implicit_pair and hi == lo:
+                hi += 1   # VALU disassembly may print a mask pair as sN alone.
+            if (pair and (hi != lo + 1 or lo % 2 or hi > 105)) or (not pair and hi != lo):
+                raise Unsupported(error)
+            mask = lo in self.masks
+            if lo in self.mask_high or (pair and (hi in self.masks or (hi in self.mask_high) != mask)):
+                raise Unsupported(error)
+            positioned = lo in self.group_positioned_masks
+            expected = ('positioned' if positioned else 'bit') if mask else 'word'
+            if not pair and high_lanes and mask:
+                raise Unsupported(error)
+            reads = self.group_mask_reads.setdefault(self.pc, {})
+            reads[lo] = expected
+            if pair:
+                reads[hi] = ('positioned_high' if positioned else 'high') if mask else 'word_high'
+            if expected == 'bit':
+                return self.S(lo)
+            low = self.S(lo)
+            high = self.S(hi) if pair and high_lanes else '0u'
+        else:
+            low = self.u(tok)
+            high = '0u'
+            if pair:
+                # The unsigned literal is zero-extended. Negative inline integers extend their sign.
+                if tok in FLOATS or (tok != 'null' and not re.fullmatch(r'-?(?:0x[\da-f]+|\d+)', tok)):
+                    raise Unsupported(error)
+                if tok != 'null' and -16 <= int(tok, 0) < 0:
+                    high = '0xffffffffu'
+        if pair and high_lanes:
+            return '(lane < 32u ? ((%s >> (lane & 31u)) & 1u) : ((%s >> (lane & 31u)) & 1u))' % (low, high)
+        if low in ('0x00000000u', '0xffffffffu'):
+            return low
+        return '((%s >> %s) & 1u)' % (low, '(lane & 31u)' if high_lanes else 'lane')
 
     @staticmethod
     def split_neg(tok):
@@ -6309,6 +6363,9 @@ class Stage:
             self.mask_high = set()
             self.uses_mask_ballot = False
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
+            if self.group_vote:
+                self.group_mask_reads, self.group_mask_defs = {}, {}
+                self.group_positioned_masks = set()  # mask SGPRs that store their bit at its guest word position
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
             self.used_s, self.used_v = set(init_used_s), set(init_used_v)
@@ -6788,6 +6845,12 @@ class Stage:
                     raise error
                 refusals.append((reason, self.kind))
         if self.group_vote:
+            try:
+                self.check_group_mask_joins()
+            except Unsupported as reason:
+                if refusals is None:
+                    raise
+                refusals.append((str(reason), self.kind))
             # A projected mask SCC can also leak through a scalar select or src_scc without branching.
             # Treat it as unmodelled wherever a reaching write has not been proven wave-uniform.
             scc_effects = {off: ('an unproved wave mask' if effect == 'emitted' and off not in uniform_scc_writes
@@ -8071,6 +8134,8 @@ class Stage:
             if mask_sources & ballot_regs:
                 raise Unsupported('slot 57 mesh: %s on a materialized mask word is not covered' % base)
         self.current_asm = asm      # named by scc_refusal
+        if self.group_vote:
+            self.group_written_masks = {}
         if self.wave_reduction(base, ops):
             return None
         if self.lower_mask_word_sop2(base, ops, mods):
@@ -8093,7 +8158,65 @@ class Stage:
         if masks and not self.lane_mask_exact():
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
+        if self.group_vote:
+            _, must, _ = scalar_effects(base, asm)
+            self.group_positioned_masks.difference_update(
+                int(t[1:]) for t in must if re.fullmatch(r's\d+', t))
+            for n, representation in self.group_written_masks.items():
+                if representation in ('high', 'positioned_high'):
+                    self.mask_high.add(n)
+                else:
+                    self.masks.add(n)
+                if representation == 'positioned':
+                    self.group_positioned_masks.add(n)
+            marked = self.masks | self.mask_high
+            defs = {n: rep for n, rep in self.group_written_masks.items()}
+            if base.startswith('v_'):
+                for token in destinations(base, ops):
+                    r = reg_range(token)
+                    if r and r[0] == 's' and r[1] in self.masks and r[1] + 1 in self.mask_high:
+                        defs[r[1] + 1] = 'high'
+            for t in must:
+                if re.fullmatch(r's\d+', t) and (n := int(t[1:])) in marked:
+                    defs.setdefault(n, 'high' if n in self.mask_high else 'bit')
+            self.group_mask_defs[self.pc] = defs
         return result
+
+    def check_group_mask_joins(self):
+        """Verify each read's representation across forward joins and loop back edges."""
+        words = {'s%d' % n for defs in self.group_mask_defs.values() for n in defs}
+        if not words:
+            return
+        successors = lane_mask_cfg(self.ins)
+        if (not successors or self.calculated_pc
+                or any(name.startswith(('s_movrel', 'v_movrel')) for _, _, name, _ in self.ins)):
+            raise Unsupported('group vote: unproven control flow for scalar lane masks')
+        reads, writes, possible = [], [], []
+        for pc, _, name, asm in self.ins:
+            used, must, may = scalar_effects(name, asm)
+            roles = {'s%d' % n: rep for n, rep in self.group_mask_reads.get(pc, {}).items()}
+            reads.append({t: roles.get(t, 'data') for t in (used | roles.keys()) & words})
+            extra = {'s%d' % n for n in self.group_mask_defs.get(pc, {})}
+            writes.append(must | extra)
+            possible.append(may - must)
+        incoming = reaching_mask_words(successors, writes, possible, words)
+        compatible = {
+            'word': {'word', 'positioned'}, 'positioned': {'word', 'positioned'},
+            'word_high': {'word', 'positioned_high'}, 'positioned_high': {'word', 'positioned_high'},
+            'bit': {'bit'}, 'high': {'high'}, 'data': {'word'},
+        }
+        for i, (pc, _, name, _) in enumerate(self.ins):
+            if incoming[i] is None:
+                continue
+            for tok, role in sorted(reads[i].items()):
+                n = int(tok[1:])
+                reps = {self.group_mask_defs.get(self.ins[j][0], {}).get(n, 'word') if j >= 0 else 'word'
+                        for j in incoming[i][tok]}
+                if reps <= compatible[role]:
+                    continue
+                if role == 'data':
+                    raise Unsupported('%s data operand %s is a lane mask' % (name, tok))
+                raise Unsupported('group vote: %s has incompatible lane mask definitions for %s' % (name, tok))
 
     def lower_image_instruction(self, proof, name, asm, ops, mods):
         pc = self.pc
@@ -8156,6 +8279,9 @@ class Stage:
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
+            if self.group_vote and not (len(ops) == 2 and ops[0] == ops[1] and ops[0] in ('exec', 'exec_lo')
+                                        and self.exec_known and math.prod(self.pipe.group) % 4 == 0):
+                raise Unsupported('group vote: %s needs whole-quad entry EXEC' % base)
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
                 self.wqm_count = getattr(self, 'wqm_count', 0) + 1
@@ -8227,6 +8353,7 @@ class Stage:
                 word = 'exec' if base[10:].startswith('exec') else 'vcc'
                 bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
                 if self.group_vote:
+                    # Every producer of VCC in this path stores this thread's bit.
                     cond = ('!' if base[10:] in ('execz', 'vccz') else '') + self.group_any(bit)
                 else:
                     # Keep the legacy vote spelling on the original translation path.
@@ -8715,7 +8842,7 @@ class Stage:
 
     def stage_quad_source(self, source):
         x, y, _ = self.pipe.group
-        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        flat = 'lane' if self.group_vote else '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
         self.uses_quad_shared = True
         self.emit('x2w_quad[%s] = %s;' % (flat, source))
         self.emit('GroupMemoryBarrierWithGroupSync();')
@@ -9056,6 +9183,15 @@ class Stage:
         dname = low(ops[0])
         if base == 's_movk_i32':
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
+        if self.group_vote:
+            special = self.is_lane_mask(dname) and not dst
+            mask_inputs = any(self.is_lane_mask(t) for t in ops[1:])
+            if special or MASK_COPY_SALU_RE.match(base) and (mask_inputs or pair and base != 's_mov_b64'):
+                if not MASK_COPY_SALU_RE.match(base) and base != 's_movk_i32':
+                    raise Unsupported('group vote: %s uses a whole-word result as a lane mask' % base)
+                operands = srcs if base == 's_movk_i32' else ops[1:]
+                self.group_scalar_mask(base, ops[0], operands, text, scc, pair)
+                return None
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         lane_complement = False
@@ -9338,10 +9474,23 @@ class Stage:
                               for t in srcs) and base.split('_')[1] in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor', 'xnor', 'not', 'cselect')
         if base in ('s_mov_b32', 's_mov_b64', 's_movk_i32') and re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', srcs[0]) and srcs[0] not in FLOATS:
             value = int(srcs[0], 0)
+            if self.group_vote and pair and not -16 <= value <= 0xffffffff:
+                raise Unsupported('group vote: s_mov_b64 has an unproven 64-bit literal')
             self.set_s(d, values[0], ('const', value & 0xffffffff))
             if pair:
                 self.set_s(d + 1, '0x%08xu' % ((value >> 32) & 0xffffffff), ('const', (value >> 32) & 0xffffffff))
             self.masks.discard(d)
+            return None
+        if self.group_vote and base == 's_mov_b64':
+            r = reg_range(ops[1])
+            if (not r or r[0] != 's' or r[2] != r[1] + 1 or r[2] > 105 or r[1] % 2
+                    or dst[2] != d + 1 or dst[2] > 105 or d % 2):
+                raise Unsupported('group vote: s_mov_b64 has an unproven scalar pair')
+            # An ordinary pair remains whole words until it is used in mask role.
+            self.emit('w = %s;' % self.S(r[2]))
+            uniform_high = self.uniform_source('s%d' % r[2])
+            self.set_s(d, values[0])
+            self.set_s(d + 1, 'w', uniform=uniform_high)
             return None
         if base == 's_mov_b32' and not pair and len(srcs) == 1 and reg_range(srcs[0]) and reg_range(srcs[0])[0] == 's' \
                 and reg_range(srcs[0])[1] == reg_range(srcs[0])[2] and len(self.sym.get(reg_range(srcs[0])[1]) or ()) == 2 \
@@ -9456,6 +9605,46 @@ class Stage:
         self.uses_group_any = True
         return 'x2w_wave_any(lane, %s)' % bit
 
+    def group_scalar_mask(self, name, dest, sources, template, scc, pair):
+        if len(sources) != (2 if '{1}' in template else 1):
+            raise Unsupported('group vote: %s has an unexpected lane mask operand count' % name)
+        special = dest in self.MASK_NAMES_LOW
+        if dest in ('exec_hi', 'vcc_hi') or not pair and special and self.group_has_high_lanes():
+            raise Unsupported('group vote: %s writes only one half of a wave64 lane mask' % name)
+        if special and pair and scc and self.program_is_wave32():
+            raise Unsupported('group vote: %s sets SCC from a 64-bit mask in wave32' % name)
+        projected = [self.group_mask_bit(name, tok, pair) for tok in sources]
+        expr = template.format(*projected)
+        if special:
+            var = 'exec' if dest.startswith('exec') else 'vcc'
+            if var == 'exec':
+                if scc:
+                    self.set_exec_scc(expr)
+                    return
+                self.exec_known = self.exec_narrow_only = False
+            self.emit('%s = (%s) & 1;' % (var, expr))
+        elif dest == 'null':
+            var = '((%s) & 1u)' % expr
+        else:
+            self.group_set_mask(name, dest, '(%s) & 1u' % expr, pair)
+            var = 's%d' % reg_range(dest)[1]
+        if scc:
+            # A projected SGPR/VCC result does not prove the whole word's SCC.
+            self.set_scc(scc.replace('$', var))
+            self.scc_uniform = self.scc_from_uniform_input = False
+
+    def group_set_mask(self, name, dest, bit, pair, *, positioned=False):
+        r = reg_range(dest)
+        if not r or r[0] != 's' or r[2] > 105 or r[2] - r[1] != int(pair) or pair and r[1] % 2:
+            raise Unsupported('group vote: %s has an unproven lane mask destination %s' % (name, dest))
+        lo, hi = r[1:]
+        self.set_s(lo, bit if not positioned else
+                   '(lane < 32u ? (%s << (lane & 31u)) : 0u)' % bit, uniform=False)
+        self.group_written_masks[lo] = 'positioned' if positioned else 'bit'
+        if pair:
+            self.set_s(hi, '(lane >= 32u ? (%s << (lane & 31u)) : 0u)' % bit if positioned else '0u', uniform=False)
+            self.group_written_masks[hi] = 'positioned_high' if positioned else 'high'
+
     def set_exec_scc(self, expr):
         self.exec_known = self.exec_narrow_only = False
         self.scc_effect = 'emitted'
@@ -9469,7 +9658,7 @@ class Stage:
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
 
-    def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
+    def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}', *, pair=True):
         if len(ops) != 2:
             raise Unsupported('saveexec with %d operands, expected 2' % len(ops))
         dst = reg_range(ops[0])
@@ -9477,6 +9666,19 @@ class Stage:
             raise Unsupported('saveexec destination %s' % ops[0])
         d = dst[1]
         src_reg = reg_range(ops[1])
+        if self.group_vote:
+            name = self.current_asm.split()[0]
+            if not pair and self.group_has_high_lanes():
+                raise Unsupported('group vote: %s writes only the low half of EXEC' % name)
+            if pair and self.program_is_wave32():
+                raise Unsupported('group vote: %s sets SCC from a 64-bit mask in wave32' % name)
+            value = self.group_mask_bit(name, ops[1], pair)
+            if src_reg and src_reg[1] == d:
+                self.emit('w = %s;' % value)
+                value = 'w'
+            self.group_set_mask(name, ops[0], 'exec', pair)
+            self.set_exec_scc(text.format(value))
+            return
         src = ops[1] if not src_reg else 's%d' % src_reg[1]
         # S0 is read at issue, before D is written (RDNA 2 ISA SOP1 S_AND_SAVEEXEC: D = EXEC; EXEC = S0 & EXEC).
         # With D == S0 (s_and_saveexec_b64 s[6:7], s[6:7]) writing D first would make the new exec exec & exec, so
@@ -9490,29 +9692,45 @@ class Stage:
         self.masks.add(d)
         self.set_exec_scc(text.format(value))
 
-    op_s_and_saveexec_b32 = op_s_and_saveexec_b64
+    def op_s_and_saveexec_b32(self, ops, mods):
+        self.op_s_and_saveexec_b64(ops, mods, pair=False)
 
     def op_s_or_saveexec_b64(self, ops, mods):
         self.op_s_and_saveexec_b64(ops, mods, 'exec | {0}')
 
-    op_s_or_saveexec_b32 = op_s_or_saveexec_b64
+    def op_s_or_saveexec_b32(self, ops, mods):
+        self.op_s_and_saveexec_b64(ops, mods, 'exec | {0}', pair=False)
 
     def op_s_andn2_saveexec_b64(self, ops, mods):
         self.op_s_and_saveexec_b64(ops, mods, '{0} & ~exec')
 
-    def op_s_andn2_wrexec_b64(self, ops, mods):
+    def op_s_andn2_wrexec_b64(self, ops, mods, *, pair=True):
         if len(ops) != 2:
             raise Unsupported('wrexec with %d operands, expected 2' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's':
             raise Unsupported('wrexec destination %s' % ops[0])
         d = dst[1]
+        if self.group_vote:
+            name = self.current_asm.split()[0]
+            if not pair and self.group_has_high_lanes():
+                raise Unsupported('group vote: %s writes only the low half of EXEC' % name)
+            if pair and self.program_is_wave32():
+                raise Unsupported('group vote: %s sets SCC from a 64-bit mask in wave32' % name)
+            value = self.group_mask_bit(name, ops[1], pair)
+            # A loop can start with a whole word and carry this result on its back edge. An
+            # in-place write to that word must leave the bit at the same position for the next read.
+            positioned = ops[0] == ops[1] and (d not in self.masks or d in self.group_positioned_masks)
+            self.set_exec_scc('%s & ~exec' % value)
+            self.group_set_mask(name, ops[0], 'exec', pair, positioned=positioned)
+            return
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.set_exec_scc('%s & ~exec' % self.u(src))
         self.set_s(d, 'exec')
         self.masks.add(d)
 
-    op_s_andn2_wrexec_b32 = op_s_andn2_wrexec_b64
+    def op_s_andn2_wrexec_b32(self, ops, mods):
+        self.op_s_andn2_wrexec_b64(ops, mods, pair=False)
 
     def scalar_accumulate(self, base, ops, mods):
         """s_addk_i32 / s_mulk_i32: D = D op signext(SIMM16), the destination is also the source.
@@ -9675,6 +9893,11 @@ class Stage:
         if len(ops) != 3:
             raise Unsupported('scalar select with %d operands, expected 3' % len(ops))
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
+        if self.group_vote and (pair or any(self.is_lane_mask(t) for t in ops[1:])
+                                or ops[0] in (*self.MASK_NAMES_LOW, *self.MASK_NAMES_HIGH)):
+            self.group_scalar_mask('s_cselect_b64' if pair else 's_cselect_b32', ops[0], ops[1:],
+                                   'scc ? {0} : {1}', None, pair)
+            return
         if pair and 'm0' in low:
             raise Unsupported('64-bit scalar operand m0')
         if (not pair and hasattr(self, 'descriptor_scc_selects') and reg_range(low[0])
@@ -12614,7 +12837,7 @@ class Stage:
             raise Unsupported('%s requires three unmodified operands' % name)
         x, y, z = self.pipe.group
         multi_wave = x * y * z > 32
-        if multi_wave:
+        if multi_wave and not self.group_vote:
             wave = self.pipe.wave_size
             if wave != 32 and (wave is not None or not wave32_exec_proof(self.ins)):
                 raise Unsupported('%s in a larger group requires a proven wave32 program' % name)
@@ -12630,6 +12853,16 @@ class Stage:
         if not base_is_vgpr and self.const_u32(ops[2]) is None:
             raise Unsupported('%s requires a VGPR or known base' % name)
         result = self.u(ops[2])
+        if self.group_vote:
+            if high and self.group_has_high_lanes():
+                result = '(countbits(0x%08xu & ((1u << (max(lane, 32u) - 32u)) - 1u)) + %s)' % (mask, result)
+            elif not high:
+                below = '((1u << (lane & 31u)) - 1u)'
+                if self.group_has_high_lanes():
+                    below = '(lane < 32u ? %s : 0xffffffffu)' % below
+                result = '(countbits(0x%08xu & %s) + %s)' % (mask, below, result)
+            self.set_v(dst[1], result)
+            return
         # RDNA 2 V_MBCNT counts mask bits strictly below the lane. A small group
         # fits in the low half of either guest wave size, including lane 31.
         if not high:
@@ -12886,7 +13119,7 @@ class Stage:
                 todo.append(target)
 
     def spills_lane_masks(self):
-        return getattr(self, 'kind', None) == 'cs'
+        return getattr(self, 'kind', None) == 'cs' and not self.group_vote
 
     def spill_operands(self, name, ops, mods):
         if mods or len(ops) != 3:
@@ -13015,9 +13248,9 @@ class Stage:
             wave_size = None
             if self.kind == 'cs':
                 x, y, z = self.pipe.group
-                if x * y * z > 32:
+                if x * y * z > 32 and not self.group_vote:
                     raise Unsupported('v_writelane_b32 vector update requires at most 32 threads per group')
-                index = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                index = 'lane' if self.group_vote else '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
                 wave_size = self.pipe.wave_size
             if lane >= 32:
                 if wave_size is None and wave32_exec_proof(self.ins):
@@ -13136,7 +13369,7 @@ class Stage:
             raise Unsupported('%s outside a compute program' % name)
         self.compute_quad_gate(name, row_ror8=True)
         x, y, _z = self.pipe.group
-        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        flat = 'lane' if self.group_vote else '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
         lane = '(%s & 15u)' % flat
         select = '(((%s < 8u ? %s : %s) >> ((%s & 7u) * 4u)) & 15u)' % (lane, self.u(ops[2]), self.u(ops[3]), lane)
         self.uses_quad_shared = True
@@ -13196,7 +13429,11 @@ class Stage:
             raise Unsupported('v_cndmask_b32 with %d operands, expected 3 or 4' % len(ops))
         for source in ops[1:3]:
             self.reject_lane_mask_data('v_cndmask_b32', source)
-        mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
+        if self.group_vote:
+            mask = self.group_mask_bit('v_cndmask_b32', ops[3] if len(ops) > 3 else 'vcc',
+                                       self.wave64_proven(), implicit_pair=True)
+        else:
+            mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
         if len(ops) == 4 and re.fullmatch(r's\d+', ops[3]):
             low = int(ops[3][1:])
             words = {low, low + 1}
@@ -13702,6 +13939,9 @@ class Stage:
         sdst = reg_range(ops[1])
         if ops[1] not in ('vcc', 'vcc_lo') and not (sdst and sdst[0] == 's' and sdst[1] == sdst[2] and sdst[1] <= 105):
             raise Unsupported('%s carry-out destination %s' % (name, ops[1]))
+        if self.group_vote:
+            for source in ops[2:4]:
+                self.reject_lane_mask_data(name, source)
         a, b = self.u(ops[2]), self.u(ops[3])
         if kind == 'subrev':
             a, b = b, a
@@ -13753,7 +13993,11 @@ class Stage:
         if cin_tok in ('vcc_hi', 'exec_hi'):
             raise Unsupported('%s carry-in %s' % (name, cin_tok))
         cin_const = self.const_u32(cin_tok)
-        if cin_const in (0, 0xffffffff):
+        if self.group_vote:
+            ci = '(%s & 1u)' % self.group_mask_bit(name, cin_tok, self.wave64_proven(), implicit_pair=True)
+            for source in ops[2:4]:
+                self.reject_lane_mask_data(name, source)
+        elif cin_const in (0, 0xffffffff):
             ci = '1u' if cin_const else '0u'
         elif self.is_lane_mask(cin_tok):
             ci = '(%s & 1u)' % self.u(cin_tok)
@@ -13938,6 +14182,9 @@ class Stage:
         # refuse it rather than emit a predicate computed from the unselected operands.
         if mods and not base.endswith('_sdwa'):
             raise Unsupported('%s with %s' % (base, mods))
+        if self.group_vote:
+            for source in ops[-2:]:
+                self.reject_lane_mask_data(base, source)
         # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
         # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
         name = base.removesuffix('_sdwa')
@@ -16488,7 +16735,7 @@ class ComputePipeline(Pipeline):
                 '}',
             ])
         lane = []
-        if s.uses_group_any or s.uses_group_first:
+        if s.group_vote:
             x, y, _ = self.group
             lane = ['    uint lane = tid.x + %du * (tid.y + %du * tid.z);' % (x, y)]
         image = getattr(s, 'image_proof', None)
