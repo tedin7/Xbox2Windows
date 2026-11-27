@@ -19,6 +19,96 @@ static void* create_present_queue(void* guest)
     return queue;
 }
 
+// One pixel per allocation. A reserved gap keeps the committed runs disjoint even
+// when VirtualAlloc places two reservations next to one another.
+static int draw_mapped_spans(ID3D12Device* desktop, void* guest, StreamTarget& target, void* pso,
+                             const char* pixels)
+{
+    constexpr UINT regions = 64, frames = 100, release_frame = 50;
+    static constexpr UINT committed = 64u << 10;
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    static std::vector<unsigned char> views;
+    views.assign(std::size_t{regions} * increment, 0);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        StreamWord backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, regions, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                reinterpret_cast<StreamWord>(views.data()), views.size()};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, reinterpret_cast<StreamWord>(&heap_desc),
+                                           reinterpret_cast<StreamWord>(&__uuidof(ID3D12DescriptorHeap)),
+                                           reinterpret_cast<StreamWord>(&heap))))) return 41;
+    const auto cpu = invoke(heap, 9);
+    const auto table = invoke(heap, 10);
+    if (cpu != reinterpret_cast<StreamWord>(views.data()) || !table) return 42;
+
+    std::array<float*, regions> buffers{};
+    const auto allocate = [&](UINT i) {
+        void* base = VirtualAlloc(nullptr, 2 * committed, MEM_RESERVE, PAGE_READWRITE);
+        if (!base) return false;
+        buffers[i] = static_cast<float*>(VirtualAlloc(base, committed, MEM_COMMIT, PAGE_READWRITE));
+        if (!buffers[i]) {
+            VirtualFree(base, 0, MEM_RELEASE);
+            return false;
+        }
+        // Alternate small bindings with 64 KiB views of the same small payload.
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<StreamWord>(buffers[i]),
+                                                  i % 2 ? 256u : committed};
+        invoke(guest, 17, reinterpret_cast<StreamWord>(&view), cpu + i * increment);
+        return true;
+    };
+    for (UINT i = 0; i < regions; ++i)
+        if (!allocate(i)) return 45;
+
+    void* list = target.list;
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(target.rtv_heap, 9))};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(regions), 1, 0, 1};
+    for (UINT frame = 0; frame < frames; ++frame) {
+        if (frame) {
+            if (FAILED(static_cast<HRESULT>(invoke(target.allocator, 8))) ||
+                FAILED(static_cast<HRESULT>(invoke(list, 139, reinterpret_cast<StreamWord>(target.allocator))))) return 46;
+            const float clear[]{0, 0, 1, 1};
+            invoke(list, 52, rtv.ptr, reinterpret_cast<StreamWord>(clear));
+            invoke(list, 50, 1, reinterpret_cast<StreamWord>(&rtv));
+            invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            invoke(list, 25, reinterpret_cast<StreamWord>(pso));
+        }
+        invoke(list, 21, 1, reinterpret_cast<StreamWord>(&viewport));
+        invoke(list, 32, 1, reinterpret_cast<StreamWord>(&heap));
+        if (frame == release_frame + 1 && !allocate(0)) return 45;
+        for (UINT i = 0; i < regions; ++i) {
+            const D3D12_RECT pixel{static_cast<LONG>(i), 0, static_cast<LONG>(i + 1), 1};
+            invoke(list, 22, 1, reinterpret_cast<StreamWord>(&pixel));
+            invoke(list, 36, 0, table + i * increment);
+            if (frame == release_frame && i == 0) {
+                // Keep the published descriptor. A stale positive cache entry must
+                // still go through the touch and bind a null view on failure.
+                if (!VirtualFree(buffers[i], 0, MEM_RELEASE)) return 50;
+                buffers[i] = nullptr;
+            } else {
+                buffers[i][0] = static_cast<float>(1 + (3 * i + frame) % 251) / 255.0f;
+                buffers[i][1] = static_cast<float>(1 + (i + 7 * frame) % 251) / 255.0f;
+            }
+            invoke(list, 12, 3, 1);
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 47;
+        invoke(target.queue, 10, 1, reinterpret_cast<StreamWord>(&list));
+        const UINT64 fence_value = frame + 1;
+        if (FAILED(static_cast<HRESULT>(invoke(target.queue, 14, reinterpret_cast<StreamWord>(target.fence), fence_value))))
+            return 48;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(target.fence, 8) < fence_value && GetTickCount64() < deadline) Sleep(1);
+        if (invoke(target.fence, 8) != fence_value) return 49;
+        const std::string path = frame + 1 == frames ? pixels : std::string(pixels) + "." + std::to_string(frame);
+        if (const int result = read_stream_target(desktop, target, path.c_str())) return result;
+        invoke(target.queue, 32, 0, 0, 0);
+    }
+    // The render heartbeat reports cumulative counts every 300 presents.
+    for (UINT frame = frames; frame < 300; ++frame) invoke(target.queue, 32, 0, 0, 0);
+    for (auto* buffer : buffers) VirtualFree(buffer, 0, MEM_RELEASE);
+    return 0;
+}
+
 // Two draws in one command list read the same constant buffer address through a descriptor table; the left half
 // of the target is drawn first, the right half second. X2W_TEST_FRAME_COPY selects what the title does to the
 // memory between the draws:
@@ -37,6 +127,7 @@ static void* create_present_queue(void* guest)
 int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, void* pso,
                       UINT width, UINT height, const char* pixels, const char* mode)
 {
+    if (!std::strcmp(mode, "mapped-spans")) return draw_mapped_spans(desktop, guest, target, pso, pixels);
     void* list = target.list;
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");

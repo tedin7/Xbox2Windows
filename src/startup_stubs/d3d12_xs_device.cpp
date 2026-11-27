@@ -8267,6 +8267,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (totals_due) {
+        if (x2w_local::mapped_cache_enabled())
+            log("x2w-render mapped spans: %lld queries, %lld hits, %lld forgets",
+                InterlockedCompareExchange64(&x2w_local::mapped_queries, 0, 0),
+                InterlockedCompareExchange64(&x2w_local::mapped_hits, 0, 0),
+                InterlockedCompareExchange64(&x2w_local::mapped_forgets, 0, 0));
         char null_totals[200];
         x2w_startup::format_null_binding_totals(null_totals, sizeof(null_totals), null_total, null_causes);
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
