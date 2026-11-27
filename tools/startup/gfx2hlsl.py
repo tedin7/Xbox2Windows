@@ -10431,8 +10431,11 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
-        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        stage = getattr(self, 'kind', None)
+        pixel_cube = dim == 'SQ_RSRC_IMG_CUBE' and stage == 'ps' and how in ('sample', 'lz', 'l', 'b')
+        cube = pixel_cube or (dim == 'SQ_RSRC_IMG_CUBE' and stage == 'cs' and how in ('lz', 'l'))
+        if pixel_cube and ('a16' in mods or 'd16' in mods):
+            raise Unsupported('cube sampling with a16 or d16 is unsupported')
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:
@@ -10533,6 +10536,8 @@ class Stage:
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         dynamic_view = desc_key is not None and desc_key[0][0] == 'dynamic_heap'
+        if pixel_cube and dynamic_view:
+            raise Unsupported('cube sampling requires a table TextureCube view')
         if dynamic_view and (integer_srvs or sample_d16 or 'd16' in mods):
             raise Unsupported('dynamic resource heap image with integer or d16 access')
         shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
