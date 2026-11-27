@@ -149,38 +149,39 @@ inline float depth_at(const unsigned char* pixel, int format)
 // A depth plane to grey. The clear value is the more common of exactly 0 and exactly 1: 0 means reversed Z (near is
 // large). The background (the clear value) is black; the rest is normalised between its minimum and maximum so that
 // the nearest geometry is 255 and the farthest geometry is geometry_floor. Non-finite values are background.
-inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned width, unsigned height, int format,
+inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned ow, unsigned oh, unsigned step, int format,
                           std::vector<unsigned char>& rgba)
 {
     const unsigned bytes = plane_bytes(format);
+    const auto at = [&](unsigned x, unsigned y) { return depth_at(data + static_cast<std::size_t>(y) * step * pitch + static_cast<std::size_t>(x) * step * bytes, format); };
     std::size_t zeros = 0, ones = 0;
-    for (unsigned y = 0; y < height; ++y)
-        for (unsigned x = 0; x < width; ++x) {
-            const float v = depth_at(data + y * pitch + x * bytes, format);
+    for (unsigned y = 0; y < oh; ++y)
+        for (unsigned x = 0; x < ow; ++x) {
+            const float v = at(x, y);
             zeros += v == 0.0f;
             ones += v == 1.0f;
         }
     const bool reversed = zeros > ones;
     const float background = reversed ? 0.0f : 1.0f;
     float low = INFINITY, high = -INFINITY;
-    for (unsigned y = 0; y < height; ++y)
-        for (unsigned x = 0; x < width; ++x) {
-            const float v = depth_at(data + y * pitch + x * bytes, format);
+    for (unsigned y = 0; y < oh; ++y)
+        for (unsigned x = 0; x < ow; ++x) {
+            const float v = at(x, y);
             if (!std::isfinite(v) || v == background) continue;
             low = v < low ? v : low;
             high = v > high ? v : high;
         }
-    rgba.assign(static_cast<std::size_t>(width) * height * 4, 255);
-    for (unsigned y = 0; y < height; ++y)
-        for (unsigned x = 0; x < width; ++x) {
-            const float v = depth_at(data + y * pitch + x * bytes, format);
+    rgba.assign(static_cast<std::size_t>(ow) * oh * 4, 255);
+    for (unsigned y = 0; y < oh; ++y)
+        for (unsigned x = 0; x < ow; ++x) {
+            const float v = at(x, y);
             int grey = 0;
             if (std::isfinite(v) && v != background) {
                 const float n = high > low ? (v - low) / (high - low) : 1.0f;  // 0 = smallest depth value
                 const float near_ness = reversed ? n : 1.0f - n;
                 grey = geometry_floor + static_cast<int>(near_ness * float(255 - geometry_floor) + 0.5f);
             }
-            unsigned char* out = &rgba[(static_cast<std::size_t>(y) * width + x) * 4];
+            unsigned char* out = &rgba[(static_cast<std::size_t>(y) * ow + x) * 4];
             out[0] = out[1] = out[2] = static_cast<unsigned char>(grey);
         }
 }
@@ -226,35 +227,28 @@ inline void color_pixel(const unsigned char* in, int format, unsigned char* out)
     }
 }
 
-// The copied plane (rows `pitch` bytes apart) to RGBA8, `width` x `height`. False for a format that is not read.
-inline bool to_rgba(const unsigned char* data, std::size_t pitch, unsigned width, unsigned height, int format,
-                    std::vector<unsigned char>& rgba)
+// Every `step`-th pixel in both directions: a 4K target keeps its picture at 1/16 of the work.
+inline unsigned step_for(unsigned width, unsigned limit = 1024) { return width > limit ? (width + limit - 1) / limit : 1; }
+
+// The copied plane (rows `pitch` bytes apart) to RGBA8, sampling every `step`-th pixel: the picture is ow x oh with
+// ow = ceil(width / step). False for a format that is not read.
+inline bool to_rgba(const unsigned char* data, std::size_t pitch, unsigned width, unsigned height, unsigned step, int format,
+                    std::vector<unsigned char>& rgba, unsigned& ow, unsigned& oh)
 {
     const unsigned bytes = plane_bytes(format);
-    if (!bytes || !width || !height) return false;
+    if (!bytes || !width || !height || !step) return false;
+    ow = (width + step - 1) / step;
+    oh = (height + step - 1) / step;
     if (is_depth_format(format)) {
-        depth_to_rgba(data, pitch, width, height, format, rgba);
+        depth_to_rgba(data, pitch, ow, oh, step, format, rgba);
         return true;
     }
-    rgba.assign(static_cast<std::size_t>(width) * height * 4, 0);
-    for (unsigned y = 0; y < height; ++y)
-        for (unsigned x = 0; x < width; ++x)
-            color_pixel(data + y * pitch + x * bytes, format, &rgba[(static_cast<std::size_t>(y) * width + x) * 4]);
+    rgba.assign(static_cast<std::size_t>(ow) * oh * 4, 0);
+    for (unsigned y = 0; y < oh; ++y)
+        for (unsigned x = 0; x < ow; ++x)
+            color_pixel(data + static_cast<std::size_t>(y) * step * pitch + static_cast<std::size_t>(x) * step * bytes, format,
+                        &rgba[(static_cast<std::size_t>(y) * ow + x) * 4]);
     return true;
-}
-
-// Nearest-neighbour stretch of an RGBA8 picture to the presented surface's size.
-inline void stretch(const std::vector<unsigned char>& source, unsigned sw, unsigned sh, unsigned dw, unsigned dh,
-                    std::vector<unsigned char>& out)
-{
-    out.resize(static_cast<std::size_t>(dw) * dh * 4);
-    for (unsigned y = 0; y < dh; ++y) {
-        const unsigned sy = static_cast<unsigned>(static_cast<unsigned long long>(y) * sh / dh);
-        for (unsigned x = 0; x < dw; ++x) {
-            const unsigned sx = static_cast<unsigned>(static_cast<unsigned long long>(x) * sw / dw);
-            std::memcpy(&out[(static_cast<std::size_t>(y) * dw + x) * 4], &source[(static_cast<std::size_t>(sy) * sw + sx) * 4], 4);
-        }
-    }
 }
 
 }  // namespace x2w_debug_present
