@@ -67,7 +67,8 @@ def check_placeholder(work, consumer, dxc, vs, ps, root, image, env):
     reference = bytes((255, 255, 0, 255)) * (8 * 8)
     clear = bytes((0, 0, 255, 255)) * (8 * 8)
     expected_report = ["x2w-render placeholder total: draws 1",
-                       f"x2w-render placeholder key {key}: draws 1, targets 8x8 format 28"]
+                       "x2w-render placeholder target 8x8 format 28: draws 1, keys 1",
+                       f"x2w-render placeholder key {key}: draws 1, targets 8x8 format 28 x1"]
     manifest = cache / f"{key}.txt"
     for marked, mode in ((False, "visible"), (True, "visible"), (True, "clipped")):
         marker = "placeholder synthetic pixel refusal\n" if marked else ""

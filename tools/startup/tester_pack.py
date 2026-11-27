@@ -612,6 +612,7 @@ STARVED_TARGET_RE = re.compile(
     rf"^x2w-render starved target ({TARGET_LABEL}): last drawn frame -?\d+, "
     r"(?:not drawn since: .+|starved, no candidate)$")
 PLACEHOLDER_TOTAL_RE = re.compile(r"^x2w-render placeholder total: draws (\d+)$")
+PLACEHOLDER_TARGET_RE = re.compile(r"^x2w-render placeholder target (.+): draws (\d+), keys \d+$")
 DRAW_PIPELINE_RE = re.compile(
     rf"^x2w-render not drawn key ([0-9a-f]{{16}}): (\d+) \([^)]+\)(?:, targets ({TARGET_LABEL}))?$")
 
@@ -629,6 +630,7 @@ def null_inputs_section(stderr_text):
     starved = {}
     totals = ""
     placeholder_draws = None
+    placeholder_targets = {}
     for line in stderr_text.splitlines():
         if match := NULL_INPUT_RE.match(line):
             key, index, cause, calls = match.groups()
@@ -650,12 +652,14 @@ def null_inputs_section(stderr_text):
             totals = line
         elif match := PLACEHOLDER_TOTAL_RE.fullmatch(line):
             placeholder_draws = int(match[1])
+        elif match := PLACEHOLDER_TARGET_RE.fullmatch(line):
+            placeholder_targets[match[1]] = (int(match[2]), line)  # cumulative: the last report wins
         elif match := STARVED_TARGET_RE.fullmatch(line):
             starved[match[1]] = line
         elif match := DRAW_PIPELINE_RE.fullmatch(line):
             key, calls, target = match.groups()
             pipelines[key] = (int(calls), line if target else line + ", targets unknown")
-    if placeholder_draws is None and not (inputs or windows or starved or pipelines or switches):
+    if placeholder_draws is None and not (inputs or windows or starved or pipelines or switches or placeholder_targets):
         return ""
     rows = [line for _, line in sorted(inputs.values(), key=lambda row: (-row[0], row[1]))]
     sections = ["null inputs", *rows, "", "render target windows", *windows, "", "render summary"]
@@ -664,6 +668,9 @@ def null_inputs_section(stderr_text):
         totals = f"{totals}, {summary}" if totals else summary
     if totals:
         sections.append(totals)
+    if placeholder_targets:
+        sections.extend(["", "placeholder draws by render target",
+                         *(line for _, line in sorted(placeholder_targets.values(), key=lambda row: (-row[0], row[1])))])
     sections.extend(["", "starved targets", *starved.values()])
     if pipelines:
         sections.extend(["", "not drawn by pipeline",
