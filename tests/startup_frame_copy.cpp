@@ -68,7 +68,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
     float* large = nullptr;
     const UINT large_words = large_bytes / sizeof(float);
     constexpr UINT head_word = 9;
-    constexpr UINT tail_word = (large_bytes - 4352) / sizeof(float) - 1;
+    const UINT tail_word = (large_bytes - 4352) / sizeof(float) - 1;
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;
