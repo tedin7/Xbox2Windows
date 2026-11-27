@@ -2481,6 +2481,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
+#include "startup_stubs/d3d12_debug_present.inl"
 
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
@@ -4659,6 +4660,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         pass.targets_single_sample &= inspect(targets[i], formats[i], pass.target_surfaces[i]);
     pass.depth_surface = {};
     if (dsv_target) pass.targets_single_sample &= inspect(dsv_target, dsv_format, pass.depth_surface);
+    debug_present::note_bound(targets, pass.target_surfaces, count, dsv_target, pass.depth_surface);
     pass.depth_view_writable = dsv_target && dsv_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
@@ -8179,6 +8181,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
+        debug_present::present(self, surface);  // X2W_DEBUG_PRESENT_TARGET: before anything reads the surface
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
