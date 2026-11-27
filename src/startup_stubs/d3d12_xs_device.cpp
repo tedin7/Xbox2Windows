@@ -6152,13 +6152,13 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                     x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {
                     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
                     std::memcpy(&view, reinterpret_cast<const void*>(described), sizeof(view));
-                    skip = volume_uav_range_error(resource_desc, view.Texture3D);
+                    skip = volume_uav_range_error(resource_desc_for_check, view.Texture3D);
                     record_refused_uav = skip != nullptr;
                 } else if (view_dimension == D3D12_UAV_DIMENSION_TEXTURE1D &&
                            x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {
                     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
                     std::memcpy(&view, reinterpret_cast<const void*>(described), sizeof(view));
-                    if (view.Texture1D.MipSlice >= resource_desc.MipLevels) skip = "an output 1D texture mip is outside the resource";
+                    if (view.Texture1D.MipSlice >= resource_desc_for_check.MipLevels) skip = "an output 1D texture mip is outside the resource";
                     record_refused_uav = skip != nullptr;
                 }
             }

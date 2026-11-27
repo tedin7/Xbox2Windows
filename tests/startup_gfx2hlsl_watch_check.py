@@ -158,7 +158,8 @@ with tempfile.TemporaryDirectory() as tmp:
     real_watch_pass = gfx2hlsl.watch_pass
     real_sleep = time.sleep
     try:
-        def mock_watch_pass_single(out_dir, skip_failed, jobs=None, completed=None):
+        def mock_watch_pass_single(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False,
+                                   clock=None, completed=None):
             observed_watch.append(('pass', jobs))
             raise KeyboardInterrupt
 
@@ -179,7 +180,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
             # --watch <dir> 3.5 --jobs 4: interval is 3.5, jobs is 4
             pass_count = [0]
-            def mock_watch_pass_multi(out_dir, skip_failed, jobs=None, completed=None):
+            def mock_watch_pass_multi(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False,
+                                   clock=None, completed=None):
                 pass_count[0] += 1
                 observed_watch.append(('pass', jobs))
                 if pass_count[0] >= 2:
@@ -486,6 +488,15 @@ with tempfile.TemporaryDirectory() as tmp:
             return self
 
         def __exit__(self, *args):
+            pass
+
+        def submit(self, fn, *args, **kwargs):
+            from concurrent.futures import Future
+            future = Future()
+            future.set_result(None)
+            return future
+
+        def shutdown(self, *args, **kwargs):
             pass
 
         def map(self, fn, *iterables, **kwargs):
