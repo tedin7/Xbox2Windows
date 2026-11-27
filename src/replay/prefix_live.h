@@ -3,7 +3,7 @@
 // Which prefix calls a replay can leave out (x2w_replay --prefix-live, v1). Pure logic, no Windows types: the player feeds the
 // prefix calls in sequence order and asks, per call in add order, whether the replay still needs it.
 //
-// Rule (v1), counted on a real recording (pilot census): every creation, AddRef and Release stays, so no object
+// Rule (v1), counted on a real recording: every creation, AddRef and Release stays, so no object
 // dependency or reference count has to be reasoned about. Left out:
 //  - a descriptor write (device slots 17 to 22 and 70) that a later write to the SAME destination handle replaces. A copy
 //    (device 23 or 24) pins every write before it: a copy may read them, so the table of "last writes" starts again after it;
