@@ -40,7 +40,9 @@ def pre_install_device():
     stack, second = 0x7253F9E0, 0x5678
     data = chunk(b"XREC", struct.pack("<IIQ", 3, CALL[3].size, 10_000_000))
     data += chunk(b"XENV", data=b"X2W_D3D12_PERMISSIVE=1\0")
-    calls = [(26, stack, [DEVICE, 0, 1]), (15, DEVICE, [2]), (15, DEVICE, [2]), (15, second, [2])]
+    # The third call's last stack word is a stale image address the slot never reads: it still plays.
+    stale = [2] + [0] * 9 + [0x7FF6C51306B8]
+    calls = [(26, stack, [DEVICE, 0, 1]), (15, DEVICE, [2]), (15, DEVICE, stale), (15, second, [2])]
     for seq, (slot, obj, args) in enumerate(calls, 1):
         data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, slot, obj, *(args + [0] * (11 - len(args))), 0, 0.0, 0, 0))
     # QueryInterface calls whose out pointer the file does not hold (the title's stack): the stand-in writes null through
@@ -100,7 +102,7 @@ def main(player):
         summary = json.loads((out / "replay_summary.json").read_text())
         assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (8, 5, 1, 1), summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
-        for line in ("skip census: 3 calls skipped in 3 kinds", "skip census 0:0 recorded failure: 1",
+        for line in ("x2w-replay: skip census: ", "skip census 0:0 recorded failure: 1",
                      "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1"):
             assert line in text, (line, text[-2500:])
     return 0

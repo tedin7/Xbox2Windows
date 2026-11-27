@@ -359,9 +359,6 @@ LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// Module images load high in the user address space (0x7ff0'00000000 up): no size or flag word reaches there.
-constexpr u64 image_low = 0x7ff000000000ull, user_high = 0x800000000000ull;
-
 // Only slots wired to the stand-in's struct-return receiver accept an object in RDX.
 // Other calls can leave a live wrapper in that register even when they take no arguments.
 bool accepts_buffer_first(const CallRecord& call)
@@ -379,6 +376,19 @@ bool skip(Player& p, const CallRecord& c, const char* reason)
     if (++p.skips[key] <= 2 && ++p.skip_lines <= 64)
         say("replay: skipped %s (seq %llu)", key, static_cast<unsigned long long>(c.seq));
     return false;
+}
+
+// A creation or QueryInterface recorded as a success that fails here: played, and counted in the census, because every
+// later call on its result will be an unknown object.
+void note_failed_here(Player& p, const CallRecord& c, u64 ret)
+{
+    if (x2w_replay_slots::output_arg(c.kind, c.slot) < 0 || FAILED(static_cast<HRESULT>(c.ret)) ||
+        SUCCEEDED(static_cast<HRESULT>(ret)))
+        return;
+    char key[96];
+    std::snprintf(key, sizeof(key), "%u:%u failed here (recorded ok)", c.kind, c.slot);
+    if (++p.skips[key] <= 2 && ++p.skip_lines <= 64)
+        say("replay: %s (seq %llu, hr 0x%08lx)", key, static_cast<unsigned long long>(c.seq), static_cast<unsigned long>(ret));
 }
 
 // The slot call with an access violation in the stand-in caught (MSVC structured exceptions): the recorded process's
@@ -432,14 +442,14 @@ bool play(Player& p, const Recording& r, const Step& step)
         call.sampled[2] = call.read_output(2, call.before[2]);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
-    // An argument the stand-in reads as memory that the file does not hold, or an address in the recorded process's
-    // image (where its IIDs and constant tables live): passing it raw would fault in the stand-in. The call is skipped
-    // and counted as a call without its memory.
+    // An argument the stand-in reads as memory (the recorder's declared captures) that the file does not hold: passing
+    // the recorded process's address would fault in the stand-in. The call is skipped and counted as a call without its
+    // memory. Other words are left alone: the unused register and stack words of a call often hold stale image or
+    // stack addresses the slot never reads.
     for (int i = 0; i < call_args; ++i) {
         const u64 raw = c.args[i];
         if (call.top[i] || !raw || a[i] != raw || page_replay().reserved(raw) || p.descriptor_backing(raw)) continue;
-        const bool image = raw >= image_low && raw < user_high;
-        if (image || x2w_replay_slots::declared_input(c.kind, c.slot, i)) {
+        if (x2w_replay_slots::declared_input(c.kind, c.slot, i)) {
             ++p.missing_blob;
             static const char* const reasons[call_args] = {
                 "argument 0 not in the file", "argument 1 not in the file", "argument 2 not in the file",
@@ -547,6 +557,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.faults;
         return skip(p, c, "fault in the stand-in");
     }
+    note_failed_here(p, c, call.ret);
     if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
         p.descriptor_backings.push_back({step.descriptor_address, step.descriptor_address + step.descriptor_bytes});
         merge_spans(p.descriptor_backings);
@@ -586,7 +597,7 @@ void print_skip_census(const Player& p)
         rows.emplace_back(count, key);
     }
     std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-    say("x2w-replay: skip census: %llu calls skipped in %zu kinds (%llu faults in the stand-in)",
+    say("x2w-replay: skip census: %llu calls skipped or failed here in %zu kinds (%llu faults in the stand-in)",
         static_cast<unsigned long long>(total), rows.size(), static_cast<unsigned long long>(p.faults));
     for (std::size_t i = 0; i < rows.size() && i < 32; ++i)
         say("x2w-replay: skip census %s: %llu", rows[i].second.c_str(), static_cast<unsigned long long>(rows[i].first));
