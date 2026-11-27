@@ -221,6 +221,14 @@ float4 translated_buffer_pixel() : SV_Target {
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
 }
 
+float4 snapshot_vertex(uint id : SV_VertexID) : SV_Position {
+    return asfloat(translated_buffer.Load4(id * ud2));
+}
+
+float4 snapshot_pixel() : SV_Target {
+    return float4(1, 0, 0, 1);
+}
+
 float4 translated_buffer_tail_pixel() : SV_Target {
     uint value = translated_buffer.Load(0x100000c);
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
@@ -304,7 +312,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
-enum class TableSample { texture, buffer, buffer_tail };
+enum class TableSample { texture, buffer, buffer_tail, snapshot, snapshot_format };
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
                                     bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
@@ -312,7 +320,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
     auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
@@ -336,15 +344,18 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         file.write(static_cast<const char*>(bytes), count);
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
-    const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel"};
+    const bool snapshot = sample == TableSample::snapshot || sample == TableSample::snapshot_format;
+    const auto vs = compile(snapshot ? "snapshot_vertex" : rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
+    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel", "snapshot_pixel", "snapshot_pixel"};
     const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
     write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
     write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
     constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
     constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
     constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
-    if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
+    constexpr char format_manifest[] = "x2w-manifest 1\nud 4\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nudsrc 3 descword3 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
+    if (sample == TableSample::snapshot_format) write(".txt", format_manifest, sizeof(format_manifest) - 1);
+    else if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
     else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
     else write(".txt", manifest, sizeof(manifest) - 1);
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
@@ -617,10 +628,12 @@ ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
     return result;
 }
 
+enum class SnapshotCase { none, enabled, disabled, shifted, format };
+
 struct TranslatedDrawFixture {
     TranslatedDrawFixture(ID3D12Device* guest, std::uint32_t colour, ID3D12Device* desktop = nullptr,
                           bool short_view = false, bool copied = false, bool replay = false, bool allow_rt = false,
-                          UINT committed_bytes = 64)
+                          UINT committed_bytes = 64, DXGI_FORMAT buffer_format = DXGI_FORMAT_UNKNOWN)
         : wrong_root(create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE})),
           backing(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
@@ -654,11 +667,11 @@ struct TranslatedDrawFixture {
         auto& srv = storage.view;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (desktop) {
-            srv.Format = DXGI_FORMAT_UNKNOWN;
+            srv.Format = buffer_format;
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             srv.Buffer.FirstElement = replay ? 0 : 1;
             srv.Buffer.NumElements = replay ? static_cast<UINT>(replay_copy_bytes / 4) : short_view ? 1 : 2;
-            srv.Buffer.StructureByteStride = replay ? 4 : 16;
+            if (buffer_format == DXGI_FORMAT_UNKNOWN) srv.Buffer.StructureByteStride = replay ? 4 : 16;
             if (committed_bytes > 64)
                 srv.Buffer.NumElements = (committed_bytes / 16) - 1 - (short_view ? 1 : 0);
         } else {
@@ -682,6 +695,7 @@ struct TranslatedDrawFixture {
     ComPtr<ID3D12DescriptorHeap> heap;
     UINT64 cpu = 0;
     UINT64 gpu = 0;
+    SnapshotCase snapshot = SnapshotCase::none;
 };
 
 struct ReplayCopy {
@@ -750,6 +764,24 @@ void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT wo
                  converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
 }
 
+struct SnapshotVertex { float x, y, z, w; };
+constexpr SnapshotVertex snapshot_vertices[]{
+    {-1, 1, 0, 1}, {-1, -1, 0, 1}, {0.5f, 1, 0, 1}, {1, -1, 0, 1}};
+static_assert(sizeof(SnapshotVertex) == 16);
+
+bool snapshot_covers(UINT x, UINT y, UINT first)
+{
+    // The fixture uses w=1 and keeps all pixel centers off triangle edges.
+    const float px = 2.0f * (x + 0.5f) / width - 1.0f;
+    const float py = 1.0f - 2.0f * (y + 0.5f) / height;
+    const auto edge = [px, py](const SnapshotVertex& a, const SnapshotVertex& b) {
+        return (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+    };
+    const auto* v = snapshot_vertices + first;
+    const float a = edge(v[0], v[1]), b = edge(v[1], v[2]), c = edge(v[2], v[0]);
+    return (a > 0 && b > 0 && c > 0) || (a < 0 && b < 0 && c < 0);
+}
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
@@ -762,6 +794,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
+    const auto snapshot = translated ? translated->snapshot : SnapshotCase::none;
     const UINT indexed_argument_offset = translated_indexed && draw_right ? 8 : argument_offset;
     const bool mesh = kind == DrawKind::mesh;
     const UINT index_bytes = indexed ? (draw_right ? sizeof(wide_indices) : sizeof(indices)) : 0;
@@ -861,6 +894,17 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             check(place(alias_page_bytes, alias_seed.GetAddressOf()), "create reference placed alias in second page");
         if (refusal == Refusal::alias_overlaps)
             check(place(0, alias_overlap.GetAddressOf()), "create overlapping alias on first page");
+    }
+    std::unique_ptr<void, FreeMemory> title_vertices;
+    if (snapshot != SnapshotCase::none && snapshot != SnapshotCase::format) {
+        title_vertices.reset(VirtualAlloc(nullptr, sizeof(snapshot_vertices), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!title_vertices) throw std::bad_alloc();
+        std::memcpy(title_vertices.get(), snapshot_vertices, sizeof(snapshot_vertices));
+        const auto address = reinterpret_cast<UINT64>(title_vertices.get()) +
+            (snapshot == SnapshotCase::shifted ? sizeof(SnapshotVertex) : 0);
+        const std::uint32_t descriptor[]{static_cast<UINT>(address),
+            static_cast<UINT>(address >> 32) | (static_cast<UINT>(sizeof(SnapshotVertex)) << 16), 3, 0};
+        std::memcpy(reinterpret_cast<void*>(translated->cpu), descriptor, sizeof(descriptor));
     }
     if (upload_table) {
         using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
@@ -1197,6 +1241,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
         UINT painted = 0;
         bool pixels_match = true;
+        bool snapshot_reference_mismatch = false;
         for (UINT y = 0; y < height; ++y)
             for (UINT x = 0; x < width; ++x) {
                 std::uint32_t actual = 0;
@@ -1219,12 +1264,23 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                     wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
                         ? (0xff350000 | (v[y] << 8) | u[x]) : black;
                 }
+                if (snapshot != SnapshotCase::none) {
+                    const bool visible = snapshot == SnapshotCase::enabled || snapshot == SnapshotCase::shifted;
+                    const auto reference = snapshot_covers(x, y, 0) ? red : black;
+                    if (snapshot == SnapshotCase::shifted && actual != reference)
+                        snapshot_reference_mismatch = true;
+                    wanted = visible && snapshot_covers(x, y, snapshot == SnapshotCase::shifted ? 1 : 0) ? red : black;
+                }
                 if (actual != background) ++painted;
                 if (actual == wanted) continue;
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
                 pixels_match = false;
             }
         pixel_readback->Unmap(0, &untouched);
+        if (snapshot == SnapshotCase::shifted) {
+            if (!snapshot_reference_mismatch) return false;
+            std::puts("one-record shift failed the original CPU raster reference");
+        }
         std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
                     external_arguments ? "" : ", argument guards intact");
         if (!pixels_match) {
@@ -1778,7 +1834,15 @@ int main(int argc, char** argv) try
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    SnapshotCase snapshot = SnapshotCase::none;
+    if (argc == 3) {
+        const std::string_view mode(argv[2]);
+        if (mode == "table-snapshot") snapshot = SnapshotCase::enabled;
+        if (mode == "table-snapshot-off") snapshot = SnapshotCase::disabled;
+        if (mode == "table-snapshot-shifted") snapshot = SnapshotCase::shifted;
+        if (mode == "table-snapshot-format") snapshot = SnapshotCase::format;
+    }
+    const bool translated = snapshot != SnapshotCase::none || root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -1821,7 +1885,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
+    if (snapshot != SnapshotCase::none || indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -2218,16 +2282,56 @@ int main(int argc, char** argv) try
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
         }
-        const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
-        const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
-        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
-        const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
         argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
         const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
+        if (snapshot != SnapshotCase::none) {
+            check(SetEnvironmentVariableA("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "1") ? S_OK : E_FAIL,
+                  "enable title input snapshots");
+            check(SetEnvironmentVariableA("X2W_INDIRECT_TABLE_SNAPSHOT", snapshot == SnapshotCase::disabled ? "0" : "1")
+                      ? S_OK : E_FAIL, "set indirect table snapshot switch");
+            const bool format_case = snapshot == SnapshotCase::format;
+            const auto snapshot_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false,
+                format_case ? TableSample::snapshot_format : TableSample::snapshot);
+            TranslatedDrawFixture binding(guest.Get(), 0, format_case ? device.Get() : nullptr,
+                false, false, false, false, 64, format_case ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN);
+            binding.snapshot = snapshot;
+            const bool pixels_ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(),
+                snapshot_pso.Get(), signature.Get(), DrawKind::vertices, false, Refusal::none, "indirect table snapshot",
+                &binding);
+            std::ifstream file{std::filesystem::path(log_path), std::ios::binary};
+            const std::string log{std::istreambuf_iterator<char>(file), {}};
+            file.close();
+            const bool recorded = log.find("translated ExecuteIndirect Draw recorded") != std::string::npos;
+            bool diagnostic_ok = recorded;
+            if (!recorded && snapshot != SnapshotCase::disabled && !format_case)
+                std::fputs("missing translated ExecuteIndirect Draw recorded diagnostic\n", stderr);
+            if (snapshot == SnapshotCase::disabled || format_case) {
+                const auto size = x2w_d3d12_census_report(nullptr, 0);
+                std::vector<char> report(size + 1);
+                x2w_d3d12_census_report(report.data(), report.size());
+                const std::string_view census(report.data());
+                const char* reason = format_case ? "formatted_buffer_not_ready" : "incomplete_table_buffer";
+                const std::string detail = format_case
+                    ? "formatted buffer refused (view format has no decoded buffer FORMAT " +
+                        std::to_string(DXGI_FORMAT_R32_UINT) + ")"
+                    : "an input is in title memory outside any placed buffer";
+                diagnostic_ok = !recorded && census.find(std::string("reason=") + reason + " calls=1") != std::string_view::npos &&
+                    log.find("translated ExecuteIndirect Draw refused") != std::string::npos &&
+                    log.find(detail) != std::string::npos;
+                if (!diagnostic_ok) std::fprintf(stderr, "missing indirect diagnostic '%s' / '%s'\n", reason, detail.c_str());
+            }
+            std::filesystem::remove_all(cache);
+            DeleteFileW(log_path.c_str());
+            return pixels_ok && diagnostic_ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
+        const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
+        const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
+        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
+        const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
         if (root_fix) {
             check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", "1") ? S_OK : E_FAIL, "enable indirect root fix");
