@@ -2688,6 +2688,7 @@ struct TranslatedIndirectDraw {
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
     const char* refusal_code = indirect_refusal_code::pipeline_or_target_unavailable;
+    const char* refusal_why = nullptr;  // incomplete_vertex_stream / incomplete_table_buffer: which input failed and why
 
     // Keep prose refusal text and census code updated together.
     void set_refusal(const char* message, const char* code)
@@ -4035,18 +4036,27 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (indirect) {
             IndirectBufferView view{};
+            const char* why = nullptr;  // the exact reason the buffer could not be taken (a string literal), logged with the refusal
             if (srv.source == 1 && indexed) {
                 const auto& vb = pass.vb[0];
                 if (vb.StrideInBytes && vb.StrideInBytes <= 0x3fff && vb.SizeInBytes % vb.StrideInBytes == 0 &&
                     vb.BufferLocation <= 0xffffffffffffull) {
                     const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
                         static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
-                    view = indirect_table_buffer(self, stream, true);
+                    view = indirect_table_buffer(self, stream, true, &why);
                     indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
+                } else {
+                    why = "the bound vertex buffer has no usable stride, size or address";
                 }
             } else if (entry_ok) {
-                view = indirect_table_buffer(self, words);
+                view = indirect_table_buffer(self, words, false, &why);
+            } else {
+                why = "the table descriptor entry is not readable";
             }
+            if (view.resource && view.resource == indirect->argument) why = "the input buffer is the indirect argument buffer";
+            else if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) why = "the input offset is not 16-byte aligned";
+            else if (!view.resource && !why) why = "no buffer resource was produced";
+            indirect->refusal_why = why;
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
                 indirect->set_refusal(
                     srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
@@ -4551,6 +4561,23 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
             const bool first_pair = indirect_draw_refusal_census.note(draw.shader_key, draw.refusal_code);
             if (first_pair || first_calls(refused, 32))
                 log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+            // One line per (shader, reason): which input buffer was missing and why, whatever the census order.
+            if (draw.refusal_why) {
+                static SRWLOCK why_lock = SRWLOCK_INIT;
+                static struct { u64 key; const char* why; } seen[64];
+                static int seen_count;
+                bool fresh = false;
+                AcquireSRWLockExclusive(&why_lock);
+                int at = 0;
+                while (at < seen_count && !(seen[at].key == draw.shader_key && seen[at].why == draw.refusal_why)) ++at;
+                if (at == seen_count && seen_count < 64) {
+                    seen[seen_count++] = {draw.shader_key, draw.refusal_why};
+                    fresh = true;
+                }
+                ReleaseSRWLockExclusive(&why_lock);
+                if (fresh)
+                    log("x2w-render indirect input buffer refused, shader %016llx: %s", draw.shader_key, draw.refusal_why);
+            }
         }
         return draw.refusal;
     }
