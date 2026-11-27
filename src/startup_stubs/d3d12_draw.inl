@@ -3020,7 +3020,14 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     } else {
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
-        bytes = u64{stride ? stride : 1} * words[2];
+        bytes = x2w_startup::buffer_descriptor_bytes(words[1], words[2], words[3]);
+        if (stride > 1 && x2w_startup::buffer_records_are_bytes(words[1], words[3])) {
+            static LONG64 raw_ranges;
+            const auto seen = static_cast<u64>(InterlockedIncrement64(&raw_ranges));
+            if (seen <= 8 || (seen & (seen - 1)) == 0)
+                log("x2w-draw V# raw range: OOB_SELECT 3 stride %u num_records %u -> %u bytes (Table 37 reading would be %llu)",
+                    stride, words[2], words[2], static_cast<unsigned long long>(u64{stride} * words[2]));
+        }
     }
     // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
     // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.

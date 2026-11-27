@@ -253,8 +253,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     constexpr UINT gpu_offset = 16;
     const bool ring_input = mode == "dispatch-input-title-ring" || mode == "dispatch-input-title-ring-full";
     const bool protected_input = mode == "dispatch-input-title-protected";
-    const UINT input_bytes = large_input ? 40u << 20 : 12u << 10;
-    const UINT record_offsets[] = {0, input_bytes / 2, input_bytes - 16};
+    const bool raw_range = mode == "dispatch-input-title-raw-range";
+    const bool range_control = mode == "dispatch-input-title-raw-range-control";
+    const bool range_fixture = raw_range || range_control;
+    const UINT input_bytes = range_fixture ? 16u * 64u : large_input ? 40u << 20 : 12u << 10;
+    const UINT record_offsets[] = {0, range_fixture ? 48u : input_bytes / 2, range_fixture ? 64u : input_bytes - 16};
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -332,8 +335,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 
         const UINT64 address = reinterpret_cast<UINT64>(source) + (gpu_input ? gpu_offset : 0);
         descriptors[0][0] = static_cast<UINT>(address);
-        descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
-        descriptors[0][2] = input_bytes / 4;
+        descriptors[0][1] = static_cast<UINT>(address >> 32) | (range_fixture ? 16u : 4u) << 16;
+        descriptors[0][2] = range_fixture ? 64u : input_bytes / 4;
+        if (range_fixture) descriptors[0][3] = raw_range ? 3u << 28 : 0;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they

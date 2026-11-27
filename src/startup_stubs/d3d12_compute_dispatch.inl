@@ -531,7 +531,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
             const std::uint32_t at = slot.at + index * slot.times;
             const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-            const UINT stride = (words[1] >> 16) & 0x3fff;
             if (!(words[0] | words[1] | words[2] | words[3])) {
                 // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
                 // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
@@ -542,7 +541,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "a heap index word is not in the list's upload memory";
                     break;
                 }
-                if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                if (u64{at} + 4 > x2w_startup::buffer_descriptor_bytes(words[1], words[2], words[3])) {
                     reason = "a heap index word is outside its table buffer";
                     break;
                 }
@@ -728,7 +727,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         // Native buffer descriptors must cover a placement that aliases title memory.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
-        const u64 bytes = u64{stride ? stride : 1} * words[2];
+        const u64 bytes = x2w_startup::buffer_descriptor_bytes(words[1], words[2], words[3]);
         const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
