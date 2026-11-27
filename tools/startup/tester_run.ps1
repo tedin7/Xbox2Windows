@@ -388,9 +388,6 @@ try {
     $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
 } catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
-# Check the effective environment inherited by run.ps1 before launching the title.
-$captureWarnings = @(Invoke-Native { & $python -B $pack capture-warnings })
-foreach ($reason in $captureWarnings) { Write-Warning "CAPTURE WARNING: $reason" }
 # Manifest input: X2W_* variables only; the user's profile path is masked.
 $envSet = [ordered]@{}
 foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } | Sort-Object Name)) {
@@ -415,7 +412,7 @@ if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -an
 $janitorFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_janitor_${stamp}_$PID.json"
 try {
     $early = [ordered]@{
-        commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds; input_script = $script; env = $envSet; capture_warnings = $captureWarnings
+        commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds; input_script = $script; env = $envSet
         gpu = (($video | ForEach-Object { $_.Name }) -join "; "); gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
         windows_build = $os.BuildNumber; wall_seconds = 0; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures
         lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; shader_cache = (Split-Path -Leaf $cache)
@@ -483,7 +480,7 @@ foreach ($root in $scanRoots) {
 $saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
 $manifest = [ordered]@{
     commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
-    input_script = $script; env = $envSet; capture_warnings = $captureWarnings
+    input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)

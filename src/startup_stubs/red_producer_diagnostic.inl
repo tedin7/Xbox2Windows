@@ -42,28 +42,6 @@ class RedProducers {
     unsigned submit_order_ = 0;
     bool full_logged_ = false;
 
-    unsigned flat_count_ = 0, level_count_ = 0;
-    unsigned levels_[8]{};
-    int closest_distance_ = 256;
-    unsigned char closest_rgb_[3]{};
-
-    void record_sample(LONG64 frame, const unsigned char* rgba, bool flat)
-    {
-        int distance = 0;
-        for (unsigned c = 0; c < 3; ++c)
-            distance = (std::max)(distance, std::abs(int(rgba[c]) - int(target_rgb_[c])));
-        if (distance < closest_distance_) {
-            closest_distance_ = distance;
-            std::copy_n(rgba, 3, closest_rgb_);
-        }
-        if (!flat || frame < (auto_count_ ? auto_min_ : first_)) return;
-        ++flat_count_;
-        const unsigned level = x2w_present_signature::luma(rgba[0], rgba[1], rgba[2]);
-        if (level_count_ < std::size(levels_) &&
-            std::find(levels_, levels_ + level_count_, level) == levels_ + level_count_)
-            levels_[level_count_++] = level;
-    }
-
 public:
     struct Disabled {};
     explicit RedProducers(Disabled) {}
@@ -72,77 +50,36 @@ public:
     {
         char value[48]{};
         onset_ = GetEnvironmentVariableA("X2W_RED_PRODUCER_ONSET", value, sizeof(value)) == 1 && value[0] == '1';
-        const DWORD frames_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", value, sizeof(value));
-        if (frames_bytes && frames_bytes < sizeof(value) &&
+        if (GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", value, sizeof(value)) &&
             std::sscanf(value, "%ld,%ld", &first_, &last_) == 2 && first_ >= 1 && last_ >= first_) {
             log("x2w-red producer capture frames %ld..%ld; max 512 center texels from known present targets", first_, last_);
         } else {
             first_ = last_ = 0;
         }
-        const DWORD auto_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value));
-        const bool auto_valid = auto_bytes && auto_bytes < sizeof(value) &&
+        if (GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value)) &&
             std::sscanf(value, "%ld,%ld", &auto_min_, &auto_count_) == 2 && auto_min_ >= 1 &&
-            auto_count_ >= 1 && auto_count_ <= 120;
-        const DWORD rgb_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_RGB", value, sizeof(value));
-        bool rgb_applied = false;
-        if (auto_valid && rgb_bytes) {
-            unsigned rgb[3]{};
-            char trailing;
-            if (rgb_bytes >= sizeof(value) || std::sscanf(value, "%3u,%3u,%3u%c", &rgb[0], &rgb[1], &rgb[2], &trailing) != 3 ||
-                rgb[0] > 255 || rgb[1] > 255 || rgb[2] > 255) {
-                auto_min_ = auto_count_ = 0;
-                log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB needs three decimal components from 0 to 255");
-            } else {
+            auto_count_ >= 1 && auto_count_ <= 120) {
+            const DWORD rgb_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_RGB", value, sizeof(value));
+            if (rgb_bytes) {
+                unsigned rgb[3]{};
+                char trailing;
+                if (rgb_bytes >= sizeof(value) || std::sscanf(value, "%3u,%3u,%3u%c", &rgb[0], &rgb[1], &rgb[2], &trailing) != 3 ||
+                    rgb[0] > 255 || rgb[1] > 255 || rgb[2] > 255) {
+                    auto_min_ = auto_count_ = 0;
+                    log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB needs three decimal components from 0 to 255");
+                    return;
+                }
                 std::copy_n(rgb, 3, target_rgb_);
-                rgb_applied = true;
             }
-        }
-        if (!auto_valid) auto_min_ = auto_count_ = 0;
-        if (auto_count_)
             log("x2w-red producer waits for RGB %u,%u,%u at or after present %ld then captures %ld future frames",
                 target_rgb_[0], target_rgb_[1], target_rgb_[2], auto_min_, auto_count_);
-
-        bool sampler_specified;
-        const int interval = x2w_present_signature::effective_interval(
-            x2w_present_signature::configured_interval(&sampler_specified), onset());
-        log("x2w-red config: floor=%ld frame count=%ld target RGB=%u,%u,%u (%s) onset=%s sampler interval=%d manual=%ld..%ld",
-            auto_count_ ? auto_min_ : first_, auto_count_ ? auto_count_ : (first_ ? last_ - first_ + 1 : 0L),
-            target_rgb_[0], target_rgb_[1], target_rgb_[2], rgb_applied ? "switch" : "default",
-            onset_ ? "on" : "off", interval, first_, last_);
-        if (onset_ && !rgb_bytes)
-            log("x2w-red WARNING: onset is on but X2W_RED_PRODUCER_RGB is unset (default target is pure red)");
-        const auto extrema = std::minmax_element(std::begin(target_rgb_), std::end(target_rgb_));
-        if (onset_ && *extrema.second - *extrema.first > x2w_present_signature::onset_rgb_tolerance)
-            log("x2w-red WARNING: onset target is not gray; a flat picture of this color is unlikely");
-        if (enabled() && (!sampler_specified || interval != 1))
-            log("x2w-red WARNING: set X2W_PRESENT_SIGNATURE_EVERY=1 to explicitly sample every present");
-        if (auto_bytes && !auto_valid)
-            log("x2w-red WARNING: X2W_RED_PRODUCER_AUTO could not be parsed");
-    }
-
-    void report_unarmed()
-    {
-        // MSVC runs DLL exit callbacks on detach. Other threads may already be gone,
-        // including a thread that held lock_. The tracker is kept alive until exit.
-        if (auto_count_ ? auto_last_ != 0 : frame_number >= first_) return;
-        char levels[8 * 5 + 1] = "none";
-        std::size_t offset = 0;
-        for (unsigned i = 0; i < level_count_; ++i)
-            offset += std::snprintf(levels + offset, sizeof(levels) - offset, "%s%u", i ? ", " : "", levels_[i]);
-        char closest[16] = "none";
-        if (closest_distance_ < 256)
-            std::snprintf(closest, sizeof(closest), "%u,%u,%u",
-                          unsigned(closest_rgb_[0]), unsigned(closest_rgb_[1]), unsigned(closest_rgb_[2]));
-        log("x2w-red not armed: last present %ld, floor %ld, flat pictures seen %u (levels %s), closest sampled colour %s",
-            frame_number, auto_count_ ? auto_min_ : first_, flat_count_, levels, closest);
+        } else {
+            auto_min_ = auto_count_ = 0;
+        }
     }
 
     bool enabled() const { return first_ || auto_count_; }
     bool onset() const { return enabled() && onset_; }
-    bool tracking_unarmed() const
-    {
-        return auto_count_ ? !auto_last_ : first_ && frame_number < first_;
-    }
     bool matches(const unsigned char* rgba, bool flat) const
     {
         if (onset_ && !flat) return false;
@@ -165,13 +102,10 @@ public:
         return interested() || wants_history();
     }
 
-    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, const unsigned char* rgba, bool flat, bool matched)
+    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, const unsigned char* rgba, bool matched)
     {
-        if (!tracking_unarmed()) return;
+        if (!auto_count_ || auto_last_) return;
         std::lock_guard<std::mutex> guard(lock_);
-        if (auto_last_) return;
-        record_sample(sampled_frame, rgba, flat);
-        if (!auto_count_) return;
         const LONG64 previous = previous_sample_;
         const bool became_matched = matched && !auto_last_match_ && (!onset_ || previous);
         auto_last_match_ = matched;
@@ -373,8 +307,6 @@ RedProducers& red_producers()
             GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value))) return new RedProducers;
         return &disabled;
     }();
-    static const bool exit_report = tracker->enabled() && std::atexit([] { tracker->report_unarmed(); }) == 0;
-    (void)exit_report;
     return *tracker;
 }
 

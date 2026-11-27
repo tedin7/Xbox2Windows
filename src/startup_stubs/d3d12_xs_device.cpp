@@ -7576,12 +7576,15 @@ void log_gpu_time(LONG frame, ULONGLONG now_ms)
 // 18 one-texel rows are copied on the presenting queue and read back on a later present; nothing waits.
 void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
 {
-    static const int explicit_every = x2w_present_signature::configured_interval();
+    static const int explicit_every = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : -1;
+    }();
     if (explicit_every == 0) return;
     static const bool producer_enabled = red_producers().enabled();
     static const bool always = explicit_every > 0 || producer_enabled;
     static const bool onset = red_producers().onset();
-    static const int every = x2w_present_signature::effective_interval(explicit_every, onset);
+    static const int every = explicit_every > 0 ? explicit_every : (onset ? 1 : 4);
     static x2w_present_signature::Block* const block = [] {
         auto* created = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
         log("x2w-present picture signature: Local\\x2w_present_signature_%lu, every %d presents %s",
@@ -7593,14 +7596,13 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
     static auto* const sampler = new x2w_present_signature::Sampler(every, always, producer_enabled, onset);
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
-    const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block,
-                                            producer_enabled && red_producers().tracking_unarmed());
+    const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
     if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* rgba = sampler->last_rgba();
         const bool red = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0;
         const bool matched = red_producers().matches(rgba, sampler->last_flat());
-        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, sampler->last_flat(), matched);
+        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, matched);
         static bool was_matched;
         if (matched != was_matched || red_producers().interested()) {
             log("x2w-red sample present=%lld published_at=%ld target=%p rgba=%u,%u,%u,%u red=%u match=%u tick=%llu",
@@ -8312,7 +8314,6 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
         device->Release();
         return;
     }
-    red_producers(); // Publish capture configuration when the device starts.
     the_device = candidate;
     removal_device = device;
 }

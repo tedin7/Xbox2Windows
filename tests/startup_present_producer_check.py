@@ -13,8 +13,6 @@ def run(mode, rgb="", *, onset=False, default_cadence=False):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_PRESENT_SIGNATURE_EVERY="1", X2W_RED_PRODUCER_FRAMES="", X2W_RED_PRODUCER_AUTO="",
                X2W_RED_PRODUCER_RGB=rgb, X2W_RED_PRODUCER_ONSET="1" if onset else "")
-    if not rgb:
-        env.pop("X2W_RED_PRODUCER_RGB")
     if default_cadence:
         env.pop("X2W_PRESENT_SIGNATURE_EVERY")
     if mode.startswith("auto"):
@@ -80,29 +78,6 @@ def check_onset():
     print(f"flat near-red edge arms after the nonuniform frame, with an onset-off control ({adapter})")
 
 
-def check_capture_diagnostics():
-    mode = "auto-black-control"
-    missed, missed_records, adapter = run(mode, onset=True)
-    armed, armed_records, _ = run(mode, "0,0,0", onset=True)
-    assert ("x2w-red config: floor=4 frame count=2 target RGB=255,0,0 (default) onset=on sampler interval=1" in missed
-            and "x2w-red WARNING: onset is on but X2W_RED_PRODUCER_RGB is unset" in missed
-            and "x2w-red WARNING: onset target is not gray" in missed), missed
-    summary = re.search(r"x2w-red not armed: last present 8, floor 4, flat pictures seen ([1-9][0-9]*) "
-                        r"\(levels ([0-9, ]+)\), closest sampled colour 64,64,64", missed)
-    assert summary and "0" in summary[2].split(", "), missed
-    assert "x2w-red auto armed " not in missed and not missed_records, missed
-
-    # UNORM bytes from the fixture's CPU clear colors, before and after each write.
-    black, gray = "0,0,0,255", "64,64,64,255"
-    target = armed_records[0][3] if armed_records else None
-    expected = [("1", "1", "7", target, gray, black), ("2", "2", "7", target, black, gray)]
-    assert armed_records == expected and missed_records != expected, (armed, missed)
-    assert "x2w-red config: floor=4 frame count=2 target RGB=0,0,0 (switch) onset=on sampler interval=1" in armed, armed
-    assert "x2w-red auto armed sampled_present=5 published_at=6" in armed, armed
-    assert "x2w-red WARNING:" not in armed and "x2w-red not armed:" not in armed, armed
-    print(f"capture diagnostics: omitted RGB misses the same WARP black edge the explicit RGB captures ({adapter})")
-
-
 def check_barriers():
     logs, _, adapter = run("barriers")
     records = re.findall(r"CommandList::slot26\(ResourceBarrier\): forwarded=(\d+) refused=(\d+)", logs)
@@ -119,8 +94,6 @@ elif __name__ == "__main__":
     check_auto(magenta=True)
     check_default_cadence()
     check_onset()
-    if BACKEND == "warp":
-        check_capture_diagnostics()
     logs, records, adapter = run("auto-magenta", "255,0,256")
     assert "auto disabled: X2W_RED_PRODUCER_RGB" in logs and "auto armed" not in logs and not records, logs
     print(f"invalid RGB disables automatic arming ({adapter})")
