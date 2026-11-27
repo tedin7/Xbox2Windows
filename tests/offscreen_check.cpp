@@ -1589,7 +1589,7 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
     } else if (operation == "--startup-pixel-image-words") {
         std::vector<float> colors(pixels.size());
         check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, colors.data(), ctx.argv[8],
-                               false, 3, false, true, 0, 3, UINT(width), UINT(height));
+                               false, 3, false, true, 0, 3, false, UINT(width), UINT(height));
         std::memcpy(pixels.data(), colors.data(), pixels.size() * sizeof(std::uint32_t));
     } else if (operation == "--startup-pixel-buffer-words") {
         const auto entry = parse_hex_words(ctx.argv[8]);
