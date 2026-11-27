@@ -2216,8 +2216,26 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
                 for source in sources:
                     key = lane_bit_key(source)
                     register = reg_range(source)
+                    try:
+                        literal = int(source, 0) if source not in FLOATS else None
+                    except ValueError:
+                        literal = None
+                    if literal is not None:
+                        # See scalar_u64_words: a 64-bit literal with bit 31 set has no
+                        # established extension; inline negative constants are distinct.
+                        if width == 64 and not (-16 <= literal <= 64 or 0 <= literal < 0x80000000):
+                            return decline('LDS general lowering: EXEC write %s at +0x%x has ambiguous 64-bit literal %s' % (base, off, source))
+                        value = literal & ((1 << width) - 1)
+                        if value in (0, (1 << width) - 1):
+                            continue
+                        if (width == 32 and wave32_exec_proof(ins) or
+                                width == 64 and wave64_exec_proof(ins)):
+                            continue
+                        return decline('LDS general lowering: EXEC write %s at +0x%x has unproven lane mask %s (wave size unknown)' % (base, off, source))
                     valid = ((source in ('exec', 'vcc') if width == 64 else source in ('exec_lo', 'vcc_lo'))
-                             or register and register[0] == 's' and register[2] - register[1] == (width // 32 - 1))
+                             or register and register[0] == 's' and
+                             (register[2] == register[1] if width == 32 else
+                              register[2] - register[1] in (0, 1) and register[1] < 105))
                     if valid and source in ('exec', 'exec_lo'):
                         continue
                     if not valid or not key or not lane_mask_read_exact(ins, i, key, require_mask=True):
@@ -2622,7 +2640,7 @@ def lane_bit_branch(base, target, state, voted):
     return edges
 
 
-def lane_bit_step(name, asm, state, voted=False):
+def lane_bit_step(name, asm, state, voted=False, wave32=False, indexed_literals=False):
     """[(target offset, or None for the next instruction, state after)] for one instruction in the lane-bit flow, or None
     for a transfer it does not follow. `state` maps 'exec', 'vcc', 'sN' and 'scc' to the known bit 0 (0 or 1) of the
     model's variable (a missing key is unknown), 'x:K' to True for an exact lane mask K and 'scc_is' to the key whose bit
@@ -2645,6 +2663,11 @@ def lane_bit_step(name, asm, state, voted=False):
         return [(None, state)]   # a no-op in the model (Stage._lower): no variable changes
     _, writes, may = scalar_effects(name, asm)
     lost = {{'exec_hi': 'exec', 'vcc_hi': 'vcc'}.get(k, k) for k in writes | may}
+    # The disassembler can spell a 64-bit SGPR destination as its low word.
+    if base.startswith('s_') and base.endswith('_b64') and ops and not base.startswith(('s_cmp', 's_bitcmp')):
+        reg = reg_range(ops[0])
+        if reg and reg[0] == 's' and reg[1] == reg[2] and reg[1] < 105:
+            lost.add('s%d' % (reg[1] + 1))
     out = {k: v for k, v in state.items() if k not in lost and k[2:] not in lost}
     # A 64-bit mask's high word is part of the value represented by its low-word key.
     for word in lost:
@@ -2653,22 +2676,27 @@ def lane_bit_step(name, asm, state, voted=False):
     if 'scc' in lost or out.get('scc_is') in lost:
         out.pop('scc_is', None)
     dest = lane_bit_key(ops[0]) if ops else None
+    def value(tok):
+        if indexed_literals and re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and int(tok, 0) not in (0, -1):
+            return None
+        return lane_bit_value(tok, state)
     saveexec = re.fullmatch(r's_(and|or|andn2)_saveexec_b(32|64)', base)
     bitwise = re.fullmatch(r's_(and|or|andn2|orn2|xor)_b(32|64)', base)
     if saveexec and len(ops) == 2 and dest not in (None, 'exec'):
         # D = EXEC; EXEC = S0 op EXEC (RDNA 2 ISA SOP1); the model emits exec = (...) & 1; scc = exec != 0.
         e = state.get('exec')
-        bit = LANE_BIT_OPS[saveexec.group(1)](lane_bit_value(ops[1], state), e)
+        bit = LANE_BIT_OPS[saveexec.group(1)](value(ops[1]), e)
         out.update({k: v for k, v in ((dest, e), ('exec', bit), ('scc', bit)) if v is not None})
         out.update({'scc_is': 'exec', 'x:' + dest: True})
     elif base in ('s_mov_b32', 's_mov_b64') and len(ops) == 2 and dest:
-        bit = lane_bit_value(ops[1], state)
+        bit = value(ops[1])
         if bit is not None:
             out[dest] = bit
-        if base == 's_mov_b64' and dest != 'exec' and lane_bit_exact(ops[1], state):
+        if (dest != 'exec' and (base == 's_mov_b64' and lane_bit_exact(ops[1], state)
+                                or base == 's_mov_b32' and wave32 and ops[1] == 'exec_lo')):
             out['x:' + dest] = True
     elif bitwise and len(ops) == 3 and dest:
-        bits = [lane_bit_value(t, state) for t in ops[1:]]
+        bits = [value(t) for t in ops[1:]]
         # An SGPR source of unknown bit may hold a symbol the model keeps without a variable; exec and vcc never do.
         if all(b is not None or t in LANE_BIT_PLAIN for t, b in zip(ops[1:], bits)):
             bit = LANE_BIT_OPS[bitwise.group(1)](*bits)
@@ -2704,6 +2732,7 @@ def lane_mask_read_exact(ins, at, mask, voted=frozenset(), require_mask=False):
             if to is None or (to <= i and to <= at):
                 return False
     seen, todo, budget = set(), [(0, {'exec': 1})], LANE_FLOW_BUDGET
+    wave32 = wave32_exec_proof(ins)
     while todo:
         i, state = todo.pop()
         visit = (i, frozenset(state.items()))
@@ -2718,7 +2747,7 @@ def lane_mask_read_exact(ins, at, mask, voted=frozenset(), require_mask=False):
                 return False
             continue
         off, _, name, asm = ins[i]
-        edges = lane_bit_step(name, asm, state, off in voted)
+        edges = lane_bit_step(name, asm, state, off in voted, wave32, require_mask)
         if edges is None:
             return False
         todo.extend((i + 1 if target is None else index[target], after) for target, after in edges
@@ -3982,6 +4011,9 @@ class Stage:
 
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
+        mapped = getattr(self, 'lds_constant_operands', {}).get(getattr(self, 'pc', None), {})
+        if tok in mapped:
+            return mapped[tok]
         if tok == 'src_scc':
             # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
             if not getattr(self, 'scc_verified', False):
@@ -5746,6 +5778,42 @@ class Stage:
             self.compute_dpp_entry = self.compute_dpp_sites(branches, names)
         if getattr(self, 'kind', None) == 'cs':
             self.lds_needs_retry = lds_retry_candidate(self.ins, bool(branches))
+        self.lds_constant_operands = {}
+        has_exec_literal = any(writes_exec(name, ops) and not name.startswith('v_cmp') and
+                               any(re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', tok) for tok in ops[1:])
+                               for _, _, name, asm in self.ins for ops in (parse(asm)[1],))
+        if getattr(self, 'kind', None) == 'cs' and self.lds_needs_retry and self.pipe is not None and has_exec_literal:
+            try:
+                check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+            except Unsupported:
+                sites = self.compute_dpp_entry if branches else None
+                if lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words, sites) is not None:
+                    x, y, _ = self.pipe.group
+                    flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                    for pc, _, name, asm in self.ins:
+                        _, operands, _ = parse(asm)
+                        if not writes_exec(name, operands) or name.startswith('v_cmp'):
+                            continue
+                        width = 32 if name.endswith('_b32') else 64
+                        for source in operands[1:]:
+                            try:
+                                value = int(source, 0) if source not in FLOATS else None
+                            except ValueError:
+                                value = None
+                            if value is None:
+                                continue
+                            value &= (1 << width) - 1
+                            if value in (0, (1 << width) - 1):
+                                expr = '1u' if value else '0u'
+                            else:
+                                lane = '(%s & %du)' % (flat, width - 1)
+                                low = '0x%08xu' % (value & 0xffffffff)
+                                if width == 64:
+                                    high = '0x%08xu' % (value >> 32)
+                                    expr = '(((%s < 32u ? %s : %s) >> (%s & 31u)) & 1u)' % (lane, low, high, lane)
+                                else:
+                                    expr = '((%s >> %s) & 1u)' % (low, lane)
+                            self.lds_constant_operands.setdefault(pc, {})[source] = expr
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
                                  if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)

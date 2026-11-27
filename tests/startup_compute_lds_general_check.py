@@ -178,6 +178,34 @@ def simulate(name, reverse=False):
     return result
 
 
+def lane_zero_program():
+    p = [raw for _, raw in enc.PREAMBLE_LINES]
+    p += [enc.vop1(1, 3, 0x100), enc.vop2(0x1b, 4, 0xa0, 3),
+          enc.vop2(0x1a, 4, 0x82, 4),
+          enc.sop1(3, 126, 129),              # s_mov_b32 exec_lo, 1
+          enc.ds_single(0x0d, 4, data0=3),
+          enc.sop1(3, 126, 193),              # s_mov_b32 exec_lo, -1
+          enc.sopp(10), enc.ds_single(0x36, 4, vdst=20),
+          enc.vop2(0x1a, 13, 0x82, 3), enc.mubuf_store(0x1c, 20, 13),
+          enc.sopp(1)]
+    return b''.join(p), sibling.USER7 | sibling.TGID_X | (1 << 15), (64, 1, 1)
+
+
+def lane_zero_pipeline():
+    code, rsrc, group = lane_zero_program()
+    return G.ComputePipeline(code, sibling.root_blob(), rsrc, group)
+
+
+def lane_zero_reference(reverse=False):
+    lds = [None, None]
+    for wave in ((1, 0) if reverse else (0, 1)):
+        lds[wave] = wave * 32
+    result = [SENTINEL] * WORDS
+    for lane in range(64):
+        result[lane] = lds[lane // 32]
+    return result
+
+
 def masked_program():
     # Save the entry mask, narrow at entry, initialize all slots, then restore
     # the narrow mask. Active lanes read initialized slots owned by inactive lanes.
@@ -325,6 +353,17 @@ def controls():
     assert simulate('bytes')[0] == 0x83828180
     assert simulate('bytes')[0] != 0x83000000  # lost byte updates
     assert simulate('bounds')[:2] == [0, 1]
+    lane_text = lane_zero_pipeline().hlsl_cs()
+    assert '0x00000001u >>' in lane_text and '& 31u' in lane_text
+    assert lane_zero_reference() == lane_zero_reference(reverse=True)
+    assert lane_zero_reference()[:64] == [0] * 32 + [32] * 32
+    saved_code, saved_rsrc, saved_group = lane_zero_program()
+    enter = enc.sop1(3, 126, 129)
+    saved_code = saved_code.replace(enter, enc.sop1(3, 40, 126) + enter).replace(
+        enc.sop1(3, 126, 193), enc.sop1(3, 126, 40))
+    saved_text = G.ComputePipeline(saved_code, sibling.root_blob(), saved_rsrc, saved_group).hlsl_cs()
+    assert 'exec = (s40) & 1;' in saved_text
+
     masked_text = masked_pipeline().hlsl_cs()
     assert masked_text.count('GroupMemoryBarrierWithGroupSync();') == 2
     writes = [line for line in masked_text.splitlines()
@@ -415,10 +454,22 @@ def controls():
     plan_reason(['s_cbranch_scc1 label_0x8', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4')
     plan_reason(['ds_write_b32 v6, v7', 's_cbranch_execz label_0xc', 'ds_read_b32 v8, v6', 's_endpgm'],
                 'ordering point inside per-lane control flow at +0x8', sites={0: 0, 12: 12})
-    plan_reason(['s_mov_b64 exec, 2', 's_endpgm'], 'unproven lane mask 2')
+    plan_reason(['s_mov_b64 exec, 2', 's_mov_b32 exec_lo, -1', 's_endpgm'],
+                'unproven lane mask 2 (wave size unknown)')
+    plan_reason(['s_mov_b64 exec, 0x80000000', 's_endpgm'], 'ambiguous 64-bit literal 0x80000000')
+    for lines in (
+        ['s_mov_b64 s[40:41], exec', 's_mov_b64 exec, 0', 's_mov_b64 exec, s40', 's_barrier', 's_endpgm'],
+        ['s_mov_b32 s40, exec_lo', 's_mov_b32 exec_lo, 1', 's_mov_b32 exec_lo, s40', 's_barrier', 's_endpgm'],
+        ['s_and_saveexec_b32 s40, exec_lo', 's_mov_b32 exec_lo, s40', 's_barrier', 's_endpgm'],
+        ['s_mov_b64 exec, -1', 's_andn2_b64 exec, exec, -1', 's_barrier', 's_endpgm'],
+    ):
+        instructions = [(i * 4, 4, line.split()[0], line) for i, line in enumerate(lines)]
+        assert G.lds_general_plan(instructions, (64, 1, 1), 128) == set(), lines
     plan_reason(['s_mov_b64 exec, s[0:1]', 's_endpgm'], 'unproven lane mask s[0:1]')
     plan_reason(['s_mov_b64 s[40:41], exec', 's_mov_b32 s41, 0',
                  's_mov_b64 exec, s[40:41]', 's_endpgm'], 'unproven lane mask s[40:41]')
+    plan_reason(['s_mov_b64 s[40:41], exec', 's_mov_b64 s39, 0',
+                 's_mov_b64 exec, s40', 's_endpgm'], 'unproven lane mask s40')
     for opcode in ('and', 'andn2', 'or', 'orn2', 'xor'):
         lines = ['v_cmp_gt_u32 vcc, 32, v0', 's_%s_b64 exec, exec, vcc' % opcode,
                  'ds_write_b32 v4, v3', 's_barrier', 's_endpgm']
@@ -433,7 +484,17 @@ def controls():
     invalid, rsrc, group = program('same_wave')
     write = enc.ds_single(0x0d, 4, data0=3)
     scalar_mask = invalid.replace(write, enc.sop1(4, 126, 130) + write)
-    refused('unproven lane mask 2', lambda: G.ComputePipeline(scalar_mask, sibling.root_blob(), rsrc, group))
+    wide_text = G.ComputePipeline(scalar_mask, sibling.root_blob(), rsrc, group).hlsl_cs()
+    assert '0x00000002u' in wide_text and '& 63u' in wide_text
+    andn = invalid.replace(write, enc.sop2(0x15, 126, 126, 193) + write)
+    andn_text = G.ComputePipeline(andn, sibling.root_blob(), rsrc, group).hlsl_cs()
+    assert 'exec = (exec & ~1u)' in andn_text
+    zero = invalid.replace(write, enc.sop1(4, 126, 128) + write)
+    zero_text = G.ComputePipeline(zero, sibling.root_blob(), rsrc, group).hlsl_cs()
+    assert 'exec = (0u) & 1;' in zero_text
+
+    unknown = invalid.replace(write, enc.sop1(4, 126, 130) + enc.sop1(3, 126, 193) + write)
+    refused('unproven lane mask 2 (wave size unknown)', lambda: G.ComputePipeline(unknown, sibling.root_blob(), rsrc, group))
     refused('LDS general lowering: GDS operation', lambda: G.ComputePipeline(
         invalid.replace(write, enc.ds_single(0x0d, 4, data0=3, gds=1)), sibling.root_blob(), rsrc, group))
     refused('LDS general lowering: allocation is 8320 dwords', lambda: G.ComputePipeline(
@@ -484,11 +545,11 @@ def dispatch(dxc, runner, adapter):
             diagnostics = renderer_diagnostics(run.stderr, adapter)
             if run.returncode or diagnostics:
                 raise AssertionError('%s: exit %d %s' % (case_name, run.returncode, run.stderr))
-        for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned', 'masked'):
+        for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned', 'masked', 'lane_zero'):
             src, cso, case = (directory / (name + ext) for ext in ('.hlsl', '.cso', '.case'))
-            src.write_text((masked_pipeline() if name == 'masked' else pipeline(name)).hlsl_cs(), encoding='ascii')
+            src.write_text((masked_pipeline() if name == 'masked' else lane_zero_pipeline() if name == 'lane_zero' else pipeline(name)).hlsl_cs(), encoding='ascii')
             subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-            case.write_bytes(struct.pack('<I', 1) + struct.pack('<%dI' % WORDS, *(masked_reference() if name == 'masked' else simulate(name))) + struct.pack('<16I', *([0] * 16)))
+            case.write_bytes(struct.pack('<I', 1) + struct.pack('<%dI' % WORDS, *(masked_reference() if name == 'masked' else lane_zero_reference() if name == 'lane_zero' else simulate(name))) + struct.pack('<16I', *([0] * 16)))
             run = subprocess.run([str(Path(runner).resolve()), adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
             print(run.stdout, end='')
             if run.returncode == 77:

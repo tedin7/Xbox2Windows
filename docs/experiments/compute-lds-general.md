@@ -16,8 +16,13 @@ guest or inserted barrier unless `compute_dpp_sites` proves the point. This
 rule also applies to scalar branches: wave-uniform SCC does not prove that every
 wave in a group takes the same edge. Backward branches remain refused.
 Lane-local compare masks and tracked lane-mask bitwise operations can update
-EXEC; scalar data and constant mask sources are refused. The general LDS path
-uses the live EXEC bit after newly supported mask writes. Unaligned atomic
+EXEC. The all-zero and all-one constants select the same bit in each lane;
+other constants use the flattened group-thread index modulo the proven guest
+wave size. This assumes waves contain consecutive flat thread IDs. A 32-bit
+EXEC write needs wave32 proof, because on wave64 it only changes the low half.
+Unknown wave sizes, scalar-data masks and 64-bit literals with ambiguous
+extension remain refused. Saved EXEC masks use the lane-mask flow proof. The
+general LDS path uses the live EXEC bit after mask writes. Unaligned atomic
 addresses still require proven alignment.
 
 On Linux, run against the commit containing this note:
@@ -51,3 +56,9 @@ a time, the same command for `startup_compute_lds_b64_check.py`,
 and `startup_gfx2hlsl_compute_check.py`. The write-guard mutant failed the
 general control: the CPU model reads 32 instead of 7 for lane 0. The WARP
 dispatch fixtures were not run on this Python-only host.
+
+On Linux with Python 3.14.8, the working tree based on `6a37665bb` passed
+the five targeted Python controls above using `nice -n 15`, one at a time. The
+wave32 lane-zero fixture writes slots from lanes 0 and 32 and reads them from
+all 64 lanes; its CPU results agree in both wave orders. It is registered in
+the WARP dispatch path, which was not run on this Python-only host.
