@@ -260,9 +260,16 @@ def check_cache_stats():
             "req_000000000000000a.a": b"x", "000000000000000a.txt": b"x", "000000000000000a.vs.cso": b"x",
             "000000000000000a.ps.cso": b"x",                                        # 1 pixel pipeline, ready
             "req_000000000000000b.c67": b"x", "000000000000000b.txt": b"x", "000000000000000b.cs.cso": b"x",  # compute, ready
-            "req_000000000000000c.m57": b"x", "000000000000000c.ms57.txt": b"x", "000000000000000c.ms57.cso": DXBC,
+            # The mesh57 manifest names its request and the digests of the stages it was compiled with (translate_mesh57).
+            "req_000000000000000c.m57": b"x",
+            "000000000000000c.ms57.txt": b"x2w-manifest 1\nmesh57-result x2w-startup-mesh-57-3 000000000000000c "
+                                         b"0000000000000001 0000000000000002\n",
+            "000000000000000c.ms57.cso": DXBC,
             "000000000000000c.ps57.cso": DXBC,                                      # mesh, ready
-            "req_000000000000000d.m57": b"x", "000000000000000d.ms57.txt": b"ps none\n", "000000000000000d.ms57.cso": DXBC,
+            "req_000000000000000d.m57": b"x",
+            "000000000000000d.ms57.txt": b"x2w-manifest 1\nmesh57-result x2w-startup-mesh-57-3 000000000000000d "
+                                         b"0000000000000001 0000000000000000\nps none\n",
+            "000000000000000d.ms57.cso": DXBC,
             "req_000000000000000e.rtv": b"x", "000000000000000e.txt": b"x", "000000000000000e.vs.cso": b"x",
             "000000000000000e.ps.cso": b"x",                                        # a variant request, ready
             "req_0000000000000010.a": b"x", "0000000000000010.fail": b"unsupported\n",   # refused
