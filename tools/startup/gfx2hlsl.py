@@ -31,6 +31,7 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+WAVE_REDUCTION_MASKED = 'wave reduction: EXEC may hold lanes outside the entry mask on some path'
 WAVE_REDUCTION_ENTRY = 'wave reduction: EXEC is not proven to be the entry mask on every incoming path'
 WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at '
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
@@ -4323,6 +4324,7 @@ class Stage:
         self.retry_mask_joins = False
         # Both retries follow a refusal so the original lowering remains byte-identical.
         self.retry_paired_exec = False
+        self.retry_masked_reduction = False
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
@@ -4429,6 +4431,9 @@ class Stage:
         elif (self.retry_wave_reduction and not self.retry_paired_exec
               and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
             self.retry_paired_exec = True
+        elif (self.retry_paired_exec and not self.retry_masked_reduction
+              and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
+            self.retry_masked_reduction = True
         else:
             return False
         self.force_joined.clear()
@@ -6075,6 +6080,149 @@ class Stage:
                     pending.add(target)
         return known
 
+    def boolean_word_sites(self, cfg):
+        """Words equal to zero or all ones on every incoming CFG path."""
+        bounds, _, succ, _ = cfg
+        if not bounds:
+            return {}
+        before, pending, sites = {0: set()}, {0}, {}
+        while pending:
+            block = pending.pop()
+            words = before[block].copy()
+            lo, hi = bounds[block]
+            for off, _, name, asm in self.ins[lo:hi]:
+                sites[off] = words.copy()
+                _, ops, _ = parse(asm)
+                writes = scalar_destinations(name, asm)
+                if 'any' in writes:
+                    words.clear()
+                else:
+                    words.difference_update(writes)
+                if name == 's_cselect_b32' and len(ops) == 3 and set(ops[1:]) == {'0', '-1'}:
+                    r = reg_range(ops[0])
+                    if r and r[0] == 's' and r[1] == r[2]:
+                        words.add(r[1])
+            for target in succ[block]:
+                merged = before[target] & words if target in before else words.copy()
+                if target not in before or before[target] != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return sites
+
+    def masked_reduction_exec_sites(self, cfg):
+        """Must-analysis of exact masks contained in the entry EXEC, including loop edges."""
+        bounds, _, succ, _ = cfg
+        wave = getattr(self.pipe, 'wave_size', None)
+        if not bounds or not (wave == 32 or wave is None and wave32_exec_proof(self.ins)):
+            return set()
+        for _, _, name, asm in self.ins:
+            _, ops, _ = parse(asm)
+            if (name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe'))
+                    or name.startswith('s_') and re.search(r'_(?:b|u|i)64(?:_|$)', name)
+                    or ops and ops[0] in ('exec_hi', 'vcc_hi')):
+                return set()
+
+        # RDNA 2 ISA 3.9: VOPC clears inactive lanes; after widening those
+        # active lanes may include lanes outside the entry EXEC.
+        # N=0, exact mask possibly outside entry=1, exact subset of entry=2.
+        def key(token):
+            if token in ('exec', 'exec_lo'):
+                return 'exec'
+            if token in ('vcc', 'vcc_lo'):
+                return 'vcc'
+            r = reg_range(token)
+            return r[1] if r and r[0] == 's' and r[1] == r[2] else None
+
+        def value(token, state):
+            k = key(token)
+            if k is not None:
+                return state.get(k, 0)
+            try:
+                n = int(token, 0) & 0xffffffff
+                return 2 if n == 0 else 1 if n == 0xffffffff else 0
+            except ValueError:
+                return 0
+
+        def calc(op, args):
+            if op == 'mov':
+                return args[0]
+            if op == 'cselect':
+                return min(args)
+            if not all(args):
+                return 0
+            if op == 'and':
+                return max(args)
+            if op == 'andn2':
+                return args[0]
+            if op in ('or', 'xor'):
+                return min(args)
+            if op in ('orn2', 'nand', 'nor', 'xnor', 'not', 'wqm'):
+                return 1
+            return 0
+
+        def transfer(state, discarded, name, asm):
+            _, ops, mods = parse(asm)
+            old = state.copy()
+            writes = scalar_destinations(name, asm)
+            if 'any' in writes:
+                state.clear()
+            else:
+                for reg in writes:
+                    state.pop(reg, None)
+            if writes_exec(name, ops):
+                state.pop('exec', None)
+            # scalar_effects includes implicit VCC writes; wave32 compares define it.
+            if 'vcc' in scalar_effects(name, asm)[2]:
+                state.pop('vcc', None)
+            if name.startswith('v_cmpx'):
+                state['exec'] = old.get('exec', 0)
+            elif name.startswith('v_cmp'):
+                dst = key(ops[0]) if ops else None
+                if dst is not None:
+                    # A compare under widened EXEC may itself include outside lanes.
+                    state[dst] = old.get('exec', 0)
+            elif name.startswith('s_') and ops:
+                match = re.fullmatch(r's_(mov|cselect|and|andn2|or|xor|orn2|nand|nor|xnor|not|wqm)(?:_saveexec)?_b32', name)
+                if match:
+                    op = match.group(1)
+                    save = '_saveexec_' in name
+                    dest = key(ops[0])
+                    args = [value(t, old) for t in ops[1:]]
+                    if save:
+                        if dest is not None:
+                            state[dest] = old.get('exec', 0)
+                        args.append(old.get('exec', 0))
+                        state['exec'] = calc(op, args)
+                    elif dest is not None and args:
+                        state[dest] = calc(op, args)
+            # RDNA 2 ISA section 3.3: EXEC does not disable scalar instructions.
+            # A VM export discards a host lane; SM 6.7 WaveOpsIncludeHelperLanes
+            # excludes that helper from later wave operations.
+            return state, discarded or name.startswith('exp') and 'vm' in asm.split()
+
+        before = {0: ({'exec': 2}, False)}
+        pending = {0}
+        sites = set()
+        while pending:
+            block = pending.pop()
+            state, discarded = before[block]
+            state = state.copy()
+            lo, hi = bounds[block]
+            for off, _, name, asm in self.ins[lo:hi]:
+                (sites.add if state.get('exec', 0) == 2 and not discarded else sites.discard)(off)
+                state, discarded = transfer(state, discarded, name, asm)
+            for target in succ[block]:
+                if target in before:
+                    prev, flag = before[target]
+                    merged = ({k: min(prev.get(k, 0), state.get(k, 0)) for k in prev.keys() | state.keys()},
+                              flag or discarded)
+                else:
+                    merged = (state.copy(), discarded)
+                if target not in before or before[target] != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return sites
+
     def paired_reduction_exec_sites(self, cfg):
         """Track the outstanding save-and-narrow pairs along every CFG edge."""
         bounds, _, succ, _ = cfg
@@ -6362,11 +6510,14 @@ class Stage:
         if scalar_vote:
             self.wave_exec = True
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.boolean_words_at = self.boolean_word_sites(self.spill_cfg)
         self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
             self.reduction_restores = set()
             self.reduction_widens = set()
+            self.masked_reduction_sites = (self.masked_reduction_exec_sites(self.spill_cfg)
+                                           if self.retry_masked_reduction else set())
             self.reduction_entry_exec = (
                 self.paired_reduction_exec_sites(self.spill_cfg) if self.retry_paired_exec
                 else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
@@ -6937,7 +7088,7 @@ class Stage:
                     del refusals[first_refusal:]
                 continue
             if retry_wave and raised_unsupported is None and self.wave_unsound is None:
-                if self.lane_exec_breaks:
+                if self.lane_exec_breaks and not self.retry_masked_reduction:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_PARTICIPATION + self.lane_exec_breaks[0][1])
                 elif self.reduction_widens - self.recognized_reductions:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_ENTRY)
@@ -9388,13 +9539,22 @@ class Stage:
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
                          if base in ('s_mul_hi_u32', 's_mul_hi_i32')
                          else self.is_lane_mask(dname))
-            # Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask the lane's
-            # bit of the result is exact. Only an SGPR destination is taken; a mixed mask and plain word is not.
+            # Bit i depends only on bit i of each source. A zero/all-ones word
+            # has the same bit in every lane, so its low bit is exact too.
             def mask_source(tok):
                 r = reg_range(tok)
-                return tok in ('vcc', 'vcc_lo', 'exec', 'exec_lo') or bool(
-                    r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks)
+                if tok in ('0', '-1', '0xffffffff'):
+                    return hasattr(self, 'boolean_words_at')
+                if tok in ('vcc', 'vcc_lo', 'exec', 'exec_lo'):
+                    return True
+                if r and r[0] == 's' and r[1] == r[2]:
+                    n = r[1]
+                    sym = self.sym.get(n)
+                    return (n in self.masks or n in getattr(self, 'boolean_words_at', {}).get(getattr(self, 'pc', None), set())
+                            or bool(sym and sym[0] == 'const' and sym[1] in (0, 0xffffffff)))
+                return False
             lane_complement = (word_complement and bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
+                               and any(self.is_lane_mask(t) for t in srcs)
                                and all(mask_source(t) for t in srcs))
             if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):
                 raise Unsupported('%s on a lane mask' % base)
@@ -14988,7 +15148,10 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if retry_wave and pc not in self.reduction_entry_exec:
+        if retry_wave and getattr(self, 'retry_masked_reduction', False):
+            if pc not in self.masked_reduction_sites:
+                raise Unsupported(WAVE_REDUCTION_MASKED)
+        elif retry_wave and pc not in self.reduction_entry_exec:
             raise Unsupported(WAVE_REDUCTION_ENTRY)
         if not getattr(self, 'wave_exec', False):
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
@@ -15125,9 +15288,11 @@ class Stage:
         operand = self.u(source)
         if (getattr(self, 'retry_paired_exec', False)
                 or not self.exec_known and not getattr(self, 'retry_wave_reduction', False)):
-            # Use the chain's identity fill on the paired path, where runtime
-            # EXEC comes from the join. The proof guarantees the entry lanes pass it.
-            # The legacy masked case also gives inactive lanes the identity.
+            # RDNA 2 ISA 3.3, SOP1 saveexec and 6.9 DPP16: the chain fills
+            # disabled guest lanes with the identity before reducing. LLVM
+            # Convergence And Uniformity: voted branches bring the wave together.
+            # HLSL Shader Model 6.6 IsHelperLane and WaveOpsIncludeHelperLanes
+            # exclude helpers; the masked proof excludes them from guest EXEC.
             operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
         value = self.WAVE_REDUCE[op][0].format(operand)
         self.needs_sm6 = True

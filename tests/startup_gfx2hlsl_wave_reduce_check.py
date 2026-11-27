@@ -305,7 +305,7 @@ BRANCH_PAIR = branch_reduction('v_min_u32', result=export('v4', 'v6', 'v8'), pai
 
 
 def paired_program(nested=False, missing=False, overwrite=False, skip_restore=False, loop=False,
-                   missing_inner=False):
+                   missing_inner=False, cmpx_nand=False):
     """Two wave-uniform arms, with per-pixel EXEC inside the selected arm."""
     instructions = []
     labels = {}
@@ -345,7 +345,15 @@ def paired_program(nested=False, missing=False, overwrite=False, skip_restore=Fa
     emit([('v_and_b32_e32 v10, 1, v0', vop2(VOP2_OPS['v_and_b32'], 10, 129, 0)),
           ('v_cmp_lt_u32_e32 vcc_lo, 0, v10',
            struct.pack('<I', 0x7c000000 | (0xc1 << 17) | (10 << 9) | 128))])
-    emit(narrow(13, 106))
+    if cmpx_nand:
+        emit([('s_mov_b32 s13, exec_lo', sop1(S_MOV_B32, 13, EXEC_LO)),
+              ('v_cmpx_lt_u32_e32 0, v10', struct.pack('<I', 0x7c000000 | (0xd1 << 17) | (10 << 9) | 128)),
+              ('s_cmp_eq_u32 0, 1', struct.pack('<I', 0xbf000000 | (6 << 16) | (129 << 8) | 128)),
+              ('s_cselect_b32 s7, -1, 0', sop2(0x0a, 7, 193, 128)),
+              ('s_nand_b32 s7, vcc_lo, s7', sop2(0x18, 7, 106, 7)),
+              ('s_and_b32 exec_lo, s7, exec_lo', sop2(0x0e, EXEC_LO, 7, EXEC_LO))])
+    else:
+        emit(narrow(13, 106))
     if nested:
         jump(8, 's_cbranch_execz', 'outer_restore')
         emit(narrow(14, 128))
@@ -407,11 +415,97 @@ def paired_controls():
             variants.append('missing_inner')
         for variant in variants:
             words = paired_program(nested, **{variant: True})[1]
-            _, reason = translate(words)
-            check(label + ' refuses ' + variant, reason == G.WAVE_REDUCTION_ENTRY, str(reason))
+            accepted, reason = translate(words)
+            check(label + ' accepts subset EXEC for ' + variant + ' (including loops)',
+                  bool(accepted and '(exec & 1u) != 0u) ?' in accepted), str(reason))
         mutant, reason = paired_mutant(paired_program(nested, missing=True)[1])
         check(label + ' translates the missing restore under the proof mutant',
               bool(mutant and mutant != text and 'WaveActiveMin(' in mutant), str(reason))
+
+
+def cmpx_program():
+    body = chain('v_max_u32')
+    skip = sum(len(data) for _, data in body) // 4
+    head = [('s_mov_b32 s6, exec_lo', sop1(S_MOV_B32, 6, EXEC_LO)),
+            ('v_cmpx_lt_u32_e32 0, v1', struct.pack('<I', 0x7c000000 | (0xd1 << 17) | (1 << 9) | 128)),
+            ('s_cbranch_execz label_0000', sopp(8, skip))]
+    return program(start('v_max_u32'), head, body, RESTORE_EXEC, RESULT, END)
+
+
+def masked_unfolded_mutant(words):
+    lower = G.Stage.lower_wave_reduction
+    def unfolded(stage, *args):
+        if not stage.retry_masked_reduction:
+            return lower(stage, *args)
+        paired = stage.retry_paired_exec
+        stage.retry_paired_exec = False
+        try:
+            return lower(stage, *args)
+        finally:
+            stage.retry_paired_exec = paired
+    with patch.object(G.Stage, 'lower_wave_reduction', unfolded):
+        return translate(words)
+
+
+def masked_controls():
+    """Exercise rejection at the real reduction and the all-or-nothing SOP2 operand."""
+    compare = [('v_cmp_lt_u32_e32 vcc_lo, 0, v10',
+                struct.pack('<I', 0x7c000000 | (0xc1 << 17) | (10 << 9) | 128))]
+    for rhs in (128, 129):
+        prefix = compare + [
+            ('s_cmp_eq_u32 0, %d' % (rhs - 128), struct.pack('<I', 0xbf000000 | (6 << 16) | (rhs << 8) | 128)),
+            ('s_cselect_b32 s7, -1, 0', sop2(0x0a, 7, 193, 128)),
+            ('s_nand_b32 s7, vcc_lo, s7', sop2(0x18, 7, 106, 7)),
+            ('s_and_b32 exec_lo, s7, exec_lo', sop2(0x0e, EXEC_LO, 7, EXEC_LO)),
+        ]
+        text, reason = translate(branch_reduction('v_max_u32', prefix)[1])
+        check('masked nand select SCC %s' % (rhs == 128),
+              bool(text and '(exec & 1u) != 0u) ?' in text), str(reason))
+    mutant, mutant_reason = masked_unfolded_mutant(paired_program(missing=True)[1])
+    check('unfolded mutant removes masked fold', bool(mutant and 'WaveActiveMax(v1)' in mutant), str(mutant_reason))
+    text, reason = translate(paired_program(missing=True, cmpx_nand=True)[1])
+    check('cmpx and nand draw fixture translates', bool(text), str(reason))
+    source, words = cmpx_program()
+    text, reason = translate(words)
+    check('cmpx and EXECZ skip translate with masked fold',
+          bool(text and '(exec & 1u) != 0u) ?' in text), str(reason))
+    rng = random.Random(4801)
+    for _ in range(300):
+        inputs = [rng.getrandbits(32) if rng.getrandbits(1) else 0 for _ in range(32)]
+        mask = rng.getrandbits(32)
+        narrowed = mask & sum(1 << i for i, value in enumerate(inputs) if value > 0)
+        if narrowed and run_model(source, inputs, mask, rng).get(1) != reduction('v_max_u32', inputs, narrowed):
+            check('cmpx model reduces narrowed lanes', False)
+            break
+    else:
+        check('cmpx model reduces narrowed lanes', True)
+    bad = [
+        ('all lanes', [('s_mov_b32 exec_lo, -1', sop1(S_MOV_B32, EXEC_LO, INLINE_M1))]),
+        ('compare under widened EXEC', [('s_mov_b32 exec_lo, -1', sop1(S_MOV_B32, EXEC_LO, INLINE_M1))] +
+         compare + [('s_mov_b32 exec_lo, vcc_lo', sop1(S_MOV_B32, EXEC_LO, 106))]),
+        ('numeric mask', [('s_and_b32 exec_lo, 0x5555, exec_lo', sop2(0x0e, EXEC_LO, 255, EXEC_LO, 0x5555))]),
+        ('nand into EXEC', compare + [('s_nand_b32 s7, vcc_lo, vcc_lo', sop2(0x18, 7, 106, 106)),
+                                     ('s_mov_b32 exec_lo, s7', sop1(S_MOV_B32, EXEC_LO, 7))]),
+        ('whole quad', WQM),
+        ('discard then restore', NARROW_EXEC + [('exp null off, off, off, off vm',
+                                  struct.pack('<II', 0xf8001090, 0))] + RESTORE_EXEC),
+    ]
+    for label, prefix in bad:
+        _, reason = translate(branch_reduction('v_max_u32', prefix)[1])
+        check('masked rejects ' + label, bool(reason and (reason == G.WAVE_REDUCTION_MASKED or
+              'wave reduction after s_wqm' in reason)), str(reason))
+    for label, words in [('pair', PAIR[1]), ('branch pair', BRANCH_PAIR[1]),
+                         ('both arms restore', paired_program()[1])]:
+        expected, reason = translate(words)
+        retry = G.Stage.retry_reduction_exec
+        def no_masked(stage, why):
+            if stage.retry_paired_exec:
+                return False
+            return retry(stage, why)
+        with patch.object(G.Stage, 'retry_reduction_exec', no_masked):
+            actual, disabled_reason = translate(words)
+        check(label + ' output unchanged with masked retry disabled',
+              expected is not None and actual == expected, str(reason or disabled_reason))
 
 
 def branch_into_later_readlane():
@@ -510,9 +604,13 @@ def run_model(source, inputs, exec_mask, rng):
     for line in source.splitlines():
         name, ops, mods = G.parse(line)
         base = re.sub(r'_e(32|64)$', '', name)
-        if base in ('v_mul_u32_u24', 'v_lshlrev_b32', 'exp', 's_endpgm') or (base == 'v_mov_b32' and ops[1][0] == 's'):
+        if base in ('v_mul_u32_u24', 'v_lshlrev_b32', 'exp', 's_endpgm', 's_cbranch_execz') or (base == 'v_mov_b32' and ops[1][0] == 's'):
             continue
-        if base == 's_or_saveexec_b32':
+        if base == 's_mov_b32' and ops[1] == 'exec_lo':
+            s[int(ops[0][1:])] = exec_lo
+        elif base == 'v_cmpx_lt_u32':
+            exec_lo &= sum(1 << i for i, x in enumerate(reg(ops[1])) if x > int(ops[0], 0))
+        elif base == 's_or_saveexec_b32':
             s[int(ops[0][1:])], exec_lo = exec_lo, MASK
         elif base == 's_mov_b32' and ops[0] == 'exec_lo':
             exec_lo = s[int(ops[1][1:])]
@@ -722,6 +820,7 @@ def new_controls():
 def controls():
     new_controls()
     paired_controls()
+    masked_controls()
     fills = G.Stage.WAVE_REDUCE_FILLS
     census = G.Stage.__dict__['wave_reduce_cndmask_fill']
     check('the identity fill table holds the census form only', fills == (census,), str(fills))
@@ -803,12 +902,12 @@ def controls():
     text, reason = translate(branch_reduction('v_max_u32', NARROW_EXEC + RESTORE_EXEC)[1])
     check('accepts a proven EXEC restore on the incoming path', text is not None and
           'v2 = WaveActiveMax(v1);' in text, str(reason))
+    for name, before in (('narrowed EXEC', NARROW_EXEC),
+                         ('overwritten saved EXEC', NARROW_EXEC + [('s_mov_b32 s6, 0', sop1(S_MOV_B32, 6, 128))] + RESTORE_EXEC)):
+        text, reason = translate(branch_reduction('v_max_u32', before, END)[1])
+        check('accepts ' + name, bool(text and '(exec & 1u) != 0u) ?' in text), str(reason))
     for name, before, result, fragment in (
-        ('changed EXEC at the reduction', NARROW_EXEC, END, 'EXEC is not proven'),
-        ('saved EXEC overwritten before the restore',
-         NARROW_EXEC + [('s_mov_b32 s6, 0', sop1(S_MOV_B32, 6, 128))] + RESTORE_EXEC,
-         END, 'EXEC is not proven'),
-        ('WQM can enable helpers', WQM, END, 'EXEC is not proven'),
+        ('WQM can enable helpers', WQM, END, 'EXEC may hold lanes outside'),
         ('scratch read across the join', [], END_READS_VP, 'read after the chain'),
     ):
         text, reason = translate(branch_reduction('v_max_u32', before, result)[1])
@@ -1020,13 +1119,12 @@ def check_paired_draws(dxc, renderer, adapter, directory):
     # quads the desktop packed into each wave and which side of the branch it chose.
     fullscreen = TRIANGLE_VS.replace('1.0, 0.37', '3.0, 1.0').replace('-0.61, -1.0', '-1.0, -3.0')
     vs = compile_hlsl(dxc, 'dxc', fullscreen, 'vs_paired', 'vs_6_0', directory)
-    for label, nested in PAIRED_CASES:
-        negative = paired_program(nested, missing=True)[1]
-        _, reason = translate(negative)
-        check(label + ' rejects the missing-restore draw', reason == G.WAVE_REDUCTION_ENTRY, str(reason))
+    for label, nested, cmpx_nand in [(label, nested, False) for label, nested in PAIRED_CASES] + [
+            ('cmpx and nand', False, True)]:
+        negative = paired_program(nested, missing=True, cmpx_nand=cmpx_nand)[1]
         for mutant in (False, True):
             tag = 'paired_%d_mutant_%d' % (nested, mutant)
-            text, reason = (paired_mutant(negative) if mutant else translate(paired_program(nested)[1]))
+            text, reason = masked_unfolded_mutant(negative) if mutant else translate(negative)
             if text is None:
                 check(tag + ' translates', False, str(reason))
                 continue
@@ -1039,15 +1137,14 @@ def check_paired_draws(dxc, renderer, adapter, directory):
                 continue
             readback = out.read_bytes()
             errors, facts = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback)
+            masked_errors, _ = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback, missing_restore=True)
+            mismatch = next((error for error in errors if error.startswith('pixel (')), None)
             if mutant:
-                masked_errors, _ = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback, missing_restore=True)
-                mismatch = next((error for error in errors if error.startswith('pixel (')), None)
-                check(label + ' proof mutant fails the whole-wave comparison and matches missing EXEC',
-                      bool(mismatch) and not masked_errors, str(mismatch) + ' ' + ' / '.join(masked_errors[:3]))
+                check(label + ' unfolded mutant fails the masked reference', bool(masked_errors), str(masked_errors[:3]))
             else:
                 print(run.stdout)
-                check(label + ' matches the CPU reference at every pixel (' + facts + ')',
-                      not errors, ' / '.join(errors[:3]))
+                check(label + ' matches masked and differs from whole-wave reference (' + facts + ')',
+                      not masked_errors and bool(mismatch), str(mismatch) + ' ' + ' / '.join(masked_errors[:3]))
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
