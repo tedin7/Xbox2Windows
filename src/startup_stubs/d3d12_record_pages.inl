@@ -148,6 +148,29 @@ void page_sink(const char* tag, const void* header, std::size_t header_bytes, co
     if (page_target->bytes.size() >= (1u << 20)) page_flush_target();
 }
 
+// A texture placed at a title address has no size in its ResourceInfo (the stand-in notes 0). Its title memory is what the
+// title placed: the size the XG stand-in reported for its description (desktop copyable footprints rounded to 64 KiB).
+// Computed once per resource (pages_lock), again when the wrapper now stands for another resource; 0 for a buffer or
+// when the device cannot size it.
+struct TitleTextureSize {
+    const void* memory;
+    D3D12_RESOURCE_DESC desc;
+    u64 bytes;
+};
+std::unordered_map<const Wrapper*, TitleTextureSize> title_texture_sizes;  // pages_lock
+u64 page_sized_textures;  // pages_lock: textures sized this way, for the counters line
+u64 title_texture_bytes(const Wrapper* w, const void* memory, const D3D12_RESOURCE_DESC& desc)
+{
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN || !the_device)
+        return 0;
+    auto& cached = title_texture_sizes[w];
+    if (cached.memory != memory || std::memcmp(&cached.desc, &desc, sizeof(desc)) != 0) {
+        cached = {memory, desc, xg_reported_bytes(the_device, desc)};
+        if (cached.bytes) ++page_sized_textures;
+    }
+    return cached.bytes;
+}
+
 // Merge page-aligned resource ranges and any enabled named title ranges.
 void page_gather_ranges(bool placed)
 {
@@ -158,10 +181,11 @@ void page_gather_ranges(bool placed)
         for (const auto& item : resource_infos()) {
             const void* memory = item.first->own().title_memory;
             if (!memory) continue;
-            if (!item.second.bytes) { ++unsized; continue; }
-            if (item.second.bytes > page_range_limit) { ++big; continue; }
+            const u64 bytes = item.second.bytes ? item.second.bytes : title_texture_bytes(item.first, memory, item.second.console);
+            if (!bytes) { ++unsized; continue; }
+            if (bytes > page_range_limit) { ++big; continue; }
             const u64 start = reinterpret_cast<u64>(memory) & ~u64{x2w_replay::page_bytes - 1};
-            const u64 end = (reinterpret_cast<u64>(memory) + item.second.bytes + x2w_replay::page_bytes - 1) & ~u64{x2w_replay::page_bytes - 1};
+            const u64 end = (reinterpret_cast<u64>(memory) + bytes + x2w_replay::page_bytes - 1) & ~u64{x2w_replay::page_bytes - 1};
             raw.push_back({start, end - start});
         }
         ReleaseSRWLockShared(&note_lock);
@@ -261,8 +285,9 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
         u64 total = 0;
         for (const PageRange& r : page_ranges) total += r.bytes;
         log("x2w-replay pages: ranges %zu (%llu MiB), pages seen %llu, distinct %llu, zero %llu, unchanged %llu, written %llu MiB, "
-            "skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
-            page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_skipped_no_size,
+            "textures sized %llu, skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
+            page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_sized_textures,
+            page_skipped_no_size,
             page_range_limit >> 20, page_skipped_big, page_unreadable, page_bytes_out >> 20, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart),
             everything ? " (base image)" : "");
     }

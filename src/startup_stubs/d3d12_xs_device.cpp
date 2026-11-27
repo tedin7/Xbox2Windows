@@ -2565,6 +2565,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 std::size_t readable_window(u64 address, std::size_t wanted);
 std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
+u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc);  // d3d12_memory_srv.inl
 #include "startup_stubs/d3d12_record.inl"
 #include "startup_stubs/d3d12_present_pictures.inl"
 

@@ -2016,7 +2016,8 @@ submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
 
 The page budget (`X2W_REPLAY_PAGES_MAX_MIB`, default half of `X2W_REPLAY_MAX_MIB`; `tester_run.ps1 -RecordPagesMaxMiB`)
 is part of the window's cap. Resources larger than `X2W_REPLAY_PAGES_MAX_RANGE_MIB` (default 8;
-`tester_run.ps1 -RecordPageRangeMiB`) are left out. The base image written when the window opens may use 3/4 of the
+`tester_run.ps1 -RecordPageRangeMiB`) are left out. A texture placed at a title address (device slot 133) is sized with
+the footprint the XG stand-in reported for it (the stand-in itself notes no size for it), so its bytes are recorded. The base image written when the window opens may use 3/4 of the
 budget; if it stops there (`x2w-replay pages: the base image stopped at ...`), the range it stopped in and the larger
 ones stay out of the later scans, and the last quarter keeps the window's changed pages (per-frame descriptors,
 constants). `pages: budget of N MiB reached` means the later changes were lost too: the window then replays from stale

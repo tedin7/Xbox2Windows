@@ -325,8 +325,10 @@ def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
                           X2W_TEST_REPLAY_ALLOC108="1"))
     assert code == 0, text[-3000:]
     data = recording.read_bytes()
-    placements, infos, memory, outputs, sizes = set(), set(), set(), set(), {}
+    placements, infos, memory, outputs, sizes, maps = set(), set(), set(), set(), {}, []
     for tag, header, _hb, _payload, _size in chunks(data):
+        if tag == b"MAP ":
+            maps.append(struct.unpack_from("<QQ", data, header))
         if tag == b"CALL":
             seq, _tid, kind, slot = struct.unpack_from("<QIHH", data, header)
             if (kind, slot) == (0, 133):
@@ -345,6 +347,10 @@ def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     assert len(placements) == 1, placements
     [seq] = placements
     assert {(seq, 1), (seq, 4)} <= memory and (seq, 5) in outputs, (seq, sorted(memory), sorted(outputs))
+    # The texture's title memory is in the pages although the stand-in notes no size for a texture placed at an address:
+    # the recorder sizes it with the XG footprint.
+    target = 0x21000000000
+    assert any(address <= target < address + size for address, size in maps), [hex(a) for a, _ in maps]
     whole = pictures(recorded_dir)
     _score, played = replay(player, recording, directory / "placed_replayed", backend, env, presents=6)
     pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
