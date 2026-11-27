@@ -33,7 +33,9 @@ VS = (mov(5, 3.0) + corner(1, 1) + corner(2, 2) + mov(3, 0.25) + mov(4, 1.0)
 VALUES = mov(6, 0.5)
 MRT0 = export(0, (6, 6, 6, 6))
 SINGLE = VALUES + TRAP + MRT0 + END
-MIXED = VALUES + TRAP + export(0, (6, 6, 6, 6), done=False) + export(1, (6, 6, 6, 6)) + END
+TAIL = struct.pack('<3I', 0xfc123456, 0xffffffff, 0xfd135791)
+MIXED = (mov(7, 0.75) + TRAP + export(0, (7, 6, 7, 6), done=False)
+         + export(1, (6, 7, 6, 7)) + END + TAIL)
 REASON = 's_trap'
 DRAWN = REASON + ' (placeholder drawn)'
 
@@ -55,11 +57,66 @@ def result_file(directory, key, extension):
     return directory / ('%016x' % key + extension)
 
 
-def check_requests(directory):
+def check_export_guards():
+    def refused(code, reason):
+        try:
+            G.pixel_export_targets(code)
+        except G.Unsupported as error:
+            assert str(error) == reason, str(error)
+        else:
+            raise AssertionError('placeholder accepted an invalid export signature: ' + reason)
+
+    unreadable = 'unreadable instruction in placeholder pixel program'
+    invalid_export = 'unreadable placeholder pixel export'
+    refused(VALUES + TAIL + MRT0 + END, unreadable)
+    refused(SINGLE[:-len(END)], 'placeholder pixel program has no end')
+    refused(SINGLE + TAIL + MRT0, 'placeholder export after final program end')
+    enter_tail = struct.pack('<I', 0xbf820003)  # Branch across the export and end.
+    back_edge = struct.pack('<I', 0xbf82fffa)
+    refused(enter_tail + MRT0 + END + TAIL[:4] + back_edge, 'placeholder pixel program has no end')
+    refused(SINGLE + export(1, (6, 6, 6, 6), mask=1) + END, invalid_export)
+    refused(VALUES + export(0, (6, 6, 6, 6), mask=7) + END, invalid_export)
+    refused(VALUES + export(10, (6, 6, 6, 6)) + END, invalid_export + ' target')
+    assert G.pixel_export_targets(SINGLE + export(7, (6, 6, 6, 6)) + END + TAIL) == {'mrt0', 'mrt7'}
+    assert G.pixel_export_targets(export(9, (0, 0, 0, 0), mask=0) + END + TAIL) == set()
+
+    decode_instruction = G.D.decode_instruction
+
+    def nonregister(code, offset):
+        size, name, asm, comment = decode_instruction(code, offset)
+        return size, name, asm.replace('v6', '1.0', 1) if name == 'exp' else asm, comment
+
+    # Hardware sources encode VGPR indices. Inject a non-register disassembly operand at the reader boundary.
+    with patch.object(G.D, 'decode_instruction', nonregister):
+        refused(SINGLE, invalid_export)
+
+
+def check_tail_mutant(directory):
+    decode = G.decode
+
+    def reject_tail(code, *args, **kwargs):
+        if kwargs.get('exports_only') and code.endswith(TAIL):
+            raise G.Unsupported('unreadable instruction in placeholder pixel program')
+        return decode(code, *args, **kwargs)
+
+    with patch.object(G, 'decode', reject_tail), patch.dict(os.environ, X2W_FXC='', X2W_PLACEHOLDER_PS='1'):
+        key = request(directory, VS, MIXED, (2, 30))
+        assert G.translate_request(str(directory), key) == 'unsupported: ' + REASON
+        assert not result_file(directory, key, '.txt').exists()
+        assert result_file(directory, key, '.fail').read_text().splitlines()[0] == REASON
+
+
+def check_requests(directory, family_retry):
     supported = request(directory, VS, VALUES + MRT0 + END)
+    supported_tail = request(directory, VS, VALUES + MRT0 + END + TAIL)
     single = request(directory, VS, SINGLE)
-    mixed = request(directory, VS, MIXED, (28, 30))
-    bad_vs = request(directory, TRAP + VS, SINGLE)
+    mixed = request(directory, VS, MIXED, (2, 30))
+    base = G.pipeline_key(VS, MIXED, root_blob())
+    assert G.decode(MIXED)[-1][2] == 's_endpgm'
+    assert G.pixel_export_targets(MIXED) == {'mrt0', 'mrt1'}
+    bad_vertices = [request(directory, struct.pack('<I', 0xbf920000 | n) + VS, SINGLE)
+                    for n in range(G.FAMILY_PROBES)]
+    bad_vs = bad_vertices[0]
     bad_export = request(directory, VS, VALUES + TRAP + export(10, (6, 6, 6, 6)) + MRT0 + END)
 
     def translate(key):
@@ -68,12 +125,14 @@ def check_requests(directory):
     def content(key, extension):
         return result_file(directory, key, extension).read_text(encoding='ascii')
 
-    with patch.dict(os.environ, X2W_FXC='', X2W_PLACEHOLDER_RGB='0,255,0'):
+    with patch.dict(os.environ, X2W_FXC='', X2W_PLACEHOLDER_RGB='0,255,0',
+                    X2W_PRE_RUN_FAMILY_RETRY=family_retry, X2W_RETRY_FAILED='0'):
         os.environ.pop('X2W_PLACEHOLDER_PS', None)
-        assert translate(supported) == 'ok'
+        assert translate(supported) == translate(supported_tail) == 'ok'
         suffixes = ('.vs.hlsl', '.ps.hlsl', '.txt')
-        unchanged = [result_file(directory, supported, ext).read_bytes() for ext in suffixes]
-        for key in (single, mixed, bad_vs):
+        unchanged = {(key, ext): result_file(directory, key, ext).read_bytes()
+                     for key in (supported, supported_tail) for ext in suffixes}
+        for key in (single, mixed, base, *bad_vertices):
             assert translate(key) == 'unsupported: ' + REASON
             assert content(key, '.fail').splitlines()[0] == REASON
             assert not result_file(directory, key, '.txt').exists()
@@ -81,10 +140,14 @@ def check_requests(directory):
 
         os.environ['X2W_PLACEHOLDER_PS'] = '1'
         assert single in G.pending_keys(str(directory), True)
-        assert translate(supported) == 'ok'
-        assert unchanged == [result_file(directory, supported, ext).read_bytes() for ext in suffixes]
+        assert translate(supported) == translate(supported_tail) == 'ok'
+        assert all(result_file(directory, key, ext).read_bytes() == data for (key, ext), data in unchanged.items())
+        weights = dict.fromkeys(bad_vertices, 1)
+        report = G.retry_lifted(str(directory), jobs=1, weights=weights)
+        assert (report.keys, report.ok, report.refused, report.skipped) == (len(bad_vertices) + 3, 0,
+                                                                            len(bad_vertices) + 3, 0)
+        assert G.retry_lifted(str(directory), jobs=1).keys == 0
         for key, targets in ((single, '0'), (mixed, '0 1')):
-            assert translate(key) == 'ok'
             manifest = content(key, '.txt').splitlines()
             assert 'placeholder ps ' + REASON in manifest and 'targets ' + targets in manifest
             assert content(key, '.fail').splitlines().count(DRAWN) == 1
@@ -92,11 +155,12 @@ def check_requests(directory):
             assert key not in G.pending_keys(str(directory), True)
         assert 'uint4 mrt1 : SV_Target1;' in content(mixed, '.ps.hlsl')
         assert translate(bad_vs) == translate(bad_export) == 'unsupported: ' + REASON
-        for key in (bad_vs, bad_export):
+        for key in (*bad_vertices, bad_export):
             assert not result_file(directory, key, '.txt').exists()
+            assert G.PLACEHOLDER_ATTEMPT in content(key, '.fail').splitlines()
         assert bad_vs not in G.pending_keys(str(directory), True)
         rows = tester_pack.cache_results(str(directory))
-        assert [(status, reason) for key, _, status, reason in rows if key == '%016x' % single] == [('refused', DRAWN)]
+        assert [(status, reason) for key, _, status, reason in rows if key == '%016x' % mixed] == [('refused', DRAWN)]
         assert tester_pack.clean_reason('long reason ' * 30 + DRAWN).endswith(G.PLACEHOLDER_DRAWN)
         with patch.dict(os.environ, X2W_FXC='fxc.exe'):
             assert single in G.pending_keys(str(directory), True)  # source-only result needs bytecode
@@ -104,25 +168,32 @@ def check_requests(directory):
         depth_code = VALUES + TRAP + export(8, (6, 0, 0, 0), mask=1, done=False) + MRT0 + END
         depth = G.Pipeline(VS, depth_code, root_blob()).hlsl_ps()
         assert 'float depth : SV_Depth;' in depth and 'o.depth = pos.z;' in depth
+        shaders = tuple(content(key, '.ps.hlsl') for key in (single, mixed))
         os.environ['X2W_PLACEHOLDER_RGB'] = 'bad'
         assert G.placeholder_rgb() == (255, 0, 255)
-        assert single in G.pending_keys(str(directory), True)
-        assert '255.0/255.0, 0.0/255.0, 255.0/255.0' in G.Pipeline(VS, SINGLE, root_blob()).hlsl_ps()
+        assert mixed in G.pending_keys(str(directory), True)
+        assert G.retry_lifted(str(directory), jobs=1).refused == 3
+        assert 'placeholder rgb 255,0,255' in content(mixed, '.txt')
+        assert '255.0/255.0, 0.0/255.0, 255.0/255.0' in content(mixed, '.ps.hlsl')
+        assert content(mixed, '.fail').splitlines()[0] == DRAWN
         os.environ['X2W_PLACEHOLDER_PS'] = '0'
-        assert single in G.pending_keys(str(directory), True)
-        shaders = tuple(content(key, '.ps.hlsl') for key in (single, mixed))
-        assert translate(single) == 'unsupported: ' + REASON
-        assert not result_file(directory, single, '.txt').exists()
-        assert content(single, '.fail').splitlines()[0] == REASON
+        assert mixed in G.pending_keys(str(directory), True)
+        assert G.retry_lifted(str(directory), jobs=1).refused == 3
+        for key in (single, mixed, base):
+            assert not result_file(directory, key, '.txt').exists()
+            assert content(key, '.fail').splitlines()[0] == REASON
+        assert all(result_file(directory, key, ext).read_bytes() == data for (key, ext), data in unchanged.items())
+        rows = tester_pack.cache_results(str(directory))
+        assert [(status, reason) for key, _, status, reason in rows if key == '%016x' % mixed] == [('refused', REASON)]
     return content(supported, '.vs.hlsl'), shaders
 
 
-def compare(data, reference, tolerance, label, expected_mismatches=0):
-    assert len(data) == len(reference) * 64, f'{label}: expected 256 bytes, got {len(data)}'
+def compare(data, layout, reference, label, expected_mismatches=0):
+    size = struct.calcsize(layout) * 64
+    assert len(data) == size, f'{label}: expected {size} bytes, got {len(data)}'
     mismatches = []
-    for index in range(64):
-        pixel = tuple(data[index * 4:index * 4 + 4])
-        if any(abs(actual - want) > tolerance for actual, want in zip(pixel, reference)):
+    for index, pixel in enumerate(struct.iter_unpack(layout, data)):
+        if pixel != reference:
             mismatches.append((index % 8, index // 8, pixel))
     assert len(mismatches) == expected_mismatches, (
         f'{label}: {len(mismatches)} differing pixels, expected {expected_mismatches}. '
@@ -150,23 +221,36 @@ def draw_checks(directory, vs_source, shaders, dxc, renderer):
         print(run.stdout, end='')
         return output.read_bytes()
 
-    clear, green, integer = (0, 0, 0, 255), (0, 255, 0, 255), (1, 2, 3, 1)
-    compare(readback('-', 'color'), clear, 0, 'refused')
-    compare(readback(single, 'color'), green, 1, 'single MRT0')
+    clear, green, integer = (-1.0,) * 4, (0.0, 1.0, 0.0, 1.0), (1, 2, 3, 1)
+    compare(readback('-', 'color'), '<4f', clear, 'refused')
+    compare(readback(single, 'color'), '<4f', green, 'single MRT0')
+    float_bytes = struct.calcsize('<4f') * 64
     valid = readback(mixed, 'mixed')
-    compare(valid[:256], green, 1, 'mixed MRT0')
-    compare(valid[256:], integer, 0, 'mixed MRT1')
-    # Substitute the one-export placeholder into the two-target draw.
-    mutant = readback(single, 'mixed')
-    compare(mutant[:256], green, 1, 'mutant MRT0')
-    compare(mutant[256:], integer, 0, 'mutant MRT1', expected_mismatches=64)
-    print('64 pixels match each CPU reference. The MRT0-only mutant fails all 64 MRT1 comparisons.')
+    compare(valid[:float_bytes], '<4f', green, 'mixed MRT0')
+    compare(valid[float_bytes:], '<4B', integer, 'mixed MRT1')
+    # The tail-rejection mutant published no shader. Both targets retain their clear values.
+    mutant = readback('-', 'mixed')
+    compare(mutant[:float_bytes], '<4f', clear, 'tail mutant MRT0 clear')
+    compare(mutant[float_bytes:], '<4B', (0, 0, 0, 1), 'tail mutant MRT1 clear')
+    compare(mutant[:float_bytes], '<4f', green, 'tail mutant MRT0', expected_mismatches=64)
+    compare(mutant[float_bytes:], '<4B', integer, 'tail mutant MRT1', expected_mismatches=64)
+    one_export = readback(single, 'mixed')
+    compare(one_export[:float_bytes], '<4f', green, 'single-export mutant MRT0')
+    compare(one_export[float_bytes:], '<4B', integer, 'single-export mutant MRT1', expected_mismatches=64)
+    print('64 pixels match each CPU reference. The tail-rejection mutant differs at all 64 pixels on both targets.')
 
 
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        vs, shaders = check_requests(directory)
+        check_export_guards()
+        mutant_dir = directory / 'mutant'
+        mutant_dir.mkdir()
+        check_tail_mutant(mutant_dir)
+        legacy = directory / 'legacy'
+        legacy.mkdir()
+        check_requests(legacy, '0')
+        vs, shaders = check_requests(directory, '1')
         print('placeholder request, cache, export signature, and refusal checks passed')
         if len(sys.argv) == 4 and sys.argv[1] == 'draw':
             draw_checks(directory, vs, shaders, *sys.argv[2:])
