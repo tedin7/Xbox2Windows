@@ -37,6 +37,7 @@ one that zero-extends the byte (no sext()), must each fail the draw against the 
 plain-integer image.
 The binary32 class draw selects the negative-normal mask bit from BYTE_1. Reading the whole dword must fail.
 """
+import operator
 import struct
 import subprocess
 import sys
@@ -463,7 +464,109 @@ def class_pixel_hlsl(select=True):
     return text
 
 
+HALF_RELATIONS = ((0xc9, operator.lt), (0xca, operator.eq), (0xcb, operator.le),
+                  (0xcc, operator.gt), (0xce, operator.ge), (0xed, operator.ne))
+HALF_WORDS = (0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400,
+              0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e01, 0xfd01)
+WORD_SELECTS = (('WORD_0', 'WORD_0'), ('WORD_0', 'WORD_1'), ('WORD_1', 'WORD_0'), ('WORD_1', 'WORD_1'))
+INLINE_HALVES = ((128, 0x0000), (129, 0x0001), (242, 0x3c00), (128, 0x0000))
+
+
+def packed_half(index, shift):
+    return HALF_WORDS[index] | HALF_WORDS[(index + shift) % len(HALF_WORDS)] << 16
+
+
+def half_program(*, inline=False, high_reads_low=False):
+    """Select two packed inputs by pixel position and export a predicate bitset per channel."""
+    def words(*values):
+        return struct.pack('<%dI' % len(values), *values)
+
+    def mov(dst, value):
+        return words(0x7e0002ff | dst << 17, value)
+
+    # The screen position is x | (y << 16). Fill v1 and v2 with different
+    # permutations in each half so changing a selector changes the image.
+    code = words(0x360000ff | 4 << 17, 0xffff, 0x2c000090 | 5 << 17)
+    for dst, coord, shift in ((1, 4, 5), (2, 5, 9)):
+        code += mov(dst, packed_half(0, shift))
+        for index in range(1, len(HALF_WORDS)):
+            code += mov(6, packed_half(index, shift))
+            code += words(0x7d840080 | coord << 9 | index,
+                          0x02000000 | dst << 17 | 6 << 9 | (256 + dst))
+    for channel, (sel0, sel1) in enumerate(WORD_SELECTS):
+        dst = 20 + channel
+        cmpx = inline and channel >= 2
+        sdst = SGPR_DST if channel & 1 and not cmpx else None
+        lhs = source('s', INLINE_HALVES[channel][0]) if inline else source('v', 1)
+        if inline:
+            sel0 = 'WORD_1' if channel == 3 else 'WORD_0'
+        if high_reads_low:
+            sel0 = sel1 = 'WORD_0'
+        code += mov(dst, 0x3f800000)  # normal float with low output bits free
+        if cmpx:
+            code += words(0xbe90047e)  # s_mov_b64 s[16:17], exec
+        for bit, (op, _) in enumerate(HALF_RELATIONS):
+            code += vopc_sdwa(op + (0x10 if cmpx else 0), lhs, source('v', 2), sdst, sel0, sel1)
+            if cmpx:
+                code += words(0x38000080 | dst << 17 | dst << 9 | (1 << bit), 0xbefe0410)
+            else:
+                mask = 106 if sdst is None else sdst
+                code += words(0xd501000a, 128 | (128 + (1 << bit)) << 9 | mask << 18,
+                              0x38000000 | dst << 17 | 10 << 9 | (256 + dst))
+    return code + words(0xf800180f, 0x17161514, 0xbf810000)
+
+
+def half_reference(*, inline=False, high_reads_low=False):
+    def half(raw):
+        return struct.unpack('<e', struct.pack('<H', raw))[0]
+
+    result = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            for channel, (sel0, sel1) in enumerate(WORD_SELECTS):
+                low0 = high_reads_low or sel0 == 'WORD_0'
+                low1 = high_reads_low or sel1 == 'WORD_0'
+                a = INLINE_HALVES[channel][1] if inline else HALF_WORDS[(x + (0 if low0 else 5)) % WIDTH]
+                b = HALF_WORDS[(y + (0 if low1 else 9)) % HEIGHT]
+                bits = sum(int(compare(half(a), half(b))) << bit for bit, (_, compare) in enumerate(HALF_RELATIONS))
+                result.append(0x3f800000 | bits)
+    return result
+
+
+def half_hlsl(**kwargs):
+    return G.Pipeline(VS_WORDS, half_program(**kwargs), root_blob(), ps_hw_inputs=PACKED).hlsl_ps()
+
+
+def check_half_fixture():
+    asm, stage = translate(vopc_sdwa(0xc9, source('s', 128), source('v', 24), None, 'WORD_0', 'WORD_1'))
+    check('binary16 zero-inline fixture decodes',
+          asm == 'v_cmp_lt_f16_sdwa vcc_lo, 0, v24 src0_sel:WORD_0 src1_sel:WORD_1', asm)
+    check('binary16 WORD_1 reads v24 bits 31:16',
+          'f16tof32(((v24 >> 16u) & 0xffffu))' in stage.lines[0], str(stage.lines))
+    for inline in (False, True):
+        text = half_hlsl(inline=inline)
+        check('all 24 binary16 predicates lower (inline=%s)' % inline,
+              text.count(' ? 1u : 0u)') >= 24 and 'f16tof32(' in text)
+        check('binary16 WORD_1 mutation changes the CPU image (inline=%s)' % inline,
+              half_reference(inline=inline) != half_reference(inline=inline, high_reads_low=True))
+    for sel in SELS:
+        if sel.startswith('BYTE_'):
+            for sels in ((sel, 'WORD_1'), ('WORD_0', sel)):
+                name, asm = decode_one(vopc_sdwa(0xc9, source('v', 1), source('v', 2), None, *sels))
+                check('binary16 refuses %s' % asm, refusal(name, asm) == name + ': f16 SDWA requires WORD_0 or WORD_1')
+    for index in (0, 1):
+        args = [source('s', 128), source('v', 2)]
+        args[index]['sext'] = True
+        decoded = G.decode(vopc_sdwa(0xc9, *args, None, 'WORD_0', 'WORD_1'))[0]
+        check('decoder refuses binary16 src%d sext' % index, '<unsupported SDWA>' in decoded[3], str(decoded))
+    name = 'v_cmp_lt_f16_sdwa'
+    check('translator refuses binary16 sext',
+          refusal(name, name + ' vcc_lo, sext(v1), v2 src0_sel:WORD_0 src1_sel:WORD_1')
+          == name + ': sext() on a float source')
+
+
 def check_fixture():
+    check_half_fixture()
     decoded = [asm for _o, _s, _n, asm in G.decode(PS_WORDS)]
     check('pixel fixture decodes to its source', decoded == PS_SOURCE.splitlines(), str(decoded))
     text = pixel_hlsl()
@@ -586,6 +689,17 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             run = draw(renderer, adapter, vs, bad_class, class_unselected)
             check('%s %s: class mutation matches the whole-dword image' % (kind, adapter),
                   run.returncode == 0, run.stdout + run.stderr)
+            for inline in (False, True):
+                tag = '%s_half_%s' % (kind, 'inline' if inline else 'registers')
+                good = words_file(directory, tag, half_reference(inline=inline))
+                for high_reads_low in (False, True):
+                    shader = compile_hlsl(compiler, kind, half_hlsl(inline=inline, high_reads_low=high_reads_low),
+                                          tag + ('_wrong_half' if high_reads_low else ''), ps_profile, directory)
+                    run = draw(renderer, adapter, vs, shader, good)
+                    passed = (run.returncode == 1 and 'pixel mismatch' in run.stderr if high_reads_low else
+                              run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout)
+                    check('%s %s high_reads_low=%s' % (adapter, tag, high_reads_low),
+                          passed, run.stdout + run.stderr)
 
 
 def main():

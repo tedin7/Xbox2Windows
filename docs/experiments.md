@@ -6,6 +6,8 @@ New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiment
 
 [Startup pixel image atomics](experiments/startup-pixel-image-atomics.md) documents the unsigned UAV readback and runtime format checks.
 
+[Startup pixel EXEC masks and binary16 compares](experiments/startup-pixel-interp-masks.md) records the explicit-LOD and mask subset proofs and their synthetic readback fixtures.
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
