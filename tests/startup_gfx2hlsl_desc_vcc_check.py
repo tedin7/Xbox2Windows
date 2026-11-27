@@ -101,7 +101,7 @@ def check_mask_draw(dxc, renderer, adapter):
     # hlsl_vs() elides parameters if the pipeline has no translated pixel stage.
     # Request a translated PS that copies param0 to the target.
     ps_code = bytes.fromhex(
-        '0203fcbe 025002c8 025106c8 02520ac8 02530ec8 0f1800f814151617 000081bf')
+        '0203fcbe 020052c8 020156c8 02025ac8 02035ec8 0f1800f814151617 000081bf')
     pipe = G.Pipeline(MASK_VS, ps_code, TABLE_ROOT)
     source = pipe.hlsl_vs()
     assert source.count(MASK_MOVE) == 1
