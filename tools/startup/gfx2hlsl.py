@@ -31,6 +31,7 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+WAVE_SCC_UNPROVEN = 'wave-wide read in a program with a branch (s_cbranch_scc'
 WAVE_REDUCTION_MASKED = 'wave reduction: EXEC may hold lanes outside the entry mask on some path'
 WAVE_REDUCTION_ENTRY = 'wave reduction: EXEC is not proven to be the entry mask on every incoming path'
 WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at '
@@ -4327,6 +4328,7 @@ class Stage:
         self.retry_masked_reduction = False
         # A retry for a loop laid out latch first (see latch_only_targets), only after a refusal at a join there.
         self.retry_latch = False
+        self.retry_uniform_readlane = False  # after a scalar branch refusal: reduction results are wave-uniform
         self.latch_mask_keep = {}  # latch -> marks a back edge into it still carries (verified, from earlier passes)
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
@@ -4469,6 +4471,10 @@ class Stage:
         elif (self.retry_paired_exec and not self.retry_masked_reduction
               and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
             self.retry_masked_reduction = True
+        elif (self.retry_wave_reduction and not getattr(self, 'retry_uniform_readlane', False)
+              and reason.startswith(WAVE_SCC_UNPROVEN)):
+            # A scalar branch on a reduction result: retry with that result wave-uniform (lower_wave_readlane).
+            self.retry_uniform_readlane = True
         else:
             return False
         self.force_joined.clear()
@@ -5072,10 +5078,36 @@ class Stage:
         target (so it runs on every path into the target) replaces it."""
         index, block_of, _succ, dom, _writes, _reached = self.flow
         target_block = block_of[index[target]]
+        if getattr(self, 'retry_latch', False):
+            return any(self.write_reaches_block(write, reg, target_block)
+                       for write in self.__dict__.get('bad_write_pcs', {}).get(reg, ()))
         proven = self.__dict__.get('uniform_write_pcs', {}).get(reg, ())
         return any(write < target and not any(write < later < target and block_of[index[later]] in dom[target_block]
                                               for later in proven)
                    for write in self.__dict__.get('bad_write_pcs', {}).get(reg, ()))
+
+    def write_reaches_block(self, write, reg, target_block):
+        """Reaching definitions over the CFG, loops included: True if the write of reg at offset `write` can be the
+        value of reg on entry to target_block, i.e. some CFG path from just after the write enters target_block
+        without passing another write of reg (a write later in the write's own block, or any block that writes reg)."""
+        index, block_of, succ, _dom, writes, _reached = self.flow
+        at = index[write]
+        start = block_of[at]
+        i = at + 1
+        while i < len(self.ins) and block_of[i] == start:
+            if reg in scalar_destinations(*self.ins[i][2:]) or 'any' in scalar_destinations(*self.ins[i][2:]):
+                return False
+            i += 1
+        seen, todo = set(), list(succ[start])
+        while todo:
+            b = todo.pop()
+            if b == target_block:
+                return True
+            if b in seen or reg in writes[b]:
+                continue
+            seen.add(b)
+            todo.extend(succ[b])
+        return False
 
     def record_scalar_uniformity(self, n, uniform):
         if uniform:
@@ -6866,6 +6898,17 @@ class Stage:
                         r for r in pre_uniform
                         if r not in clobber or (r not in fwd_clobber and r not in blocked)
                     }
+                    if getattr(self, 'retry_latch', False) and self.wave_exec:
+                        # retry_latch with every branch a wave decision (wave_exec; any other branch makes the stage
+                        # wave_unsound and refuses): all threads of the wave take one path, so a register is uniform
+                        # at a join when no unproven write reaches it over the CFG (bad_write_reaches, loops
+                        # included), whatever arm wrote it. Kept tentatively, refuted by bad_sgprs on a rerun. A latch
+                        # entered only by back edges has no program-order state at all: every plain register.
+                        kept_u |= (pre_uniform & clobber) - blocked
+                        if off in self.latch_assumed:
+                            latch_kept = {r for r in clobber if isinstance(r, int) and r <= 105} - blocked - self.masks
+                            kept_u |= latch_kept
+                            self.varying_s -= latch_kept
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
@@ -7138,7 +7181,9 @@ class Stage:
                     self.descriptor_block_first = instruction_index + 1
 
             new_bad = self.bad_sgprs - force_unproven
-            if getattr(self, 'kind', None) == 'ps' and not back_targets and getattr(self, 'flow', None) is not None:
+            if (getattr(self, 'kind', None) == 'ps' and (not back_targets or getattr(self, 'retry_latch', False))
+                    and getattr(self, 'flow', None) is not None):
+                # retry_latch: bad_write_reaches follows reaching definitions over the CFG, so loops are fine.
                 # No loop can bring a later write back to an earlier join: block a register only at the joins its
                 # unproven write can still reach, so a proven rewrite further down lets it be trusted again.
                 for reg in [r for r in new_bad if isinstance(r, int) and r in self.__dict__.get('bad_write_pcs', {})]:
@@ -15390,7 +15435,10 @@ class Stage:
         if claim is not None and not claim[0]:
             raise Unsupported('wave reduction: the later readlane of the v_min_u32 chain is not carried by a v_max_u32 '
                               'chain')
-        self.set_s(sd, self.u('v%d' % vt), uniform=False)
+        # retry_uniform_readlane: the WaveActive* result is the same in every lane that takes part, every non-helper
+        # lane of the converged host wave (helpers never take part and get no defined value: the contract of the host
+        # votes, which also exclude them). A scalar branch on it is then a wave decision like a vote.
+        self.set_s(sd, self.u('v%d' % vt), uniform=bool(getattr(self, 'retry_uniform_readlane', False)))
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
