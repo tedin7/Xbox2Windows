@@ -3649,10 +3649,19 @@ snapshot by device, address, size and bytes. A changed publication uses a separa
 so older descriptors retain their original bytes until device cleanup. To observe a title
 write through a desktop descriptor, publish the SRV again. The switch defaults to off.
 
+The `memory SRV switches` census follows the slot 70 refusal census. A snapshot
+attempt counts either a new backing or a failed attempt. Reusing unchanged bytes
+increments the bind count only. The byte count includes bytes copied into new
+backings. The regular buffer refusal cache can skip the regular lookup while the
+snapshot path still checks the requested bytes. The tester archive summarizes the
+latest cumulative buffer, texture alias and 1D counts in `null-inputs.txt`.
+
 On Windows, run
-`ctest --preset dev --no-tests=error -R '^startup_slot70_memory_buffer_(enabled|off|stale)_warp$'`.
-The fixture publishes a synthetic 256-byte SRV inside a partially committed reservation and
-compares native compute readback with CPU data. The off control checks the refusal and null
+`ctest --preset dev --no-tests=error -R '^startup_slot70_memory_buffer_(enabled|off|stale|recover|cache_first)_warp$'`.
+The fixture publishes a synthetic 256-byte SRV inside a partially committed reservation
+and compares WARP draw readback with CPU data. The recovery case first caches a refusal
+and then makes the requested bytes readable while the cache witness stays reserved.
+The cache-first mutant must sample null. The off control checks the refusal and null
 readback. The stale mutant must fail the refreshed readback with the first generation.
 
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,

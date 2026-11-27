@@ -130,6 +130,7 @@ constexpr int slot_count = 512;
 // Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
+x2w_startup::MemorySrvSwitchCensus memory_srv_switch_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
@@ -6026,6 +6027,7 @@ void note_slot133_texture(Wrapper* device, Wrapper* texture, const D3D12_RESOURC
     const u64 span = slot70_texture_alias_enabled() && x2w_startup::gfx10::supports(*desc)
         ? x2w_startup::gfx10::Layout(*desc).bytes() : 0;
     note_resource(texture, desc, 0, span ? device : nullptr, span);
+    if (span) ++memory_srv_switch_census.alias_registered;
 }
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
@@ -8348,6 +8350,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
         memory_srv_census.report([](const char* line) { log("%s", line); }, true);
+        memory_srv_switch_census.report([](const char* line) { log("%s", line); }, true);
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
@@ -8376,6 +8379,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
     memory_srv_census.report(emit, false);
+    memory_srv_switch_census.report(emit, false);
     token_null_census.report(emit, false);
     x2w_startup::NullInputCensus::Batch null_report;
     draw_lock_acquire_exclusive();

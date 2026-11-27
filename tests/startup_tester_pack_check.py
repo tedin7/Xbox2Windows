@@ -874,7 +874,12 @@ def check_null_inputs():
     other = row.format(1, 2).replace("input 1", "input 2")
     target = "x2w-render target abc (4x2 format 28): draws 2, with a null input 1 frames 1..2"
     clean = "x2w-render target abc (4x2 format 28): draws 3, with a null input 0 frames 3..5"
-    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean])
+    switches = ("x2w-d3d12 memory SRV switches: snapshot attempts 4 bound 6 bytes 512 not_readable 1 "
+                "over_limit 1 allocation 0 view_does_not_fit 0 cached_skip 0 cached_rechecks 2; alias registered 3 resolved 2 "
+                "unreadable 1 (texture_unreadable: CPU source range); 1D published 1 bound 3 refused 2 "
+                "unsupported_desktop_format=2")
+    stale = switches.replace("attempts 4", "attempts 1").replace("resolved 2", "resolved 0")
+    stderr = "\n".join([row.format(1, 1), other, target, stale, row.format(2, 5), clean, switches])
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "run"
         run.mkdir()
@@ -887,6 +892,10 @@ def check_null_inputs():
     assert row.format(1, 1) not in section
     assert f"{target} (50.0% poisoned)" in section
     assert f"{clean} (0.0% poisoned)" in section
+    summary = ["memory buffers: bound 6 of 4 attempts", "texture aliases: resolved 2",
+               "1D textures: bound 3, refused 2"]
+    assert section.splitlines()[-3:] == summary
+    assert T.null_inputs_section(switches).splitlines()[-3:] == summary
     assert not T.null_inputs_section("unrelated log")
 
 

@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -61,6 +62,50 @@ inline bool memory_srv_reason_has_shape(int reason)
            reason != memory_srv_reason_index("unreadable_resource") && reason != memory_srv_reason_index("unreadable_view") &&
            reason != memory_srv_reason_index("null_address") && reason != memory_srv_reason_index("destination_outside_view_heaps");
 }
+
+struct MemorySrvSwitchCensus {
+    using Count = std::atomic<unsigned long long>;
+    Count attempts{}, bound{}, bytes{}, not_readable{}, over_limit{}, allocation{}, view_does_not_fit{};
+    Count cached_skip{}, cached_rechecks{};
+    Count alias_registered{}, alias_resolved{}, alias_unreadable{};
+    Count one_d_published{}, one_d_bound{};
+    Count one_d_refused[memory_srv_reason_count + 1]{};
+
+    template<class Emit>
+    void report(Emit emit, bool only_if_changed)
+    {
+        char line[4096];
+        unsigned long long refused = 0;
+        unsigned long long by_reason[memory_srv_reason_count + 1];
+        for (int i = 0; i <= memory_srv_reason_count; ++i) {
+            by_reason[i] = one_d_refused[i].load(std::memory_order_relaxed);
+            refused += by_reason[i];
+        }
+        const auto a = attempts.load(), b = bound.load(), copied = bytes.load();
+        const auto unreadable = not_readable.load(), limit = over_limit.load(), alloc = allocation.load();
+        const auto fit = view_does_not_fit.load(), skip = cached_skip.load(), rechecks = cached_rechecks.load();
+        const auto registered = alias_registered.load(), resolved = alias_resolved.load(), missed = alias_unreadable.load();
+        const auto published = one_d_published.load(), views = one_d_bound.load();
+        const auto total = a + b + copied + unreadable + limit + alloc + fit + skip + rechecks +
+                           registered + resolved + missed + published + views + refused;
+        if (!total || (only_if_changed && last_reported_.exchange(total) == total)) return;
+        int n = std::snprintf(line, sizeof(line),
+            "x2w-d3d12 memory SRV switches: snapshot attempts %llu bound %llu bytes %llu "
+            "not_readable %llu over_limit %llu allocation %llu view_does_not_fit %llu cached_skip %llu cached_rechecks %llu; "
+            "alias registered %llu resolved %llu unreadable %llu (texture_unreadable: CPU source range); "
+            "1D published %llu bound %llu refused %llu",
+            a, b, copied, unreadable, limit, alloc, fit, skip, rechecks, registered, resolved, missed, published, views, refused);
+        for (int i = 0; i <= memory_srv_reason_count; ++i) {
+            if (!by_reason[i]) continue;
+            n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu",
+                               i == memory_srv_reason_count ? "other" : memory_srv_reasons[i], by_reason[i]);
+        }
+        emit(line);
+    }
+
+private:
+    Count last_reported_{};
+};
 
 struct RefusedShape {
     int reason;
