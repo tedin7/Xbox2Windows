@@ -98,10 +98,10 @@ void check_depth_writers()
     expect(has("func GREATER, viewport 0,0 2560x1440 depth 0..1, scissor 0,0..2560,1440, cull back (front ccw), depth clip 0, view "
                "last cleared to 0.0, a fragment can pass the test against the clear: yes: 1 draws (state 3 of the first 32)"),
            "GREATER on a view cleared to 0.0 can pass");
-    x2w_depth_census::DepthWrite far = less;
-    far.func = 7, far.min_depth = 1;
+    x2w_depth_census::DepthWrite far_range = less;
+    far_range.func = 7, far_range.min_depth = 1;
     census.executed(&shadow, 1.0f, x2w_depth_census::clear_depth_flag);
-    census.depth_write_draw(&shadow, far);
+    census.depth_write_draw(&shadow, far_range);
     expect(has("func GREATER_EQUAL, viewport 0,0 2560x1440 depth 1..1, scissor 0,0..2560,1440, cull back (front cw), depth clip 1, "
                "view last cleared to 1.0, a fragment can pass the test against the clear: only at depth 1: 1 draws (state 4 of"),
            "another depth resource is its own state");
