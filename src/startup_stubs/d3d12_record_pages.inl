@@ -284,9 +284,9 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
     // it, or it closes before a second frame is recorded.
     if (everything && placed && end_s < 1e300) {
         const double took = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(frequency.QuadPart);
-        end_s += took;
-        log("x2w-replay record: the base image took %.3f s: the window now ends at %.3f s (was %.3f s)", took, end_s,
-            end_s - took);
+        const double was = end_s;
+        end_s = was + took;
+        log("x2w-replay record: the base image took %.6f s: the window now ends at %.6f s (was %.6f s)", took, end_s, was);
     }
     if (everything || page_scans % 20 == 0) {
         const x2w_replay::PageStats& s = page_writer->stats();

@@ -172,7 +172,7 @@ def main(scene, backend):
         base = re.search(r"the base image took ([0-9.]+) s: the window now ends at ([0-9.]+) s \(was ([0-9.]+) s\)", text)
         assert base, text[-3000:]
         took, ends, was = map(float, base.groups())
-        assert abs(ends - was - took) < 0.002, base.group(0)
+        assert took > 1e-5 and abs(ends - was - took) < 2e-6, base.group(0)
         end_totals(slow)
 
         # A present ends the window at the end of the scene: a finisher thread writes the shader cache (here 128 extra
