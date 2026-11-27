@@ -6,6 +6,8 @@
 #include "startup_stubs/texture_drop_mips.h"
 
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 
 namespace x2w_startup::view_desc {
 
@@ -231,7 +233,8 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     if (!fits) return Refusal::dimension;
     if (!mip_count && !resource.MipLevels) return Refusal::mip_range;
 
-    if (mip_count && (first_mip >= resource.MipLevels || *mip_count == 0))
+    // MipLevels 0 is invalid in D3D12, where -1 means every level from MostDetailedMip down: it is repaired to -1 below.
+    if (mip_count && first_mip >= resource.MipLevels)
         return Refusal::mip_range;
     if (!std::isfinite(min_lod) || min_lod < 0.0f) return Refusal::lod;
     if (dropped_levels && ((view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D &&
@@ -287,7 +290,9 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         repair(field, static_cast<UINT>(value), static_cast<UINT>(replacement));
         value = replacement;
     };
-    if (mip_count && *mip_count != ~0u) {
+    if (mip_count && *mip_count == 0) {
+        update(Field::mip_levels, *mip_count, ~0u);
+    } else if (mip_count && *mip_count != ~0u) {
         // Match the lazy texture policy: subtract dropped top levels, keeping one level.
         const UINT count = drop_mips::view_mip_levels(*mip_count, dropped_levels);
         update(Field::mip_levels, *mip_count, (std::min)(count, UINT{resource.MipLevels} - first_mip));
@@ -300,6 +305,95 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     update(Field::format, view.Format, format);
     if (plane_slice) update(Field::plane_slice, *plane_slice, plane);
     return Refusal::none;
+}
+
+// The shader resource view equivalent of a texture unordered access view: the same resource window at the UAV's one mip.
+// A console image descriptor serves loads and samples alike, so a title can sample through a descriptor it wrote as a
+// UAV. Read as an SRV description, a UAV description's union lands one field early (MipLevels reads as zero).
+// False for buffer views and dimensions with no SRV form.
+inline bool srv_from_uav(const D3D12_UNORDERED_ACCESS_VIEW_DESC& uav, D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = uav.Format;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    switch (uav.ViewDimension) {
+    case D3D12_UAV_DIMENSION_TEXTURE1D:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.Texture1D = {uav.Texture1D.MipSlice, 1, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        view.Texture1DArray = {uav.Texture1DArray.MipSlice, 1, uav.Texture1DArray.FirstArraySlice,
+                               uav.Texture1DArray.ArraySize, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE2D:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Texture2D = {uav.Texture2D.MipSlice, 1, uav.Texture2D.PlaneSlice, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {uav.Texture2DArray.MipSlice, 1, uav.Texture2DArray.FirstArraySlice,
+                               uav.Texture2DArray.ArraySize, uav.Texture2DArray.PlaneSlice, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D:
+        // An SRV has no depth window: it reads the whole depth of the UAV's mip.
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Texture3D = {uav.Texture3D.MipSlice, 1, 0.0f};
+        break;
+    default:
+        return false;
+    }
+    out = view;
+    return true;
+}
+
+// The SRV description of a recorded view (slot 18 SRV or slot 19 UAV, `bytes` of title description). False when the
+// record has no full description; a UAV with no SRV form keeps only its format and an unknown dimension.
+inline bool recorded_srv(unsigned slot, const void* desc, std::size_t bytes, D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    if (bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) return false;
+    if (slot != 19) {
+        std::memcpy(&out, desc, sizeof(out));
+        return true;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    std::memcpy(&uav, desc, sizeof(uav));
+    if (!srv_from_uav(uav, out)) {
+        out = {};
+        out.Format = uav.Format;
+    }
+    return true;
+}
+
+// `view` re-expressed as the texture type the shader declares, where both name the same texels: a single-slice array
+// at slice 0 and its plain form. False when no such form exists (cube, multisample, several slices).
+inline bool as_dimension(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, D3D12_SRV_DIMENSION wanted,
+                         D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    if (view.ViewDimension == wanted) {
+        out = view;
+        return true;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC shaped{};
+    shaped.Format = view.Format;
+    shaped.ViewDimension = wanted;
+    shaped.Shader4ComponentMapping = view.Shader4ComponentMapping;
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && wanted == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        const auto t = view.Texture2D;
+        shaped.Texture2DArray = {t.MostDetailedMip, t.MipLevels, 0, 1, t.PlaneSlice, t.ResourceMinLODClamp};
+    } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY && wanted == D3D12_SRV_DIMENSION_TEXTURE2D &&
+               view.Texture2DArray.FirstArraySlice == 0 && view.Texture2DArray.ArraySize == 1) {
+        const auto t = view.Texture2DArray;
+        shaped.Texture2D = {t.MostDetailedMip, t.MipLevels, t.PlaneSlice, t.ResourceMinLODClamp};
+    } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY && wanted == D3D12_SRV_DIMENSION_TEXTURE1D &&
+               view.Texture1DArray.FirstArraySlice == 0 && view.Texture1DArray.ArraySize == 1) {
+        const auto t = view.Texture1DArray;
+        shaped.Texture1D = {t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp};
+    } else {
+        return false;
+    }
+    out = shaped;
+    return true;
 }
 
 } // namespace x2w_startup::view_desc

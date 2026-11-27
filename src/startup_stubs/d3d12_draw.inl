@@ -4094,10 +4094,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // shared MostDetailedMip and MipLevels in all supported texture views
             if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+            // A token of an unordered access view (slot 19) holds a UAV description: it is read as the SRV of its mip.
             // What the shader does with this view (manifest srvuse; absent = unknown) and the view the title made decide
             // whether the texture may lose its top mip levels when it is materialized by this bind (texture_drop_mips.h).
             D3D12_SHADER_RESOURCE_VIEW_DESC title_view{};
-            if (record.desc_bytes >= sizeof(title_view)) std::memcpy(&title_view, record.desc, sizeof(title_view));
+            const bool described = srv_check::recorded_srv(record.slot, record.desc, record.desc_bytes, title_view);
             x2w_startup::drop_mips::ViewFacts drop_view;
             drop_view.most_detailed_mip = title_view.Texture2D.MostDetailedMip;
             drop_view.min_lod_clamp = title_view.Texture2D.ResourceMinLODClamp;
@@ -4108,8 +4109,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
                 texture = sampled_address_texture(resource);
             }
-            if (texture && record.desc_bytes >= sizeof(desc)) {
-                std::memcpy(&desc, record.desc, sizeof(desc));
+            if (texture && described) {
+                desc = title_view;
                 desc.Format = desktop_format(desc.Format);
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
@@ -4156,12 +4157,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
-            auto* view = record.desc_bytes >= sizeof(desc) ? &desc : nullptr;
+            auto* view = described ? &desc : nullptr;
             if (texture) {
                 const auto real_desc = texture->GetDesc();
+                // A single-slice array view and its plain form name the same texels: take the type the shader declares.
+                if (view && view->ViewDimension != dimension) srv_check::as_dimension(desc, dimension, desc);
                 if ((view && view->ViewDimension != dimension) ||
                     (!view && srv_check::default_dimension(real_desc) != dimension)) {
                     log_srv_refusal(srv_check::Refusal::dimension);
+                    static LONG mismatch_shown;
+                    if (first_calls(mismatch_shown, 6))
+                        log("x2w-draw   %016llx srv %u: the shader declares view dimension %d; the slot %u view has %d "
+                            "(resource dim=%d array=%u samples=%u): binding null",
+                            tr->key, i, static_cast<int>(dimension), record.slot,
+                            view ? static_cast<int>(view->ViewDimension) : static_cast<int>(srv_check::default_dimension(real_desc)),
+                            static_cast<int>(real_desc.Dimension), real_desc.DepthOrArraySize, real_desc.SampleDesc.Count);
                     texture = nullptr;
                     mismatched = true;
                 } else {
