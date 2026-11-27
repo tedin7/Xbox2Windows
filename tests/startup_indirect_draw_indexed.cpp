@@ -1220,7 +1220,24 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     Words observed{};
     if (arguments) {
         const D3D12_RANGE arg_range{0, sizeof(initial)};
-        check(arg_readback->Map(0, &arg_range, &memory), "map argument readback");
+        const HRESULT mapped = arg_readback->Map(0, &arg_range, &memory);
+        if (FAILED(mapped)) {
+            // A lost device: say why, and print what the debug layer stored before the loss.
+            std::fprintf(stderr, "%s: device removed reason 0x%08lx\n", label,
+                         static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+            ComPtr<ID3D12InfoQueue> lost;
+            if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&lost)))) {
+                for (UINT64 i = 0; i < lost->GetNumStoredMessages() && i < 16; ++i) {
+                    SIZE_T size = 0;
+                    if (FAILED(lost->GetMessage(i, nullptr, &size))) continue;
+                    std::vector<char> storage(size);
+                    auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                    if (SUCCEEDED(lost->GetMessage(i, message, &size)))
+                        std::fprintf(stderr, "debug layer %u: %s\n", static_cast<unsigned>(message->Severity), message->pDescription);
+                }
+            }
+        }
+        check(mapped, "map argument readback");
         std::memcpy(observed.data(), memory, sizeof(observed));
         arg_readback->Unmap(0, &untouched);
         Words expected = initial_words;
