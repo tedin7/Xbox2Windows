@@ -664,7 +664,7 @@ set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPR
 add_executable(startup_view_desc tests/startup_view_desc_check.cpp)
 target_include_directories(startup_view_desc PRIVATE src)
 target_compile_features(startup_view_desc PRIVATE cxx_std_17)
-target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi)
+target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi d3dcompiler)
 add_test(NAME startup_view_desc COMMAND startup_view_desc)
 add_test(NAME startup_view_desc_warp COMMAND startup_view_desc warp)
 set_tests_properties(startup_view_desc_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
