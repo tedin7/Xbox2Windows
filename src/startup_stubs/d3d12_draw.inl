@@ -1528,9 +1528,38 @@ const char* prepare_slot57_draw(Wrapper* self, const Pass& pass, Slot57Draw& dra
     std::array<DXGI_FORMAT, 9> formats{};
     std::copy_n(pass.target_formats, pass.target_count, formats.begin());
     formats.back() = pass.dsv_format;
+    // The key compares bytes, so copy the fields into zeroed structs: padding of the source must not make a new key.
+    D3D12_DEPTH_STENCIL_DESC depth_key{};
+    depth_key.DepthEnable = depth.DepthEnable;
+    depth_key.DepthWriteMask = depth.DepthWriteMask;
+    depth_key.DepthFunc = depth.DepthFunc;
+    depth_key.StencilEnable = depth.StencilEnable;
+    depth_key.StencilReadMask = depth.StencilReadMask;
+    depth_key.StencilWriteMask = depth.StencilWriteMask;
+    depth_key.FrontFace = depth.FrontFace;
+    depth_key.BackFace = depth.BackFace;
+    D3D12_BLEND_DESC blend_key{};
+    if (result.targets) {
+        blend_key.AlphaToCoverageEnable = bound->blend.AlphaToCoverageEnable;
+        blend_key.IndependentBlendEnable = bound->blend.IndependentBlendEnable;
+        for (UINT i = 0; i < 8; ++i) {
+            const auto& from = bound->blend.RenderTarget[i];
+            auto& to = blend_key.RenderTarget[i];
+            to.BlendEnable = from.BlendEnable;
+            to.LogicOpEnable = from.LogicOpEnable;
+            to.SrcBlend = from.SrcBlend;
+            to.DestBlend = from.DestBlend;
+            to.BlendOp = from.BlendOp;
+            to.SrcBlendAlpha = from.SrcBlendAlpha;
+            to.DestBlendAlpha = from.DestBlendAlpha;
+            to.BlendOpAlpha = from.BlendOpAlpha;
+            to.LogicOp = from.LogicOp;
+            to.RenderTargetWriteMask = from.RenderTargetWriteMask;
+        }
+    }
     DeviceCache::PipelineState state{};
-    std::memcpy(state.data(), &depth, sizeof(depth));
-    if (result.targets) std::memcpy(state.data() + sizeof(depth), &bound->blend, sizeof(bound->blend));
+    std::memcpy(state.data(), &depth_key, sizeof(depth_key));
+    std::memcpy(state.data() + sizeof(depth_key), &blend_key, sizeof(blend_key));
     const DeviceCache::PipelineKey pso_key{pass.requested_mesh_key, pass.target_count, formats, state};
     const auto [found, inserted] = cache.pipelines.try_emplace(pso_key);
     if (inserted) found->second = create_mesh57_pipeline(device, pass, result, *bound, depth);
