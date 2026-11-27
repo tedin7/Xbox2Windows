@@ -379,6 +379,7 @@ def controls():
     barycentric_controls(expected)
     flow_controls()
     extended_flow_controls()
+    half_source_controls()
     monotone_exec_controls()
     cfg_exec_and_memory_controls()
     sample_and_subset_controls()
@@ -615,6 +616,58 @@ def scan_decoded(*instructions, pixel=False):
     stage.ins = [(4 * i, 4, G.parse(asm)[0], asm) for i, asm in enumerate(instructions)]
     stage.interp_f16_scan()
     return stage
+
+
+def half_source_fixture(*, high_operand=None, wrong_compare=False):
+    # The first pair leaves v20's partial unmaterialized. The second pair
+    # replaces only v20's low half, which both subsequent instructions use.
+    pairs = b''.join(interp_words(20, 19, 0) + interp_words(24, 20, 0))
+    compare = 0xd4cc0028 if wrong_compare else 0xd4c90028  # v_cmp_{gt,lt}_f16_e64 s40
+    select_high = 1 << 12  # op_sel[1]
+    read = words(compare | (select_high if high_operand == 'compare' else 0), 128 | 276 << 9)
+    if high_operand == 'add':
+        read += words(0xd5320015 | select_high, 240 | 276 << 9)
+    else:
+        read += words(0x32 << 25 | 21 << 17 | 20 << 9 | 240)  # v_add_f16 v21, 0.5, v20
+    result = words(0x7e001700 | 22 << 17 | 21, 0xd5010017, 128 | 242 << 9 | 40 << 18)
+    return M0 + pairs + read + result + export_words(22, 23, 22, 23) + END
+
+
+def half_source_controls():
+    ps = translate(half_source_fixture()).hlsl_ps()
+    assert 's40 = ((f16tof32(0x0000u) < f16tof32(v20)) ? 1u : 0u);' in ps, ps
+    assert 'v21 = f16rn(0.5 + f16tof32(v20 & 0xffffu));' in ps, ps
+    stale = ('v20 is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+             'a v_interp_p2_f16 that wrote another register')
+    for operand, op in (('compare', 'v_cmp_lt_f16'), ('add', 'v_add_f16')):
+        refused('high operand in ' + op, half_source_fixture(high_operand=operand), stale % op)
+
+    alias = ('v_interp_p1ll_f16 v20, v0, attr0.x', 'v_interp_p2_f16 v20, v1, attr0.x, v20')
+    for read in (
+            'v_cmp_class_f16 vcc_lo, v21, v20',
+            'v_cmp_lt_u16 vcc_lo, 0, v20',
+            'v_cmp_lt_i16 vcc_lo, v20, v21',
+            'v_cvt_f32_f16 v21, v20',
+            'v_add_f16 v22, v21, v20 op_sel:[1,0]',
+            'v_mad_u32_u16 v22, v20, v21, v23',
+            'v_fmac_f16 v22, v21, v20 op_sel:[1,0]'):
+        scan_decoded(*alias, read)
+    for read in (
+            'v_cmp_lt_f16 s40, 0, v20 op_sel:[0,1]',
+            'v_fmac_f16 v22, v21, v20 op_sel:[0,1]',
+            'v_mad_u32_u16 v22, v21, v23, v20',
+            'v_sad_u16 v22, v21, v20, v23',
+            'v_sat_pk_u8_i16 v22, v20',
+            'v_pk_add_f16 v22, v21, v20',
+            'v_dot2_f32_f16 v22, v21, v20, v23',
+            'v_cvt_f16_f32 v22, v20',
+            'v_cvt_pkrtz_f16_f32 v22, v21, v20'):
+        try:
+            scan_decoded(*alias, read)
+        except G.Unsupported as error:
+            assert 'reads the preserved half of an omitted v_interp_p1ll_f16 result v20' in str(error), error
+        else:
+            raise AssertionError(read)
 
 
 def monotone_exec_controls():
@@ -1389,12 +1442,16 @@ def check_extended_flow_draw(dxc, renderer, adapter):
     red = [0xffff if x < 4 else round((17 + 2 * x) * 65535 / 32) for x in range(width)]
     red_words = [word for value in red * height for word in (value, 0, 0, 0)]
     rgba = '--startup-pixel-words'
+    # The low half of attr0.x is 2.0 at every vertex. Add 0.5 and test 0 < 2.
+    half_source_words = list(map(f32_bits, (2.0 + 0.5, float(0 < 2.0)))) * (2 * width * height)
     cases = (
         ('masked_r16', half_exec_fixture(), (56,), red_words, '--startup-r16-unorm', False),
         ('missing_restore', half_exec_fixture(restore=False), (56,), red_words, '--startup-r16-unorm', True),
         ('same_exec', restored_exec_fixture(), (), [0x3f800000] * (width * height * 4), rgba, False),
         ('wide', restored_exec_fixture(wide=True), (),
          [0x3f800000, 0x3fc00000] * (width * height * 2), rgba, False),
+        ('half_sources', half_source_fixture(), (), half_source_words, rgba, False),
+        ('half_sources_wrong_compare', half_source_fixture(wrong_compare=True), (), half_source_words, rgba, True),
     )
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)

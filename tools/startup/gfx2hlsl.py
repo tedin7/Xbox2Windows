@@ -12926,9 +12926,7 @@ class Stage:
 
     def interp_read_halves(self, name, asm, sources, mods):
         halves = [3] * len(sources)
-        if name == 'v_cvt_f32_f16' and not mods and len(sources) == 1:
-            halves[0] = 1
-        elif name in ('v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+        if name in ('v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
             half, high, _ = self.mix_selections(mods)
             if len(sources) == len(half) == len(high) == 3:
                 halves = [1 << h if f else 3 for f, h in zip(half, high)]
@@ -12937,6 +12935,22 @@ class Stage:
                 select = re.fullmatch(r'src([01])_sel:(WORD_[01]|BYTE_[0-3])', mod)
                 if select and (src := int(select[1])) < len(sources):
                     halves[src] = 1 if select[2] in ('WORD_0', 'BYTE_0', 'BYTE_1') else 2
+        elif (name.startswith('v_') and name.endswith(('_f16', '_i16', '_u16'))
+              and not name.startswith(('v_pk_', 'v_dot', 'v_interp_', 'v_sad_', 'v_sat_pk_'))):
+            # A plain 16-bit source reads the low half by default (including
+            # the class mask of v_cmp_class_f16). VOP3 op_sel indexes the
+            # encoded sources, so skip an implicit read of the destination.
+            first = int(name.startswith(READ_MODIFY_WRITE))
+            end = min(2, len(sources)) if name in ('v_mad_i32_i16', 'v_mad_u32_u16') else len(sources)
+            selectors = [m for m in mods if m.startswith('op_sel')]
+            if not selectors:
+                halves[:end] = [1] * end
+            elif len(selectors) == 1:
+                select = re.fullmatch(r'op_sel:\[([01](?:,[01]){0,3})\]', selectors[0])
+                if select:
+                    bits = select[1].split(',')
+                    if len(bits) >= end - first:
+                        halves[first:end] = [1 << int(bit) for bit in bits[:end - first]]
         elif name == 'exp':
             target, vals, flags = export_operands(asm)
             if len(vals) == 4 and 'compr' in flags and self.red_only_export(target):
