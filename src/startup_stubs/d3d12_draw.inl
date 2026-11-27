@@ -4032,6 +4032,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         } else {
             if (address && large_raw) {
                 bool extent_ok = false;
+                x2w_local::arm_mapped_table();
                 const std::size_t extent = x2w_local::mapped_cache_enabled()
                     ? x2w_local::committed_extent_with(address, bytes, x2w_local::query_readable_mapped_span, &extent_ok)
                     : x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
