@@ -1074,6 +1074,12 @@ bool read_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter
     return true;
 }
 
+bool is_slot57_mesh_pipeline(Wrapper* pipeline, const std::vector<RootParameter>* root)
+{
+    Slot57MeshRequest request;
+    return read_slot57_mesh_request(pipeline, root, request);
+}
+
 void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
@@ -2905,6 +2911,7 @@ struct TranslatedIndirectDraw {
     ID3D12Resource* argument;
     u64 offset;
     IndirectIndexView indices;
+    bool mesh = false;
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
     const char* refusal_code = indirect_refusal_code::pipeline_or_target_unavailable;
@@ -3049,6 +3056,90 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
 
     // The clamp changes the native compute root and invalidates its arguments.
     // In render mode slot 43 is the forwarded compute parameter setter.
+    restore_compute_root(pass_of(self), list);
+    return scratch.Get();
+}
+
+// The mesh translator consumes a linear SV_GroupID.x. Keep the guard on the GPU so GPU-produced
+// arguments remain authoritative, and use the leading word as an internal ExecuteIndirect count.
+ID3D12Resource* linearize_mesh_arguments(Wrapper* self, ID3D12GraphicsCommandList* list, const TranslatedIndirectDraw& draw)
+{
+    auto* device = device_of(self->own().list_device);
+    static IndexedValidationPipeline compute = [device] {
+        IndexedValidationPipeline result;
+        result.device = device;
+        D3D12_ROOT_PARAMETER params[3]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = 1;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        const D3D12_ROOT_SIGNATURE_DESC desc{3, params};
+        x2w_startup::ComPtr<ID3DBlob> signature, code;
+        HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr);
+        if (SUCCEEDED(hr)) hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                                            IID_PPV_ARGS(&result.root));
+        static constexpr char shader[] = R"(
+cbuffer Params : register(b0) { uint offset; };
+ByteAddressBuffer input_args : register(t0);
+RWByteAddressBuffer output_args : register(u0);
+[numthreads(1, 1, 1)] void main() {
+    uint3 g = input_args.Load3(offset);
+    bool valid = g.x <= 65535u && (g.x == 0u || g.y <= 65535u / max(g.x, 1u));
+    uint xy = valid ? g.x * g.y : 0u;
+    valid = valid && (xy == 0u || g.z <= 65535u / max(xy, 1u));
+    uint n = valid ? xy * g.z : 0u;
+    output_args.Store(0, valid ? 1u : 0u);
+    output_args.Store3(4, uint3(n, 1u, 1u));
+})";
+        if (SUCCEEDED(hr)) hr = D3DCompile(shader, sizeof(shader) - 1, "mesh argument linearization", nullptr, nullptr,
+                                           "main", "cs_5_0", 0, 0, &code, nullptr);
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+            pipeline.pRootSignature = result.root.Get();
+            pipeline.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            hr = device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&result.pipeline));
+        }
+        if (FAILED(hr)) log("x2w-render mesh argument linearization setup failed 0x%08lx", static_cast<unsigned long>(hr));
+        return result;
+    }();
+    if (compute.device.Get() != device || !compute.pipeline) return nullptr;
+    const auto desc = draw.argument->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        draw.offset > UINT_MAX - sizeof(D3D12_DISPATCH_MESH_ARGUMENTS) || draw.offset > desc.Width ||
+        desc.Width - draw.offset < sizeof(D3D12_DISPATCH_MESH_ARGUMENTS))
+        return nullptr;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 16;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    x2w_startup::ComPtr<ID3D12Resource> scratch;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, IID_PPV_ARGS(&scratch)))) return nullptr;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto found = list_recordings.find(self);
+    bool retained = false;
+    if (found != list_recordings.end() && found->second) {
+        try { found->second->indexed_validation.push_back(scratch); retained = true; }
+        catch (const std::bad_alloc&) {}
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    if (!retained) return nullptr;
+    D3D12_RESOURCE_STATES previous = D3D12_RESOURCE_STATE_COMMON;
+    for (const auto& state : pass_of(self).states)
+        if (state.first == draw.argument) previous = state.second;
+    require_state(self, draw.argument, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetPipelineState(compute.pipeline.Get());
+    list->SetComputeRootSignature(compute.root.Get());
+    list->SetComputeRoot32BitConstant(0, static_cast<UINT>(draw.offset), 0);
+    list->SetComputeRootShaderResourceView(1, draw.argument->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2, scratch->GetGPUVirtualAddress());
+    list->Dispatch(1, 1, 1);
+    require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if (previous != D3D12_RESOURCE_STATE_COMMON) require_state(self, draw.argument, previous);
     restore_compute_root(pass_of(self), list);
     return scratch.Get();
 }
@@ -3918,9 +4009,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     u64 not_drawn_key = 0;
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const bool rect = pass.topology == 0x11;
+    const bool mesh = indirect && indirect->mesh;
+    const bool rect = !mesh && pass.topology == 0x11;
     const bool indexed_rect = rect && indexed && indirect;
-    if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
+    if (!list || !pass.pipeline || !pass.targets_bound || !(mesh || rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) {
         const int site = !list ? 0 : !pass.pipeline ? no_pipeline_set_site : !pass.targets_bound ? targets_not_bound_site
                          : !(rect || pass.topology == 4 || pass.topology == 5) ? unsupported_topology_site : rect_draw_unsupported_site;
@@ -3934,7 +4026,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     // Mesh recording is not wired to this draw entry yet.
-    if (tr && tr->mesh) {
+    if (tr && tr->mesh != mesh) {
         draw_lock_release_exclusive();
         return not_drawn(pass, list, not_drawn_key, 1);
     }
@@ -3944,7 +4036,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
     const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
     if (!formatted_ok) {
-        if (indirect && tr)
+        if (indirect && tr && tr->mesh && !translation_ok)
+            indirect->set_refusal(tr->retry_manifest_at ? "slot57 mesh translation pending" : "slot57 mesh translation refused",
+                                  indirect_refusal_code::translation_not_ready);
+        else if (indirect && tr)
             indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
                                      : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
@@ -3965,7 +4060,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             draw_lock_release_exclusive();
             return not_drawn(pass, list, not_drawn_key, 2);
         }
-        if (indexed && pass.compute_pipeline) {
+        if ((indexed || mesh) && pass.compute_pipeline) {
             indirect->set_refusal("indexed validation cannot replace a live guest compute pipeline",
                                   indirect_refusal_code::live_compute_pipeline);
             draw_lock_release_exclusive();
@@ -3978,7 +4073,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return not_drawn(pass, list, not_drawn_key, 4);
         }
         auto& entry = indexed ? tr->indexed_indirect_entry : tr->independent_indirect_entry;
-        if (!entry.has_value()) {
+        if (!entry.has_value() && !mesh) {
             bool found_base = !indexed;
             if (indexed) {
                 for (std::size_t i = 0; i < tr->uds.size(); ++i) {
@@ -3993,7 +4088,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     return srv.source == 0 || (indexed && srv.kind == 0 && srv.source == 1 && srv.a == 0);
                 });
         }
-        if (!*entry || tr->samplers.heap) {
+        const bool mesh_entry = mesh && std::all_of(tr->uds.begin(), tr->uds.end(), [](const Translation::Ud& ud) {
+            return ud.kind != Translation::rect && ud.kind != Translation::base_vertex && ud.kind != Translation::start_instance;
+        }) && std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) { return srv.source == 0; });
+        if ((!mesh && !*entry) || (mesh && !mesh_entry) || tr->samplers.heap) {
             indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
                                   indirect_refusal_code::unsupported_resource_or_entry);
             draw_lock_release_exclusive();
@@ -4721,10 +4819,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     ID3D12Resource* validated = nullptr;
-    if (indirect && indexed) {
-        validated = validate_indexed_arguments(self, list, *tr, *indirect, indexed_vertices);
+    if (indirect && (indexed || mesh)) {
+        validated = mesh ? linearize_mesh_arguments(self, list, *indirect)
+                         : validate_indexed_arguments(self, list, *tr, *indirect, indexed_vertices);
         if (!validated) {
-            indirect->set_refusal("translated indexed argument validation could not be recorded",
+            indirect->set_refusal(mesh ? "slot57 mesh argument linearization could not be recorded" :
+                                         "translated indexed argument validation could not be recorded",
                                   indirect_refusal_code::indexed_validation_failed);
             draw_lock_release_exclusive();
             return not_drawn(pass, list, not_drawn_key, 14);
@@ -4756,7 +4856,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         follow_inputs();
         const auto red_samples = trace_inputs
             ? red_producer_draw_before(self, list, "translated-indirect-draw", tr->key) : RedDrawSamples{};
-        if (validated) {
+        if (validated && mesh) {
+            list->ExecuteIndirect(indirect->signature, 1, validated, 4, validated, 0);
+        } else if (validated) {
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
         } else {
@@ -4837,9 +4939,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 }
 
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset,
-                                     const IndirectIndexView& indices)
+                                     const IndirectIndexView& indices, bool mesh)
 {
-    TranslatedIndirectDraw draw{signature, argument, offset, indices};
+    TranslatedIndirectDraw draw{signature, argument, offset, indices, mesh};
     if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
         if (draw.shader_key) {
@@ -4870,7 +4972,7 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     static LONG reported;
     if (first_calls(reported, 16))
         log("x2w-render translated ExecuteIndirect %s recorded, shader %016llx, offset 0x%llx",
-            indices.resource ? "DrawIndexed" : "Draw", draw.shader_key, offset);
+            mesh ? "DispatchMesh" : indices.resource ? "DrawIndexed" : "Draw", draw.shader_key, offset);
     return nullptr;
 }
 
