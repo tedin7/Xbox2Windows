@@ -372,6 +372,7 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
 }
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
+LONG readonly_depth_masked_draws;
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
@@ -1218,7 +1219,16 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
+enum : unsigned { readonly_depth_plane = 1, readonly_stencil_plane = 2 };
+
+unsigned readonly_depth_planes(const Pass& pass)
+{
+    if (!readonly_depth_draws() || !pass.bound_depth) return 0;
+    return (!pass.depth_view_writable ? readonly_depth_plane : 0u) |
+           (pass.stencil_view_readonly ? readonly_stencil_plane : 0u);
+}
+
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect, unsigned readonly_planes)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
@@ -1229,6 +1239,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    if (readonly_planes) key = fnv_bytes(&readonly_planes, sizeof(readonly_planes), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -1260,7 +1271,11 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         bound.pipelines[key] = nullptr;
         return nullptr;
     }
-    if (use_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
+    if (use_depth_stencil) {
+        desc.DepthStencilState = bound.depth_stencil;
+        if (readonly_planes & readonly_depth_plane) desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        if (readonly_planes & readonly_stencil_plane) desc.DepthStencilState.StencilWriteMask = 0;
+    }
     desc.SampleMask = ~0u;
     if (bound.has_rasterizer) {
         desc.RasterizerState = bound.rasterizer;
@@ -2955,7 +2970,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             draw_lock_release_exclusive();
             return not_drawn(5);
         }
-        if (bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
+        if (!readonly_depth_draws() && bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
             ((bound->depth_stencil.DepthEnable && bound->depth_stencil.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) ||
              (bound->depth_stencil.StencilEnable && bound->depth_stencil.StencilWriteMask != 0))) {
             indirect->set_refusal("translated draw writes depth or stencil to a read-only depth view",
@@ -2964,7 +2979,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return not_drawn(6);
         }
     }
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
+    const unsigned readonly_planes = readonly_depth_planes(pass);
+    const unsigned enabled_writes =
+        (bound->depth_stencil.DepthEnable && bound->depth_stencil.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO ? readonly_depth_plane : 0u) |
+        (bound->depth_stencil.StencilEnable && bound->depth_stencil.StencilWriteMask != 0 ? readonly_stencil_plane : 0u);
+    const unsigned readonly_masks = bound->has_depth_stencil ? readonly_planes & enabled_writes : 0;
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device)
+        ? pipeline_for(*bound, *tr, pass, indexed_rect, readonly_planes) : nullptr;
     if (indirect && indexed_rect && !pipeline) {
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
@@ -3146,21 +3167,41 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 }
             }
-            const auto aliases_writable_target = [&](ID3D12Resource* tex) {
-                if (!tex) return false;
+            const bool depth_alias = texture && pass.bound_depth == texture;
+            const bool track_depth_plane = depth_alias && readonly_depth_draws();
+            const bool stencil_srv = desc.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                                     desc.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            const bool writable_depth_alias = depth_alias &&
+                (track_depth_plane && stencil_srv ? !pass.stencil_view_readonly : pass.depth_view_writable);
+            const auto aliases_writable_target = [&] {
                 for (UINT t = 0; t < pass.target_count; ++t)
-                    if (pass.bound_targets[t] == tex) return true;
-                return pass.bound_depth == tex && pass.depth_view_writable;
+                    if (pass.bound_targets[t] == texture) return true;
+                return writable_depth_alias;
             };
-            if (indirect && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
+            if (indirect && (!texture || record.slot != 18 || aliases_writable_target())) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
                 return not_drawn(9);
             }
+            if (track_depth_plane && writable_depth_alias) {
+                draw_lock_release_exclusive();
+                return not_drawn(9);
+            }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) {
-                require_state(self, texture, sampled_state(self, texture));
+                if (track_depth_plane) {
+                    const auto state = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    const auto planes = std::find_if(pass.mixed.begin(), pass.mixed.end(),
+                        [texture](const x2w_dsv::Planes& p) { return p.resource == texture; });
+                    if (planes != pass.mixed.end())
+                        x2w_dsv::move_plane(list, *planes, stencil_srv ? 1 : 0, state);
+                    else
+                        require_state(self, texture, state);
+                } else {
+                    require_state(self, texture, sampled_state(self, texture));
+                }
                 if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
             }
             const bool had_texture = texture != nullptr;
@@ -3631,6 +3672,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
+    if (drawn && readonly_masks) InterlockedIncrement(&readonly_depth_masked_draws);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
     if (indirect) return drawn;

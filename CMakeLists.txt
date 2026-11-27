@@ -1715,7 +1715,9 @@ foreach(backend IN ITEMS warp hardware)
         PASS_REGULAR_EXPRESSION "word 0: got 0xa5a5a5a5a5a5a5a5")
 endforeach()
 
-add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)
+add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp
+    tests/startup_draw_depth_target.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_definitions(startup_indirect_draw_indexed PRIVATE X2W_DEPTH_TARGET_SHARED_FIXTURE)
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)
 target_include_directories(startup_indirect_draw_indexed PRIVATE src)
 target_link_libraries(startup_indirect_draw_indexed PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
@@ -5070,6 +5072,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardware_adapter_filter_check.py"
         "$<TARGET_FILE:startup_indirect_dispatch>" hardware count)
     set_tests_properties(startup_indirect_dispatch_adapter_filter PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_draw_readonly_depth_direct_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+        "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+        "$<TARGET_FILE:startup_draw_depth_target>" warp readonly)
+    foreach(mode IN ITEMS indirect indirect-off)
+        add_test(NAME startup_draw_readonly_depth_${mode}_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+            "$<TARGET_FILE:startup_indirect_draw_indexed>" warp readonly-${mode})
+    endforeach()
+    set_tests_properties(startup_draw_readonly_depth_direct_warp startup_draw_readonly_depth_indirect_warp
+        startup_draw_readonly_depth_indirect-off_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
