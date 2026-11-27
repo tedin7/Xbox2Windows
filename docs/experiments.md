@@ -10325,9 +10325,8 @@ below a wave-uniform SGPR bound. The translator evaluates
 `(tid & ~63u) < bound` at the compare and branches around the load when the
 guest wave is empty. A mixed wave gets the loaded word in every lane. Vector
 instructions inside the block still follow per-lane EXEC. The proof requires a
-wave-uniform address and a defined, wave-uniform previous value. It refuses
-other scalar instructions inside the block, wider loads, non-buffer scalar
-loads, stores, atomics and branches into the block.
+wave-uniform address and a defined, wave-uniform previous value. Stores,
+atomics and branches into the block remain outside the proof.
 
 The slot 57 skeleton `draw` fixture uses bound 6 and vertices from threads 39
 and 5 in the mixed wave. Their flat red is 255, and only thread 5 gets green
@@ -10337,6 +10336,25 @@ Its byte address is 736, beyond the 512 bytes of input and the renderer's
 only for the mixed wave, reuses that word across its lanes, then rasterizes
 the triangles. Swapping the two waves' red values in the reference must
 change every covered pixel.
+
+The same draw test exercises three additional position fixtures. A uniform
+buffer load supplies a word that a scalar shift reads along with explicit
+`src_scc`. The translator verifies the incoming SCC and the other scalar
+inputs. It also checks the definitions at the forward joins. The narrowed
+and compare-mask branches use the guest wave64 vote, while vector writes
+still use the lane's EXEC bit. The three fixtures contain the scalar step
+alone, the scalar step under an inner EXEC skip, and the scalar step under
+both an inner EXEC and VCC skip.
+
+The fixtures put two triangles in each of two logical waves. The second wave
+skips the whole block. Part of the first wave receives a two-pixel X
+displacement. The VCC fixture draws both a compare hit and a compare miss.
+The renderer compares all 1,024 pixels with the CPU rasteriser. Removing the
+displacement, dropping the EXEC narrowing, or forcing the VCC branch to
+fall through must produce 80, 30, or 58 mismatched pixels respectively.
+Run `python -B tests/startup_mesh57_skeleton_check.py` for the host checks and
+`ctest --preset dev --no-tests=error -V -R '^startup_mesh57_skeleton(_draw_warp)?$'`
+on Windows for the host check and WARP readback.
 
 The `startup_mesh57_formatted_load_{warp,hardware}` tests use one
 `buffer_load_format_x` to set vertex red. The fixture supplies descriptor word 3

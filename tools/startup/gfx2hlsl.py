@@ -2282,7 +2282,7 @@ MESH_WAVE_BLOCK_LOADS = ('s_buffer_load_dword', 's_buffer_load_dwordx2', 's_buff
                          's_load_dwordx4', 's_load_dwordx8', 's_load_dwordx16')
 
 
-def mesh_wave_block_scalar(name, asm):
+def mesh_wave_block_scalar(name, asm, *, explicit_scc=False):
     """True for an instruction of a pre-exchange execz block that the lowering may run for every lane of a wave with
     an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
     if name in MESH_WAVE_BLOCK_LOADS:
@@ -2297,7 +2297,8 @@ def mesh_wave_block_scalar(name, asm):
             's_memtime', 's_memrealtime', 's_buffer_load', 's_scratch', 's_dcache', 's_gl1', 's_wqm', 's_quadmask',
             's_denorm_mode', 's_round_mode')):
         return name.startswith(('s_cmp_', 's_bitcmp')) and not re.search(r'\b(exec|vcc|m0|src_)', asm)
-    if re.search(r'\b(exec|m0|src_|ttmp|tba|tma|flat_scratch|xnack)', asm) or 'saveexec' in name:
+    if (re.search(r'\b(exec|m0|src_(?!scc\b)|ttmp|tba|tma|flat_scratch|xnack)', asm)
+            or ('src_scc' in asm and not explicit_scc) or 'saveexec' in name):
         return False
     reads, must, may = scalar_effects(name, asm)
     return all(reg in ('scc', 'vcc', 'vcc_hi') or re.fullmatch(r's\d+', reg) for reg in reads | must | may)
@@ -2446,7 +2447,7 @@ MESH_MASK_WORDS = {'exec_lo': ('exec', 0), 'exec_hi': ('exec', 32),
 MESH_MASK_SELECT = 's_cselect_b32_mesh'
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -2621,9 +2622,12 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
         return not any(live_at_join(reg, join) for reg in must | may)
 
     inner_vcc = set()
+    inner_execz = set()
     load_branches = {}
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
+            if source in inner_execz:
+                continue
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
             if (source == first_post_count_branch and source >= b_end + 2 and target == source + 2
                     and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
@@ -2667,6 +2671,26 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                         nested |= {i - 1, i, edges[i]}
                         nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
                     inner += sorted(vcc_edges | {i for i in nested if ins[i][2] == 's_cbranch_execz'})
+                    extra = {i for i in range(source + 1, target)
+                             if 'src_scc' in ins[i][3] and mesh_wave_block_scalar(*ins[i][2:], explicit_scc=True)}
+                    # Keep the original lane-only lowering for existing narrowed arms. For a new
+                    # scalar arm all lanes of the guest wave must take the same branch, even if
+                    # only some lanes have EXEC set. VALU still observes its own EXEC bit.
+                    scalar_arms = set()
+                    if extra:
+                        for i in nested:
+                            if i not in edges:
+                                continue
+                            join = edges[i]
+                            confined = all(
+                                (i <= edge < join and i < dest <= join)
+                                or not (i <= edge < join or i - 1 <= dest <= join)
+                                for edge, dest in edges.items()
+                            )
+                            if confined and (extra.intersection(range(i + 1, join)) or any(
+                                i < edge < join for edge in vcc_edges
+                            )):
+                                scalar_arms.add(i)
                     scalar = [i for i in range(source + 1, target)
                               if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
@@ -2709,13 +2733,33 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                          any(source < d < target and not source < s < target for s, d in edges.items())),
                         ('an unsupported branch inside the block (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
+                        ('a backward branch inside the block',
+                         bool(extra) and any(source < latch < target or source < header < target
+                                             for header, (latch, _) in constant_trips.items())),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
-                         any(not mesh_wave_block_scalar(*ins[i][2:]) for i in scalar))) if failed]
+                         any(not mesh_wave_block_scalar(*ins[i][2:], explicit_scc=i in extra)
+                             or (extra and ins[i][2].startswith('s_')
+                                 and scalar_effects(*ins[i][2:])[0] & VCC_KEYS)
+                             for i in scalar))) if failed]
                     if causes:
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
                     inner_vcc.update(vcc_edges)
+                    inner_execz.update(scalar_arms)
+                    if extra:
+                        wave_scalars.update(ins[i][0] for i in scalar if ins[i][2].startswith('s_')
+                                            and ins[i][2] not in MESH_WAVE_BLOCK_LOADS)
+                        for branch in inner:
+                            join = edges[branch]
+                            if ins[branch][2] == 's_branch':
+                                continue
+                            writes = set().union(*(scalar_effects(*ins[i][2:])[2]
+                                                   for i in scalar if branch < i < join))
+                            live_over_skip = tuple(sorted(reg for reg in writes
+                                                          if re.fullmatch(r's\d+', reg)
+                                                          and live_at_join(reg, join)))
+                            wave_scalar_joins[ins[branch][0]] = live_over_skip
                     load_compares[compare] = int(prefix[2] if prefix else vector_limit[1])
                     load_branches.setdefault(compare, []).append(source)
                     wave_loads[ins[source][0]] = (ins[compare][0], prefix[1] if prefix and full_reset else None,
@@ -2836,6 +2880,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                 if mask != index - 1 or not cmp or int(cmp[2]) != thread:
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
+            if index in inner_execz:
+                wave_votes[off] = ('exec', True)
             if index in inner_vcc:
                 wave_votes[off] = ('vcc', name.endswith('z'))
             elif name in MESH_VCC_BRANCHES:
@@ -3144,11 +3190,14 @@ class Stage:
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
             self.mesh_wave_votes = {}
+            self.mesh_wave_scalars = set()
+            self.mesh_wave_scalar_joins = {}
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
-                                     self.mesh_wave_loads, self.mesh_wave_votes)
+                                     self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
+                                     self.mesh_wave_scalar_joins)
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):
@@ -4847,6 +4896,8 @@ class Stage:
         wave_loads = getattr(self, 'mesh_wave_loads', {})
         wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values() if bound is not None}
         mesh_votes = getattr(self, 'mesh_wave_votes', {})
+        wave_scalars = getattr(self, 'mesh_wave_scalars', ())
+        wave_scalar_joins = getattr(self, 'mesh_wave_scalar_joins', {})
         mesh_reads = {off for off, _, name, _ in self.ins if name == 'x2w_mesh_firstlane'}
         mesh_selects = {off for off, _, name, _ in self.ins if name == MESH_MASK_SELECT}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
@@ -5285,6 +5336,14 @@ class Stage:
                             raise Unsupported(execz_effects)
                         # Capture the bound at the compare, before any intervening SGPR write.
                         self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if off in wave_scalars:
+                        reads, _, _ = scalar_effects(name, asm)
+                        if any(
+                            not (self.scc_verified and self.scc_uniform) if reg == 'scc' else
+                            not (self.uniform_source(reg) and int(reg[1:]) in self.defined_uniform_s)
+                            for reg in reads
+                        ):
+                            raise Unsupported(execz_effects + ' (wave-load block: a scalar input is not wave-uniform)')
                     if off in wave_load_sites:
                         offset = smem_offset(parse(asm)[1][2])
                         if not self.uniform_source(offset) or (
@@ -5297,13 +5356,13 @@ class Stage:
                         uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
-                        if off in wave_loads:
-                            # An empty wave keeps the previous values of the scalars the block writes and the
-                            # join reads, so each must be wave-uniform and defined before the block.
-                            for dst in wave_loads[off][3]:
-                                if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
-                                    raise Unsupported(execz_effects)
-                                self.u(dst)  # declare the variable; refuses a symbol with no run-time value
+                        # A skipped wave retains its old scalar state. Prove that it supplies
+                        # defined, wave-uniform values for the scalars read after the join.
+                        live_on_skip = wave_loads[off][3] if off in wave_loads else wave_scalar_joins.get(off, ())
+                        for dst in live_on_skip:
+                            if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
+                                raise Unsupported(execz_effects)
+                            self.u(dst)
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
                                         or off in wave_limits or off in wave_loads or off in mesh_votes)
                         if off in vcc_branches:
