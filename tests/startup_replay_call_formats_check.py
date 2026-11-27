@@ -35,20 +35,25 @@ def recording(version, *, wire_version=None, slot=15, tail=False):
 
 def pre_install_device():
     """A recording that starts after the device existed: its first device call is the struct-return form (object = the
-    title's return buffer, the device second), a second device-kind object never named by an OUTP appears later, and a
-    failed QueryInterface left its out pointer unrecorded."""
+    title's return buffer, the device second), a second device-kind object never named by an OUTP appears later, then
+    calls the player cannot play safely: it skips each one and counts it in the census."""
     stack, second = 0x7253F9E0, 0x5678
     data = chunk(b"XREC", struct.pack("<IIQ", 3, CALL[3].size, 10_000_000))
     data += chunk(b"XENV", data=b"X2W_D3D12_PERMISSIVE=1\0")
     calls = [(26, stack, [DEVICE, 0, 1]), (15, DEVICE, [2]), (15, DEVICE, [2]), (15, second, [2])]
     for seq, (slot, obj, args) in enumerate(calls, 1):
         data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, slot, obj, *(args + [0] * (11 - len(args))), 0, 0.0, 0, 0))
-    # A QueryInterface that failed (E_NOINTERFACE): the file holds its IID, not its out pointer, which is the title's
-    # stack. The stand-in writes null through the out pointer, so the player must hand it a buffer of its own.
+    # QueryInterface calls whose out pointer the file does not hold (the title's stack): the stand-in writes null through
+    # it, so one recorded as a success gets a buffer of the player's own; one recorded as a failure is skipped.
     riid, out = 0x7FF6C513CE88, 0x7253F8A0
-    data += chunk(b"CALL", CALL[3].pack(5, 1, 0, 0, DEVICE, riid, out, *([0] * 9), 0x80004002, 0.0, 0, 0))
-    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 5, 0, 0, riid, 16, 0x51D))
+    for seq, result in ((5, 0), (6, 0x80004002)):
+        data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, 0, DEVICE, riid, out, *([0] * 9), result, 0.0, 0, 0))
+        data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 0, 0, riid, 16, 0x51D))
     data += chunk(b"BLOB", struct.pack("<QQ", 0x51D, 16), bytes(range(1, 17)))
+    # A pipeline creation whose description is an address in the title's image the file does not hold: skipped.
+    data += chunk(b"CALL", CALL[3].pack(7, 1, 0, 57, DEVICE, 0x7FF6C51306B8, riid, out, *([0] * 8), 0, 0.0, 0, 0))
+    # A call on a resource no OUTP named: skipped.
+    data += chunk(b"CALL", CALL[3].pack(8, 1, 7, 8, 0x9999, *([0] * 11), 0, 0.0, 0, 0))
     return data
 
 
@@ -93,8 +98,11 @@ def main(player):
         code, text, out = play(player, directory, "pre-install", pre_install_device())
         assert code == 0, (code, text[-2500:])
         summary = json.loads((out / "replay_summary.json").read_text())
-        assert summary["calls"] == summary["played"] == 5 and summary["unknown_object"] == 0, summary
+        assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (8, 5, 1, 1), summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
+        for line in ("skip census: 3 calls skipped in 3 kinds", "skip census 0:0 recorded failure: 1",
+                     "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1"):
+            assert line in text, (line, text[-2500:])
     return 0
 
 

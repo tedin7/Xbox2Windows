@@ -89,6 +89,8 @@ struct Player {
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 adopted = 0;  // device-kind objects first seen as a call's object, bound to the player's device
     u64 scratch_outputs = 0;  // out pointers the file did not hold, given a buffer of the player's own
+    std::map<std::string, u64> skips;  // "kind:slot reason" -> calls skipped (the census printed at the end)
+    u64 skip_lines = 0, faults = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
@@ -357,6 +359,9 @@ LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Module images load high in the user address space (0x7ff0'00000000 up): no size or flag word reaches there.
+constexpr u64 image_low = 0x7ff000000000ull, user_high = 0x800000000000ull;
+
 // Only slots wired to the stand-in's struct-return receiver accept an object in RDX.
 // Other calls can leave a live wrapper in that register even when they take no arguments.
 bool accepts_buffer_first(const CallRecord& call)
@@ -366,7 +371,33 @@ bool accepts_buffer_first(const CallRecord& call)
     return call.kind == resource_kind && call.slot == resource_get_desc;
 }
 
-// Plays one call. false: its object was never seen (skipped).
+// A call the player cannot play safely is skipped: counted in the census by kind, slot and reason, the first few logged.
+bool skip(Player& p, const CallRecord& c, const char* reason)
+{
+    char key[96];
+    std::snprintf(key, sizeof(key), "%u:%u %s", c.kind, c.slot, reason);
+    if (++p.skips[key] <= 2 && ++p.skip_lines <= 64)
+        say("replay: skipped %s (seq %llu)", key, static_cast<unsigned long long>(c.seq));
+    return false;
+}
+
+// The slot call with an access violation in the stand-in caught (MSVC structured exceptions): the recorded process's
+// state the file did not hold, an address the player could not translate, ends one call instead of the replay.
+bool guarded_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[call_args], u64& ret)
+{
+#ifdef _MSC_VER
+    __try {
+        ret = call_slot(object, rcx, slot, a);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+#else
+    ret = call_slot(object, rcx, slot, a);
+#endif
+    return true;
+}
+
+// Plays one call. false: skipped (counted in the census).
 bool play(Player& p, const Recording& r, const Step& step)
 {
     current_step = &step;
@@ -384,8 +415,12 @@ bool play(Player& p, const Recording& r, const Step& step)
         if (++p.adopted <= 8) say("replay: adopted pre-install wrapper %u 0x%llx", c.kind, static_cast<unsigned long long>(c.object));
     } else {
         ++p.unknown_object;
-        return false;
+        return skip(p, c, "unknown object");
     }
+    // A creation or QueryInterface that failed when recorded made nothing: the out pointer may be the title's stack and
+    // the inputs may not be in the file. Nothing later can name its result, so it is not played.
+    if (x2w_replay_slots::output_arg(c.kind, c.slot) >= 0 && FAILED(static_cast<HRESULT>(c.ret)))
+        return skip(p, c, "recorded failure");
     apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
@@ -397,6 +432,23 @@ bool play(Player& p, const Recording& r, const Step& step)
         call.sampled[2] = call.read_output(2, call.before[2]);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
+    // An argument the stand-in reads as memory that the file does not hold, or an address in the recorded process's
+    // image (where its IIDs and constant tables live): passing it raw would fault in the stand-in. The call is skipped
+    // and counted as a call without its memory.
+    for (int i = 0; i < call_args; ++i) {
+        const u64 raw = c.args[i];
+        if (call.top[i] || !raw || a[i] != raw || page_replay().reserved(raw) || p.descriptor_backing(raw)) continue;
+        const bool image = raw >= image_low && raw < user_high;
+        if (image || x2w_replay_slots::declared_input(c.kind, c.slot, i)) {
+            ++p.missing_blob;
+            static const char* const reasons[call_args] = {
+                "argument 0 not in the file", "argument 1 not in the file", "argument 2 not in the file",
+                "argument 3 not in the file", "argument 4 not in the file", "argument 5 not in the file",
+                "argument 6 not in the file", "argument 7 not in the file", "argument 8 not in the file",
+                "argument 9 not in the file", "argument 10 not in the file"};
+            return skip(p, c, reasons[i]);
+        }
+    }
     // An out pointer the file does not hold (older files dropped it when the call failed) is the recorded process's
     // stack address: the stand-in would write through it. It gets a zeroed buffer of the player's own.
     if (const int out = x2w_replay_slots::output_arg(c.kind, c.slot);
@@ -444,7 +496,11 @@ bool play(Player& p, const Recording& r, const Step& step)
                 a[base + 2] = reinterpret_cast<u64>(lengths.data());
             }
         }
-        call_slot(call.self, rcx, c.slot, a);
+        u64 ignored = 0;
+        if (!guarded_slot(call.self, rcx, c.slot, a, ignored)) {
+            ++p.faults;
+            return skip(p, c, "fault in the stand-in");
+        }
         ++p.played;
         return true;
     }
@@ -455,7 +511,7 @@ bool play(Player& p, const Recording& r, const Step& step)
             if (static_cast<UINT>(c.args[i < 3 ? 0 : 3]) && c.args[i] && a[i] == c.args[i] &&
                 !page_replay().reserved(a[i])) {
                 ++p.missing_blob;
-                return false;
+                return skip(p, c, "descriptor arrays not in the file");
             }
         }
     }
@@ -487,8 +543,9 @@ bool play(Player& p, const Recording& r, const Step& step)
         say("x2w-replay: slot 133 seq %llu heap id %llu offset 0x%llx hr=0x%08lx",
             c.seq, placement.id, placement.offset, static_cast<unsigned long>(hr));
         if (FAILED(hr)) ++p.slot_result_mismatches;
-    } else {
-        call.ret = call_slot(call.self, rcx, c.slot, a);
+    } else if (!guarded_slot(call.self, rcx, c.slot, a, call.ret)) {
+        ++p.faults;
+        return skip(p, c, "fault in the stand-in");
     }
     if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
         p.descriptor_backings.push_back({step.descriptor_address, step.descriptor_address + step.descriptor_bytes});
@@ -517,6 +574,22 @@ bool play(Player& p, const Recording& r, const Step& step)
     learn_after(p, r, call);
     ++p.played;
     return true;
+}
+
+// The skip census: every (kind:slot, reason) the player skipped, most frequent first.
+void print_skip_census(const Player& p)
+{
+    u64 total = 0;
+    std::vector<std::pair<u64, std::string>> rows;
+    for (const auto& [key, count] : p.skips) {
+        total += count;
+        rows.emplace_back(count, key);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    say("x2w-replay: skip census: %llu calls skipped in %zu kinds (%llu faults in the stand-in)",
+        static_cast<unsigned long long>(total), rows.size(), static_cast<unsigned long long>(p.faults));
+    for (std::size_t i = 0; i < rows.size() && i < 32; ++i)
+        say("x2w-replay: skip census %s: %llu", rows[i].second.c_str(), static_cast<unsigned long long>(rows[i].first));
 }
 
 int pick_adapter(bool hardware, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter)
@@ -865,6 +938,7 @@ int run(const Options& o)
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
+    print_skip_census(p);
     write_summary(o, p, r, wall, stopped, timing ? &*timing : nullptr);
     if (stopped) return 5;
     if (!dump_ok) return 2;

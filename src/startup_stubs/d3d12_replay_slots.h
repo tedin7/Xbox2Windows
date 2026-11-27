@@ -78,6 +78,23 @@ inline constexpr const Layout* find(int kind, int slot)
 // the recorder captures with create()/output() (d3d12_record.inl), and the declared wrapper outputs. A call that fails
 // still passes that pointer: the recorder keeps its 8 bytes either way, and the player gives one the file does not hold
 // a buffer of its own instead of the recorded process's (stack) address.
+// An argument the stand-in reads as memory (the recorder's declared captures): the player must not pass the recorded
+// process's address for it when the file holds no copy.
+inline constexpr bool declared_input(int kind, int slot, int arg)
+{
+    if (slot == 0) return arg == 0;  // QueryInterface's IID
+    if (const Layout* layout = find(kind, slot); layout && layout->known_memory)
+        return arg < 5 && layout->memory[arg] && arg != layout->wrapper_output;
+    if (kind != device) return false;
+    switch (slot) {
+    case 57: case 67: return arg == 0 || arg == 1;
+    case 55: return arg == 2 || arg == 3;
+    case 25: return arg == 3;
+    case 133: return arg == 1 || arg == 4;
+    default: return false;
+    }
+}
+
 inline constexpr int output_arg(int kind, int slot)
 {
     if (slot == 0) return 1;  // QueryInterface(riid, out)
