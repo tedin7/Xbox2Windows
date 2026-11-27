@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 
 #include "startup_stubs/d3d12_teardown.h"
+#include "startup_stubs/fence_completion.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -123,13 +124,12 @@ public:
         std::vector<DrawDump> complete;
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = entries_.begin(); it != entries_.end();) {
-            const UINT64 value = it->fence ? it->fence->GetCompletedValue() : 0;
-            if (!value) {
+            const auto state = fence_completion(it->fence ? it->fence->GetCompletedValue() : 0, 1);
+            if (state == FenceCompletion::pending) {
                 ++it;
                 continue;
             }
-            // D3D12 reports UINT64_MAX for device removal, including during a wait.
-            if (value != UINT64_MAX) {
+            if (state == FenceCompletion::completed) {
                 complete.push_back(std::move(it->dump));
                 ++consumed_;
             }

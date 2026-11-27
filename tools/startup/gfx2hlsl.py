@@ -858,6 +858,7 @@ EXECZ_SCALAR_JOIN = frozenset({
 EXECZ_REFUSED = ('s_endpgm', 's_store', 's_atomic', 's_buffer_store', 's_buffer_atomic', 's_barrier', 's_sendmsg',
                  's_setreg', 's_setpc', 's_swappc', 's_dcache', 's_icache', 's_gl1', 's_memtime', 's_memrealtime',
                  's_trap', 's_sleep', 'v_writelane', 's_movrel', 'v_movrel')
+EXECZ_EXIT_WAITS = ('s_nop', 's_waitcnt', 's_waitcnt_depctr')
 
 
 def scalar_tokens(text):
@@ -1066,6 +1067,12 @@ def names_one_value(sym):
     if sym[0] == 'ptr' and len(sym) == 3 and sym[1][0] == 'table':
         return isinstance(sym[2], int)
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
+
+
+def descriptor_select(sym):
+    """True for what Stage.scalar_select records for a compute s_cselect_b32 with a descnum arm:
+    ('descnum', 'cselect', select offset, arm, arm). It has no run-time value, so no consumer may read it as one."""
+    return bool(sym) and sym[:2] == ('descnum', 'cselect')
 
 
 def scalar_destinations(name, asm):
@@ -2449,16 +2456,15 @@ VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
 MESH_LOOP_REFUSAL = 'slot 57 mesh: a loop outside the group-memory exchanges is not covered'
-# Scalar buffer loads a pre-exchange execz block may issue once per wave (#2660 accepted one s_buffer_load_dword).
-MESH_WAVE_BLOCK_LOADS = ('s_buffer_load_dword', 's_buffer_load_dwordx2', 's_buffer_load_dwordx4',
-                         's_buffer_load_dwordx8', 's_buffer_load_dwordx16', 's_load_dword', 's_load_dwordx2',
-                         's_load_dwordx4', 's_load_dwordx8', 's_load_dwordx16')
+SCALAR_LOADS = ('s_buffer_load_dword', 's_buffer_load_dwordx2', 's_buffer_load_dwordx4',
+                's_buffer_load_dwordx8', 's_buffer_load_dwordx16', 's_load_dword', 's_load_dwordx2',
+                's_load_dwordx4', 's_load_dwordx8', 's_load_dwordx16')
 
 
 def mesh_wave_block_scalar(name, asm, *, explicit_scc=False):
     """True for an instruction of a pre-exchange execz block that the lowering may run for every lane of a wave with
     an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
-    if name in MESH_WAVE_BLOCK_LOADS:
+    if name in SCALAR_LOADS:
         pass
     elif name == 'v_readfirstlane_b32':
         return bool(re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm))
@@ -2789,7 +2795,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         """Scalar ALU in a skipped block whose results no path reads past the join. Lanes that skip the block per lane
         never read them, and lanes that run it compute the wave-uniform values the guest computes once per wave."""
         name, asm = ins[i][2:]
-        if name in MESH_WAVE_BLOCK_LOADS or not name.startswith('s_') or not mesh_wave_block_scalar(name, asm):
+        if name in SCALAR_LOADS or not name.startswith('s_') or not mesh_wave_block_scalar(name, asm):
             return False
         _, must, may = scalar_effects(name, asm)
         return not any(live_at_join(reg, join) for reg in must | may)
@@ -2807,7 +2813,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                 shift_branch = source
                 continue
             if a_end <= source < target < count_at:
-                loads = [i for i in range(source + 1, target) if ins[i][2] in MESH_WAVE_BLOCK_LOADS]
+                loads = [i for i in range(source + 1, target) if ins[i][2] in SCALAR_LOADS]
                 if loads:
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
@@ -2922,7 +2928,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     inner_execz.update(scalar_arms)
                     if extra:
                         wave_scalars.update(ins[i][0] for i in scalar if ins[i][2].startswith('s_')
-                                            and ins[i][2] not in MESH_WAVE_BLOCK_LOADS)
+                                            and ins[i][2] not in SCALAR_LOADS)
                         for branch in inner:
                             join = edges[branch]
                             if ins[branch][2] == 's_branch':
@@ -3618,8 +3624,9 @@ class Stage:
             return ('alu', 'max({0}, 1u)', (stride,)) if kind == 'stride_min1' else stride
         return node
 
-    def descriptor_number(self, node, budget=None, *, fixed_only=False):
-        """Materialize an immutable descriptor expression only when a numeric consumer needs it."""
+    def descriptor_number(self, node, budget=None, *, fixed_only=False, probe=False):
+        """Materialize an immutable descriptor expression only when a numeric consumer needs it. With probe=True
+        nothing is registered (no constant, no resource): the call only proves the expression can be materialized."""
         if budget is None:
             budget = [128]
         budget[0] -= 1
@@ -3628,7 +3635,8 @@ class Stage:
         kind, *args = node
         if kind == 'alu':
             template, operands = args
-            return '(' + template.format(*(self.descriptor_number(word, budget, fixed_only=fixed_only) for word in operands)) + ')'
+            return '(' + template.format(*(self.descriptor_number(word, budget, fixed_only=fixed_only, probe=probe)
+                                           for word in operands)) + ')'
         if kind == 'value':
             return args[0]
         if kind == 'desc':
@@ -3637,8 +3645,10 @@ class Stage:
                 raise Unsupported('cannot materialize descriptor word %d from an advanced descriptor' % word)
             if (getattr(self, 'kind', None) in ('ps', 'vs') and source[0] == 'table' and 0 <= source[1] < 16
                     and offset is not None and offset % 4 == 0 and 0 <= offset + 4 * word <= 0x7ffffffc):
-                return 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
+                return 'ud' if probe else 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
             if getattr(self, 'kind', None) == 'cs' and source[0] == 'table' and offset is not None and word % 4 == 3:
+                if probe:
+                    return 'ud'
                 key = source, offset + 4 * (word - 3)
                 self.pipe.resource(key, 'buf')
                 return 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
@@ -4146,6 +4156,14 @@ class Stage:
     def descriptor(self, tok, *, allow_null=True):
         """Return (source, byte offset) for a resource operand, or None for a proven null resource."""
         r = reg_range(tok)
+        held = self.select_word(tok)
+        if held is not None:
+            # Only the first word names the resource below; a select of descriptor data in any word (such as a
+            # size word zeroed on one arm) would be dropped, so the access refuses.
+            raise Unsupported('descriptor operand %s: s%d holds a select of descriptor data' % (tok, held))
+        held = self.joined_word(tok)
+        if held is not None:
+            raise Unsupported('descriptor operand %s: s%d holds a word joined at a branch target' % (tok, held))
         s = self.sym.get(r[1]) if r else None
         if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
             if getattr(self, 'has_branches', False):
@@ -4196,6 +4214,23 @@ class Stage:
         r = reg_range(tok)
         return (r and r[0] == 's' and r[2] - r[1] in (3, 7)
                 and all(self.is_const(i) == 0 for i in range(r[1], r[2] + 1)))
+
+    def select_word(self, tok):
+        """The first SGPR of operand tok that holds a select of descriptor data (descriptor_select), or None."""
+        r = reg_range(tok)
+        if not r or r[0] != 's':
+            return None
+        return next((n for n in range(r[1], min(r[2], 105) + 1) if descriptor_select(self.sym.get(n))), None)
+
+    def joined_word(self, tok):
+        """In compute, the first SGPR after the first word of operand tok that holds a value joined at a branch
+        target, or None. The paths bring different words there, a select of descriptor data possibly among them,
+        and the access names its resource by the first word only. A loop head joins the same way."""
+        r = reg_range(tok)
+        if getattr(self, 'kind', None) != 'cs' or not r or r[0] != 's':
+            return None
+        return next((n for n in range(r[1] + 1, min(r[2], 105) + 1)
+                     if (self.sym.get(n) or ('',))[0] == 'joined at a branch target'), None)
 
     def heap_sampler(self, tok):
         """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
@@ -4303,7 +4338,8 @@ class Stage:
         the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
         the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
         shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
-        or a backward s_cbranch_execz is refused.
+        or a backward s_cbranch_execz is refused. A proven straight lane-exhaustion exit can leave the block for a
+        scalar run ending in an EXEC restore (execz_scalar_exit, #2645 T3).
 
         The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
@@ -4416,7 +4452,6 @@ class Stage:
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
                         b < (exit_index := index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1)) <= t):
-                    reason = 'branch out of the block'
                     # A lane can leave while the wave takes the latch, or take the latch after the wave exits.
                     if inner == 's_cbranch_scc0' and any(
                             t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
@@ -4426,6 +4461,9 @@ class Stage:
                             i < latch < exit_index and self.ins[latch][2] == 's_branch'
                             and target in index and index[target] <= i for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_branch'
+                    elif not (inner == 's_cbranch_scc0' and exit_index > t and
+                              self.execz_scalar_exit(b, i, t, exit_index, effects, live_in, into)):
+                        reason = 'branch out of the block'
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
@@ -4472,6 +4510,77 @@ class Stage:
         if any(k in into for k in range(t + 1, j + 1)):
             return 'cause: a branch target (loop or join) lies between the join and the read'
         return 'cause: other'
+
+    def execz_scalar_exit(self, guard, branch, join, target, effects, live_in, into):
+        """Prove the straight b32 lane-exhaustion exit and its shared scalar run before restoring EXEC (#2645 T3).
+
+        ANDN2 clears the breaking lanes from a saved mask, SCC tests whether that mask is empty, and the staying
+        path installs it as EXEC. The proof is scoped to single-wave32 groups (`x * y * z <= 32`) and rejects if
+        `mask` or `scc` is live at `target`. The wave can do extra vector work only with the exiting lane disabled.
+        A lane that skipped the guard keeps its original mask bit through ANDN2 because EXEC was clear for that lane.
+        The shared run can read neither incoming EXEC nor scalar values that differ between the wave and model.
+        """
+        x, y, z = self.pipe.group
+        if (x * y * z > 32 or into.get(join) != [guard]
+                or any(k in into for k in range(guard + 1, target) if k != join)):
+            return False
+        name, ops, mods = parse(self.ins[branch - 1][3])
+        if (name != 's_andn2_b32' or mods or len(ops) != 3 or ops[0] != ops[1]
+                or ops[2] != 'exec_lo' or not re.fullmatch(r's\d+', ops[0])):
+            return False
+        mask = ops[0]
+        if live_in[target] & {mask, 'scc'}:
+            return False
+
+        def saved_exec(src, move, exec_reg):
+            words = scalar_tokens(src)
+            for k in range(guard - 1, -1, -1):
+                name, ops, mods = parse(self.ins[k][3])
+                if k + 1 in into or name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_movrel',
+                                                       's_call', 's_endpgm', 's_rfe')):
+                    break
+                if words & effects[k][2]:
+                    return not mods and (name == move and ops == [src, exec_reg] or move == 's_mov_b32' and
+                                         name == 's_and_saveexec_b32' and len(ops) == 2 and ops[0] == src)
+            return False
+
+        if not saved_exec(mask, 's_mov_b32', 'exec_lo'):
+            return False
+        for k in range(guard + 1, branch - 1):
+            name, asm = self.ins[k][2:]
+            if mask in effects[k][2] or not (name in SCA or name in EXECZ_EXIT_WAITS or
+                                            name.startswith(('v_cmp_', 'v_cmpx_')) or
+                                            self.vector_only_instruction(name, asm)):
+                return False
+        if parse(self.ins[branch + 1][3]) != ('s_mov_b32', ['exec_lo', mask], []):
+            return False
+        for k in range(branch + 2, target):
+            name, asm = self.ins[k][2:]
+            if name not in EXECZ_EXIT_WAITS and (
+                    not self.vector_only_instruction(name, asm) or name.endswith('_dpp') or
+                    name.startswith(('v_permlane', 'v_movrel')) or effects[k][0] & (EXEC_KEYS | {mask, 'scc'})):
+                return False
+
+        for k in range(target, len(self.ins)):
+            if k != target and k in into:
+                return False
+            name, ops, mods = parse(self.ins[k][3])
+            if effects[k][2] & EXEC_KEYS:
+                if mods or len(ops) != 2 or (name, ops[0]) not in (('s_mov_b32', 'exec_lo'), ('s_mov_b64', 'exec')):
+                    return False
+                src = reg_range(ops[1])
+                if not src or src[0] != 's' or src[2] - src[1] != (1 if name == 's_mov_b64' else 0):
+                    return False
+                words = scalar_tokens(ops[1])
+                return saved_exec(ops[1], name, ops[0]) and all(
+                    not words & effects[j][2] for j in range(guard + 1, k))
+            if name in EXECZ_EXIT_WAITS:
+                continue
+            if (mods or not (name in SCA or name in SCALAR_LOADS or name.startswith(('s_cmp_', 's_bitcmp'))) or
+                    any(not (re.fullmatch(r's(?:\d+|\[\d+:\d+\])|src_scc|-?(?:0x[\da-f]+|\d+)', op)
+                             or op in FLOATS) for op in ops)):
+                return False
+        return False
 
     def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
@@ -8256,6 +8365,7 @@ class Stage:
                     self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
+        self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
@@ -8776,6 +8886,18 @@ class Stage:
                 and reg_range(low[0])[0] == 's' and reg_range(low[0])[1] <= 105
                 and not any(self.is_lane_mask(token) for token in low)):
             self.descriptor_scc_selects.add(self.pc)
+        r = reg_range(low[0])
+        if not pair and getattr(self, 'kind', None) == 'cs' and r and r[0] == 's' and r[1] == r[2] <= 105:
+            # A select between descriptor-derived data (descnum, no run-time value) and constants, such as
+            # s_cselect_b32 sX, 0, sX, which can zero a buffer's size: record both arms and the offset whose SCC
+            # picks one. Nothing reads that symbol as a value (S, refuse_select_source, select_word), so neither
+            # arm is dropped.
+            # A descnum S can materialize (word 3 of a table descriptor) keeps the numeric select below.
+            arms = [self.select_arm(t) for t in low[1:]]
+            if (None not in arms and any(arm[0] == 'descnum' for arm in arms)
+                    and not all(self.descnum_materializes(arm) for arm in arms if arm[0] == 'descnum')):
+                self.set_s(r[1], None, ('descnum', 'cselect', self.pc, *arms))
+                return
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
         if low[0] == 'm0':
             self.sym.pop('m0', None)
@@ -8796,6 +8918,38 @@ class Stage:
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
+
+    def descnum_materializes(self, sym):
+        """True when S gives the descnum symbol sym a run-time value; registers nothing (descriptor_number probe)."""
+        if len(sym) != 3:
+            return False
+        try:
+            self.descriptor_number(self.descriptor_number_node(sym), probe=True)
+        except Unsupported:
+            return False
+        return True
+
+    def select_arm(self, tok):
+        """An s_cselect_b32 source as a symbol: the descnum a register holds, ('const', value) for a literal or a
+        register holding a known constant, otherwise None."""
+        r = reg_range(tok)
+        if r:
+            sym = self.sym.get(r[1]) if r[0] == 's' and r[1] == r[2] and r[1] <= 105 else None
+            return sym if sym and (sym[0] == 'descnum' or sym[0] == 'const' and len(sym) == 2) else None
+        value = self.const_u32(tok)
+        return None if value is None else ('const', value)
+
+    def refuse_select_source(self, base, srcs):
+        """A scalar ALU source holding a select of descriptor data in any of its registers (the high word of a pair
+        too): a move copies the symbol, anything else would turn it into an unrelated descnum or descriptor edit,
+        losing the arm that SCC picks, so it refuses."""
+        if base in ('s_mov_b32', 's_mov_b64'):
+            return
+        for tok in srcs:
+            r = reg_range(tok)
+            regs = ['m0'] if tok == 'm0' else range(r[1], r[2] + 1) if r and r[0] == 's' else ()
+            if any(descriptor_select(self.sym.get(n)) for n in regs):
+                raise Unsupported('%s on a select of descriptor data' % base)
 
     def smem_soffset(self, tok, record_use=True):
         """Runtime expression for an SMEM scalar offset operand (s0..s105 or m0)."""
