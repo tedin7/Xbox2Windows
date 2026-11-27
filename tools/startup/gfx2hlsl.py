@@ -4533,9 +4533,11 @@ class Stage:
                     elif ops[1] not in FLOATS and -16 <= vals[0] <= 64:
                         value = vals[0] & 0xffffffffffffffff
                 if value is not None and dst and set(dst) <= changed:
+                    uniform_mask = (base == 's_mov_b64' and dst == (2, 3)
+                                    and value in (0, 0xffffffffffffffff))
                     for n, k in enumerate(dst):
                         new[k] = (value >> (32 * n)) & 0xffffffff
-                        if k >= 2:
+                        if k >= 2 and not uniform_mask:
                             tainted |= 1 << (k - 2)
             nexts = []
             if name in ('s_setpc_b64', 's_swappc_b64'):

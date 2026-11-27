@@ -205,6 +205,21 @@ def vcc_sampler_controls():
     assert text.index('s46 = (vcc) & 1;') < text.index('vcc = (0x18500000u) & 1;')
     assert text.index('.SampleLevel(') < text.index('vcc = (s46) & 1;') < text.index('v0 = (vcc & 1) ? v1 : v0;')
     assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18500000 0x0'
+    # A full wave of zeros or ones is already an exact per-lane VCC mask.
+    for inline, expression in ((128, '0x00000000u'), (193, '0xffffffffu')):
+        uniform = restored.replace(compare, struct.pack('<I', 0xbeea0400 | inline), 1)
+        pipe = G.Pipeline(VS_WORDS, uniform, root_blob())
+        text = pipe.hlsl_ps()
+        assert text.index('vcc = (%s) & 1;' % expression) < text.index('s46 = (vcc) & 1;')
+        assert 'vcc = (s46) & 1;' in text and 'v0 = (vcc & 1) ? v1 : v0;' in text
+        assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18500000 0x0'
+    partial_mask = restored.replace(compare, struct.pack('<I', 0xbeea0481), 1)
+    try:
+        G.Pipeline(VS_WORDS, partial_mask, root_blob())
+    except G.Unsupported as error:
+        assert "descriptor operand s[104:107] holds ('const', 0x92)" == str(error), str(error)
+    else:
+        raise AssertionError('nonuniform VCC constant read as a mask')
     before_restore = code[:end_sample] + select + restore + code[end_sample:]
     try:
         G.Pipeline(VS_WORDS, before_restore, root_blob())
