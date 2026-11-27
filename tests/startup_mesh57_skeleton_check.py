@@ -2473,6 +2473,25 @@ def publish_request(directory, publisher, adapter, mesh=MESH):
     return 0, (cache, key, root_blob)
 
 
+def runtime_mismatch_report(actual, expected, correct, group_zero, clear, log):
+    """Say which known image a wrong runtime image is closest to, where it differs and what the runtime logged."""
+    def pixels(image):
+        return [tuple(image[i:i + 4]) for i in range(0, len(image), 4)]
+    got, want = pixels(actual), pixels(expected)
+    counts = [sum(a != b for a, b in zip(got, pixels(ref))) for ref in (expected, correct, group_zero, clear)]
+    lines = ['pixels differing from: expected %d, two groups %d, group zero %d, clear %d; non-clear pixels %d'
+             % (*counts, sum(p != (0, 0, 0, 255) for p in got))]
+    wrong = [(i % SIDE, i // SIDE, a, b) for i, (a, b) in enumerate(zip(got, want)) if a != b]
+    worst = [max(abs(a[c] - b[c]) for _, _, a, b in wrong) for c in range(4)] if wrong else []
+    lines.append('largest channel difference (r, g, b, a): %s' % (worst,))
+    lines += ['  (%d,%d) got %s want %s' % item for item in wrong[:8]]
+    if log.exists():
+        text = [line for line in log.read_text(errors='replace').splitlines()
+                if 'slot57' in line or 'mesh' in line or 'ExecuteIndirect' in line or 'desktop pipeline' in line]
+        lines += ['log: ' + line[:200] for line in text[:20]]
+    return '\n'.join(lines)
+
+
 def runtime(dxc, renderer, adapter, publisher):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
@@ -2512,7 +2531,8 @@ def runtime(dxc, renderer, adapter, publisher):
             actual = pixels.read_bytes()
             if actual != expected:
                 raise AssertionError(f'mesh runtime {groups}: image differs at '
-                                     f'{sum(a != b for a, b in zip(actual, expected))} bytes')
+                                     f'{sum(a != b for a, b in zip(actual, expected))} bytes\n'
+                                     + runtime_mismatch_report(actual, expected, correct, group_zero, clear, log))
             if reason and (not log.exists() or reason not in log.read_text(errors='replace')):
                 raise AssertionError(f'mesh runtime did not log {reason}')
             return 0
