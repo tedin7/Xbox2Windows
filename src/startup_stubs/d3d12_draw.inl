@@ -15,7 +15,7 @@
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
     bool array = false;
-    bool load = false;  // manifest 'uavload N': the program also reads the texel back (partial-dmask store)
+    bool load = false;  // manifest 'uavload N': the pixel program reads through this view
 };
 static_assert(x2w_startup::kSupport2UavTypedLoad == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, "typed load bit");
 static_assert(x2w_startup::kSupport2UavTypedStore == D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, "typed store bit");
@@ -124,8 +124,10 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     if (srgb_uav_format(format)) return "sRGB format";
     if (!float_uav_format(format)) return "format is not a float colour format";
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    const unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
-                                  ? 0u : static_cast<unsigned>(support.Support2);
+    unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                            ? 0u : static_cast<unsigned>(support.Support2);
+    static const bool test_no_typed_load = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_NO_TYPED_LOAD", nullptr, 0) != 0;
+    if (test_no_typed_load) support2 &= ~x2w_startup::kSupport2UavTypedLoad;
     if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, needs_load)) return unsupported;
     out = {};
     out.Format = format;
@@ -653,7 +655,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
         } else if (line.compare(0, 8, "uavload ") == 0) {
-            // The pixel program reads the stored image back (partial-dmask store); the view then needs typed load.
+            // A texel load or a partial store reads the image through the UAV and requires typed load.
             unsigned index = 0;
             const std::string digits = line.substr(8);
             const bool well_formed = !digits.empty() && digits.size() <= 9 &&
@@ -4091,8 +4093,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + srv_count + j} * draw_heap_increment};
-        require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
+        auto* resource = uav_bindings[j].resource;
+        require_state(self, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (tr->uavs[j].load) {
+            // Order earlier UAV writes before a draw that reads the current contents.
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = resource;
+            list->ResourceBarrier(1, &barrier);
+        }
+        device_of(the_device)->CreateUnorderedAccessView(resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
         if (first_calls(shown, 6)) {
             if (uav_bindings[j].view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
