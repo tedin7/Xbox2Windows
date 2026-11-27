@@ -2371,7 +2371,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm = op_name
         elif op_name in {
             "s_nop", "s_setkill", "s_sethalt", "s_sleep", "s_setprio", "s_trap",
-            "s_incperflevel", "s_decperflevel", "s_denorm_mode",
+            "s_incperflevel", "s_decperflevel", "s_round_mode", "s_denorm_mode",
         }:
             asm = f"{op_name} {simm}"
         elif op_name == "s_waitcnt":
