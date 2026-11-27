@@ -456,7 +456,7 @@ int main(int argc, char** argv)
             format_disk(disk_text, sizeof disk_text, 20, after, before, 10.0, 10000000.0);
             const char* const want_disk =
                 "x2w-dstorage disk 20 s: 100 reads (+100), 100.0 MB/s while reading, reading 5% of the window; "
-                "read sizes <=4K 0 <=16K 0 <=64K 0 <=256K 0 <=1M 100 >1M 0; offsets sequential 99 forward 0 backward 0 first 1; read failures 0";
+                "read sizes <=4K 0 <=16K 0 <=64K 0 <=256K 0 <=1M 100 >1M 0; offsets sequential 99 forward 0 backward 0 first 1; read failures 0; mean 5.000000 ms/read since start";
             if (!expect(std::strcmp(disk_text, want_disk) == 0, "disk line differs")) {
                 std::fprintf(stderr, "  got:  %s\n  want: %s\n", disk_text, want_disk);
                 ok = false;

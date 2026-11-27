@@ -17,11 +17,23 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
+// Intercept only the file reader used by the queue and prefetch cache.
+static bool slow_reader = false;
+static BOOL read_with_delay(HANDLE file, void* buffer, DWORD count, DWORD* read, OVERLAPPED* position)
+{
+    if (slow_reader) std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    return ReadFile(file, buffer, count, read, position);
+}
+#define ReadFile read_with_delay
+#include "startup_stubs/dstorage_file_read.h"
+#undef ReadFile
 #include "startup_stubs/xcrdapi.cpp"
 
 namespace {
@@ -130,13 +142,16 @@ int check_forget()
     return 0;
 }
 
-int main(int argc, char** argv)
+int check_queue(int argc, char** argv, bool cold_control)
 {
     if (argc == 2 && std::strcmp(argv[1], "forget") == 0) return check_forget();
     const bool deep = argc == 2 && std::strcmp(argv[1], "deep") == 0;  // 1500 scattered requests: the look-ahead window is deeper than 256 entries
-    const bool on = deep || (argc == 2 && std::strcmp(argv[1], "on") == 0);
+    const bool cold = cold_control || (argc == 2 && std::strcmp(argv[1], "cold") == 0);
+    slow_reader = cold;
+    SetEnvironmentVariableA("X2W_STORAGE_HDD_ADAPTIVE", cold && !cold_control ? "1" : nullptr);
+    const bool on = cold || deep || (argc == 2 && std::strcmp(argv[1], "on") == 0);
     if (!on && !(argc == 2 && std::strcmp(argv[1], "off") == 0)) {
-        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off|deep|forget\n");
+        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off|deep|forget|cold|cold-control\n");
         return 2;
     }
     SetEnvironmentVariableA("X2W_STORAGE_HDD", on ? "1" : nullptr);  // read once, at the first use
@@ -145,9 +160,9 @@ int main(int argc, char** argv)
     GetTempPathW(MAX_PATH, temp_dir);
     std::swprintf(data_path, MAX_PATH, L"%lsx2w_hdd_queue_%lu.bin", temp_dir, GetCurrentProcessId());
     const unsigned request_count = deep ? 1500 : base_count;
-    const unsigned stride = deep ? 16384 : piece;  // deep: pieces 16 KiB apart, so only a deep window merges them
+    const unsigned stride = cold ? 192 * 1024 : deep ? 16384 : piece;  // deep: pieces 16 KiB apart, so only a deep window merges them
     std::vector<unsigned char> file_bytes(static_cast<std::size_t>(request_count) * stride);
-    for (std::size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = static_cast<unsigned char>((i * 131 + (i >> 8)) ^ 0x5a);
+    for (std::size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = static_cast<unsigned char>((i * 131 + (i >> 8) + (i >> 16)) ^ 0x5a);
     {
         HANDLE out = CreateFileW(data_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         DWORD written = 0;
@@ -185,6 +200,17 @@ int main(int argc, char** argv)
     std::vector<unsigned> slot_of(request_count);
     for (unsigned i = 0; i < request_count; ++i) slot_of[i] = (i * (deep ? 37 : 5) + 7) % request_count;
     std::vector<std::vector<unsigned char>> destination(request_count);
+    if (cold) {
+        // Prime the previous window with an actual delayed read of the same package.
+        const HANDLE handle = static_cast<Object*>(file_ptr)->handle;
+        std::vector<unsigned char> seed;
+        LARGE_INTEGER begin{}, end{};
+        QueryPerformanceCounter(&begin);
+        const bool read = x2w_startup::read_storage_file(handle, 0, piece, seed);
+        QueryPerformanceCounter(&end);
+        if (!expect(read, "slow-reader seed failed")) return 1;
+        note_disk_read(handle, 0, piece, end.QuadPart - begin.QuadPart, read);
+    }
     const DiskStats disk_before = disk_snapshot();
     for (unsigned i = 0; i < request_count; ++i) {
         destination[i].assign(piece, 0xA5);
@@ -256,6 +282,15 @@ int main(int argc, char** argv)
     }
     DeleteFileW(data_path);
     if (!ok) return 1;
+    if (reduction_failed) return 3;
     std::printf("hdd mode %s: all %u requests returned the file's bytes; %ld file reads\n", on ? "on" : "off", request_count, reads);
     return 0;
+}
+
+int main(int argc, char** argv)
+{
+    const bool cold_control = argc == 2 && std::strcmp(argv[1], "cold-control") == 0;
+    const int result = check_queue(argc, argv, cold_control);
+    // WILL_FAIL accepts only a verified miss of the reduction target.
+    return cold_control ? (result == 3 ? 1 : 0) : result;
 }
