@@ -4852,6 +4852,16 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    add_test(NAME startup_compute_tg_size_fields_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" fields-dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_compute_tg_size_fields_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    foreach(control IN ITEMS wave32-shift wave64-shift drop-wave-count)
+        add_test(NAME startup_compute_tg_size_fields_${control}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" fields-control ${control} "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" warp)
+        set_tests_properties(startup_compute_tg_size_fields_${control}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl wave32 vcc_hi as an ordinary scalar register in a compute program with an s_cbranch_execz block.
     add_test(NAME startup_compute_vcc_hi_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_vcc_hi_check.py")

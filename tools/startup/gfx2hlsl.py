@@ -4506,8 +4506,8 @@ class Stage:
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
-        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set (only accepted
-        for at most 32 threads per group, #2274), and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
+        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set,
+        and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
         inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not place (s0-s3 and
         any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
@@ -4523,9 +4523,15 @@ class Stage:
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
-            if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
-                    and not wave32_exec_proof(self.ins):
+            wave = self.pipe.wave_size
+            if wave is None:
+                if wave32_exec_proof(self.ins):
+                    wave = 32
+                elif wave64_exec_proof(self.ins):
+                    wave = 64
+            if math.prod(self.pipe.group) > 32 and wave not in (32, 64):
                 raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+            self.tg_size_wave = wave
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -9454,21 +9460,30 @@ class Stage:
             for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
         ]
         if tg_srcs:
-            # Wave-ID bits TG_SIZE[11:6] (mask 0xfc0) are identically 0 for <= 32 threads per group (1 wave).
             if (base == 's_and_b32' and not mods and len(srcs) == 2
                     and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105):
                 other = (srcs[1] if syms[0] == ('tg_size',) and syms[1] != ('tg_size',)
                          else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
                          else None)
-                if other is not None and self.const_u32(other) == 0xfc0:
+                mask = self.const_u32(other) if other is not None else None
+                if mask in (0x3f, 0xfc0):
                     x, y, z = self.pipe.group
-                    if x * y * z <= 32:
+                    threads = x * y * z
+                    wave = self.tg_size_wave
+                    if mask == 0x3f:
+                        if wave not in (32, 64):
+                            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+                        count = (threads + wave - 1) // wave
+                        self.set_s(dst[1], '%du' % count, ('const', count), scc='true')
+                        return None
+                    if threads <= (wave if wave in (32, 64) else 32):
                         self.set_s(dst[1], '0u', ('const', 0), scc='false')
                         return None
-                    # Wave32 waves hold 32 consecutive threads in x-major order: the wave ID is the flat thread index / 32,
-                    # and differs between the waves of one group (so the register is not uniform).
+                    # Only actual group threads enter the per-lane EXEC model, including in the last wave.
+                    # The guest wave ID may differ within the group, independently of the host wave layout.
+                    shift = 5 if wave == 32 else 6
                     flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
-                    self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
+                    self.set_s(dst[1], '((%s >> %du) << 6u)' % (flat, shift), scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
@@ -16681,10 +16696,7 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
-        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
-                wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
-            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+        self.wave_size = wave_size  # caller-supplied guest wave size (32, 64), or None
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
@@ -17945,7 +17957,7 @@ LIFTED_REASONS = (
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
-# what this build writes for some cases its lift does not cover (such as TG_SIZE_EN groups outside wave32 coverage),
+# what this build writes for some cases its lift does not cover (such as TG_SIZE_EN groups with unknown wave size),
 # so a newer .fail of a lifted family is retried once per build, not at the head of every run.
 RETRIED_NAME = 'pre_run_retried.txt'
 # The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
