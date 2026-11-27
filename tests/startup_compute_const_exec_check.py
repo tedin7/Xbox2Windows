@@ -22,20 +22,41 @@ ALL32 = ('s_mov_b32 exec_lo, -1', 'c103febe')
 ONE64 = ('s_mov_b64 exec, 1', '8104febe')
 ONE32 = ('s_mov_b32 exec_lo, 1', '8103febe')
 ZERO64 = ('s_mov_b64 exec, 0', '8004febe')
+TWO64 = ('s_mov_b64 exec, 2', '8204febe')
+INVERT64 = ('s_andn2_b64 exec, -1, exec', 'c17efe8a')
+INVERT32 = ('s_andn2_b32 exec_lo, -1, exec_lo', 'c17e7e8a')
 HIGH64 = (('s_mov_b32 s30, 0', '80039ebe'), ('s_mov_b32 s31, 1', '81039fbe'),
           ('s_mov_b64 exec, s[30:31]', '1e04febe'))
 INDEX = ('v_mov_b32_e32 v9, s20', '1402127e')
 VARYING_INDEX = ('v_mov_b32_e32 v9, v0', '0003127e')
 SMEM = ('s_buffer_load_dword s20, s[12:15], 0', '060520f4000000fa')
 OLD_MARKER, NEW_MARKER = 13, 57
+PIECE_VALUES = (11, 29, 23)  # root s4, loaded s20, root s5 in readfirstlane order
+PIECE_INPUTS = ('ud0', 's20', 'ud1')
+PIECE_WRITES = (('v_mov_b32_e32 v10, s4', '0402147e'),
+                ('v_mov_b32_e32 v11, s5', '0502167e'),
+                ('v_mov_b32_e32 v12, s20', '1402187e'))
+PIECE_ZEROS = (('v_mov_b32_e32 v10, 0', '8002147e'),
+              ('v_mov_b32_e32 v11, 0', '8002167e'),
+              ('v_mov_b32_e32 v12, 0', '8002187e'))
+PIECE_READS = (('v_readfirstlane_b32 s23, v10', '0a052e7e'),
+               ('v_readfirstlane_b32 s24, v12', '0c05307e'),
+               ('v_readfirstlane_b32 s25, v11', '0b05327e'))
+PIECE_PACK = (
+    (('v_lshlrev_b32_e32 v7, 16, v10', '90140e34'), ('v_or_b32_e32 v7, s23, v7', '170e0e38')),
+    (('v_lshlrev_b32_e32 v7, 16, v12', '90180e34'), ('v_or_b32_e32 v7, s24, v7', '180e0e38')),
+    (('v_lshlrev_b32_e32 v7, 16, v11', '90160e34'), ('v_or_b32_e32 v7, s25, v7', '190e0e38')),
+)
+
+
+def flat_id(group):
+    if group[1] == 1:
+        return (('v_mov_b32_e32 v3, v0', '0003067e'),)
+    return (('v_lshlrev_b32_e32 v3, 4, v1', '84020634'),
+            ('v_add_nc_u32_e32 v3, v0, v3', '0007064a'))
 
 
 def program(group, width, *, saved=False, mask=None, index=INDEX, before_read=(), after_restore=()):
-    if group[1] == 1:
-        flat = (('v_mov_b32_e32 v3, v0', '0003067e'),)
-    else:  # x-major group layout, with X = 16
-        flat = (('v_lshlrev_b32_e32 v3, 4, v1', '84020634'),
-                ('v_add_nc_u32_e32 v3, v0, v3', '0007064a'))
     width_mask = ('v_and_b32_e32 v7, 63, v3', 'bf060e36') if width == 64 else (
         'v_and_b32_e32 v7, 31, v3', '9f060e36')
     save = ((SAVE64 if width == 64 else waterfall.PREFIX[-2]),) if saved else ()
@@ -45,12 +66,26 @@ def program(group, width, *, saved=False, mask=None, index=INDEX, before_read=()
         restore = waterfall.RESTORE if saved else ALL32
     if mask is None:
         mask = (ONE64 if width == 64 else ONE32,)
-    return (*waterfall.PREFIX[:4], *flat, width_mask, ('v_mov_b32_e32 v8, 13', '8d02107e'),
+    return (*waterfall.PREFIX[:4], *flat_id(group), width_mask, ('v_mov_b32_e32 v8, 13', '8d02107e'),
             *save, *mask, SMEM, waterfall.PREFIX[3], ('s_add_u32 s20, s20, s4', '14041480'),
             ('s_and_b32 s20, s20, 3', '14831487'), ('s_lshl_b32 s20, s20, 1', '1481148f'),
             index, FORMAT, VM_WAIT, *before_read, READ, ('v_mov_b32_e32 v8, 57', 'b902107e'),
             restore, *after_restore, ('v_add_nc_u32_e32 v7, s22, v7', '160e0e4a'),
             ('v_and_b32_e32 v8, s5, v8', '05101036'), ('v_xor_b32_e32 v7, v8, v7', '080f0e3a'),
+            ('v_lshlrev_b32_e32 v4, 2, v3', '82060834'), waterfall.STORE, waterfall.END)
+
+
+def piecewise_program(group, width, component, *, switch=None, writes=PIECE_WRITES,
+                      zeros=PIECE_ZEROS, restore=None):
+    one, all_lanes = (ONE64, ALL64) if width == 64 else (ONE32, ALL32)
+    if switch is None:
+        switch = (INVERT64 if width == 64 else INVERT32,)
+    if restore is None:
+        restore = (all_lanes,)
+    return (*waterfall.PREFIX[:4], *flat_id(group), SMEM, waterfall.PREFIX[3],
+            one, INDEX, READ, *writes, *switch, *zeros,
+            ('s_buffer_load_dword s20, s[12:15], 0x4', '060520f4040000fa'), waterfall.PREFIX[3],
+            *restore, *PIECE_READS, *PIECE_PACK[component],
             ('v_lshlrev_b32_e32 v4, 2, v3', '82060834'), waterfall.STORE, waterfall.END)
 
 
@@ -65,6 +100,12 @@ def programs():
     yield 'wave64-2d', (16, 16, 1), 64, 1, True, None
     yield 'wave32-1d', (64, 1, 1), 32, 1, True, None
     yield 'wave64-high-bit', (128, 1, 1), 64, 1 << 32, False, HIGH64
+
+
+def piecewise_cases():
+    yield 'pieces-wave64-2d', (16, 16, 1), 64
+    yield 'pieces-wave64-1d', (128, 1, 1), 64
+    yield 'pieces-wave32-1d', (64, 1, 1), 32
 
 
 def reference(group, width, mask, key, marker_bits, source, *, broadcast=False):
@@ -92,11 +133,103 @@ def reference(group, width, mask, key, marker_bits, source, *, broadcast=False):
     return output
 
 
+def piecewise_reference(group, width, values, component):
+    """Interpret the three writes and reads in each wave, using per-lane VGPR storage."""
+    output = [SENTINEL] * WORDS
+    for start in range(0, math.prod(group), width):
+        lanes = range(min(width, math.prod(group) - start))
+        wave = (1 << len(lanes)) - 1
+        vgprs = [[None] * len(lanes) for _ in values]
+        for exec_mask, writes in ((1, values), (wave & ~1, (0, 0, 0))):
+            for reg, value in zip(vgprs, writes):
+                for lane in lanes:
+                    if exec_mask & (1 << lane):
+                        reg[lane] = value
+        exec_mask = wave
+        first = next(lane for lane in lanes if exec_mask & (1 << lane))
+        readback = [reg[first] for reg in vgprs]
+        for lane in lanes:
+            output[start + lane] = (vgprs[component][lane] << 16) | readback[component]
+    return output
+
+
 def broadcast_exec(hlsl):
     # Negative control: turn the first EXEC restriction into the legacy broadcast of bit 0 to all threads.
     mutant, count = re.subn(r'^(\s*exec = )[^\n]*tid\.x[^\n]*;$', r'\g<1>1u;', hlsl, count=1, flags=re.M)
     assert count == 1
     return mutant
+
+
+def check_piecewise_reads(hlsl, inputs):
+    for reg, (scalar, vector) in zip(inputs, ((23, 10), (24, 12), (25, 11))):
+        assignment = re.search(r'\bs%d = (ul[0-9a-f]+_%d);' % (scalar, vector), hlsl)
+        assert assignment, (scalar, vector, hlsl)
+        assert re.search(r'^    %s = %s;$' % (assignment[1], re.escape(reg)), hlsl, re.M), assignment[1]
+
+
+def piecewise_controls():
+    for label, group, width in piecewise_cases():
+        for component, value in enumerate(PIECE_VALUES):
+            rows = piecewise_program(group, width, component)
+            pipe = translate(rows, group, width)
+            assert pipe.retry_const_exec, label
+            hlsl = pipe.hlsl_cs()
+            check_piecewise_reads(hlsl, PIECE_INPUTS)
+            assert 'scc = true;' in hlsl and '0xfffffffeu' in hlsl, label
+            for reg in (10, 11, 12):
+                assert f'if (exec & 1) v{reg} = 0x00000000u;' in hlsl, label
+            result = piecewise_reference(group, width, PIECE_VALUES, component)
+            assert result[:math.prod(group)] == [
+                value | (value << 16 if i % width == 0 else 0) for i in range(math.prod(group))
+            ], label
+
+    group = (128, 1, 1)
+    unknown = (('s_mov_b32 s21, 0', '800395be'),
+               ('s_andn2_b64 exec, -1, s[20:21]', 'c114fe8a'))
+    varying = (('v_mov_b32_e32 v10, v0', '0003147e'), *PIECE_ZEROS[1:])
+    for change in (dict(switch=unknown), dict(writes=PIECE_WRITES[1:]),
+                   dict(restore=(ZERO64,)), dict(zeros=varying)):
+        refused(REFUSAL, lambda: translate(piecewise_program(group, 64, 0, **change), group, 64))
+    hlsl = translate(piecewise_program(group, 64, 0, restore=(TWO64,)), group, 64).hlsl_cs()
+    check_piecewise_reads(hlsl, ('0x00000000u',) * 3)
+    copy = ('v_mov_b32_e32 v10, v10', '0a03147e')
+    hlsl = translate(piecewise_program(group, 64, 0, writes=(*PIECE_WRITES, copy)), group, 64).hlsl_cs()
+    assert re.search(r'\bul[0-9a-f]+_10 = ul[0-9a-f]+_10;', hlsl)
+    refused(REFUSAL, lambda: translate(piecewise_program(group, 64, 0, restore=(ALL64, copy)), group, 64))
+
+    partial = (65, 1, 1)
+    translate(piecewise_program(partial, 64, 0), partial, 64)
+    refused(REFUSAL, lambda: translate(piecewise_program(partial, 64, 0, restore=(TWO64,)), partial, 64))
+
+
+def mask_logic_controls():
+    for width, group, exec_reg, saved, restore, invert in (
+        (64, (128, 1, 1), 'exec', 's[26:27]', RESTORE64, INVERT64),
+        (32, (64, 1, 1), 'exec_lo', 's26', waterfall.RESTORE, INVERT32),
+    ):
+        # Identity operations on the complemented mask, followed by two complements.
+        delta = int(width == 64)
+        logic = tuple(
+            (f's_{op}_b{width} {exec_reg}, {exec_reg}, {src}',
+             bytes((0x7e, 0xc1 if src == -1 else 0x80, 0x7e | (delta << 7), opcode)).hex())
+            for op, src, opcode in (('and', -1, 0x87), ('or', 0, 0x88), ('xor', 0, 0x89), ('orn2', -1, 0x8b))
+        )
+        negate = (f's_not_b{width} {exec_reg}, {exec_reg}', bytes((0x7e, 7 + delta, 0xfe, 0xbe)).hex())
+        rows = piecewise_program(group, width, 0, switch=(invert, *logic, negate, negate))
+        check_piecewise_reads(translate(rows, group, width).hlsl_cs(), PIECE_INPUTS)
+        for i, (op, src) in enumerate((('and', 0), ('or', 0), ('xor', 1), ('andn2', -1), ('orn2', 0))):
+            opcode = (0x24 if width == 64 else 0x3c) + i
+            save = (f's_{op}_saveexec_b{width} {saved}, {src}',
+                    bytes((0xc1 if src == -1 else 0x80 + src, opcode, 0x9a, 0xbe)).hex())
+            rows = piecewise_program(group, width, 0, switch=(save, restore, invert))
+            hlsl = translate(rows, group, width).hlsl_cs()
+            check_piecewise_reads(hlsl, PIECE_INPUTS)
+            assert 's26 = 0x00000001u;' in hlsl
+            if width == 64:
+                assert 's27 = 0x00000000u;' in hlsl
+            assert re.findall(r'^    scc = (true|false);$', hlsl, re.M) == [
+                'false' if op in ('and', 'xor') else 'true', 'true'
+            ], op
 
 
 def controls():
@@ -120,7 +253,8 @@ def controls():
     refused(REFUSAL, lambda: translate(program(group, 64, index=VARYING_INDEX), group, 64))
     refused(REFUSAL, lambda: translate(program(group, 64, mask=(ZERO64,)), group, 64))
     refused(REFUSAL, lambda: translate(program(group, 64, before_read=(VARYING_INDEX,)), group, 64))
-    refused(REFUSAL, lambda: translate(program(group, 64, before_read=(ONE64,)), group, 64))
+    assert translate(program(group, 64, before_read=(ONE64,)), group, 64).retry_const_exec
+    refused(REFUSAL, lambda: translate(program(group, 64, before_read=(TWO64,)), group, 64))
     high_clobber = (('s_mov_b32 s27, 0', '80039bbe'),)
     refused(REFUSAL, lambda: translate(program(group, 64, saved=True, before_read=high_clobber), group, 64))
     join = (('s_branch 0', '000082bf'),)
@@ -129,7 +263,9 @@ def controls():
     refused(REFUSAL, lambda: translate(program(partial, 64, mask=HIGH64), partial, 64))
     mixed = program(group, 64, after_restore=(ALL32,))
     refused(waterfall.G.CONST_EXEC_WAVE_SIZE, lambda: translate(mixed, group, None))
-    print('constant EXEC: multi-wave projections, recomputation and refusal controls passed')
+    piecewise_controls()
+    mask_logic_controls()
+    print('constant EXEC: multi-wave projections, piecewise recomputation and refusal controls passed')
 
 
 def dispatch(directory, dxc, runner, adapter):
@@ -156,6 +292,26 @@ def dispatch(directory, dxc, runner, adapter):
             src.write_text(variant, encoding='ascii')
             subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
             if check_references(name, runner, adapter, shader, checks, allow_skip=True) == 77:
+                return 77
+    return dispatch_piecewise(directory, dxc, runner, adapter, source)
+
+
+def dispatch_piecewise(directory, dxc, runner, adapter, source):
+    values = {('rootconst', 0, 0): PIECE_VALUES[0], ('rootconst', 0, 1): PIECE_VALUES[2]}
+    assert source[0] == PIECE_VALUES[1]
+    for label, group, width in piecewise_cases():
+        for component, (scalar, vector) in enumerate(((23, 10), (24, 12), (25, 11))):
+            pipe = translate(piecewise_program(group, width, component), group, width)
+            expected = piecewise_reference(group, width, PIECE_VALUES, component)
+            name = f'{label}-s{scalar}'
+            case, src, shader = (directory / (name + ext) for ext in ('.case', '.hlsl', '.cso'))
+            constants = [values[ud] for ud in pipe.uds]
+            words = [1, *expected, *constants, *([0] * (16 - len(constants))), *source]
+            case.write_bytes(struct.pack('<%dI' % len(words), *words))
+            src.write_text(pipe.hlsl_cs(), encoding='ascii')
+            subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+            if check_references(name, runner, adapter, shader, [(case, f's{scalar} and v{vector}', None)],
+                                allow_skip=True) == 77:
                 return 77
     return 0
 

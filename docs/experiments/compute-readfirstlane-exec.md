@@ -80,25 +80,41 @@ ctest --preset dev --no-tests=error -R '^startup_compute_readfirstlane_wave_(con
 ## Constant EXEC across compute waves
 
 After the existing compute retries end in a uniform-source refusal, the
-translator can project a constant EXEC move onto each guest lane. It uses
+translator can project a constant EXEC write onto each guest lane. It uses
 the flattened thread ID modulo the guest wave width. A group larger than
 32 threads requires a proven width. The first active lane must exist in
 every wave, including the tail wave.
 
-The fallback recomputes the first lane's value from uniform arithmetic or a
-uniform read-only buffer load. It keeps the original EXEC guard on the VGPR
-assignment. A branch, block boundary or EXEC write ends the proof. A direct
-move can restore a proven saved mask or set every lane's bit with `-1`.
+The fallback tracks the lanes that received each uniform VGPR definition.
+Each thread computes a copy of the value in a temporary, while the original
+VGPR assignment keeps its EXEC guard. A later uniform definition replaces the
+proof for the lanes it writes. The read uses the temporary that covers the
+lowest set EXEC bit. A varying write invalidates the VGPR proof. A branch or
+block boundary clears the mask and all VGPR proofs.
 
-The fixture covers groups of 128 and 16×16 threads in wave64 and 64 threads
-in wave32. It checks the loaded word plus the lane index and a VGPR write
-that only active lanes should see. The WARP test also dispatches a mutant
-that enables all lanes and expects the first differing word predicted by
-the CPU reference.
+Moves and bitwise scalar EXEC writes retain a constant mask when their inputs
+are known. SAVEEXEC records the previous mask in the destination SGPRs.
+Bitwise writes set SCC from the scalar result. See SOP1, SOP2, and VOP1 in the
+[RDNA 2 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+The piecewise fixture runs with 128 and 16×16 threads in wave64 and 64 threads
+in wave32. Lane zero receives three uniform values. A complementary EXEC
+write enables the other lanes to overwrite their copies with zero. A scalar
+load then clobbers one of the original SGPRs. After EXEC is restored, every
+lane stores each first-lane result packed with its own VGPR value. The WARP
+leg compares those words with an independent guest-wave interpreter.
+Controls cover an unknown mask write, a missing lane definition, empty EXEC,
+and a first set bit absent from a partial wave.
 
 ```bash
 env -u X2W_DXC nice -n 15 python3 -B tests/startup_compute_const_exec_check.py
 ```
+
+The Python controls passed on x86-64 Linux with Python 3.14.8.
+`8b483922a` refused the second readfirstlane in all three new layouts.
+The 40 general compute fixtures and four earlier constant-EXEC fixtures
+emitted byte-identical HLSL and matching manifests against that revision.
+The nine WARP case files were checked in Python. GPU readback is pending.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_compute_const_exec_(controls|warp)$' -V
