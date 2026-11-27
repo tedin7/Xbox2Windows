@@ -238,6 +238,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool title_input = mode.rfind("dispatch-input-title-", 0) == 0;
+    const bool view_tokens = mode.rfind("dispatch-input-view-tokens", 0) == 0;
     const bool gpu_input = mode == "dispatch-input-title-gpu";
     const bool alias_input = mode == "dispatch-input-title-alias";
     const bool large_input = mode == "dispatch-input-title-large" || gpu_input || alias_input;
@@ -281,12 +282,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     void* title_placement = nullptr;
     void* title_upload = nullptr;
     unsigned char* source = nullptr;
-    if (title_input) {
+    if (title_input || view_tokens) {
         const D3D12_RESOURCE_DESC output_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(input), 1, 1, 1,
             DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         title_readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, output_desc, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!title_readback) return 71;
-
+    }
+    if (title_input) {
         if (large_input || ring_input || protected_input) {
             source = static_cast<unsigned char*>(VirtualAlloc(nullptr, input_bytes + 0x1000,
                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -418,10 +420,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                             mode == "dispatch-texel-sint" ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
         if (!bind_identifier_fixture(device, list, cpu + 64, format, identifier_fixture_dimension())) return 80;
     }
-    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
-        const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
-        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
-        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || view_tokens) {
+        const UINT width = view_tokens || mode == "dispatch-sampled-2x1" ? 2 : 1;
+        const UINT16 mips = view_tokens ? 2 : 1;
+        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
+        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, view_tokens ? 768u : 256u, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
         void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -432,6 +435,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         unsigned char rgba[8] = {255, 64, 128, 32, 255, 64, 128, 32};
         if (width == 2) rgba[0] = 0;
         std::memcpy(texel, rgba, sizeof(rgba));
+        if (view_tokens) {
+            const unsigned char mip[] = {17, 93, 201, 45};
+            std::memcpy(static_cast<unsigned char*>(texel) + 512, mip, sizeof(mip));
+        }
         invoke(upload, 9, 0, 0);
         D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -439,7 +446,24 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         view.Texture2D.MipLevels = 1;
+        if (view_tokens) {
+            image.SubresourceIndex = 1;
+            source.PlacedFootprint = {512, {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+            view.Texture2D.MostDetailedMip = 1;
+        }
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
+    }
+    if (view_tokens) {
+        if (mode == "dispatch-input-view-tokens-wrong-kind") {
+            std::memcpy(reinterpret_cast<void*>(cpu + 32), reinterpret_cast<const void*>(cpu + 64), 32);
+        } else {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+            view.Buffer.FirstElement = mode == "dispatch-input-view-tokens-shifted" ? 12 : 8;
+            view.Buffer.NumElements = 4;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            invoke(device, 19, word(placed[1]), 0, word(&view), cpu + 32);
+        }
     }
     if (mode == "dispatch-input-null-token") {
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
@@ -619,7 +643,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(queue, 10, 1, word(&lists[t]));
         }
     } else if (formatted_heap) invoke(list, 14, 1, 1, 1);
-    else if (title_input) {
+    else if (view_tokens) {
+        invoke(list, 14, 1, 1, 1);
+        invoke(list, 15, word(title_readback), 0, word(placed[1]), 0, sizeof(input));
+    } else if (title_input) {
         if (ring_input) {
             const bool fill_overflow = mode == "dispatch-input-title-ring-full";
             if (x2w_d3d12_fixture_fill_upload_ring(list, 16u << 10, fill_overflow) != (fill_overflow ? 5u : 4u))
