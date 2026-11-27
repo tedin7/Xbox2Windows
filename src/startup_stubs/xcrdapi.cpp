@@ -615,7 +615,9 @@ void note_disk_read(HANDLE file, unsigned long long offset, unsigned long long c
             ++d.failed;
             return;
         }
-        if (adaptive_hdd_reads()) disk_latency.record(ticks);
+        // Only reads up to 1 MiB estimate seek cost. A merged prefetch of several MiB takes over 3 ms even on
+        // an SSD, and counting it would keep the wide limits on (bigger reads, slower mean, wider limits).
+        if (adaptive_hdd_reads() && count <= (1ull << 20)) disk_latency.record(ticks);
         d.bytes += static_cast<LONG64>(count);
         ++d.reads;
         unsigned bucket = 0;
