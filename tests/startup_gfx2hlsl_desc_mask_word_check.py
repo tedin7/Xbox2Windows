@@ -11,11 +11,20 @@ from startup_gfx2hlsl_refusals_check import put_request
 
 
 REASON = 's_buffer_load destination vcc_lo for 1 dwords'
-SHIFT = 'WaveGetLaneIndex() & 31u'
+SHIFT = 'WaveGetLaneIndex() & 3u'
 VERTEX = """
-float4 main(uint vertex : SV_VertexID) : SV_Position {
+struct Out {
+    float4 param0 : PARAM0;
+    float4 param1 : PARAM1;
+    float4 param2 : PARAM2;
+    float4 pos : SV_Position;
+};
+Out main(uint vertex : SV_VertexID) {
     float2 uv = float2((vertex << 1u) & 2u, vertex & 2u);
-    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    Out o;
+    o.param0 = o.param1 = o.param2 = float4(0, 0, 0, 0);
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    return o;
 }
 """
 

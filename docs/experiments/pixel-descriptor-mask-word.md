@@ -2,8 +2,10 @@
 
 A scalar buffer load into `vcc_lo` can feed a pixel select when the program
 establishes wave32 through an EXEC instruction. The translator loads the
-buffer word and extracts the current lane's bit using the desktop wave index
-modulo 32. The lift covers straight-line pixel programs whose remaining
+buffer word and extracts the bit of the current lane inside its quad (desktop wave index
+modulo 4: a host wave may have only four lanes, and the quad slot in the guest
+wave is not known). The lowering is exact for masks that repeat every four bits,
+such as left and right columns. The lift covers straight-line pixel programs whose remaining
 instructions are waits, VCC selects, exports and termination.
 
 `python -B tests/startup_gfx2hlsl_desc_mask_word_check.py` runs the read-only

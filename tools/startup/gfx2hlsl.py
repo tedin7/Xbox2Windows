@@ -8354,7 +8354,9 @@ class Stage:
             expr = self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic else '%s.Load(%s)' % (buf, address)
             if into_mask:
                 self.needs_sm6 = True
-                self.emit('vcc = (%s >> (WaveGetLaneIndex() & 31u)) & 1u;' % expr)
+                # Quads sit on four aligned host lanes on every wave size (WARP has only four), but which guest
+                # lane a quad holds is unknown: use the lane inside the quad, exact for masks that repeat every four bits.
+                self.emit('vcc = (%s >> (WaveGetLaneIndex() & 3u)) & 1u;' % expr)
                 return
             self.set_s(dst[1] + i, expr, uniform=uniform)
             if is_lit:
