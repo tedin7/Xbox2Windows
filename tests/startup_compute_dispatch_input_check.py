@@ -297,8 +297,8 @@ def main(consumer, dxc, adapter):
         zero_expected += untouched[written:]
         assert zero_expected != expected and expected != untouched
         for settings in (env, null_env):
-            got, result = dispatch(directory, consumer, settings, 'dispatch-input-empty')
-            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+            got, result = dispatch(directory, consumer, settings, 'dispatch-input-empty')  # the mode dispatches twice
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 2 and not lines(result, 'refused: '), result.stderr[-3000:]
             assert got == zero_expected, 'an unfilled heap slot must read zeros'
             assert lines(result, 'unfilled heap slot ') == [f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}'], result.stderr[-3000:]
             errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
