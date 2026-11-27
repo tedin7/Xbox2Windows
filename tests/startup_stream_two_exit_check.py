@@ -159,6 +159,13 @@ def translator_cases(directory):
     table = [END, END, 7, END]
     image = getpc + table
     assert native_code(vertex(image), stage=1) == struct.pack("<8I", *image)
+
+    def unreadable_tail(code):
+        if len(code) > 20:
+            raise ValueError("undecodable table")
+        return decode_native(code)
+
+    assert native_code(vertex(image), unreadable_tail, stage=1) == struct.pack("<8I", *image)
     with patch.object(pixel_aot, "_vertex_getpc_tail", return_value=False):
         refused("stage 1, 3 decoded exits: unreachable instruction at +0x14", vertex(image), stage=1)
     refused("stage 1, 3 decoded exits: unreachable instruction at +0x14",
