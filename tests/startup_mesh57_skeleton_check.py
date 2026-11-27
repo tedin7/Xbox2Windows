@@ -8,6 +8,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py runtime <dxc> <startup_indirect_draw_indexed>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -494,6 +495,13 @@ def refusal_head(text):
     return text.split(' (wave-load block:')[0]
 
 
+def complete_test_manifest(path, key, bytecode, has_pixel):
+    lines = path.read_text().splitlines(keepends=True)
+    digest = G.fnv(bytecode)
+    lines[1] = G.mesh57_result_line(key, digest, digest if has_pixel else 0) + '\n'
+    path.write_text(''.join(lines))
+
+
 def expect(what, got, want):
     if got != want:
         FAILED.append(what)
@@ -683,6 +691,8 @@ def depth_only_controls():
             expect('a depth-only pair without its pixel bytecode is pending (unlike ps none)', G.pending_keys(tmp, False), [key])
             pixel_bytecode = Path(tmp) / ('%016x.ps57.cso' % key)
             pixel_bytecode.write_bytes(bytecode)
+            expect('source-only manifest with old bytecode needs recompiling', G.pending_keys(tmp, False), [key])
+            complete_test_manifest(Path(tmp) / ('%016x.ms57.txt' % key), key, bytecode, True)
             expect('a depth-only pair with both bytecodes is done', G.pending_keys(tmp, False), [])
             pixel_bytecode.write_bytes(bytecode[:-1])
             expect('a depth-only pair with truncated pixel bytecode is pending', G.pending_keys(tmp, False), [key])
@@ -711,6 +721,16 @@ def depth_only_controls():
 
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
+    mesh, pixel = runtime_program()
+    words = lambda stage: [f'{word:08x}' for (word,) in struct.iter_unpack('<I', stage)]
+    for stage in (pixel, b''):
+        with tempfile.TemporaryDirectory() as tmp:
+            key, result = request(tmp, words(mesh), words(stage))
+            expect('runtime fixture translates without resources', result, 'ok')
+            if result == 'ok':
+                marker = Path(tmp, f'{key:016x}.ms57.txt').read_text().splitlines()
+                expect('runtime fixture entry layout', [line for line in marker if line.startswith(('ud', 'srv'))],
+                       ['ud 3', 'udsrc 0 rect', 'udsrc 1 rootconst 0 0', 'udsrc 2 rootconst 0 1'])
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
@@ -858,6 +878,7 @@ def controls():
             mesh_bytecode = Path(tmp) / ('%016x.ms57.cso' % key)
             mesh_bytecode.write_bytes(bytecode)
             (Path(tmp) / ('%016x.ms57.cso' % paired)).write_bytes(bytecode)
+            complete_test_manifest(Path(tmp) / ('%016x.ms57.txt' % key), key, bytecode, False)
             expect('only the pair missing its pixel bytecode is pending', G.pending_keys(tmp, False), [paired])
             mesh_bytecode.write_bytes(bytecode[:-1])
             expect('mesh-only result with truncated bytecode is pending', G.pending_keys(tmp, False), sorted([key, paired]))
@@ -940,14 +961,14 @@ def buffer(points, colours, words):
     return bytes(data)
 
 
-def rasterise(points, colours, indices, verts, prims):
+def rasterise(points, colours, indices, verts, prims, *, width=SIDE, height=SIDE):
     """D3D rules: sample at the pixel centre, top-left fill, flat colour of the first vertex, later primitives on top.
 
     Counts above the 128 threads of a group are clamped and an index at or past the vertex count names the last
     vertex, as the lowering documents. Vertex `thread` holds slot `thread & 15`, as the fixture reads it.
     Coordinates are doubled so centres are integers."""
     verts, prims = min(verts, 128), min(prims, 128)
-    image = [(0, 0, 0, 255)] * (SIDE * SIDE)
+    image = [(0, 0, 0, 255)] * (width * height)
     if not verts:
         return image
     for a, b, c in indices[:prims]:
@@ -959,8 +980,8 @@ def rasterise(points, colours, indices, verts, prims):
             continue
         if area < 0:
             tri[1], tri[2] = tri[2], tri[1]
-        for y in range(SIDE):
-            for x in range(SIDE):
+        for y in range(height):
+            for x in range(width):
                 inside = True
                 for k in range(3):
                     (ax, ay), (bx, by) = tri[k], tri[(k + 1) % 3]
@@ -968,7 +989,7 @@ def rasterise(points, colours, indices, verts, prims):
                     edge = dx * (2 * y + 1 - ay) - dy * (2 * x + 1 - ax)
                     inside &= edge > 0 or (edge == 0 and (dy < 0 or (dy == 0 and dx > 0)))
                 if inside:
-                    image[y * SIDE + x] = colour
+                    image[y * width + x] = colour
     return image
 
 
@@ -1579,6 +1600,111 @@ def draw_shift(dxc, renderer, adapter):
     return 0
 
 
+def runtime_program():
+    # Reuse the ABI exchange prologue from the skeleton. The new program
+    # supplies literal counts and computes its own triangle without a buffer.
+    prologue = MESH[:MESH.index('f4080405')]
+    exchange = MESH[MESH.index('bf8a0000', MESH.index('be8e0309')):MESH.index('7d28000e')]
+    counts = ['be8d0381', 'be8e0383']  # one primitive, three vertices
+    # x = float(lane & 1) - 1, y = 1 - float(lane & 2), z = 0.5, w = 1.
+    vertices = '7d28000e 36200081 7e200d10 062020f3 36220082 7e220d11 082222f2 7e2402f0 7e2602f2 f80008cf 13121110'
+    # The first lane exports packed indices (0, 1, 2).
+    primitives = 'befe04c1 7d28000d 7e3002ff 00200400 f8000941 00000018 bf810000'
+    pixel = '7e0002f2 7e020280 f800180f 00010100 bf810000'  # opaque red
+    return code(prologue + counts + exchange + vertices.split() + primitives.split()), code(pixel.split())
+
+
+def draw_runtime(dxc, guest):
+    """Exercise guest request publication, result validation and indirect WARP readback."""
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        source_ms, source_ps = runtime_program()
+        (folder / 'ms.bin').write_bytes(source_ms)
+        (folder / 'ps.bin').write_bytes(source_ps)
+        os.environ['X2W_DXC'] = dxc
+        os.environ.pop('X2W_FXC', None)
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=tmp,
+                   X2W_MESH57_CENSUS='1', X2W_TRANSLATED_INDIRECT_MESH57='0')
+        args = [guest, 'warp', 'mesh']
+        published = subprocess.run(args, env=env, capture_output=True, text=True)
+        print(published.stdout, end='')
+        print(published.stderr, end='', file=sys.stderr)
+        if published.returncode:
+            return published.returncode
+        cache = folder / 'requests'
+        requests = sorted(cache.glob('req_*.m57'))
+        expect('paired and mesh-only requests', len(requests), 2)
+        if len(requests) != 2:
+            return 1
+        # Map the two clip-space quads to their render-target coordinates.
+        points = [(x, y) for left in (0, 2) for x, y in
+                  ((left, 0), (left + 2, 0), (left, 2), (left + 2, 2))]
+        colors = [(255, 0, 0, 255)] * 4 + [(0, 255, 0, 255)] * 4
+        triangles = [(a + start, b + start, c + start) for start in (0, 4)
+                     for a, b, c in ((0, 1, 2), (2, 1, 3))]
+        image = rasterise(points, colors, triangles, 8, 4, width=4, height=2)
+        (folder / 'color.bin').write_bytes(b''.join(bytes(pixel) for pixel in image))
+        (folder / 'depth.bin').write_bytes(struct.pack('<8I', *(
+            0x8000 if pixel != (0, 0, 0, 255) else 0xffff for pixel in image)))
+        translated = rasterise([(0, 0), (2, 0), (0, 2)], colors[:3], [(0, 1, 2)], 3, 1, width=4, height=2)
+        expect('the translated triangle covers a strict subset of the target',
+               0 < sum(pixel != (0, 0, 0, 255) for pixel in translated) < 8, True)
+        (folder / 'color-translated.bin').write_bytes(b''.join(bytes(pixel) for pixel in translated))
+        (folder / 'depth-translated.bin').write_bytes(struct.pack('<8I', *(
+            0x8000 if pixel != (0, 0, 0, 255) else 0xffff for pixel in translated)))
+        shader = Path(__file__).with_name('startup_mesh57_runtime.hlsl')
+        for stage, profile in (('mesh', 'ms_6_5'), ('pixel', 'ps_6_0')):
+            subprocess.run([dxc, '-T', profile, '-E', stage, '-Fo', str(folder / stage), str(shader)], check=True)
+        mesh, pixel = ((folder / stage).read_bytes() for stage in ('mesh', 'pixel'))
+        for source in requests:
+            key = int(source.stem[4:], 16)
+            prefix = cache / f'{key:016x}'
+            ps_path = source.with_suffix('.ps57')
+            has_pixel = bool(ps_path.stat().st_size)
+            expect('request content key', G.mesh57_key(source.read_bytes(), ps_path.read_bytes(),
+                                                       source.with_suffix('.root').read_bytes()), key)
+            result = G.translate_request(str(cache), key)
+            expect('guest request translates and compiles', result, 'ok')
+            if result != 'ok':
+                return 1
+            mode = 'color-translated' if has_pixel else 'depth-translated'
+            run = subprocess.run(args, env=dict(env, X2W_TEST_MESH57_REPLAY=mode,
+                                 X2W_TRANSLATED_INDIRECT_MESH57='1'), capture_output=True, text=True)
+            print(run.stdout, end='')
+            print(run.stderr, end='', file=sys.stderr)
+            expect('translated shader guest WARP ' + mode, run.returncode, 0)
+
+            # The independent desktop program uses SV_GroupID for the group-count control.
+            prefix.with_suffix('.ms57.cso').write_bytes(mesh)
+            if has_pixel:
+                prefix.with_suffix('.ps57.cso').write_bytes(pixel)
+            identity = G.mesh57_result_line(key, G.fnv(mesh), G.fnv(pixel) if has_pixel else 0)
+            marker = prefix.with_suffix('.ms57.txt')
+            manifest = 'x2w-manifest 1\n' + identity + '\nud 0\nparams 0\n'
+            manifest += 'targets 0\n' if has_pixel else 'ps none\n'
+            marker.write_text(manifest)
+            cases = ('depth', 'depth-off') if not has_pixel else ('color', 'off', 'one-group', 'invalid')
+            for mode in cases:
+                if mode == 'invalid':
+                    marker.write_text(manifest.replace(identity, identity[:-16] + '0' * 16))
+                run = subprocess.run(args, env=dict(env, X2W_TEST_MESH57_REPLAY=mode,
+                                     X2W_TRANSLATED_INDIRECT_MESH57='0' if mode.endswith('off') else '1'),
+                                     capture_output=True, text=True)
+                print(run.stdout, end='')
+                print(run.stderr, end='', file=sys.stderr)
+                expect('guest WARP ' + mode, run.returncode, 0)
+                if mode == 'one-group':
+                    expect('the one-group record loses four covered pixels',
+                           '4/8 non-clear pixels' in run.stdout and 'pixel (2,0)' in run.stderr, True)
+                else:
+                    surface = 'color0=4x2/28' if has_pixel else (
+                        'depth=4x2/55' if mode == 'depth-off' else 'none=0x0/0')
+                    ps = 'yes' if has_pixel else 'none'
+                    line = f'x2w-render indirect mesh refusals key={key:016x} ps={ps} {surface} calls=1'
+                    expect('one refusal in the report window', run.stderr.splitlines().count(line), 1)
+    return int(FAILED)
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
@@ -1595,6 +1721,8 @@ def main(argv):
         status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:
         status = draw_shift(*argv[2:])
+    elif argv[1:2] == ['runtime'] and len(argv) == 4:
+        status = draw_runtime(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:

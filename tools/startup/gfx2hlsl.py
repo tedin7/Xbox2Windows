@@ -15501,8 +15501,15 @@ def read_ps_inputs(path, key):
     return int(masks['ena'], 16), int(masks['addr'], 16)
 
 
+MESH57_REVISION = 'x2w-startup-mesh-57-3'
+
+
+def mesh57_result_line(key, mesh_digest, pixel_digest):
+    return f'mesh57-result {MESH57_REVISION} {key:016x} {mesh_digest:016x} {pixel_digest:016x}'
+
+
 def mesh57_key(ms, ps, root):
-    value = shader_cache_seed(b'x2w-startup-mesh-57-3')
+    value = shader_cache_seed(MESH57_REVISION.encode('ascii'))
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value
@@ -15549,7 +15556,7 @@ def translate_mesh57(out_dir, key):
     """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
 
     Writes <key>.ms57.hlsl and the compiled .ms57.cso, their .ps57 counterparts if present, and <key>.ms57.txt (last).
-    No runtime path loads these names yet."""
+    The manifest records the request identity and the compiled stage digests."""
     name = os.path.join(out_dir, '%016x' % key)
     discard_stale_placeholder(name + '.ms57.txt')
     source = os.path.join(out_dir, 'req_%016x' % key)
@@ -15576,6 +15583,7 @@ def translate_mesh57(out_dir, key):
     if ps:
         sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
     manifest = pipe.manifest()
+    digests = [0, 0]
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
     compile_enabled = os.environ.get('X2W_FXC') != ''
@@ -15586,7 +15594,7 @@ def translate_mesh57(out_dir, key):
         import subprocess
         # Publish bytecode only after all requested stages compile successfully.
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
-            for stage, profile, _ in sources:
+            for index, (stage, profile, _) in enumerate(sources):
                 bytecode = os.path.join(staging, stage + '.cso')
                 r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
                                    capture_output=True, text=True)
@@ -15594,6 +15602,8 @@ def translate_mesh57(out_dir, key):
                     # DXC names the source path; keep only the diagnostic after it.
                     lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                     raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
+                with open(bytecode, 'rb') as compiled:
+                    digests[index] = fnv(compiled.read())
             for stage, _, _ in sources:
                 os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
     placeholder = isinstance(pipe.ps, PlaceholderPixelStage)
@@ -15601,7 +15611,8 @@ def translate_mesh57(out_dir, key):
         publish_placeholder_failure(name, pipe.ps, compile_enabled, ('.ms57.cso', '.ps57.cso'))
     temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
     with open(temporary, 'w') as result:
-        result.write(manifest)
+        header, body = manifest.split('\n', 1)
+        result.write(f'{header}\n{mesh57_result_line(key, *digests)}\n{body}')
     os.replace(temporary, name + '.ms57.txt')
     if not placeholder:
         with suppress(FileNotFoundError):
@@ -16570,12 +16581,21 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
             continue
         if os.path.isfile(manifest) and not lost and not (
                 described is not None and described > os.path.getmtime(manifest)):
-            if manifest_only or all(ready_bytecode(result + s) for s in stages):
-                continue
-            if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
+            if mesh:
                 with suppress(OSError), open(manifest, 'rb') as published:
-                    if b'ps none' in published.read().splitlines():
-                        continue
+                    rows = published.read().splitlines()
+                    marker = (f'mesh57-result {MESH57_REVISION} {key:016x} ').encode('ascii')
+                    digests = re.fullmatch(rb'([0-9a-f]{16}) ([0-9a-f]{16})', rows[1][len(marker):]) if (
+                        len(rows) > 1 and rows[1].startswith(marker)) else None
+                    if digests:
+                        none = b'ps none' in rows
+                        needed = stages[:1] if none else stages
+                        mesh_digest, pixel_digest = (int(value, 16) for value in digests.groups())
+                        if manifest_only or (mesh_digest and bool(pixel_digest) != none and
+                                             all(ready_bytecode(result + s) for s in needed)):
+                            continue
+            elif manifest_only or all(ready_bytecode(result + s) for s in stages):
+                continue
         if placeholder:
             keys.append(key)
             continue
