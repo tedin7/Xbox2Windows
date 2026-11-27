@@ -76,30 +76,3 @@ The four new kernels and their mutations previously reported
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_compute_readfirstlane_wave_(controls|warp)$' -V
 ```
-
-## Wide vector raw loads
-
-The same waterfall proof accepts one to four dwords per raw vector load. With
-`offen`, the lane's VGPR byte offset can be combined with the MUBUF immediate.
-All consecutive destination VGPRs belong to the executing lane. The descriptor
-must stay fixed throughout the loop. The proof also accepts 32-bit signed
-scalar field extract, signed scalar minimum and maximum, unsigned scalar
-minimum, and vector AND, OR, NOT and XNOR. The scalar variants have the same
-SCC effects as their admitted counterparts. The vector bitwise operations
-write one VGPR in the executing lane.
-
-The [readback fixtures](../../tests/startup_compute_waterfall.py) use two
-32-thread dispatches and five unevenly distributed keys. The keys select
-regions of one bound raw input buffer. Each lane writes all six raw load
-results or all eight integer ALU results. The four-word load is independently
-mutated to emit only its first destination and to omit its immediate offset.
-Indexed and cache-flagged loads and a lane-count body remain refusal controls.
-
-On Linux, the translation, controls and assembly comparison passed with
-`python -B tests/startup_compute_readfirstlane_check.py --llvm-mc llvm-mc-19`.
-The existing accepted waterfall controls produced byte-identical HLSL against
-`e8015da7a`. Windows GPU readback remains pending.
-
-```powershell
-ctest --preset dev --no-tests=error -R '^startup_compute_readfirstlane(_warp)?$' -V
-```
