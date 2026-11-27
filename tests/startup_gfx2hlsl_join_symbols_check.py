@@ -27,8 +27,8 @@ The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
 - CS_RELOAD: a compute loop that stores through its descriptor at the header and reloads it from the same table slot
   before the back edge (kept, and dispatched); CS_RELOAD_OTHER reloads another slot (refused).
 - CALC: s23 = 1, a proven s_setpc_b64 skips s23 = 2 and lands on the read (a calculated jump is a branch; 1).
-- LOOP_RFL, JOIN_RFL: v_readfirstlane_b32 of a loop counter, and of a register written on one path of a join (both
-  refused as unproven, never recomputed with a folded constant).
+- LOOP_RFL, JOIN_RFL: v_readfirstlane_b32 of a loop counter, and of a register written on both arms of a wave-wide
+  forward join (both read at run time, never recomputed with a folded constant).
 - exec_join(): a lane mask written on the fall-through of a forward s_cbranch_execz and ANDed with exec by the
   instruction at the branch target, while the skipping edge still brings a descriptor word. On the skipping edge
   the lane's exec bit is 0, so bit 0 of `S & exec` is 0 (and of `S | ~exec` is 1) whatever S holds: these two
@@ -312,10 +312,12 @@ def check_controls():
     user = lines('USER_ONE_PATH')
     assert '        v0 = s12;' in user and not any('v0 = 0x00000002u' in l for l in user), user
     # LOOP_RFL reads a uniform loop counter via v_readfirstlane_b32 dynamically (not constant-folded);
-    # JOIN_RFL writes both paths before the forward join and stays refused.
+    # JOIN_RFL writes both paths of a wave-wide forward branch before the join: the pixel stage now proves the
+    # joined scalar wave-wide, and still reads it at run time instead of folding either arm's constant.
     loop_rfl = lines('LOOP_RFL')
     assert '        s23 = s23 + 0x00000001u;' in loop_rfl and '        s24 = s23;' in loop_rfl, loop_rfl
-    refused('JOIN_RFL', 'v_readfirstlane_b32 requires a proven uniform source')
+    join_rfl = lines('JOIN_RFL')
+    assert '        s24 = s23;' in join_rfl and not any('s24 = 0x0000000' in l or 'v0 = 0x0000000' in l for l in join_rfl), join_rfl
     # Equal tuples that do not name one value are not kept: a word modified on both paths (the written value is not
     # in the symbol) and descnum.
     assert not G.names_one_value(('desc', ('table', 0), 0, 0, 'modified')) and not G.names_one_value(('descnum',))
