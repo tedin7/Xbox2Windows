@@ -8181,7 +8181,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
-        debug_present::present(self, surface);  // X2W_DEBUG_PRESENT_TARGET: before anything reads the surface
+        // X2W_DEBUG_PRESENT_TARGET: before anything reads the surface. A timed picture is due about 5 s after the last one.
+        debug_present::present(self, surface, frame, static_cast<LONG64>(GetTickCount64() - gray_t0) - gray_last_readback_ms >= 4000);
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
