@@ -7842,7 +7842,7 @@ class Stage:
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         shared = getattr(self.pipe, 'shared_pixel_images', {})
-        shareable = (self.kind == 'ps' and how == 'load' and 'd16' not in mods
+        shareable = (getattr(self, 'kind', None) == 'ps' and how == 'load' and 'd16' not in mods
                      and kinds[dim] in ('tex2d', 'tex2da') and desc_key[0][0] == 'table')
         rw_image = shareable and desc_key in shared
         scalar = rw_image and shared[desc_key]
@@ -8190,7 +8190,7 @@ class Stage:
                   'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z'),
                   # The cube's third integer coordinate is its flattened face slice (face + 6 * layer).
                   'SQ_RSRC_IMG_CUBE': (3, 'tex2da', 'x, y and face')}
-        if dims[0] not in shapes or (self.kind != 'cs' and dims[0] in
+        if dims[0] not in shapes or (getattr(self, 'kind', None) != 'cs' and dims[0] in
                                     ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_CUBE')) or \
                 (d16 and dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D')):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
@@ -8238,16 +8238,16 @@ class Stage:
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         shared = getattr(self.pipe, 'shared_pixel_images', {})
-        if self.kind == 'ps' and key in shared:
+        if getattr(self, 'kind', None) == 'ps' and key in shared:
             if shared[key] and (mask != 1 or d16):
                 raise Unsupported('scalar pixel UAV store requires dmask 0x1 and full-width data')
             image = self.pipe.pixel_image_uav(key, image_kind, shared[key])
         else:
-            prior = self.pipe.resources.get(key) if self.kind == 'ps' else None
+            prior = self.pipe.resources.get(key) if getattr(self, 'kind', None) == 'ps' else None
             if prior and prior['kind'] == image_kind and prior.get('shareable_loads') == prior.get('calls'):
                 raise SharedPixelImage(key, mask == 1 and not d16 and prior['scalar_loads'])
             image = self.pipe.uav(key, image_kind)
-            if self.kind == 'ps':
+            if getattr(self, 'kind', None) == 'ps':
                 candidate = mask == 1 and not d16
                 r = self.pipe.uavs[key]
                 r['scalar_candidate'] = candidate and r.get('scalar_candidate', True)
@@ -8576,7 +8576,7 @@ class Stage:
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
             raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
         if ops[1] == 'exec_lo':
-            if self.kind == 'ps':
+            if getattr(self, 'kind', None) == 'ps':
                 self.first_active_lane(dst[1])
                 return None
             if self.kind != 'cs':
