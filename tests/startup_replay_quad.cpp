@@ -19,6 +19,7 @@
 #include "startup_stream_setup.h"
 
 extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_calls();
+extern "C" __declspec(dllimport) void x2w_d3d12_replay_record_stop(int at_exit);
 
 using Word = StreamWord;
 template <class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
@@ -496,6 +497,9 @@ int main(int argc, char** argv)
     if (std::strcmp(recorder_case, "cap") == 0)
         std::printf("replay quad: recorder calls after scene %llu\n",
                     static_cast<unsigned long long>(x2w_d3d12_replay_record_calls()));
+    // Exercise the exit path while the finisher is alive. ExitProcess terminates it before DLL detach.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_FINISHER_STALL_MS", nullptr, 0))
+        x2w_d3d12_replay_record_stop(1);
     std::printf("replay quad: %u presents drawn\n", scene.signature ? 0 : frames);
     return 0;
 }
