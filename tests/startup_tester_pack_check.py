@@ -923,6 +923,10 @@ def check_null_inputs():
     assert T.null_inputs_section(switches).splitlines()[-3:] == summary
     assert refused in section.splitlines()
     assert f"render summary\n{totals}\n\nstarved targets\n{starved}\n{no_candidate}\n" in section
+    assert "placeholder draws" not in section
+    marked = stderr + "\nx2w-render placeholder total: draws 2\nx2w-render placeholder total: draws 7\n"
+    assert T.null_inputs_section(marked) == section.replace(totals, totals + ", placeholder draws 7")
+    assert "placeholder draws 1" in T.null_inputs_section("x2w-render placeholder total: draws 1")
     assert f"not drawn by pipeline\n{pipeline}\n{old_pipeline}, targets unknown\n" in section
     assert T.key_weights(stderr)[key] == 7
     assert not T.null_inputs_section("unrelated log")

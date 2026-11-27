@@ -8333,6 +8333,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (now - last_key_report >= 60000) {
             last_key_report = now;
             log_not_drawn_keys();
+            report_placeholder_draws([](const char* line) { log("%s", line); });
         }
     }
     if (render_mode() && frame % 300 == 0) {
@@ -8463,6 +8464,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     null_report.emit(emit);
     target_draw_snapshot(false).report(emit, InterlockedCompareExchange(&frame_number, 0, 0), 30, false);
     memory_srv_writes.report(emit, false);
+    report_placeholder_draws(emit);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
