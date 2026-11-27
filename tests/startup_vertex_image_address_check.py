@@ -190,7 +190,7 @@ def translator_controls():
             }
             for suffix, digest in want.items():
                 matches = list((path / 'old').glob('*' + suffix))
-                assert len(matches) == 1 and hashlib.sha256(matches[0].read_bytes()).hexdigest() == digest, suffix
+                assert len(matches) == 1 and hashlib.sha256(matches[0].read_bytes().replace(b'\r\n', b'\n')).hexdigest() == digest, suffix
     finally:
         if saved is None:
             os.environ.pop('X2W_FXC', None)
