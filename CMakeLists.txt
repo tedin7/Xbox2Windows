@@ -1311,6 +1311,7 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
+set_tests_properties(startup_overlay_window PROPERTIES SKIP_RETURN_CODE 77)
 # Text of the x2w-budget commit fields and the commit-exhausted line (src/startup_stubs/commit_state.h).
 add_executable(startup_commit_state_check tests/startup_commit_state_check.cpp)
 target_compile_features(startup_commit_state_check PRIVATE cxx_std_17)
