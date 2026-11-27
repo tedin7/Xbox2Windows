@@ -32,6 +32,7 @@ footprint of two texels on the 4x4 base level, an implicit LOD of exactly 1. The
 import contextlib
 import io
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,20 @@ def bias_stage(form, word2, word1=BIAS_LIMITS):
 
 
 def bias_controls():
+    # RDNA 2 ISA, S_BFM_B64, section 7: a 64-bit mask can build two sampler words.
+    instruction = struct.pack('<I', 0x80000000 | 0x25 << 23 | 52 << 16 | 182 << 8 | 130)
+    program = bias_code(('lz',))
+    program = program[:8] + instruction + program[24:]
+    program = program.replace(bytes.fromhex('803f0008'), bytes.fromhex('00005018'))
+    assert any(asm == 's_bfm_b64 s[52:53], 2, 54' for _, _, _, asm in G.decode(program))
+    mask = ((1 << 2) - 1) << 54
+    words = (mask & 0xffffffff, mask >> 32, 0x18500000, 0)
+    assert words == (0, 0xc00000, 0x18500000, 0)
+    assert ((1 << 2) - 1) << 22 != mask  # A 32-bit shift is a discriminating mutant.
+    pipe = G.Pipeline(BIAS_VS_WORDS, program, root_blob())
+    assert '.SampleLevel(' in pipe.hlsl_ps()
+    assert sampler_line(pipe) == 'smpl 0 ' + ' '.join(hex(word) for word in words)
+
     for form, name, call in (('sample', 'image_sample', '.Sample'), ('lz', 'image_sample_lz', '.SampleLevel')):
         for bias, field in ((-128, 0x3f80), (128, 0x80), (0, 0), (-4096, 0x3000), (4093, 0xffd)):
             pipe = bias_stage(form, LINEAR_MIP | field)
