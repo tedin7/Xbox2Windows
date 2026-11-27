@@ -44,7 +44,8 @@ def census_block(stdout):
     blocks = re.findall(r"census report begin\n(.*?)census report end", stdout, re.S)
     if not blocks:
         raise AssertionError("no census report in the consumer output")
-    return [line.rstrip() for line in blocks[-1].splitlines() if line.strip()]
+    # The null-input census prints its own "x2w-render ..." rows in the same block; this check owns only the memory SRV rows.
+    return [line.rstrip() for line in blocks[-1].splitlines() if line.strip() and not line.startswith("x2w-render ")]
 
 
 def check(directory, consumer, backend, control=False):
