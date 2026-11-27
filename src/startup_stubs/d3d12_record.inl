@@ -717,7 +717,6 @@ void present()
             if (window_open && !was_open) pages_at_window_open(b, seq, present);
             else if (window_open) pages_at_present(b, seq, present);
         }
-        ReleaseSRWLockExclusive(&b.lock);
     }
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&b.lock);
