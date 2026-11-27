@@ -578,6 +578,23 @@ calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture th
 root constant into the blue channel. It checks the original bindings, the same signature, a switched signature and
 six out-of-range calls. The switched case clears both inputs to the shader.
 
+## Refused compute and mesh57 dispatches
+
+The runtime logs cumulative `x2w-render compute refused key` and
+`x2w-render mesh57 refused key` rows at powers of two of each kind's refusal
+total and on normal teardown. Each snapshot lists up to 40 keys by skipped
+dispatches, with the first runtime refusal for each key.
+
+For mesh57, the group total is the sum of X×Y×Z from CPU-readable indirect
+argument snapshots. Unreadable or invalid arguments increment the unknown
+group count. These snapshots measure the arguments observed at record time.
+The tester archive adds the latest counts to `shader_results.txt` and ranks
+refused shader requests by skipped dispatches.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(refused_dispatch_census|tester_pack|gfx2hlsl_retry_lifted)$'
+```
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N` and its six causes: `entry`,
