@@ -256,6 +256,7 @@ inline void draw_lock_acquire_exclusive()
     draw_lock_held_since = end.QuadPart;
     if (fixture_draw_lock_calls >= 0) ++fixture_draw_lock_calls;
     const LONG64 waited = end.QuadPart - start.QuadPart;
+    x2w_phase::LockWaitScope::note(waited);
     InterlockedIncrement64(&draw_lock_stats.wait_calls);
     InterlockedAdd64(&draw_lock_stats.wait_ticks, waited);
     draw_lock_note_max(draw_lock_stats.wait_max, waited);

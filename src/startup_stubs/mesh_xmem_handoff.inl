@@ -263,7 +263,9 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
         info->placement_device != list->own().list_device || info->console.Flags != D3D12_RESOURCE_FLAG_NONE)
         return;
     auto* desktop_list = static_cast<ID3D12GraphicsCommandList*>(list->own().real);
+    const auto wait_start = x2w_phase::LockWaitScope::active ? x2w_phase::now_ticks() : 0;
     const std::lock_guard lock(mesh_xmem_mutex);
+    if (x2w_phase::LockWaitScope::active) x2w_phase::LockWaitScope::note(x2w_phase::now_ticks() - wait_start);
     if (mesh_xmem_tracking_failed) return;
     try {
         auto& recorded = mesh_xmem_recordings[desktop_list];

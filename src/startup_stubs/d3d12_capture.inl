@@ -68,6 +68,7 @@ inline void note_lock_acquire(bool exclusive)
     QueryPerformanceCounter(&end);
     QueryPerformanceFrequency(&frequency);
     const LONG64 waited = end.QuadPart - start.QuadPart;
+    x2w_phase::LockWaitScope::note(waited);
     const int k = exclusive ? 1 : 0;
     InterlockedIncrement64(&note_lock_waits.calls[k]);
     InterlockedAdd64(&note_lock_waits.ticks[k], waited);
