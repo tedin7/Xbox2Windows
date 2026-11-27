@@ -197,6 +197,30 @@ DIM_CLAMP = (sop2(0x20, 27, 27, 25) + sop2(0x09, 27, 27, ONE)
 DIM_EXPORT = bytes.fromhex('1b0c087e1c0c0a7e') + bytes.fromhex(IMAGE_TAIL)  # convert s27 and s28 to float
 
 
+def image_dimensions_null_shader(compare, on_null=ZERO, on_bound=27):
+    # Give the null path a nonzero candidate width so dropping the select changes the readback.
+    width_min = sop2(0x09, 27, 27, ONE)  # s_max_u32 s27, s27, 1
+    select = sop2(0x0a, 27, on_null, on_bound)  # s_cselect_b32 s27, 0, s27
+    return (bytes.fromhex(IMAGE_HEAD) + DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_CLAMP
+            + width_min + compare + select + bytes.fromhex(IMAGE_LOAD) + DIM_EXPORT)
+
+
+def image_dimensions_null_control():
+    eq_zero = sopc(0x00, 17, ZERO)  # s_cmp_eq_i32 s17, 0
+    pipe, vs, ps = translate(VS_WORDS, image_dimensions_null_shader(eq_zero))
+    assert pipe.ps.retry_heap_dimensions and ps.count('.GetDimensions(0u,') == 3
+    assert re.search(r'scc = heap_w_\w+ == 0u;', ps)
+    assert re.search(r's27 = scc \? 0x00000000u : \(max\(heap_w_\w+, 0x00000001u\)\);', ps)
+    lg_zero = sopc(0x07, ZERO, 17)  # s_cmp_lg_u32 0, s17
+    lg = translate(VS_WORDS, image_dimensions_null_shader(lg_zero, 27, ZERO))[2]
+    assert re.search(r'scc = heap_w_\w+ != 0u;', lg)
+    for compare in (sopc(0x00, 17, ONE),  # s_cmp_eq_i32 s17, 1
+                    sopc(0x02, 17, ZERO)):  # s_cmp_gt_i32 s17, 0
+        reason = refusal(VS_WORDS, image_dimensions_null_shader(compare))
+        assert reason and 'cannot materialize descriptor word 1' in reason, reason
+    return pipe, vs, ps
+
+
 def image_dimensions_control():
     head, image = bytes.fromhex(IMAGE_HEAD), bytes.fromhex(IMAGE_LOAD)
     body = DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_CLAMP
@@ -221,6 +245,7 @@ def image_dimensions_control():
 
 
 EMBEDDED_WORDS = (0x3fa00000, 0x40200000, 0x40800000, 0x41000000, 0x41800000)
+EMBEDDED_MASK_WRITE = bytes.fromhex('1c0206d4f0020200')  # v_cmp_ge_f32_e64 s28, 0.5, |v0|
 
 
 def embedded_scalar_vertex(*, carry=0, flags=0x31016fac, bound=20, displacement=0, escape=b'', before_copy=b''):
@@ -240,12 +265,35 @@ def embedded_scalar_vertex(*, carry=0, flags=0x31016fac, bound=20, displacement=
 def embedded_scalar_control():
     data = struct.pack('<5I', *EMBEDDED_WORDS)
     code = embedded_scalar_vertex()
-    pipe, vs, ps = translate(code + data + bytes.fromhex('000000f8'))  # invalid if decoded instead of treated as data
+    _, vs, _ = translate(code + data + bytes.fromhex('000000f8'))  # invalid if decoded instead of treated as data
     assert 'static const uint embedded_vs_scalar[5]' in vs
     assert 'embedded_vs_sload(a, 1u, 12u)' in vs and 'embedded_vs_sload(a, 5u, 12u)' in vs
     assert 'embedded_vs_sload(s15, 8u, 20u)' in vs and 'embedded_vs_sload(s15, 12u, 20u)' in vs
     assert '(scalar_offset + imm) & ~3u' in vs and 'a > bound - 4u' in vs
     assert 'embedded_vs_scalar[5]' in translate(embedded_scalar_vertex(carry=None) + data)[1]
+    cmp_code = embedded_scalar_vertex(escape=EMBEDDED_MASK_WRITE)
+    cmp_pipe, cmp_vs, cmp_ps = translate(cmp_code + data)
+    assert 'embedded_vs_scalar[5]' in cmp_vs and re.search(r'\bs28 = .*abs\(', cmp_vs)
+
+    mov_scc = sop1(S_MOV_B32, 21, 253)  # s_mov_b32 s21, src_scc
+    read_s21 = sopc(0x01, 21, ZERO)  # s_cmp_lg_i32 s21, 0
+    both_arms = COND + sopp(S_CBRANCH_SCC1, 2) + mov_scc + sopp(2, 1) + mov_scc
+    joined = embedded_scalar_vertex(escape=both_arms + read_s21)
+    assert 'embedded_vs_scalar[5]' in translate(joined + data)[1]
+
+    cmov = sop1(0x05, 21, ONE)  # s_cmov_b32 s21, 1
+    read_s28 = sopc(0x01, 28, ZERO)
+    for label, escape in (
+        ('unwritten copy', read_s28),
+        ('conditional move before read', COND + cmov + read_s21),
+        ('mask write before read', EMBEDDED_MASK_WRITE + read_s28),
+        ('ordinary rewrite in one arm', COND + sopp(S_CBRANCH_SCC1, 1) + mov_scc + read_s21),
+    ):
+        bad = embedded_scalar_vertex(escape=escape)
+        assert G.embedded_scalar_buffer_proof(bad + data, G.decode(bad)) is None, label
+        reason = refusal(bad + data)
+        assert reason and 'shader load address' in reason, (label, reason)
+
     for bad in (embedded_scalar_vertex(flags=0x21016fac), embedded_scalar_vertex(bound=28),
                 embedded_scalar_vertex(displacement=-4), embedded_scalar_vertex(carry=1),
                 embedded_scalar_vertex(escape=bytes.fromhex('1402107e')),  # v_mov_b32 v8, s20
@@ -261,7 +309,7 @@ def embedded_scalar_control():
         '6ae9d0b469c599e2cbbe58a2bac0c74cf9d9536ce9a105228dc8792c21fcdd52',
         '9a6837358af0301f1dc4f3c4b36cdf8cfbf81be2f4f11c269c8027b4efd50839',
     ]
-    return pipe, vs, ps
+    return cmp_pipe, cmp_vs, cmp_ps
 
 
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
@@ -312,6 +360,7 @@ def main(dxc=None):
     vertex_image_loop_control()
     descriptor_word_control()
     image_dimensions_control()
+    image_dimensions_null_control()
     embedded_scalar_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
@@ -502,6 +551,18 @@ def warp_image_dimensions(offscreen, dxc):
             draw_pixel(offscreen, vs, ps, 32 * slot, expected, count, heap_count=5)
         wrong = compile_shader(dxc, directory, 'ps_6_6', source.replace('.GetDimensions(0u,', '.GetDimensions(1u,'))
         draw_pixel(offscreen, vs, wrong, 32 * slot, expected, count, negative=True, heap_count=5)
+        null_pipe, null_vs, null_source = image_dimensions_null_control()
+        vs = compile_shader(dxc, directory, 'vs_6_6', null_vs)
+        ps = compile_shader(dxc, directory, 'ps_6_6', null_source)
+        count = len(null_pipe.uds)
+        cases = [(slot, list(struct.unpack('<4I', struct.pack('<4f', *reference))))
+                 for slot, reference in ((3, (37, 11, 4, 8)), (5, (0, 0, 0, 0)))]
+        for slot, expected in cases:
+            draw_pixel(offscreen, vs, ps, 32 * slot, expected, count, heap_count=6)
+        compare = re.search(r'heap_w_\w+ == 0u', null_source).group()
+        wrong = compile_shader(dxc, directory, 'ps_6_6', mutate(null_source, compare, compare.replace('==', '!=')))
+        for slot, expected in cases:
+            draw_pixel(offscreen, vs, wrong, 32 * slot, expected, count, negative=True, heap_count=6)
 
 
 def embedded_reference(index):

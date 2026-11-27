@@ -72,13 +72,19 @@ The WARP fixture binds texture SRVs directly. The runtime's dynamic-heap
 snapshot still creates raw buffer SRVs.
 
 Image dimensions use the complete shift-and-clamp calculation for the view's
-top mip. The two fixtures use 37 × 11 at mip 0 and 43 × 15 at mip 1. Raw
+top mip. The fixtures use 37 × 11 at mip 0 and 43 × 15 at mip 1. A separate
+width select compares image record word 1 with zero and draws with a bound 37
+× 11 view and a typed null view. The CPU reference expects widths 37 and 0.
+Inverting the comparison changes both readbacks. Raw
 mip-zero size fields and absolute mip indices remain unavailable because the
 desktop view supplies its relative mip range. [AMD RDNA 2 ISA, §8.2.6](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
 The vertex scalar table fixture reads a program-image table through two raw
 descriptors with different bounds. It checks a misaligned byte offset, a
 two-dword read that overwrites its offset register and reads past the bounds.
+The WARP variant also writes a compare mask into a copied address word after
+its last table access. The Python controls cover an ordinary rewrite on both
+branch arms and reject escapes through a still-tainted address word.
 The shape without a high-word add uses the same 4 GiB address-window assumption
 as the vector table lowering. [AMD RDNA 2 ISA, §7.2.1 and §7.5](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 

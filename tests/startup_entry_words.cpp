@@ -115,6 +115,7 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
         std::memcpy(static_cast<unsigned char*>(mapped) + index_table_offset, image_indices, sizeof(image_indices));
         source->Unmap(0, nullptr);
         // Slots 0..2 are raw buffers. Slots 3 and 4 are textures, repeated at 6 and 7 for the shift control.
+        // Slot 5 is a typed null texture for the image dimensions control.
         const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create raw fixture heap");
@@ -159,6 +160,10 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
             alias.ptr += 3 * increment;
             device->CreateShaderResourceView(images[i].Get(), &view, alias);
         }
+        D3D12_SHADER_RESOURCE_VIEW_DESC null_view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        null_view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(nullptr, &null_view, cpu);
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);
     }

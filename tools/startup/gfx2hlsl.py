@@ -1584,7 +1584,10 @@ def embedded_scalar_address_dead(ins, branches, setup, loads):
             # s_cmov may leave the old value, so it keeps whatever taint it finds.
             writes = scalar_destinations(name, asm) & tracked
             written = writes if name in SCA or name.startswith(('s_load_', 's_buffer_load_', 's_cselect_')) else set()
-            read_ops = ops[2:] if pc in loads else ops[1:] if written else ops
+            # A compare's explicit mask destination is separate from its sources. A conditional move can
+            # preserve the old value, which stays tainted until a later unconditional write.
+            predicated_dest = name.startswith('s_cmov') or (name.startswith('v_cmp_') and name.endswith('_e64'))
+            read_ops = ops[2:] if pc in loads else ops[1:] if written or predicated_dest else ops
             reads = scalar_registers(' '.join(read_ops)) & tracked
             if reads_scc(name, asm) or 'scc' in scalar_effects(name, asm)[0]:
                 reads.add('scc')
