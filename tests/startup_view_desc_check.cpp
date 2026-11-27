@@ -7,6 +7,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -172,6 +173,96 @@ static bool pure_checks()
         srv::check_default(resource) == srv::Refusal::format;
 }
 
+static unsigned log_lines;
+static char last_log[256];
+
+static void capture_format_log(const char* format, ...)
+{
+    if (std::strncmp(format, "x2w-d3d12 console format ", sizeof("x2w-d3d12 console format ") - 1) &&
+        std::strncmp(format, "x2w-d3d12 SRV census ", sizeof("x2w-d3d12 SRV census ") - 1)) return;
+    ++log_lines;
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(last_log, sizeof(last_log), format, args);
+    va_end(args);
+}
+
+static D3D12_RESOURCE_DESC console_depth_desc()
+{
+    auto desc = texture_desc();
+    desc.Width = 2560;
+    desc.Height = 1440;
+    desc.MipLevels = 1;
+    desc.Format = static_cast<DXGI_FORMAT>(118);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    return desc;
+}
+
+static bool console_format_log_check()
+{
+    auto desc = console_depth_desc();
+    const D3D12_CLEAR_VALUE clear{desc.Format};
+    D3D12_CLEAR_VALUE copy{};
+    const auto* mapped = x2w_startup::desktop_clear_value(&clear, desc.Format,
+        x2w_startup::desktop_format(desc.Format), copy);
+    log_lines = 0;
+    x2w_startup::log_console_format("committed", 76, desc, &clear, mapped, capture_format_log);
+    // Removing the size field (or any digit of it) must fail this comparison.
+    if (log_lines != 1 || std::strcmp(last_log,
+            "x2w-d3d12 console format 118 -> desktop format 45 path=committed slot=76 dim=3 size=2560x1440x1 "
+            "mips=1 samples=1 flags=0x2 clear_present=1 clear_mapped=1")) return false;
+
+    for (unsigned i = 1; i < 16; ++i) {
+        ++desc.Width;
+        x2w_startup::log_console_format("committed", 76, desc, nullptr, nullptr, capture_format_log);
+    }
+    if (log_lines != 16 || !std::strstr(last_log, "clear_present=0 clear_mapped=0")) return false;
+    for (unsigned i = 17; i <= 32; ++i) {
+        ++desc.Width;
+        x2w_startup::log_console_format("committed", 76, desc, nullptr, nullptr, capture_format_log);
+    }
+    return log_lines == 17 && !std::strcmp(last_log, "x2w-d3d12 console format 118 -> desktop format 45 count=32");
+}
+
+static bool stencil_census_check(ID3D12Device* device, const D3D12_HEAP_PROPERTIES& heap,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    auto desc = console_depth_desc();
+    const auto original = desc.Format;
+    desc.Format = x2w_startup::desktop_format(original);
+    D3D12_CLEAR_VALUE clear{desc.Format};
+    clear.DepthStencil.Depth = 1.0f;
+    ComPtr<ID3D12Resource> resource;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                               &clear, IID_PPV_ARGS(&resource)))) return false;
+    x2w_startup::mark_console_format(resource.Get(), original);
+    if (!x2w_startup::has_console_format_remap(resource.Get())) return false;
+
+    auto stencil = view_desc(0, 1);
+    stencil.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    stencil.Texture2D.PlaneSlice = 1;
+    log_lines = 0;
+    // The typed remap retains the existing refusal and writes a null descriptor.
+    if (x2w_startup::x2w_create_srv(device, resource.Get(), &stencil, dest, "fixture-stencil", capture_format_log) ||
+        log_lines != 1 || std::strcmp(last_log,
+            "x2w-d3d12 SRV census size=2560x1440x1 resource_format=45 view_format=47 "
+            "plane_requested=1 plane_used=-1 count=1")) return false;
+
+    // A typeless depth-stencil backing can carry a stencil SRV using plane 1.
+    desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    resource.Reset();
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                               &clear, IID_PPV_ARGS(&resource)))) return false;
+    log_lines = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!x2w_startup::x2w_create_srv(device, resource.Get(), &stencil, dest, "fixture-stencil", capture_format_log))
+            return false;
+    }
+    return log_lines == 3 && !std::strcmp(last_log,
+        "x2w-d3d12 SRV census size=2560x1440x1 resource_format=44 view_format=47 "
+        "plane_requested=1 plane_used=1 count=4");
+}
+
 static int warp_check()
 {
     ComPtr<ID3D12Debug> debug;
@@ -222,6 +313,11 @@ static int warp_check()
         std::puts("FAIL: debug layer reported messages while creating SRVs");
         return 1;
     }
+    if (!stencil_census_check(device.Get(), heap, dest)) {
+        std::printf("FAIL: stencil SRV census, last line: %s\n", last_log);
+        return 1;
+    }
+    if (FAILED(device->GetDeviceRemovedReason())) return 1;
     std::puts("PASS: WARP created the repaired and null SRVs");
     return 0;
 }
@@ -230,6 +326,10 @@ int main(int argc, char** argv)
 {
     if (!buffer_checks() || !alias_checks() || !pure_checks()) {
         std::puts("FAIL: texture, alias mip and buffer SRV descriptor checks");
+        return 1;
+    }
+    if (!console_format_log_check()) {
+        std::printf("FAIL: console resource format census, last line: %s\n", last_log);
         return 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "warp") == 0) return warp_check();
