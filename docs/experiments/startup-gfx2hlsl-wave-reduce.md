@@ -105,7 +105,7 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_wave_reduce_(controls|
 ```
 
 
-## Wave64 sum and shift-add SCC
+## Wave64 sum
 
 The wave64 sum uses the same DPP steps with `s_or_saveexec_b64` and a two-word saved mask. The
 [V_PERMLANEX16_B32 definition in the RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
@@ -115,14 +115,8 @@ sum of the original active lanes. For a straight-line pixel stage at entry EXEC,
 result lowers to `WaveActiveSum` over the desktop wave. The saved mask, partial sums, vector scratch
 and carry from the scalar add must be unobserved.
 
-The shift-add condition flag (SCC) can be calculated independently of an opaque descriptor addend
-when the shifted first source is zero or when that shift alone overflows 32 bits. In either case
-the descriptor-dependent destination stays symbolic. A first source whose shifted value is between
-1 and 2³²−1 requires the descriptor value to determine carry.
-
-`python -B tests/startup_gfx2hlsl_wave_reduce_check.py` checks both synthetic requests with the
+`python -B tests/startup_gfx2hlsl_wave_reduce_check.py` checks the synthetic request with the
 read-only refusal diagnostic. The 64-lane source model checks the sum on both isolated halves and
 mixed masks. A repeated low-half read is the negative control. The Windows
-`startup_gfx2hlsl_wave_reduce_warp` check draws both translations and compares each covered pixel
-with the CPU reference. It requires a pixel mismatch for a lane-local sum and for each flipped
-carry flag.
+`startup_gfx2hlsl_wave_reduce_warp` check draws the translation and compares each covered pixel
+with the CPU reference. It requires a pixel mismatch for a lane-local sum.
