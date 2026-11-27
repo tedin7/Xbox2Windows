@@ -12,9 +12,10 @@
 // The view type of a global (descriptor heap) SRV slot that a dispatch can select from GPU data.
 //
 // A shader that picks its slot at run time can only be recorded and replayed if the type of every slot it may pick is
-// known: the capture keeps {slot, type, stride} for each slot of the heap, and the dispatch is refused, before any
-// shader runs, when the selected slot holds another type than the one the shader reads. No heap-indexed data read is
-// translated here; this header only classifies, serializes and checks.
+// known: the capture keeps {slot, type, stride, bytes} for each slot of the heap (and the 32-bit channel count of a
+// typed buffer slot), and the dispatch is refused, before any shader runs, when the selected slot holds another type
+// than the one the shader reads. No heap-indexed data read is translated here; this header only classifies,
+// serializes and checks, and names the heap view contract a request allows (global_srv_contract).
 //
 // A .views file describes the one dispatch it was captured from. It is not part of the .cdx/.root content key of the
 // request it sits next to.
@@ -43,6 +44,7 @@ struct GlobalSrvView {
     GlobalSrvType type = GlobalSrvType::none;
     unsigned stride = 0; // Bytes per element for a buffer view (the value native_view_stride gives), 0 for a texture.
     std::uint64_t bytes = 0; // Size of the buffer in bytes, 0 for a texture. Set by the caller from the resource description.
+    unsigned dword_channels = 0; // Typed buffer of 32-bit channels: their count (typed_dword_channels), else 0.
 };
 
 // Classifies the description a title passed for an SRV (slot 18 of the device interface). False: not a view this
@@ -62,6 +64,7 @@ inline bool classify_global_srv_view(unsigned heap_slot, const void *bytes, std:
     view.type = desc.Buffer.StructureByteStride ? GlobalSrvType::structured_buffer
                 : (desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? GlobalSrvType::raw_buffer
                                                                    : GlobalSrvType::typed_buffer;
+    if (view.type == GlobalSrvType::typed_buffer) view.dword_channels = typed_dword_channels(desc);
     return true;
 }
 
@@ -78,6 +81,10 @@ inline std::string encode_global_srv_request(const GlobalSrvRequest &request) {
     out << "x2w-global-srv-views 2\nselect " << request.selected << "\nneed " << global_srv_type_name(request.needed) << '\n';
     for (const auto &view : request.views)
         out << "slot " << view.slot << ' ' << global_srv_type_name(view.type) << ' ' << view.stride << ' ' << view.bytes << '\n';
+    // After the slot lines: the 32-bit channel count of each typed buffer slot that has one.
+    for (const auto &view : request.views)
+        if (view.type == GlobalSrvType::typed_buffer && view.dword_channels)
+            out << "dword " << view.slot << ' ' << view.dword_channels << '\n';
     return out.str();
 }
 
@@ -121,6 +128,19 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
                 return false;
             }
             request.views.push_back(view);
+        } else if (key == "dword") {
+            // Names an earlier typed buffer slot line, once, with 1-4 channels.
+            unsigned slot = 0, channels = 0;
+            GlobalSrvView *named = nullptr;
+            if (fields >> slot >> channels)
+                for (auto &view : request.views)
+                    if (view.slot == slot) named = &view;
+            if (!named || named->type != GlobalSrvType::typed_buffer || named->dword_channels || channels < 1 ||
+                channels > 4) {
+                error = "global SRV view metadata: unreadable dword line";
+                return false;
+            }
+            named->dword_channels = channels;
         } else {
             error = "global SRV view metadata: unknown line '" + key + "'";
             return false;
@@ -144,5 +164,31 @@ inline std::string refuse_global_srv_selection(const std::vector<GlobalSrvView> 
                ", the shader needs " + global_srv_type_name(needed);
     }
     return "global SRV slot " + std::to_string(selected) + " has no captured view type";
+}
+
+// The class of heap reads a request's metadata lets the translator emit (x2w::HeapViewContract::none, raw_buffer,
+// typed_dword). Call after refuse_global_srv_selection accepted the selection. A typed request needs one-channel 32-bit
+// typed buffers: the checks are necessary conditions on the captured resources only; the view's element range and the
+// guest descriptor fields stay the caller's guarantee.
+enum class GlobalSrvContract { none, raw_buffer, typed_dword };
+
+inline GlobalSrvContract global_srv_contract(const GlobalSrvRequest &request, std::string &error) {
+    const auto refuse = [&error](std::string text) {
+        error = std::move(text) + "; only raw and one-channel 32-bit typed heap reads are translated";
+        return GlobalSrvContract::none;
+    };
+    if (request.needed == GlobalSrvType::raw_buffer) return GlobalSrvContract::raw_buffer;
+    if (request.needed != GlobalSrvType::typed_buffer)
+        return refuse(std::string("GPU-selected heap slot view type ") + global_srv_type_name(request.needed) +
+                      " is not raw_buffer or typed_buffer");
+    // Every captured typed buffer slot, the selected one included, must be a one-channel 32-bit buffer.
+    for (const auto &view : request.views) {
+        if (view.type != GlobalSrvType::typed_buffer) continue;
+        if (view.dword_channels != 1 || view.stride != 4 || !view.bytes || view.bytes % 4)
+            return refuse("GPU-selected heap slot " + std::to_string(view.slot) +
+                          " is not a one-channel 32-bit typed buffer" +
+                          (view.dword_channels ? "" : " (no 32-bit channel metadata)"));
+    }
+    return GlobalSrvContract::typed_dword;
 }
 } // namespace x2w_startup

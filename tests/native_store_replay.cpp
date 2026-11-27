@@ -134,7 +134,8 @@ int wmain(int argc, wchar_t **argv) {
             if (position>=hd.NumDescriptors) return 2;
             auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=UINT64(position)*step;
             Window w;w.write=compute_buffer_uav(b.kind);
-            const bool vector_bytes = b.kind == ComputeViewKind::raw_vector_srv;
+            // A byte window is the byte-address rewrite of the same raw table view.
+            const bool vector_bytes = b.kind == ComputeViewKind::raw_vector_srv || b.kind == ComputeViewKind::byte_window_srv;
             const bool root_bytes = b.kind == ComputeViewKind::root_buffer_srv;
             if (!w.write && b.kind!=ComputeViewKind::typed_buffer_srv && b.kind!=ComputeViewKind::buffer_srv && !vector_bytes && !root_bytes) return 2;
             const bool raw=root_bytes || vector_bytes || b.kind==ComputeViewKind::buffer_srv || b.kind==ComputeViewKind::raw_buffer_uav;

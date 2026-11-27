@@ -274,7 +274,7 @@ struct DirectCompute {
             }
         }
     }
-    // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer is the only class that is translated.
+    // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer and typed_dword are translated.
     void refuse_heap_contract(unsigned pc) const {
         if (heap_view == HeapViewContract::none)
             refuse(pc, "direct resource-heap load requires the selected GPU slot and its view type");
@@ -286,11 +286,18 @@ struct DirectCompute {
     // dispatch before the shader runs. The binding names the heap (no table register); the pipeline indexes it directly.
     // A byte window is the byte-address rewrite of that descriptor (word 0 copied, word 1 without stride, word 2 the
     // byte count, word 3 with the raw out-of-bounds mode; see byte_descriptor_field): read as the same raw slot view.
+    // Under typed_dword the slot is a one-channel 32-bit typed buffer instead: a typed load of one channel (an element
+    // index), read as R32_UINT; raw reads and byte windows are refused.
     string heap_resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes) {
         const auto &symbol = s.at(base);
         refuse_heap_contract(i.pc);
+        const bool typed = heap_view == HeapViewContract::typed_dword;
+        if (typed && kind != ComputeViewKind::typed_buffer_srv)
+            refuse(i.pc, "a GPU-selected heap slot is read as a typed dword buffer SRV only");
+        if (typed && (i.op & 3))
+            refuse(i.pc, "typed heap load reads one channel only");
         const bool window = kind == ComputeViewKind::byte_window_srv;
-        if (kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv && !window)
+        if (!typed && kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv && !window)
             refuse(i.pc, "a GPU-selected heap slot is read as a raw buffer SRV only");
         if (symbol.offset % 32 || s[base].type != Symbol::Type::indexed_descriptor)
             refuse(i.pc, "unaligned heap descriptor");
@@ -313,13 +320,20 @@ struct DirectCompute {
                 refuse(i.pc, "non-contiguous resource descriptor");
         }
         auto &bindings = analysis.result.bindings;
-        auto it = std::find_if(bindings.begin(), bindings.end(), [](const auto &b) {
-            return b.kind == ComputeViewKind::heap_buffer_srv;
+        const auto heap_kind = typed ? ComputeViewKind::heap_typed_srv : ComputeViewKind::heap_buffer_srv;
+        auto it = std::find_if(bindings.begin(), bindings.end(), [heap_kind](const auto &b) {
+            return b.kind == heap_kind;
         });
         if (it == bindings.end())
-            bindings.push_back({ComputeViewKind::heap_buffer_srv, compute_resource_heap, 0, 0, bytes});
+            bindings.push_back({heap_kind, compute_resource_heap, 0, 0, bytes});
         else
             it->required_bytes = (std::max)(it->required_bytes, bytes);
+        if (typed) {
+            // A typed buffer of one U32 component (TypedBuffer, props: component type 5 + count * 256); the load reads
+            // element 0 of its ResRet only. No raw-buffer flag.
+            ir.features |= 0x40000000;
+            return ir.heap_handle(ir.binary("add", read(base), to_string(symbol.offset / 32)), 10, 5 + 1 * 256);
+        }
         // 16: raw buffers. 0x40000000: the module reads ResourceDescriptorHeap (DXC sets both for the HLSL reference,
         // see tests/native_heap_handle_probe_check.py); the validator refuses a module whose flags do not match.
         ir.features |= 16 | 0x40000000;

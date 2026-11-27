@@ -319,7 +319,9 @@ NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, u
     identity += container ? "/container/cs_6_6" : "/slot67/cs_6_6";
     word(identity, container ? 0 : entry);
     if (heap_view != HeapViewContract::none)
-        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
+        identity += heap_view == HeapViewContract::raw_buffer    ? "/heap-view/raw_buffer"
+                    : heap_view == HeapViewContract::typed_dword ? "/heap-view/typed_dword"
+                                                                 : "/heap-view/other";
     if (container) {
         packed = read_compute_container(input);
         identity += shader_digest(packed.bytes) + shader_digest(packed.root);
