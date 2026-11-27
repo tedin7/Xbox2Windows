@@ -4,6 +4,7 @@ struct MemoryShaderResourceView {
     u64 address;
 };
 static_assert(offsetof(MemoryShaderResourceView, address) == 0x28);
+static_assert(sizeof(MemoryShaderResourceView) == x2w_replay_slots::find(device_kind, 70)->memory[1]);
 
 bool same_texture_description(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b)
 {
