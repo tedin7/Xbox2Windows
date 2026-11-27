@@ -9736,11 +9736,6 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 
-extern "C" __declspec(dllexport) std::uint64_t x2w_d3d12_take_view_id()
-{
-    return take_view_id();
-}
-
 extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment)
 {
     if (type >= 4) return;

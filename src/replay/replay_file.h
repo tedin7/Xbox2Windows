@@ -65,12 +65,10 @@ struct Step {
     std::vector<Output> outputs;
     const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
     u64 descriptor_address = 0, descriptor_bytes = 0;   // DHPM: caller-supplied CPU backing for slot 14
-    bool has_view_id = false;                          // VIDS: the stand-in stored this view during the call
-    std::uint32_t recorded_view_id = 0;
 };
 
 // A call in the file: its sequence number and where its CALL chunk starts. The recorder writes a call's ARGM, BLOB,
-// OUTP, HPLC, DARR, DHPM and VIDS chunks right after its CALL, before the next call's.
+// OUTP, HPLC, DARR and DHPM chunks right after its CALL, before the next call's.
 struct StepRef {
     u64 seq, at;
 };
@@ -166,14 +164,6 @@ inline std::string add_to_step(const unsigned char* base, std::uint32_t version,
             return "invalid descriptor backing at " + std::to_string(at);
         step.descriptor_address = backing[1];
         step.descriptor_bytes = backing[2];
-    } else if (name == "VIDS") {
-        u64 seq;
-        if (c.header_bytes != 16 || c.data_bytes || step.has_view_id)
-            return "invalid VIDS at " + std::to_string(at);
-        std::memcpy(&seq, h, 8);
-        if (!owner(seq)) return "VIDS not after its CALL at " + std::to_string(at);
-        std::memcpy(&step.recorded_view_id, h + 8, 4);
-        step.has_view_id = true;
     } else if (name == "OUTP" && c.header_bytes >= 24) {
         u64 seq;
         Output o{};
@@ -189,7 +179,7 @@ inline std::string add_to_step(const unsigned char* base, std::uint32_t version,
 inline bool step_chunk(const ChunkHead& c)
 {
     return !std::memcmp(c.tag, "ARGM", 4) || !std::memcmp(c.tag, "HPLC", 4) || !std::memcmp(c.tag, "DARR", 4) ||
-           !std::memcmp(c.tag, "DHPM", 4) || !std::memcmp(c.tag, "OUTP", 4) || !std::memcmp(c.tag, "VIDS", 4);
+           !std::memcmp(c.tag, "DHPM", 4) || !std::memcmp(c.tag, "OUTP", 4);
 }
 
 struct Blob {
@@ -230,7 +220,6 @@ struct Recording {
     // opens it), so a call before it belongs to the prefix; a recording from the start has a one-frame prefix.
     u64 window_seq = ~0ull;
     bool ended = false;
-    bool has_view_ids = false;
 
     // The CALL of a step.
     CallRecord call_of(const StepRef& ref) const { return read_call(base + ref.at + 16, version); }
@@ -244,8 +233,6 @@ struct Recording {
         step.outputs.clear();
         step.descriptor_arrays = nullptr;
         step.descriptor_address = step.descriptor_bytes = 0;
-        step.has_view_id = false;
-        step.recorded_view_id = 0;
         ChunkHead c;
         if (!chunk_at(base, size, ref.at, c)) return;
         for (u64 at = c.data_at + c.data_bytes; chunk_at(base, size, at, c) && std::memcmp(c.tag, "CALL", 4);
@@ -310,7 +297,6 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
                 return problem;
             if (!placed && current.placement.id) out.placed_steps.push_back(out.steps.back());
             if (!backed && current.descriptor_bytes) out.backed_steps.push_back(out.steps.back());
-            if (current.has_view_id) out.has_view_ids = true;
         } else if (name == "BLOB" && header_bytes >= 16) {
             u64 hash, bytes;
             std::memcpy(&hash, h, 8);

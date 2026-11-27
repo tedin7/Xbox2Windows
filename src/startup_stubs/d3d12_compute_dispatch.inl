@@ -140,11 +140,11 @@ bool compute_texture_srv_range_fits(const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
 // view's range and give the program the descriptor words 1 to 3 the hardware descriptor would have held (stride, records
 // and the unified FORMAT with identity channel selection), so a program that reads them runs too.
 const char* compute_uav_token(Wrapper* self, const std::uint32_t* words, Wrapper*& wrapper,
-                              ID3D12Resource*& resource, u64& offset, u64& bytes, std::uint32_t (&out)[4], u64 entry, u64 key)
+                              ID3D12Resource*& resource, u64& offset, u64& bytes, std::uint32_t (&out)[4])
 {
     ViewRecord record{};
     bool materialized = false;
-    if (!read_view_token(words, record, &materialized, entry, key))
+    if (!read_view_token(words, record, &materialized))
         return "an output view token has an unknown kind and record";
     if (record.slot == 18) return "an output shader resource view token cannot supply unordered access";
     if (record.slot != 19) return "an output view token is not an unordered access view";
@@ -523,8 +523,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (slot.word_param >= 0) {
             // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
             // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
-            const u64 table_entry = replay_record::draw_table_entry(pass.compute_tables.table(slot.word_param),
-                                                                   static_cast<u64>(slot.word_byte), 16);
+            const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
             if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
                 reason = "a table descriptor is not bound";
                 break;
@@ -546,7 +545,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "a heap index word is outside its table buffer";
                     break;
                 }
-                replay_record::draw_pages_note(reinterpret_cast<u64>(self), address + at, 4, false);
                 std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
             }
         }
@@ -562,8 +560,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         // title memory of the list's view heap: a literal byte offset, as a table's is.
         const UINT heap_offset = slot.word_param >= 0 || slot.a >= 0 ? std::uint32_t{index << 5} : slot.at;
         const u64 entry = slot.heap ? pass.title_view_heap.record(heap_offset, 16)
-            : slot.a < 0 || slot.b < 0 ? 0 : replay_record::draw_table_entry(pass.compute_tables.table(slot.a),
-                                                                           static_cast<u64>(slot.b), slot.texture ? 32 : 16);
+            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
@@ -575,7 +572,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // a null view would read zeros or drop the program's stores without a trace.
             ViewRecord record{};
             bool created = false;
-            const bool known = read_view_token(words, record, &created, entry, key);
+            const bool known = read_view_token(words, record, &created);
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr
                 : output ? static_cast<ID3D12Resource*>(wrapper->own().real) : sampled_address_texture(wrapper);
@@ -653,8 +650,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (slot.heap && formatted_inputs[i] && words[0] == view_token_magic) {
                 std::uint32_t format = 0;
                 if (const char* refusal = formatted_buffer_word3(words, format, extended_buffer_formats())) {
-                    ViewRecord record{};
-                    read_view_token(words, record, nullptr, entry, key);
                     reason = refusal == x2w_startup::undecoded_view_format
                         ? "a formatted input view has no buffer format code"
                         : "a formatted input has no word 3 the program decodes";
@@ -662,7 +657,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 }
             }
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true, entry, key);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
             if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
                 tr->unfilled_heap_slot_logged = true;
                 log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
@@ -691,7 +686,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (words[0] == view_token_magic && compute_view_tokens_enabled()) {
             auto& view = views[i];
-            reason = compute_uav_token(self, words, view.wrapper, view.resource, view.offset, view.bytes, view.words, entry, key);
+            reason = compute_uav_token(self, words, view.wrapper, view.resource, view.offset, view.bytes, view.words);
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].resource == view.resource)
                     reason = "an output unordered access view token names a buffer that is also an input";

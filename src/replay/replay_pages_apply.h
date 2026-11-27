@@ -39,9 +39,6 @@ struct PageReplay {
     std::vector<ReservedSpan> map_spans;  // only ranges whose contents are restored by MAP
     std::size_t next_map = 0;
     u64 maps_applied = 0, pages_written = 0, zero_pages = 0, missing_pages = 0, bad_maps = 0;
-    bool rewrite_view_tokens = false;
-    std::unordered_map<std::uint32_t, std::uint32_t> view_ids;
-    u64 view_tokens_rewritten = 0, view_tokens_unmapped = 0;
 
     bool reserved(u64 address, u64 bytes = 1) const
     {
@@ -169,26 +166,8 @@ inline void write_page(const PageTarget& target, u64 at, const unsigned char* da
 {
     u64 bytes = page_bytes;
     auto* to = reinterpret_cast<unsigned char*>(target ? target(at, bytes) : at);
-    if (!data) {
-        std::memset(to, 0, static_cast<std::size_t>(bytes));
-        return;
-    }
-    std::memcpy(to, data, static_cast<std::size_t>(bytes));
-    PageReplay& state = page_replay();
-    if (!state.rewrite_view_tokens) return;
-    constexpr std::uint32_t token_magic = 0x56573258;  // "X2WV"
-    for (u64 offset = 0; offset + 32 <= bytes; offset += 32) {
-        std::uint32_t words[2];
-        std::memcpy(words, to + offset, sizeof(words));
-        if (words[0] != token_magic) continue;
-        const auto id = state.view_ids.find(words[1]);
-        if (id == state.view_ids.end()) {
-            ++state.view_tokens_unmapped;
-        } else if (id->second != words[1]) {
-            std::memcpy(to + offset + sizeof(words[0]), &id->second, sizeof(id->second));
-            ++state.view_tokens_rewritten;
-        }
-    }
+    if (data) std::memcpy(to, data, static_cast<std::size_t>(bytes));
+    else std::memset(to, 0, static_cast<std::size_t>(bytes));
 }
 
 inline void apply_map(const Recording& r, const PageMap& m, const PageTarget& target)
