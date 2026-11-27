@@ -529,6 +529,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 break;
             }
             std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+            if ((reason = refuse_native_buffer_addressing(words))) break;
             const std::uint32_t at = slot.at + index * slot.times;
             const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
             if (!(words[0] | words[1] | words[2] | words[3])) {

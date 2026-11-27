@@ -51,10 +51,18 @@ def translate(code, binding, address, cbv):
     return source
 
 
-def check_dispatch(directory, consumer, env, mode, first, *, mismatch=None):
+def check_dispatch(directory, consumer, env, mode, first, *, mismatch=None, swizzled=False):
     got, result = dispatch(directory, consumer, env, mode)
     assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
-    assert not lines(result, 'refused'), result.stderr[-3000:]
+    refusals = lines(result, 'refused: ')
+    if swizzled:
+        diagnostic, = refusals
+        assert diagnostic.startswith('x2w-draw input V# '), diagnostic
+        assert diagnostic.endswith('an input buffer descriptor is swizzled (V# swizzle_enable); '
+                                   'swizzled addressing is not implemented'), diagnostic
+        assert int(diagnostic.split()[4], 16) & (1 << 31), diagnostic
+    else:
+        assert not refusals, result.stderr[-3000:]
     assert not [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line], result.stderr[-3000:]
     expected = [first] + [SENTINEL] * 319
     if mismatch is not None:
@@ -84,6 +92,10 @@ def gpu_case(consumer, dxc, code, binding, address, wrong_address, cbv):
         assert f'{key:016x}: ok' in out, out
         check_dispatch(directory, consumer, env, mode, BUFFER_WORD)
         check_dispatch(directory, consumer, env, mode + '-outside', 0)
+        # Both select slot 2. Rejecting the entire heap breaks the unrelated-slot case, and
+        # mirroring the flagged slot as a linear view gives a nonzero word in the selected case.
+        check_dispatch(directory, consumer, env, mode + '-unrelated-swizzled', BUFFER_WORD, swizzled=True)
+        check_dispatch(directory, consumer, env, mode + '-selected-swizzled', 0, swizzled=True)
 
         cso = cache / f'{key:016x}.cs.cso'
         wrong_word = mutate(source, f'r0.Load({address})', f'r0.Load({wrong_address})')
