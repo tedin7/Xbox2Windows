@@ -58,3 +58,32 @@ colour input to each invocation. Inverting the logic writer must produce
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc_join_draw_warp$' -V
 ```
+
+## Vertex and compute joins
+
+Vertex and compute shaders use the same proof for explicit SCC operands.
+Modeled producers and wave-uniform branches are still required. The synthetic
+program saves the compare bit on each arm of two scalar branches. The vertex
+test draws two triangles in one 4×4 target and compares all four channels with
+a CPU reference. The compute test checks the two saved words in a UAV. A mutant
+flips one arm's save. The expected differences are all 16 pixels and the first
+UAV word, respectively.
+
+The synthetic vertex and compute programs reproduce
+`src_scc with unverified SCC [operand read: s_mov_b32, destination sgpr]`
+on base `741f301fa`. On Linux with Python 3.14.8 and LLVM 19.1.7, the commands
+below accept both programs, verify their encodings, and still reject paths with
+a missing writer. Nine previously accepted pixel fixtures and the existing
+dispatch fixture emit byte-identical HLSL compared with that base.
+
+```sh
+python3 -B tests/startup_gfx2hlsl_src_scc_check.py
+python3 -B tests/startup_gfx2hlsl_src_scc_join_check.py
+python3 -B tests/startup_gfx2hlsl_src_scc_join_check.py binary /usr/bin/llvm-mc-19
+```
+
+Run the readback and mutation checks on Windows with D3D12 WARP.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc_join(_(draw|dispatch)_warp)?$' -V
+```
