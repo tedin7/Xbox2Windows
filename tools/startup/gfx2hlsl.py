@@ -3285,7 +3285,7 @@ class Stage:
                 return 's%d' % n
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
-            if (s[0] == 'desc' and s[1][0] == 'table' and getattr(self, 'kind', None) == 'ps'
+            if (s[0] == 'desc' and isinstance(s[1], tuple) and s[1][0] == 'table' and getattr(self, 'kind', None) == 'ps'
                     and getattr(self.pipe, 'lower_table_counts', False)
                     and 0 <= s[1][1] < 16 and s[3] % 4 == 2 and s[2] is not None):
                 offset = s[2] + 4 * (s[3] - 2)
