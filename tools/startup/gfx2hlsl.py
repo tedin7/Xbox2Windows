@@ -11533,9 +11533,16 @@ class Stage:
         if vector_op:
             if name != 'v_writelane_b32' or kind == 'ms':
                 raise Unsupported('%s: v%d is also used as a vector (%s)' % (name, n, vector_op))
-        elif kind != 'ms':  # slot 57 mesh is always wave64, so k and k + 32 are two slots
+        elif kind != 'ms' and not self.wave64_proven():  # slot 57 mesh is always wave64, so k and k + 32 are two slots
             self.require_spill_lanes_apart(n, name)
         return n, sreg, lane, vector_op is not None
+
+    def wave64_proven(self):
+        """The pipeline says wave64, or the program's own 64-bit exec forms prove it (graphics stages carry no register)."""
+        wave = getattr(getattr(self, 'pipe', None), 'wave_size', None)
+        if wave is not None:
+            return wave == 64
+        return wave64_exec_proof(getattr(self, 'ins', ()))
 
     def require_spill_lanes_apart(self, n, name):
         """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
@@ -14785,6 +14792,24 @@ def wave32_exec_proof(ins):
             ops = parse(asm)[1]
             wave32 |= bool(ops) and ops[0] == 'exec_lo'
     return wave32 and not wave64
+
+
+def wave64_exec_proof(ins):
+    """True when the program names the 64-bit exec pair in a scalar instruction and no wave32 exec write. A compiler emits
+    the 64-bit forms (s_mov_b64 exec, s_and_saveexec_b64, ...) only for wave64 (RDNA 2 ISA, SOP1/SOP2 _B64 forms); the
+    mirror of wave32_exec_proof. A program that never touches exec proves nothing."""
+    wave64 = wave32 = False
+    for _off, _size, name, asm in ins:
+        if not name.startswith('s_'):
+            continue
+        if re.search(r'\bexec\b', asm):
+            wave64 = True
+        elif name.endswith('saveexec_b32'):
+            wave32 = True
+        elif re.search(r'\bexec_lo\b', asm) and name.endswith('_b32'):
+            ops = parse(asm)[1]
+            wave32 |= bool(ops) and ops[0] == 'exec_lo'
+    return wave64 and not wave32
 
 
 class ReadWriteBuffer(Unsupported):
