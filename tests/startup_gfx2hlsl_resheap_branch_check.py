@@ -2,6 +2,7 @@
 
   (no arguments)   translation controls, pure Python
   dxc <dxc.exe>    also compile the translated vertex stage as vs_6_6 with that DXC
+  warp <offscreen_check> <dxc.exe>   draw both vertex fixtures on WARP and compare the target (with a mutant)
 
 The register-offset `s_load_dwordx4 sD, s[ptr:ptr+1], sOFF` was refused in any program that had a branch target, so a
 vertex stage that loads the record in a branch arm could not be translated. The fixture is the flat-parameter vertex
@@ -19,6 +20,7 @@ The words are encoded from the SOP1 / SOP2 / SOPC / SOPP, SMEM and MUBUF field l
 """
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -99,6 +101,37 @@ PS_BRANCHED = assemble([sop1(S_MOV_B32, S_HEAP + 1, ZERO), COND, 'join', LOAD, s
 # The load and the read inside a loop: every pass reloads the record, so the index is assigned again each pass.
 LOOP_VS = HEAD + assemble(SETUP + [LOAD, sopp(S_WAITCNT, LGKM0), READ, sopp(S_WAITCNT, VM0), COND_ONE, ('back', 2)]) + EXPORTS
 
+# Part 2: the loaded record is rewritten into a raw buffer descriptor before the read (the structured-to-raw
+# conversion): stride in bits 16..29 of word 1 becomes the multiplier of NUM_RECORDS, the stride field is cleared and
+# the out-of-range select in word 3 is set. Encoded with llvm-mc (gfx1030, wave32) and checked by the decode test.
+S_BFE_STRIDE = bytes.fromhex('11ff949310000e00')      # s_bfe_u32 s20, s17, 0xe0010
+S_MAX_STRIDE = bytes.fromhex('14819484')              # s_max_u32 s20, s20, 1
+S_MUL_RECORDS = bytes.fromhex('12141293')             # s_mul_i32 s18, s18, s20
+S_CLEAR_STRIDE = bytes.fromhex('11ff1187ffff00c0')    # s_and_b32 s17, s17, 0xc000ffff
+S_CLEAR_OOB = bytes.fromhex('13ff1387ffffffcf')       # s_and_b32 s19, s19, 0xcfffffff
+S_SET_OOB = bytes.fromhex('13ff138800000030')         # s_or_b32 s19, s19, 0x30000000
+REWRITE = [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE, S_CLEAR_OOB, S_SET_OOB]
+# Every word of the same quadruple is needed: each control drops or changes one step.
+REWRITE_CONTROLS = {
+    'no out-of-range select': REWRITE[:5],
+    'stride field kept': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_OOB, S_SET_OOB],
+    'stride mask too wide': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE.replace(b'\xff\xff\x00\xc0', b'\xff\xff\x01\xc0'),
+                             S_CLEAR_OOB, S_SET_OOB],
+    'records not scaled': [S_BFE_STRIDE, S_MAX_STRIDE, S_CLEAR_STRIDE, S_CLEAR_OOB, S_SET_OOB],
+    'select value changed': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE, S_CLEAR_OOB,
+                             S_SET_OOB.replace(b'\x00\x00\x00\x30', b'\x00\x00\x00\x20')],
+}
+# The same read, with the rewritten descriptor.
+REWRITE_ARM = [LOAD, sopp(S_WAITCNT, LGKM0)] + REWRITE + [READ, sopp(S_WAITCNT, VM0)]
+# The result of the read copied into all four parameter words, so the target holds one value four times (a plain
+# copy: no denormal or NaN words to flush).
+COPY_V8 = bytes.fromhex('08030c7e08030e7e0803127e')   # v_mov_b32 v6, v8 / v7, v8 / v9, v8
+
+
+def vertex_copy(arm):
+    return HEAD + assemble(SETUP + [COND, 'join'] + arm) + COPY_V8 + EXPORTS
+
+
 REFUSAL = "s_load with a register offset through ('resheap',)"
 
 
@@ -161,7 +194,62 @@ def main(dxc=None):
     expect('loop: assigned and read in the same pass', len(set_at) == 1 and len(read_at) == 1 and read_at[0] == set_at[0] + 2
            and '[loop] for' in loop_source)
     print('heap record in a branch: controls matched')
+    rewrite_controls()
+
+
+def rewrite_controls():
+    decoded = [asm for _, _, _, asm in G.decode(assemble(REWRITE))]
+    expect('rewrite decodes', decoded == [
+        's_bfe_u32 s20, s17, 0xe0010', 's_max_u32 s20, s20, 1', 's_mul_i32 s18, s18, s20',
+        's_and_b32 s17, s17, 0xc000ffff', 's_and_b32 s19, s19, 0xcfffffff', 's_or_b32 s19, s19, 0x30000000'], str(decoded))
+    pipe, vs_source, _ = translate(vertex_copy(REWRITE_ARM))
+    expect('rewritten record translates', 'dynamic_heap\n' in pipe.manifest() and 'x2w_heap_load(' in vs_source)
+    for label, steps in REWRITE_CONTROLS.items():
+        reason = refusal(vertex_copy([LOAD, sopp(S_WAITCNT, LGKM0)] + steps + [READ, sopp(S_WAITCNT, VM0)]))
+        expect('rewrite refused: ' + label, reason == 'dynamic resource heap descriptor requires four intact words', str(reason))
+    print('heap record rewrite: controls matched')
+
+
+def draw(offscreen, vs, ps, offset, reference, count, negative=False):
+    """One draw of the vertex stage that reads heap record `offset` (ud1) when ud2 is 2."""
+    entry = [0] * count + [2]
+    entry[1], entry[2] = offset, 2
+    as_hex = lambda words: ','.join('%08x' % word for word in words)
+    result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
+                             as_hex([reference] * 4)], capture_output=True, text=True)
+    if result.returncode == 77:
+        print(result.stdout, end='')
+        sys.exit(77)
+    expect('draw offset %d%s' % (offset, ' (mutant)' if negative else ''), result.returncode == int(negative),
+           result.stdout + result.stderr)
+    if negative:
+        expect('mutant reads another record', 'startup_entry_words mismatch' in result.stderr, result.stderr)
+
+
+def mutate(source, old, new):
+    expect('mutation site ' + old, source.count(old) == 1, source)
+    return source.replace(old, new)
+
+
+def warp(offscreen, dxc):
+    """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
+    record chosen by a root constant inside a branch; the target must hold the word the record names."""
+    for label, arm in (('branch', ARM), ('rewrite', REWRITE_ARM)):
+        pipe, vs_source, ps_source = translate(vertex_copy(arm))
+        count = len(pipe.uds)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
+            ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+            draw(offscreen, vs, ps, 0, 0x3fa00000, count)
+            draw(offscreen, vs, ps, 32, 0x40200000, count)
+            wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(vs_source, ') >> 5;', ') >> 6;'))
+            draw(offscreen, wrong, ps, 32, 0x40200000, count, negative=True)
+        print('heap record %s: readback and mutant matched' % label)
 
 
 if __name__ == '__main__':
-    main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())
+    if sys.argv[1:2] == ['warp']:
+        warp(*sys.argv[2:4])
+    else:
+        main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())

@@ -1128,6 +1128,16 @@ def raw_descriptor_alu(base, syms, constants):
     return None
 
 
+def raw_heap_words(loaded):
+    """The four words of a resource heap record after the structured-to-raw conversion that raw_descriptor_alu names:
+    the base word unchanged, the stride cleared, NUM_RECORDS times the stride (at least 1) and OOB_SELECT 3. The
+    draw builds the view of a heap record from the same words as the base address and max(stride, 1) * NUM_RECORDS
+    bytes (indirect_table_buffer in src/startup_stubs/d3d12_draw.inl), and a raw read with OOB_SELECT 3 is out of
+    range when the offset plus the size passes NUM_RECORDS bytes. The converted descriptor therefore names the view
+    the draw already made, and a raw load through it needs no run-time word."""
+    return (loaded[0], loaded[1] + ('stride0',), loaded[2] + ('byte_count',), loaded[3] + ('oob3',))
+
+
 def smem_offset(tok):
     """The SMEM offset operand as a token: 'off' (no offset operand) is the literal 0, anything else unchanged."""
     return '0' if tok == 'off' else tok
@@ -4143,9 +4153,18 @@ class Stage:
         if s and s[0] == 'desc':
             if s[1][0] == 'dynamic_heap':
                 words = 8 if len(s[1]) > 2 else 4  # an image record is the whole 32-byte heap entry
-                if (r[0] != 's' or r[2] - r[1] != words - 1 or s[3] != 0 or
-                        any(self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, words))):
+                if r[0] != 's' or r[2] - r[1] != words - 1 or s[3] != 0:
                     raise Unsupported('dynamic resource heap descriptor requires %s intact words' % ('eight' if words == 8 else 'four'))
+                if words == 8:
+                    if any(self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, words)):
+                        raise Unsupported('dynamic resource heap descriptor requires eight intact words')
+                else:
+                    if len(s) != 4:
+                        raise Unsupported('dynamic resource heap descriptor requires four intact words')
+                    loaded = tuple(desc_word(s, i) for i in range(4))
+                    actual = tuple(self.sym.get(r[1] + i) for i in range(4))
+                    if actual != loaded and actual != raw_heap_words(loaded):
+                        raise Unsupported('dynamic resource heap descriptor requires four intact words')
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
@@ -8266,6 +8285,11 @@ class Stage:
                 self.sym[d] = raw
                 if raw[0] == 'desc':
                     self.pipe.modified.add(desc_key(raw))
+                    if raw[1][0] == 'dynamic_heap' and raw[-1] == 'byte_count' and not any(
+                            t and t[:2] == ('descnum', 'stride_min1') for t in syms):
+                        # NUM_RECORDS times a stride that may be 0 (a record that is already raw) would be 0 bytes
+                        # where the draw's view has NUM_RECORDS bytes: not the converted descriptor of the view.
+                        self.pipe.other_modified.add(desc_key(raw))
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add(desc_key(own))
@@ -8924,7 +8948,9 @@ class Stage:
         return name
 
     def dynamic_heap_load(self, key, address):
-        if key[1] != 0 or key in self.pipe.modified:
+        # descriptor() has just checked the registers: four intact words, or the complete raw conversion of them.
+        # A write the translator could not name leaves other words behind and puts the key in other_modified.
+        if key[1] != 0 or key in self.pipe.other_modified:
             raise Unsupported('dynamic resource heap descriptor was advanced')
         self.pipe.uses_dynamic_heap = True
         return 'x2w_heap_load(%s, %s)' % (key[0][1], address)
