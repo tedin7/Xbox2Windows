@@ -216,6 +216,50 @@ def patched(byte, mask, value=None):
     return bytes(store)
 
 
+# The packed 16-bit form (a16, x in the low half and y in the high half of one VGPR) of the same read-modify-write:
+# the load and the store name v2. PACKED_OTHER stores at v3 and PACKED_MOVED changes v2 between the two.
+PACKED_SOURCE = """s_load_dwordx8 s[24:31], s[8:9], 0x0
+s_waitcnt lgkmcnt(0)
+{pre}image_load v[32:35], {load_at}, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D unorm a16
+s_waitcnt vmcnt(0)
+v_add_f32_e32 v32, s9, v32
+v_add_f32_e32 v33, s10, v33
+v_add_f32_e32 v34, s11, v34
+v_add_f32_e32 v35, s12, v35
+{between}image_store v[32:35], {store_at}, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D unorm a16
+exp mrt0 v32, v33, v34, v35 done vm
+s_endpgm
+"""
+PACKED_FIELDS = {
+    'packed': dict(pre='', load_at='v2', between='', store_at='v2'),
+    'other texel': dict(pre='', load_at='v2', between='', store_at='v3'),
+    'moved coordinate': dict(pre='', load_at='v2', between='v_add_nc_u32_e32 v2, 1, v2\n', store_at='v2'),
+}
+PACKED_WORDS = {
+    'packed': bytes.fromhex('04060cf4000000fa7fc08cbf081f00f002200640703f8cbf094040060a4242060b4444060c464606081f20f0022006400f1800f820212223000081bf'),
+    'other texel': bytes.fromhex('04060cf4000000fa7fc08cbf081f00f002200640703f8cbf094040060a4242060b4444060c464606081f20f0032006400f1800f820212223000081bf'),
+    'moved coordinate': bytes.fromhex('04060cf4000000fa7fc08cbf081f00f002200640703f8cbf094040060a4242060b4444060c4646068104044a081f20f0022006400f1800f820212223000081bf'),
+}
+
+
+def packed_controls():
+    pipe = G.Pipeline(VS_WORDS, PACKED_WORDS['packed'], rw_root())
+    hlsl, manifest = pipe.hlsl_ps(), pipe.manifest()
+    unpacked = 'uint2(v2 & 0xffffu, v2 >> 16)'
+    assert 't = w0[uint2(v2 & 0xffffu, v2 >> 16)];' in hlsl.replace('if (exec & 1) ', ''), hlsl
+    assert 'w0[%s] = asfloat(uint4(' % unpacked in hlsl, hlsl
+    assert 'uav 0 tex2d table 0 0\nuavload 0\n' in manifest, manifest
+    assert not any(line.startswith('srv ') for line in manifest.splitlines()), manifest
+    for label in ('other texel', 'moved coordinate'):
+        try:
+            G.Pipeline(VS_WORDS, PACKED_WORDS[label], rw_root())
+        except G.Unsupported as error:
+            assert 'both read and stored to' in str(error), (label, error)
+        else:
+            raise AssertionError('accepted a read-write image whose store is not at the texel it read: ' + label)
+    print('packed 16-bit read-write image shared; a store at another texel or after the coordinate changed is refused')
+
+
 def controls():
     text = D.decode_instruction(STORE, 0)[2]
     assert text == 'image_store v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D', text
@@ -375,6 +419,10 @@ def check_binary(llvm_mc):
         built = assemble(llvm_mc, src)
         if built != expected:
             raise AssertionError('%s: assembled %s, recorded %s' % (label, built.hex(), expected.hex()))
+    for label, fields in PACKED_FIELDS.items():
+        built = assemble(llvm_mc, PACKED_SOURCE.format(**fields))
+        if built != PACKED_WORDS[label]:
+            raise AssertionError('packed %s: assembled %s, recorded %s' % (label, built.hex(), PACKED_WORDS[label].hex()))
     print('fixture words match llvm-mc')
 
 
@@ -486,6 +534,7 @@ def check_draw(dxc, renderer, adapter):
 
 def main():
     controls()
+    packed_controls()
     if len(sys.argv) == 1:
         return
     mode, *args = sys.argv[1:]
