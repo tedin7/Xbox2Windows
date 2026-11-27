@@ -5646,6 +5646,9 @@ class Stage:
             tentative_kept = set()
             materialize = {}
             incoming = {}
+            incoming_masks = {}
+            skipped_marks = (set(), set(), set())  # program-order marks suppressed in the current block
+            carried_masks = set()  # edge marks absent from the program-order state
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -5702,6 +5705,26 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
+                    marks = (self.masks, self.mask_high, self.join_masks)
+                    arriving_masks = incoming_masks.get(off, set())
+                    if falls:
+                        arriving_masks = arriving_masks.union(carried_masks, *marks)
+                    # Start with the program-order marks. An edge that skipped the previous block
+                    # can still carry one of the marks suppressed while lowering that block.
+                    ordered_marks = tuple(current | skipped for current, skipped in zip(marks, skipped_marks))
+                    if off not in back_targets:
+                        skipped_marks = tuple(current - arriving_masks for current in ordered_marks)
+                        marks = tuple(current & arriving_masks for current in ordered_marks)
+                    else:
+                        skipped_marks = (set(), set(), set())
+                        marks = ordered_marks
+                        # An unvisited back edge can carry writes into a later forward edge.
+                        # The printed destination of a wave64 compare may name only the low word.
+                        loop_writes = joined.get(off, ())
+                        arriving_masks = arriving_masks.union(
+                            loop_writes, (r + 1 for r in loop_writes if isinstance(r, int) and r % 2 == 0))
+                    self.masks, self.mask_high, self.join_masks = marks
+                    carried_masks = arriving_masks.difference(*marks)
                     self.heap_index.clear()  # another path into the join may hold a different word
                     self.align4_v.clear()
                     self.align4_s.clear()
@@ -5823,6 +5846,8 @@ class Stage:
                         if getattr(self, 'phi_regs', {}).get(b_target):
                             self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        incoming_masks.setdefault(b_target, set()).update(
+                            self.masks | self.mask_high | self.join_masks | carried_masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                         if self.firstlane_cfg and self.uniform_cf:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
@@ -5972,6 +5997,17 @@ class Stage:
                     continue
                 # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
+                if dests:
+                    for skipped in skipped_marks:
+                        skipped.difference_update(dests)
+                    if carried_masks:
+                        # A copy or bitwise operation can forward a mask that only some paths carry.
+                        copies_mask = ((MASK_COPY_SALU_RE.match(name) or name == 's_cselect_b32') and
+                                       bool(carried_masks & scalar_registers(' '.join(parse(asm)[1][1:]))))
+                        if copies_mask:
+                            carried_masks.update(dests)
+                        else:
+                            carried_masks.difference_update(dests)
                 if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
                     # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
                     # value (descriptor_scc_reads follows every path from here to the reader).
