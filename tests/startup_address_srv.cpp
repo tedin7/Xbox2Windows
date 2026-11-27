@@ -335,6 +335,69 @@ int draw_cube_srvs(void* guest, void* list)
     return 0;
 }
 
+int draw_desktop_array_srvs(void* guest, void* list)
+{
+    constexpr std::size_t slice_stride = 64 * 1024;
+    constexpr auto color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    alignas(4096) static std::array<unsigned char, 6 * slice_stride> small{};
+    alignas(4096) static std::array<unsigned char, 12 * slice_stride> large{};
+    const auto fill = [slice_stride](unsigned char* data, UINT slices, UINT side, UINT red) {
+        for (UINT slice = 0; slice < slices; ++slice)
+            for (UINT y = 0; y < side; ++y)
+                for (UINT x = 0; x < side; ++x) {
+                    const unsigned char color[] = {static_cast<unsigned char>(red + 13 * slice),
+                        static_cast<unsigned char>(slice < 6 ? 53 : 53 + 61 * y),
+                        static_cast<unsigned char>(slice < 6 ? 197 : 197 - 73 * x), 255};
+                    // Using an unrounded footprint stride reads zero padding for faces 1 through 5.
+                    std::memcpy(data + slice * slice_stride + y * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT + 4 * x,
+                                color, sizeof(color));
+                }
+    };
+    fill(small.data(), 6, 1, 19);
+    fill(large.data(), 12, 2, 31);
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_RESOURCE_DESC shape{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 2, 12, 1, color_format,
+        {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, static_cast<D3D12_RESOURCE_FLAGS>(0x300000)};
+    ViewAt binding{};
+    binding.view.Format = color_format;
+    binding.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    binding.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    binding.view.TextureCube.MipLevels = 1;
+    binding.address = ptr(large.data());
+
+    const auto draw = [&](LONG top, LONG bottom) {
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        const D3D12_RECT region{0, top, 8, bottom};
+        invoke(list, 22, 1, ptr(&region));
+        invoke(list, 12, 3, 1);
+    };
+    if (GetEnvironmentVariableW(L"X2W_TEST_DESKTOP_ARRAY_SLICES", nullptr, 0)) {
+        binding.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        binding.view.Texture2DArray = {0, 1, 6, 6, 0, 0};
+        draw(0, 4);
+    } else {
+        draw(2, 4);
+        shape.Width = shape.Height = 1;
+        shape.DepthOrArraySize = 6;
+        binding.address = ptr(small.data());
+        draw(0, 2);
+
+        const void* slot = reinterpret_cast<const void*>(cpu);
+        std::array<unsigned char, 32> previous;
+        std::memcpy(previous.data(), slot, previous.size());
+        shape.DepthOrArraySize = 5;
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        if (std::memcmp(previous.data(), slot, previous.size()) != 0) return 48;
+        shape.DepthOrArraySize = 6;
+        shape.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        if (std::memcmp(previous.data(), slot, previous.size()) != 0) return 48;
+    }
+    return 0;
+}
+
 int draw_bc_address_srvs(void* guest, void* list)
 {
     wchar_t path[MAX_PATH]{};
