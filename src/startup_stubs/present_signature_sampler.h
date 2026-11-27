@@ -28,6 +28,23 @@
 
 namespace x2w_present_signature {
 
+inline int configured_interval(bool* specified = nullptr)
+{
+    static const auto config = [] {
+        struct Config { int interval; bool specified; };
+        char value[16]{};
+        const DWORD bytes = GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value));
+        return Config{bytes == 0 || bytes >= sizeof(value) ? -1 : std::atoi(value), bytes != 0};
+    }();
+    if (specified) *specified = config.specified;
+    return config.interval;
+}
+
+inline int effective_interval(int configured, bool onset)
+{
+    return configured >= 0 ? configured : (onset ? 1 : 4);
+}
+
 // Layout of the 4-byte colour formats the signature reads; false for any other format.
 inline bool layout_of(DXGI_FORMAT format, Layout& layout)
 {
@@ -51,7 +68,8 @@ public:
         : capture_center_(capture_center || check_flat), check_flat_(check_flat), every_(every), always_(always) {}
 
     // Called once per present with the presented surface. Returns true when this call published a sample.
-    bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
+    bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block,
+                 bool track_flat = false)
     {
         bool published = false;
         if (in_flight_ && fence_->GetCompletedValue() >= fence_value_) {
@@ -68,7 +86,7 @@ public:
                 const auto* base = static_cast<const unsigned char*>(mapped);
                 if (capture_center_)
                     std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
-                if (check_flat_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                if ((check_flat_ || track_flat) && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
                     last_flat_ = true;
                     for (int band = 0; band < cells_y && last_flat_; ++band) {
                         const auto* row = base + row_stride_ * band;

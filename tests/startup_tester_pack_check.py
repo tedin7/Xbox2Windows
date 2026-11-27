@@ -198,7 +198,7 @@ def check_zip():
             assert z.read("stdout.txt") == b"title text" and z.read("debugger_summary.out") == b"debugger summary\n"
         everything = sorted(["finished.txt", "events.txt", "stderr.txt", "translate.txt", "translate_err.txt", "window.png",
                              "stdout.txt", "files.txt", "trap.log", "threads.txt", "threads_stop.txt", "bink_luma.png",
-                             "debugger_summary.out", "manifest.json"] + ["window_%03ds.png" % (15 * (n + 1)) for n in range(5)])
+                             "debugger_summary.out", "manifest.json", "REPORT.txt"] + ["window_%03ds.png" % (15 * (n + 1)) for n in range(5)])
         assert names == everything, names
         for gone in ("request.bin", "crash.dmp", "shader_cache"):
             assert gone not in names
@@ -231,6 +231,7 @@ def check_zip():
         for name in ("events.txt", "window.png", "window_180s.png", "stdout.txt"):
             assert name in seen, name
         on_disk = sorted(n for n in os.listdir(run2) if (run2 / n).is_file() and not n.endswith(".dmp"))
+        assert seen.pop("REPORT.txt").startswith(b"manifest:")
         assert sorted(seen) == on_disk, "a log was dropped or an extra file travelled"
 
         # A file larger than a piece is cut into numbered pieces that join back to the original.
@@ -904,6 +905,51 @@ def check_symbols():
             assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
 
 
+def check_capture_report():
+    correct = {"X2W_RED_PRODUCER_AUTO": "12,5", "X2W_RED_PRODUCER_ONSET": "1",
+               "X2W_RED_PRODUCER_RGB": "32,32,32", "X2W_PRESENT_SIGNATURE_EVERY": "1"}
+    missing_rgb = dict(correct)
+    del missing_rgb["X2W_RED_PRODUCER_RGB"]
+    warnings = T.capture_warnings(missing_rgb)
+    assert len(warnings) == 2 and "RGB is unset" in warnings[0] and "not gray" in warnings[1]
+    assert not T.capture_warnings(correct)
+    assert not T.capture_warnings(dict(correct, X2W_RED_PRODUCER_AUTO="0s,5",
+                                       X2W_RED_PRODUCER_RGB="any", X2W_RED_PRODUCER_REARM="3"))
+    assert not T.capture_warnings(dict(missing_rgb, X2W_RED_PRODUCER_ONSET="black"))
+    assert T.capture_warnings(dict(correct, X2W_RED_PRODUCER_AUTO="bad", X2W_RED_PRODUCER_ONSET="0")) == [
+        "X2W_RED_PRODUCER_AUTO could not be parsed"]
+    for interval in ("", "0", "3"):
+        assert T.capture_warnings(dict(correct, X2W_PRESENT_SIGNATURE_EVERY=interval)) == [
+            "set X2W_PRESENT_SIGNATURE_EVERY=1 to explicitly sample every present"]
+
+    unarmed = ("x2w-red not armed: last present 9, floor 12, flat pictures seen 0 (levels none), "
+               "closest sampled colour 32,32,32")
+
+    def report(env, preflight, stderr="", trap=""):
+        with tempfile.TemporaryDirectory() as temp:
+            logdir = Path(temp) / "logs"
+            logdir.mkdir()
+            write(logdir, "stderr.txt", stderr.encode())
+            write(logdir, "trap.log", trap.encode())
+            manifest = dict(MANIFEST, env=env, capture_warnings=preflight)
+            [(archive, _)] = T.pack(str(logdir), manifest, os.path.join(temp, "report.zip"))
+            with zipfile.ZipFile(archive) as z:
+                return z.read("REPORT.txt").decode()
+
+    missing_report = report(missing_rgb, warnings[:1],
+                            "".join(f"x2w-red WARNING: {reason}\n" for reason in warnings))
+    assert missing_report.splitlines()[:3] == [
+        *(f"CAPTURE WARNING: {reason}" for reason in warnings), "manifest: manifest.json (commit abcdef12, build abcdef12)"]
+    missed_floor = report(correct, [], trap=unarmed + "\n")
+    assert missed_floor.startswith("CAPTURE WARNING: not armed: last present 9, floor 12,")
+    assert f"producer:\n{unarmed}" in missed_floor
+    waiting = "x2w-red producer waits for RGB 32,32,32 at or after present 12 then captures 5 future frames\n"
+    interrupted = report(correct, [], waiting + "x2w-d3d12 heartbeat: 9 frames presented in 2.00 s\n")
+    assert interrupted.startswith("CAPTURE WARNING: no automatic arm recorded before the log ended (last present #9 at 2 s, floor 12)")
+    clean = report(correct, [], waiting + "x2w-red auto armed sampled_present=12 published_at=13 target=1 capture=14..18 rgb=32,32,32\n")
+    assert clean.startswith("manifest:") and "CAPTURE WARNING" not in clean and "producer:" in clean
+
+
 if __name__ == "__main__":
     check_symbols()
     check_seed_cache()
@@ -926,4 +972,5 @@ if __name__ == "__main__":
     check_cache_tag()
     check_memory_gib()
     check_zip()
+    check_capture_report()
     print("startup_tester_pack_check: preset, manifest and zip checks pass")

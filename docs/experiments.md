@@ -80,6 +80,13 @@ inputs in onset mode. Compute writes and alias writes require separate evidence.
 The diagnostic retains up to eight present resources and 512 paired readbacks in
 an opted-in process.
 
+Producer diagnostics log the effective configuration at device startup. The
+tester launcher prints configuration warnings before launch and records them
+in `manifest.json`. An orderly exit without an arm logs the last present,
+the floor, up to eight distinct flat luma levels, and the closest sampled RGB.
+`REPORT.txt` puts capture warnings first. It also flags logs that end after
+automatic capture was configured without recording an arm or an exit reason.
+
 `startup_present_producer` uses a 16×16 source-built texture and known clears. It
 checks exact colors on both sides of each clear, compared to subsequent presents,
 then resubmits the closed recording and reverses the writes. The automatic cases
@@ -88,7 +95,13 @@ refuse an out-of-range RGB component. The default-cadence case omits the signatu
 override. The onset case compares a near-red center in a nonuniform picture with
 a uniform near-red picture, then checks the producer readbacks with onset on and
 automatic capture with onset off. Run the WARP and hardware checks separately
-when reporting adapter results.
+when reporting adapter results. The WARP diagnostic cases compare the same flat
+black frames with default red and explicit black targets. The packer fixture
+checks the warning order in the resulting archive.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^(startup_present_producer_warp|startup_tester_pack)$' -V
+```
 
 ```powershell
 cmake --build --preset dev --target startup_present_producer
