@@ -1627,7 +1627,9 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 // target must hold, compared bit for bit.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
-    const bool dynamic_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    const auto operation = std::string_view(ctx.argv[2]);
+    const bool texture_heap = operation == "--startup-dynamic-textures";
+    const bool dynamic_heap = texture_heap || operation == "--startup-dynamic-heap";
     if (dynamic_heap) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
@@ -1638,15 +1640,23 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
     const auto expected = parse_hex_words(ctx.argv[6]);
     if (entry.empty() || entry.size() > 32)
         return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
-    if (expected.size() != 4)
-        return {OutcomeKind::fail, "expected value is not four hex words"};
-    std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap);
-    if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
-        std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
-                             "actual=%08x,%08x,%08x,%08x\n",
-                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
-        return {OutcomeKind::fail, "entry constant readback differs"};
+    if (expected.size() != 4 && !(texture_heap && expected.size() == 16))
+        return {OutcomeKind::fail, "expected value is not one or four RGBA pixels"};
+    const UINT extent = texture_heap ? 8u : 1u;
+    std::vector<std::uint32_t> words(extent * extent * 4);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()),
+                              words.data(), extent, extent, dynamic_heap, texture_heap);
+    for (UINT y = 0; y < extent; ++y) {
+        for (UINT x = 0; x < extent; ++x) {
+            const auto* actual = words.data() + (y * extent + x) * 4;
+            const auto* reference = expected.data() + x * 4 % expected.size();
+            if (std::memcmp(actual, reference, 4 * sizeof(*actual)) == 0) continue;
+            std::fprintf(stderr, "startup_entry_words mismatch at (%u,%u) expected=%08x,%08x,%08x,%08x "
+                                 "actual=%08x,%08x,%08x,%08x\n",
+                         x, y, reference[0], reference[1], reference[2], reference[3],
+                         actual[0], actual[1], actual[2], actual[3]);
+            return {OutcomeKind::fail, "entry constant readback differs"};
+        }
     }
     return {OutcomeKind::pass, nullptr};
 }
@@ -1782,6 +1792,7 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
+    {"--startup-dynamic-textures", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
