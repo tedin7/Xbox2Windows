@@ -15829,7 +15829,7 @@ SGPRs, with no gap for an omitted axis (`SV_GroupID`). v0-v2 hold `SV_GroupThrea
 `TIDIG_COMP_CNT`. This is how `compute_store_aot` decodes `COMPUTE_PGM_RSRC2` (#1608).
 `TG_SIZE_EN` stays refused.
 
-Root parameters are placed from s4, which is an inference, like the graphics stages' s8. #1608 defines no
+Root parameters are placed from s4, which is an inference, like the pixel and vertex stages' s8. #1608 defines no
 root placement. The only in-repo evidence is the local compute-record scan above, whose table bindings
 used s4 or s5. A numeric read of a user SGPR that the root signature does not place, including s0-s3,
 is refused because its value is unknown.

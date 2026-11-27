@@ -4356,7 +4356,7 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
 
 
 def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
-    """Number forward paths. RDNA 2 ISA §3.12.2 p. 24: GS user data starts at s8."""
+    """Number forward paths. GS user data starts at s8; the root starts at s16."""
     if any(first <= i < exchange for i in constant_trips) or any(
             first <= i < exchange and not i < dest <= exchange for i, dest in edges.items()):
         return {}, set(), {}
@@ -5776,10 +5776,11 @@ class Stage:
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
-        # Graphics root parameters start at s8. For compute, s4 is an inference, not a documented layout: the only
-        # in-repo evidence is a local compute-record scan whose table bindings used s4 or s5 (docs/experiments.md).
-        # s0-s3 are not modelled.
-        reg = 4 if self.kind == 'cs' else 8
+        # Mesh uses GS waves: eight system SGPRs precede user data ("RDNA 2" Instruction Set Architecture,
+        # §3.12.2, pp. 23–24; "RDNA3" Instruction Set Architecture (2023-02), §3.5.3.2, Table 9, pp. 28–29).
+        # Eight platform words precede the graphics root.
+        # Compute s4 is inferred from a local record scan (docs/experiments.md); compute s0–s3 are not modelled.
+        reg = 4 if self.kind == 'cs' else 16 if self.kind == 'ms' else 8
         for index, p in enumerate(root['params']):
             if p['type'] == 0:
                 self.sym[reg] = ('ptr', ('table', index))
@@ -12617,18 +12618,18 @@ class Stage:
             return self.heap_record(dst, base, token, imm, count)
         if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) in ('ps', 'vs'):
             return self.dynamic_heap_image_record(dst, base, token, imm)
-        if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
+        if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps', 'ms'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
                                             "s_load with a register offset through ('resheap',)")
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
     def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
         r = reg_range(token)
-        # A vertex stage may load the record inside a branch arm: the index lives in a temporary that is declared at
+        # A vertex or mesh stage may load the record inside a branch arm: the index lives in a temporary that is declared at
         # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
-        # it. Only the vertex stage does this; the pixel and compute stages keep refusing the load in a branch.
+        # it. Pixel and compute stages keep refusing the load in a branch.
         in_branch = self.has_branches
-        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) != 'vs')
+        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) not in ('vs', 'ms'))
                 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
                 or self.sym.get(base[2]) != ('const', 0)):
             raise Unsupported(refusal)
@@ -15494,8 +15495,8 @@ class Stage:
         self.exec_known = self.exec_narrow_only = False
 
     def op_x2w_mesh_group(self, ops, mods):
-        # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
-        self.sym[reg_range(ops[0])[1]] = ('the mesh group index',)
+        # The recognized exchange broadcasts wave 0 lane 0 entry v5 >> 7, the linear group index.
+        self.set_s(reg_range(ops[0])[1], 'gid.x', uniform=True)
 
     def op_x2w_mesh_firstlane(self, ops, mods):
         self.mesh_collect_reads[self.pc] = self.u(ops[1])
@@ -20236,12 +20237,23 @@ class MeshPipeline(Pipeline):
     """A slot 57 mesh pipeline with an optional pixel stage. The mesh stage is self.vs."""
     vertex_kind = 'ms'
 
+    def mesh_profile(self):
+        return 'ms_6_6' if self.uses_dynamic_heap else 'ms_6_5'
+
     def hlsl_ms(self):
         s = self.vs
         lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
                         re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
                                lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
                  for line in s.body()]
+        # Omit an unused group exchange, including its otherwise unused declaration.
+        unused_group_regs = set()
+        for index in range(len(lines) - 1, -1, -1):
+            match = re.fullmatch(r'\s*(s\d+) = gid\.x;', lines[index])
+            if match and not any(re.search(r'\b%s\b' % match[1], other)
+                                 for other in lines[:index] + lines[index + 1:] + s.entry):
+                del lines[index]
+                unused_group_regs.add(int(match[1][1:]))
         if self.ps is None:
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
@@ -20284,12 +20296,19 @@ class MeshPipeline(Pipeline):
             ]
         counts = ['    uint mesh_%s_count = 0u;' % kind for kind, key in (('vertex', 'verts'), ('primitive', 'prims'))
                   if key in s.mesh_count_rewrites]
+        used_s = s.used_s
+        try:
+            s.used_s = used_s - unused_group_regs
+            declarations = s.declarations()
+        finally:
+            s.used_s = used_s
         return '\n'.join(
             self.common() + collectives + mask_collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
-                'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
-                % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
-            + s.declarations() + counts + ['    ' + line for line in s.entry] + lines
+                'void main(uint tid : SV_GroupIndex, %sout vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
+                % ('uint3 gid : SV_GroupID, ' if any('gid.x' in line for line in lines + declarations + s.entry) else '',
+                   MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
+            + declarations + counts + ['    ' + line for line in s.entry] + lines
             + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
 
 
@@ -20873,9 +20892,10 @@ def translate_mesh57(out_dir, key):
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
     pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
-    sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
+    mesh_hlsl = pipe.hlsl_ms()
+    sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
     if ps:
-        sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
+        sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
     manifest = pipe.manifest()
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
