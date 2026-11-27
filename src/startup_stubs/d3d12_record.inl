@@ -176,6 +176,14 @@ u64 content_hash(const unsigned char* data, std::size_t bytes)
     return hash;
 }
 
+bool committed_region_readable(const MEMORY_BASIC_INFORMATION& info)
+{
+    const DWORD protection = info.Protect & 0xff;
+    return info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) &&
+        (protection == PAGE_READONLY || protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+         protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
+}
+
 // Cache only the queried region within its 64 KiB granule. Page protection
 // and commitment can change on smaller boundaries inside a granule.
 std::size_t committed_readable_prefix(u64 start, std::size_t bytes)
@@ -203,10 +211,7 @@ std::size_t committed_readable_prefix(u64 start, std::size_t bytes)
             MEMORY_BASIC_INFORMATION info{};
             if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) break;
             const u64 first = reinterpret_cast<u64>(info.BaseAddress);
-            const DWORD protection = info.Protect & 0xff;
-            const bool readable = info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) &&
-                (protection == PAGE_READONLY || protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
-                 protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
+            const bool readable = committed_region_readable(info);
             const Region found{(std::max)(first, base), (std::min)(first + info.RegionSize, base + granule), readable};
             // Only readable spans are kept: memory reserved now is often committed later (a title heap grows inside a
             // granule), and the prefix can run for minutes without a present to expire the cache.

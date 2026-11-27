@@ -15,6 +15,8 @@ namespace {
 
 constexpr UINT64 page_bytes = 4096;
 constexpr UINT64 allocation_bytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+constexpr UINT64 hole_allocation_bytes = UINT64{4} << 20;
+constexpr UINT64 hole_prefix_bytes = 2 * allocation_bytes;
 constexpr auto queue_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
 
 template<class Result = HRESULT, class... Args>
@@ -59,13 +61,13 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes)
             {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
 }
 
-int scene(IDXGIAdapter* adapter, void* memory, const char* readback_path)
+int scene(IDXGIAdapter* adapter, void* memory, const char* readback_path, void* hole_base)
 {
     unsigned char parameters[64]{};
     void *device = nullptr, *placed = nullptr, *readback = nullptr;
     void *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     const GUID& resource = __uuidof(ID3D12Resource);
-    const auto placed_desc = buffer_desc(allocation_bytes);
+    const auto placed_desc = buffer_desc(hole_base ? hole_allocation_bytes - hole_prefix_bytes : allocation_bytes);
     const auto readback_desc = buffer_desc(2 * page_bytes);
     const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
     const D3D12_COMMAND_QUEUE_DESC queue_desc{queue_type};
@@ -79,6 +81,17 @@ int scene(IDXGIAdapter* adapter, void* memory, const char* readback_path)
         !check(invoke(device, 73, list_desc, allocator, nullptr, &__uuidof(ID3D12GraphicsCommandList), &list), "compute list") ||
         !check(invoke(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence), &fence), "fence"))
         return 1;
+    if (hole_base) {
+        // Slot 133 records the texture's 128 KiB title footprint without using it as live GPU backing.
+        // Its range joins the buffer's at +128 KiB, putting the hole and copy source in the same scan slab.
+        const D3D12_RESOURCE_DESC texture_desc{
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+            {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+        void* texture = nullptr;
+        if (!check(invoke(device, 133, hole_base, &texture_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &resource,
+                          &texture), "placed texture spanning hole"))
+            return 1;
+    }
     // X2W_TEST_SUBMIT_PAGES_BIG=1: a second placed buffer of 4 MiB whose pages all differ, bigger than a small page budget.
     if (GetEnvironmentVariableA("X2W_TEST_SUBMIT_PAGES_BIG", nullptr, 0)) {
         constexpr UINT64 big_bytes = UINT64{4} << 20;
@@ -148,10 +161,22 @@ int main(int argc, char** argv)
         return 77;
     }
     // A fixed, allocation-aligned address keeps the independently launched replay reproducible.
-    void* memory = VirtualAlloc(reinterpret_cast<void*>(0x300000000000ull), allocation_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* hole_base = nullptr;
+    void* memory = nullptr;
+    if (GetEnvironmentVariableA("X2W_TEST_SUBMIT_PAGES_HOLE", nullptr, 0)) {
+        // Use adjacent allocations so the buffer can alias a fully committed allocation of its own.
+        auto* base = reinterpret_cast<unsigned char*>(0x300000400000ull);
+        hole_base = VirtualAlloc(base, hole_prefix_bytes, MEM_RESERVE, PAGE_READWRITE);
+        if (hole_base && VirtualAlloc(hole_base, allocation_bytes, MEM_COMMIT, PAGE_READWRITE))
+            memory = VirtualAlloc(base + hole_prefix_bytes, hole_allocation_bytes - hole_prefix_bytes,
+                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    } else {
+        memory = VirtualAlloc(reinterpret_cast<void*>(0x300000000000ull), allocation_bytes,
+                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
     if (!memory) {
         std::fprintf(stderr, "Could not allocate the fixture's title memory (error %lu)\n", GetLastError());
         return 1;
     }
-    return scene(adapter.Get(), memory, argv[2]);
+    return scene(adapter.Get(), memory, argv[2], hole_base);
 }
