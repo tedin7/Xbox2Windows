@@ -568,7 +568,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         auto* const index = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
         if (!index) return 81;
         index[0] = 3;
-        index[1] = mode.find("-outside") != std::string::npos ? 4 : 2;
+        // The snapshot has four records, then the format information view, then the translated tables: the first
+        // index past the records is that information view (null here), so the unbounded control reads at 5.
+        index[1] = mode.find("-outside") != std::string::npos ? 5 : 2;
         invoke(list, mode.find("-cbv") != std::string::npos ? 41 : 43, 2, word(index));
         const UINT64 index_address = reinterpret_cast<UINT64>(index);
         const UINT index_view[4]{static_cast<UINT>(index_address), static_cast<UINT>(index_address >> 32), 16, 0};

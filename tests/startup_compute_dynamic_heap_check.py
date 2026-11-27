@@ -101,7 +101,7 @@ def gpu_case(consumer, dxc, code, binding, address, wrong_address, cbv):
         wrong_word = mutate(source, f'r0.Load({address})', f'r0.Load({wrong_address})')
         cso.write_bytes(compile_shader(dxc, directory, 'cs_6_6', wrong_word).read_bytes())
         check_dispatch(directory, consumer, env, mode, BUFFER_WORD, mismatch=0x42aa6000)
-        unbounded = mutate(source, 'index >= heap_count', 'index > heap_count')
+        unbounded = mutate(source, 'index >= heap_count', 'index > heap_count + 1u')  # the tables start after the format view
         cso.write_bytes(compile_shader(dxc, directory, 'cs_6_6', unbounded).read_bytes())
         check_dispatch(directory, consumer, env, mode + '-outside', 0, mismatch=3)
 
