@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -221,6 +222,8 @@ def start(op):
 
 
 def word(op, x, y):
+    if op == PAIRED_INPUT:
+        return 0x3f000000 | (x & 1)
     if op == WAVE64:
         return x
     return (1 << (x & 31)) if op == 'v_or_b32' else ((x | (y << 16)) * MULTIPLIER) & MASK
@@ -299,6 +302,116 @@ def branch_reduction(op, before_dispatch=(), result=END, pair=False, scc_vote=Fa
 
 
 BRANCH_PAIR = branch_reduction('v_min_u32', result=export('v4', 'v6', 'v8'), pair=True)
+
+
+def paired_program(nested=False, missing=False, overwrite=False, skip_restore=False, loop=False,
+                   missing_inner=False):
+    """Two wave-uniform arms, with per-pixel EXEC inside the selected arm."""
+    instructions = []
+    labels = {}
+
+    def emit(*parts):
+        instructions.extend(line for part in parts for line in part)
+
+    def label(name):
+        labels[name] = sum(len(data) for _, data in instructions)
+
+    def jump(opcode, name, target):
+        instructions.append(((opcode, name, target), sopp(opcode)))
+
+    def narrow(reg, src):
+        return [('s_and_saveexec_b32 s%d, %s' % (reg, 'vcc_lo' if src == 106 else '0'),
+                 sop1(S_AND_SAVEEXEC_B32, reg, src))]
+
+    def restore(reg):
+        return [('s_or_b32 exec_lo, exec_lo, s%d' % reg, sop2(0x10, EXEC_LO, EXEC_LO, reg))]
+
+    emit([('v_and_b32_e32 v1, 1, v0', vop2(VOP2_OPS['v_and_b32'], 1, 129, 0)),
+          ('v_or_b32_e32 v1, 0x3f000000, v1',
+           vop2(VOP2_OPS['v_or_b32'], 1, 255, 1) + struct.pack('<I', 0x3f000000))])
+    jump(2, 's_branch', 'dispatch')
+    label('reduce')
+    emit(chain('v_max_u32', steps=(STEPS[2], STEPS[1], STEPS[0], STEPS[3])),
+         chain('v_min_u32', vt=8, vp=9, ss=4, sd=5),
+         [move(4, 1), move(6, 5)], export('v4', 'v1', 'v6'))
+    label('dispatch')
+    # Choose the arm over the wave based on y, then narrow EXEC based on x parity.
+    emit([('v_cmp_lt_u32_e32 vcc_lo, 0x9ffff, v0',
+           struct.pack('<II', 0x7c000000 | (0xc1 << 17) | 255, 0x9ffff))])
+    jump(7, 's_cbranch_vccnz', 'odd')
+    emit(narrow(12, 128), restore(12))
+    jump(2, 's_branch', 'reduce')
+    label('odd')
+    emit([('v_and_b32_e32 v10, 1, v0', vop2(VOP2_OPS['v_and_b32'], 10, 129, 0)),
+          ('v_cmp_lt_u32_e32 vcc_lo, 0, v10',
+           struct.pack('<I', 0x7c000000 | (0xc1 << 17) | (10 << 9) | 128))])
+    emit(narrow(13, 106))
+    if nested:
+        jump(8, 's_cbranch_execz', 'outer_restore')
+        emit(narrow(14, 128))
+        if not missing_inner:
+            emit([('s_mov_b32 exec_lo, s14', sop1(S_MOV_B32, EXEC_LO, 14))])
+        label('outer_restore')
+    if overwrite:
+        emit([('s_mov_b32 s13, 0', sop1(S_MOV_B32, 13, 128))])
+    if loop:
+        jump(9, 's_cbranch_execnz', 'dispatch')
+    if skip_restore:
+        jump(8, 's_cbranch_execz', 'reduce')
+    emit([('s_nop 7', sopp(0, 7))] if missing else restore(13))
+    jump(2, 's_branch', 'reduce')
+
+    built, pc = [], 0
+    for name, data in instructions:
+        if isinstance(name, tuple):
+            opcode, mnemonic, target = name
+            target = labels[target]
+            name, data = ('%s label_%04X' % (mnemonic, target), sopp(opcode, (target - pc - 4) // 4))
+        built.append((name, data))
+        pc += len(data)
+    return program(built)
+
+
+PAIRED_CASES = [('both arms restore', False), ('nested restore with EXECZ skip', True)]
+PAIRED_INPUT = 'paired EXEC input'
+PAIRED_CHANNELS = (('reduce', 'v_max_u32'), ('input', None), ('reduce', 'v_min_u32'))
+
+
+def assume_missing_restore(stage, cfg):
+    """Mutate only the proof: tell it the marker restored s13, while emission still sees a NOP."""
+    original = stage.ins
+    stage.ins = [(off, size, 's_or_b32', 's_or_b32 exec_lo, exec_lo, s13')
+                 if asm == 's_nop 7' else (off, size, name, asm)
+                 for off, size, name, asm in original]
+    try:
+        return PAIRED_PROOF(stage, cfg)
+    finally:
+        stage.ins = original
+
+
+PAIRED_PROOF = G.Stage.paired_reduction_exec_sites
+
+
+def paired_mutant(words):
+    with patch.object(G.Stage, 'paired_reduction_exec_sites', assume_missing_restore):
+        return translate(words)
+
+
+def paired_controls():
+    for label, nested in PAIRED_CASES:
+        text, reason = translate(paired_program(nested)[1])
+        check(label + ' lowers max and min after the join',
+              bool(text and 'WaveActiveMax(' in text and 'WaveActiveMin(' in text), str(reason))
+        variants = ['missing', 'overwrite', 'skip_restore', 'loop']
+        if nested:
+            variants.append('missing_inner')
+        for variant in variants:
+            words = paired_program(nested, **{variant: True})[1]
+            _, reason = translate(words)
+            check(label + ' refuses ' + variant, reason == G.WAVE_REDUCTION_ENTRY, str(reason))
+        mutant, reason = paired_mutant(paired_program(nested, missing=True)[1])
+        check(label + ' translates the missing restore under the proof mutant',
+              bool(mutant and mutant != text and 'WaveActiveMin(' in mutant), str(reason))
 
 
 def branch_into_later_readlane():
@@ -608,6 +721,7 @@ def new_controls():
 
 def controls():
     new_controls()
+    paired_controls()
     fills = G.Stage.WAVE_REDUCE_FILLS
     census = G.Stage.__dict__['wave_reduce_cndmask_fill']
     check('the identity fill table holds the census form only', fills == (census,), str(fills))
@@ -823,11 +937,12 @@ DRAWS += [
 ]
 
 
-def verify(input_op, channels, words, tagged=False):
+def verify(input_op, channels, words, tagged=False, missing_restore=False):
     """Group the readback by desktop wave and compare with the CPU reference. Returns (errors, facts)."""
     if len(words) != SIZE * SIZE * 16:
         return ['readback size is %d bytes' % len(words)], ''
     pixels = struct.unpack('<%dI' % (len(words) // 4), words)
+    paired = input_op == PAIRED_INPUT
     groups, errors = collections.defaultdict(list), []
     for y in range(SIZE):
         for x in range(SIZE):
@@ -848,13 +963,15 @@ def verify(input_op, channels, words, tagged=False):
         counts.update((p[3] >> 8) & 0xff for _x, _y, p in members)
         if len(set(lanes)) != len(lanes) or (key & 31, key >> 5) not in {(x, y) for x, y, _p in members}:
             errors.append('wave %d: lanes %s do not name one wave' % (key, lanes))
-        taken = any(y >= 16 for _x, y, _p in members)
+        taken = any(y >= (10 if paired else 16) for _x, y, _p in members)
         arms.add(taken)
         reduced = {}
         for kind, op in channels:
             if kind in ('reduce', 'branch'):
                 value = IDENTITY[op]
                 for x, y, _p in members:
+                    if missing_restore and taken and not x & 1:
+                        continue
                     value = apply(op, value, word(input_op, x, y) | input_bits)
                 reduced[kind, op] = 0 if kind == 'branch' and not taken else value
         for x, y, p in members:
@@ -874,7 +991,7 @@ def verify(input_op, channels, words, tagged=False):
     quads = {(x // 2, y // 2) for x, y in covered}
     partial_quads = sum(1 for qx, qy in quads
                         if sum((2 * qx + i, 2 * qy + j) in covered for i in (0, 1) for j in (0, 1)) < 4)
-    if branched and arms != {False, True}:
+    if (branched or paired) and arms != {False, True}:
         errors.append('the draw did not exercise both branch arms')
     if len(counts) != 1:
         errors.append('lane counts %s' % sorted(counts))
@@ -882,7 +999,9 @@ def verify(input_op, channels, words, tagged=False):
     facts = ('covered=%d waves=%d lane_count=%s partial_waves=%d partial_quads=%d'
              % (len(covered), len(groups), '/'.join(map(str, sorted(counts))),
                 sum(1 for members in groups.values() if len(members) < lane_count), partial_quads))
-    if partial_quads == 0 or len(covered) < 100:
+    if paired and len(covered) != SIZE * SIZE:
+        errors.append('fullscreen draw missed pixels: ' + facts)
+    if not paired and (partial_quads == 0 or len(covered) < 100):
         errors.append('the draw does not exercise partly covered quads: ' + facts)
     return errors, facts
 
@@ -896,9 +1015,45 @@ def dump(renderer, adapter, vs, ps, out):
     return run
 
 
+def check_paired_draws(dxc, renderer, adapter, directory):
+    # The oversized triangle covers every quad. The lane tag still identifies which
+    # quads the desktop packed into each wave and which side of the branch it chose.
+    fullscreen = TRIANGLE_VS.replace('1.0, 0.37', '3.0, 1.0').replace('-0.61, -1.0', '-1.0, -3.0')
+    vs = compile_hlsl(dxc, 'dxc', fullscreen, 'vs_paired', 'vs_6_0', directory)
+    for label, nested in PAIRED_CASES:
+        negative = paired_program(nested, missing=True)[1]
+        _, reason = translate(negative)
+        check(label + ' rejects the missing-restore draw', reason == G.WAVE_REDUCTION_ENTRY, str(reason))
+        for mutant in (False, True):
+            tag = 'paired_%d_mutant_%d' % (nested, mutant)
+            text, reason = (paired_mutant(negative) if mutant else translate(paired_program(nested)[1]))
+            if text is None:
+                check(tag + ' translates', False, str(reason))
+                continue
+            ps = compile_hlsl(dxc, 'dxc', observed(text), tag, 'ps_6_0', directory)
+            out = directory / (tag + '.bin')
+            run = dump(renderer, adapter, vs, ps, out)
+            clean = 'debug_layer=enabled' not in run.stdout or 'debug_errors=0 debug_warnings=0' in run.stdout
+            if run.returncode or not out.exists() or not clean:
+                check(tag + ' draws', False, run.stdout + run.stderr)
+                continue
+            readback = out.read_bytes()
+            errors, facts = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback)
+            if mutant:
+                masked_errors, _ = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback, missing_restore=True)
+                mismatch = next((error for error in errors if error.startswith('pixel (')), None)
+                check(label + ' proof mutant fails the whole-wave comparison and matches missing EXEC',
+                      bool(mismatch) and not masked_errors, str(mismatch) + ' ' + ' / '.join(masked_errors[:3]))
+            else:
+                print(run.stdout)
+                check(label + ' matches the CPU reference at every pixel (' + facts + ')',
+                      not errors, ' / '.join(errors[:3]))
+
+
 def check_draw(dxc, renderer, adapter, fxc=None):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        check_paired_draws(dxc, renderer, adapter, directory)
         vs = compile_hlsl(dxc, 'dxc', TRIANGLE_VS, 'vs_dxc', 'vs_6_0', directory)
         for label, words, input_op, channels in DRAWS:
             text, reason = translate(words)
@@ -982,6 +1137,8 @@ def check_binary(llvm_mc):
                  ('rewritten permlane VGPR', program(START_MUL, chain('v_max_u32'), RESULT, KILL_VP, END_READS_VP))]
     programs += [(label, branch_reduction(op, before)) for label, (op, before) in BRANCHED.items()]
     programs.append((BRANCH_PAIR_LABEL, BRANCH_PAIR))
+    programs.extend((label + (' (missing restore)' if missing else ''), paired_program(nested, missing=missing))
+                    for label, nested in PAIRED_CASES for missing in (False, True))
     for label, (source, words) in programs:
         if 'label_' not in source:
             built = assemble(llvm_mc, source)

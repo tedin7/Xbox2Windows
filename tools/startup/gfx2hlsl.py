@@ -30,6 +30,8 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+WAVE_REDUCTION_ENTRY = 'wave reduction: EXEC is not proven to be the entry mask on every incoming path'
+WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at '
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
                            'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
@@ -3220,6 +3222,8 @@ class Stage:
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
         self.retry_wave_reduction = False
+        # Both retries follow a refusal so the original lowering remains byte-identical.
+        self.retry_paired_exec = False
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
         first_refusal = len(refusals) if refusals is not None else 0
         while True:
@@ -3246,15 +3250,11 @@ class Stage:
             try:
                 self.translate()
             except Unsupported as reason:
-                if kind != 'ps' or self.retry_wave_reduction or str(reason) != WAVE_REDUCTION_BRANCHES:
+                if not self.retry_reduction_exec(str(reason)):
                     raise
-                self.retry_wave_reduction = True
-                self.force_joined.clear()
                 continue
-            if (kind == 'ps' and not self.retry_wave_reduction and refusals is not None
-                    and (WAVE_REDUCTION_BRANCHES, kind) in refusals[first_refusal:]):
-                self.retry_wave_reduction = True
-                self.force_joined.clear()
+            if refusals is not None and any(
+                    stage == kind and self.retry_reduction_exec(reason) for reason, stage in refusals[first_refusal:]):
                 del refusals[first_refusal:]
                 continue
             grown = False
@@ -3267,6 +3267,19 @@ class Stage:
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
+
+    def retry_reduction_exec(self, reason):
+        if self.kind != 'ps':
+            return False
+        if not self.retry_wave_reduction and reason == WAVE_REDUCTION_BRANCHES:
+            self.retry_wave_reduction = True
+        elif (self.retry_wave_reduction and not self.retry_paired_exec
+              and (reason == WAVE_REDUCTION_ENTRY or reason.startswith(WAVE_REDUCTION_PARTICIPATION))):
+            self.retry_paired_exec = True
+        else:
+            return False
+        self.force_joined.clear()
+        return True
 
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
@@ -4780,6 +4793,90 @@ class Stage:
                     pending.add(target)
         return known
 
+    def paired_reduction_exec_sites(self, cfg):
+        """Track the outstanding save-and-narrow pairs along every CFG edge."""
+        bounds, _, succ, _ = cfg
+        wave = getattr(self.pipe, 'wave_size', None)
+        offsets = {off for off, *_ in self.ins}
+        if (not bounds or not (wave == 32 or wave is None and wave32_exec_proof(self.ins))
+                or any(name.startswith(('s_swappc', 's_call', 's_rfe', 's_wqm'))
+                       or name == 's_setpc_b64' and self.calculated_pc.get(off) not in offsets
+                       for off, _, name, _ in self.ins)):
+            return set()
+
+        mask = ('exec', 'exec_lo')
+        operations = []
+        for off, _, name, asm in self.ins:
+            _, ops, mods = parse(asm)
+            writes = scalar_effects(name, asm)[2]
+            save = restore = None
+            widen = False
+            if not mods and len(ops) == 2:
+                if name == 's_and_saveexec_b32' or name == 's_or_saveexec_b32' and ops[1] == '-1':
+                    save = ops[0]
+                    widen = name == 's_or_saveexec_b32'
+                elif name == 's_mov_b32' and ops[0] in mask:
+                    restore = ops[1]
+            elif not mods and name == 's_or_b32' and len(ops) == 3 and ops[0] in mask:
+                if ops[1] in mask:
+                    restore = ops[2]
+                elif ops[2] in mask:
+                    restore = ops[1]
+            if save and save in writes and re.fullmatch(r's[0-9]+', save) and int(save[1:]) <= 105:
+                if widen:
+                    self.reduction_widens.add(off)
+            else:
+                save = None
+            operations.append((off, writes, 'any' in scalar_destinations(name, asm),
+                               writes_exec(name, ops) or bool(writes & EXEC_KEYS),
+                               save, widen, restore, name == 's_or_b32'))
+
+        # An absent block is unreachable so far. None means a path broke a pair
+        # or arrived with a different stack of saves. The empty stack proves entry EXEC.
+        before = {0: ()}
+        pending = {0}
+        known = set()
+
+        def closes_loop(source, target):
+            seen = set()
+            work = [target]
+            while work:
+                block = work.pop()
+                if block == source:
+                    return True
+                if block not in seen:
+                    seen.add(block)
+                    work.extend(succ[block])
+            return False
+
+        while pending:
+            block = pending.pop()
+            stack = before[block]
+            lo, hi = bounds[block]
+            for off, writes, unknown_write, exec_write, save, widen, restore, restore_or in operations[lo:hi]:
+                (known.add if stack == () else known.discard)(off)
+                self.reduction_restores.discard(off)
+                if stack is None:
+                    continue
+                if (stack and restore == stack[-1][0] and (not restore_or or not stack[-1][1])):
+                    stack = stack[:-1]
+                    self.reduction_restores.add(off)
+                elif any(unknown_write or reg in writes for reg, _ in stack):
+                    stack = None
+                elif save:
+                    stack += ((save, widen),)
+                elif exec_write:
+                    stack = None
+            for target in succ[block]:
+                # A loop may revisit its header with a different subset even when
+                # it uses the same save registers. An acyclic jump can carry a save.
+                edge = None if stack and target <= block and closes_loop(block, target) else stack
+                merged = edge if before.get(target, edge) == edge else None
+                if target not in before or before[target] != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return known
+
     def compute_dpp_sites(self, branches, names):
         """Map proven EXEC sites to blocks reached once by every group thread."""
         bounds, _, succ, _ = self.spill_cfg
@@ -4984,7 +5081,10 @@ class Stage:
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
             self.reduction_restores = set()
-            self.reduction_entry_exec = self.entry_exec_sites(self.spill_cfg, self.reduction_restores)
+            self.reduction_widens = set()
+            self.reduction_entry_exec = (
+                self.paired_reduction_exec_sites(self.spill_cfg) if self.retry_paired_exec
+                else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
         self.whole_quad_sites = set()
         if (getattr(self, 'kind', None) == 'ps' and not getattr(self, 'fetched', False) and
                 any(name == 'v_add_f32_dpp' for _, _, name, _ in self.ins)):
@@ -5081,6 +5181,7 @@ class Stage:
             self.active_waterfall_loads = set()
             self.wave_unsound = None
             if retry_wave:
+                self.recognized_reductions = set()
                 self.reduce_plan, self.reduce_pending = {}, {}
                 self.reduction_scratch = {}
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
@@ -5475,8 +5576,9 @@ class Stage:
                 continue
             if retry_wave and raised_unsupported is None and self.wave_unsound is None:
                 if self.lane_exec_breaks:
-                    self.wave_unsound = Unsupported('wave reduction: lane participation may change at %s'
-                                                    % self.lane_exec_breaks[0][1])
+                    self.wave_unsound = Unsupported(WAVE_REDUCTION_PARTICIPATION + self.lane_exec_breaks[0][1])
+                elif self.reduction_widens - self.recognized_reductions:
+                    self.wave_unsound = Unsupported(WAVE_REDUCTION_ENTRY)
                 else:
                     self.wave_unsound = self.wave_scratch_refusal()
             if raised_unsupported is None and self.wave_unsound is not None:
@@ -12923,7 +13025,7 @@ class Stage:
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
         if retry_wave and pc not in self.reduction_entry_exec:
-            raise Unsupported('wave reduction: EXEC is not proven to be the entry mask on every incoming path')
+            raise Unsupported(WAVE_REDUCTION_ENTRY)
         if not getattr(self, 'wave_exec', False):
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
                 raise Unsupported(WAVE_REDUCTION_BRANCHES)
@@ -12933,6 +13035,7 @@ class Stage:
             raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
         after_restore = index + first + 7
         if retry_wave:
+            self.recognized_reductions.add(pc)
             self.reduction_scratch[index + first + 4] = (vp, after_restore)
         else:
             for _off, _n, name, asm in self.ins[after_restore:]:
@@ -13056,8 +13159,11 @@ class Stage:
 
     def lower_wave_reduction(self, op, vt, vp, ss, source):
         operand = self.u(source)
-        if not self.exec_known and not getattr(self, 'retry_wave_reduction', False):
-            # Past an EXEC write the lanes outside the old EXEC take the identity (the v_cndmask of the chain).
+        if (getattr(self, 'retry_paired_exec', False)
+                or not self.exec_known and not getattr(self, 'retry_wave_reduction', False)):
+            # Use the chain's identity fill on the paired path, where runtime
+            # EXEC comes from the join. The proof guarantees the entry lanes pass it.
+            # The legacy masked case also gives inactive lanes the identity.
             operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
         value = self.WAVE_REDUCE[op][0].format(operand)
         self.needs_sm6 = True
