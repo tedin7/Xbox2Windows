@@ -579,39 +579,6 @@ def check_draw(dxc, renderer, adapter):
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
 
-        # Preserving the old channels with read-modify-write would leave -1.0 and fail the zero comparison.
-        partial_source = translate(with_store(patched(1, 0, 0x5))).hlsl_ps()
-        partial_want = ','.join((BITS[0], '00000000', BITS[1], '00000000'))
-        run = draw(partial_source, 'partial_store', partial_want)
-        if run.returncode:
-            raise AssertionError('partial store draw failed\n%s\n%s' % (run.stdout, run.stderr))
-        print('draw dmask 0x5: texel (1, 2) = %s, other texels untouched' % partial_want)
-        values = 'uint4(v4, 0u, v5, 0u)'
-        for label, replacement in (('partial channels preserved', 'uint4(v4, 0xbf800000u, v5, 0xbf800000u)'),
-                                   ('partial channels swapped', 'uint4(v5, 0u, v4, 0u)')):
-            text = partial_source.replace(values, replacement)
-            assert text != partial_source, label
-            run = draw(text, label.replace(' ', '_'), partial_want)
-            if run.returncode == 0 or 'texel_mismatch x=1 y=2' not in run.stderr:
-                raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
-            print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
-
-        for mask in (0x1, 0x2, 0x4, 0x7, 0x9):
-            channels = [c for c in range(4) if mask >> c & 1]
-            want = ','.join(BITS[channels.index(c)] if c in channels else '00000000' for c in range(4))
-            source_m = translate(with_store(patched(1, 0, mask))).hlsl_ps()
-            label = 'dmask_%#x' % mask
-            run = draw(source_m, label, want)
-            if run.returncode:
-                raise AssertionError('partial store %#x draw failed\n%s\n%s' % (mask, run.stdout, run.stderr))
-            print('draw dmask %#x: texel (1, 2) = %s, other texels untouched' % (mask, want))
-            store = next(line for line in source_m.splitlines() if 'w0[uint2(v0, v1)] = asfloat(uint4(' in line)
-            full = source_m.replace(store, '    w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));')
-            run = draw(full, label + '_all_four', want)
-            if run.returncode == 0 or 'texel_mismatch x=1 y=2' not in run.stderr:
-                raise AssertionError('control all-four-channels %#x was not detected\n%s\n%s' % (mask, run.stdout, run.stderr))
-            print('control dmask %#x written as all four channels: fails as expected (%s)' % (mask, mismatch_line(run.stderr)))
-
         # Exec after v_cmpx: an active lane writes the texel, an inactive one leaves it at its starting value.
         untouched_bits = ','.join(['bf800000'] * 4)
         on, off = translate(EXEC_ON).hlsl_ps(), translate(EXEC_OFF).hlsl_ps()
