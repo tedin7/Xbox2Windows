@@ -10612,12 +10612,6 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_pixel_pipeline_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_pixel_pipeline_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-        if(adapter STREQUAL "warp")
-            add_test(NAME startup_mesh57_skeleton_runtime_warp COMMAND "${INTAKE_PYTHON}" -B
-                "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" runtime "${DXC_EXECUTABLE}"
-                "$<TARGET_FILE:startup_indirect_draw_indexed>")
-            set_tests_properties(startup_mesh57_skeleton_runtime_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-        endif()
         add_test(NAME startup_mesh57_skeleton_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

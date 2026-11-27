@@ -876,30 +876,27 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, int& pixel_stage,
-                        bool census_only)
+void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
-    if (!bound_root) return 0;
     wchar_t marker[MAX_PATH];
-    const bool publish = !census_only && cache_path(marker, L"req_", 0, L".m57");
-    if (!publish && !census_only) return 0;
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return 0;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return 0;  // VS at +0x48
+    if (words[9] || words[10]) return;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return 0;
+    if (!root || root_info(root) != bound_root) return;
     std::vector<unsigned char> root_blob;
     {
         note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return 0;
+    if (root_blob.empty()) return;
     std::vector<unsigned char> mesh, pixel;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
@@ -909,15 +906,13 @@ u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bou
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
-    pixel_stage = pixel.empty() ? 0 : 1;
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
                                                                                  sizeof(shader_cache::mesh57_revision) - 1))));
-    if (!publish) return key;
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
-    if (written.count(key)) return key;
+    if (written.count(key)) return;
     const unsigned char none = 0;
     if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
@@ -928,7 +923,6 @@ u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bou
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
     }
-    return key;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -1275,285 +1269,6 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         load_translation(*entry, request);
     }
     return entry;
-}
-
-struct Mesh57Result {
-    x2w_startup::ComPtr<ID3DBlob> ms, ps;
-    x2w_startup::ComPtr<ID3D12RootSignature> root;
-    std::vector<std::pair<UINT, UINT>> constants;
-    std::array<UINT, 8> write_masks{};
-    UINT targets = 0;
-    ULONGLONG retry_at = 0;
-};
-
-bool load_mesh57_result(ID3D12Device* device, u64 key, bool has_pixel, Mesh57Result& result)
-{
-    wchar_t path[MAX_PATH];
-    const auto cache_file = [&](const wchar_t* ext, DWORD limit) {
-        WIN32_FILE_ATTRIBUTE_DATA info{};
-        return cache_path(path, L"", key, ext) && GetFileAttributesExW(path, GetFileExInfoStandard, &info) &&
-            !info.nFileSizeHigh && info.nFileSizeLow && info.nFileSizeLow <= limit;
-    };
-    std::string text;
-    if (!cache_file(L".ms57.txt", 8192) || !read_text(path, text)) return false;
-    const auto load_stage = [&](const wchar_t* ext, x2w_startup::ComPtr<ID3DBlob>& stage, DxilMeshStage kind) {
-        return cache_file(ext, 1u << 20) && SUCCEEDED(D3DReadFileToBlob(path, stage.GetAddressOf())) &&
-            desktop_dxil_mesh_stage({stage->GetBufferPointer(), stage->GetBufferSize()}) == kind;
-    };
-    if (!load_stage(L".ms57.cso", result.ms, DxilMeshStage::mesh) ||
-        (has_pixel && !load_stage(L".ps57.cso", result.ps, DxilMeshStage::pixel))) return false;
-
-    char identity[160];
-    std::snprintf(identity, sizeof(identity), "mesh57-result %s %016llx %016llx %016llx",
-        shader_cache::mesh57_revision, key, fnv_bytes(result.ms->GetBufferPointer(), result.ms->GetBufferSize()),
-        result.ps ? fnv_bytes(result.ps->GetBufferPointer(), result.ps->GetBufferSize()) : 0);
-    std::istringstream input(text);
-    std::string line;
-    const auto read_line = [&] {
-        if (!std::getline(input, line)) return false;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        return true;
-    };
-    if (!read_line() || line != "x2w-manifest 1" || !read_line() || line != identity) return false;
-    UINT expected_constants = UINT_MAX;
-    UINT exported_targets = 0;
-    bool stage_seen = false;
-    bool params_seen = false;
-    while (read_line()) {
-        std::istringstream fields(line);
-        std::string name, kind, extra;
-        UINT index = 0, a = 0, b = 0;
-        fields >> name;
-        if (name == "ud") {
-            if (expected_constants != UINT_MAX || !(fields >> expected_constants) || expected_constants > 32) return false;
-        } else if (name == "udsrc") {
-            if (!(fields >> index >> kind) || index != result.constants.size() || index >= 32) return false;
-            if (kind == "rect") {
-                // The shared graphics entry layout includes a rectangle-list flag.
-                result.constants.emplace_back(UINT_MAX, 0);
-            } else {
-                if (kind != "rootconst" || !(fields >> a >> b) || a >= 16 || b >= 8) return false;
-                result.constants.emplace_back(a, b);
-            }
-        } else if (name == "params") {
-            if (params_seen || !(fields >> a)) return false;
-            params_seen = true;
-        } else if (name == "ps" && !has_pixel && !stage_seen) {
-            if (!(fields >> kind) || kind != "none") return false;
-            stage_seen = true;
-        } else if (name == "targets" && has_pixel && !stage_seen) {
-            stage_seen = true;
-            while (fields >> index) {
-                if (index >= 8 || (exported_targets & (1u << index))) return false;
-                exported_targets |= 1u << index;
-                result.targets = (std::max)(result.targets, index + 1);
-                result.write_masks[index] = D3D12_COLOR_WRITE_ENABLE_ALL;
-            }
-            if (!fields.eof()) return false;
-            continue;
-        } else if (name == "wmask" && stage_seen && has_pixel) {
-            if (!(fields >> index >> std::hex >> a) || index >= 8 || !(exported_targets & (1u << index)) ||
-                a > D3D12_COLOR_WRITE_ENABLE_ALL) return false;
-            result.write_masks[index] = a;
-        } else {
-            // Resources, placeholder stages and heap bindings have no verified mesh binding here.
-            return false;
-        }
-        if (fields >> extra) return false;
-    }
-    if (!stage_seen || !params_seen || expected_constants != result.constants.size()) return false;
-    const UINT root_words = (std::max)(1u, expected_constants);
-    return SUCCEEDED(x2w_startup::create_translated_root(device, root_words, 0, {}, result.root.GetAddressOf()));
-}
-
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Value>
-struct alignas(void*) Mesh57Subobject {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-    Value value{};
-};
-
-x2w_startup::ComPtr<ID3D12PipelineState> create_mesh57_pipeline(ID3D12Device* device, const Pass& pass,
-                                            const Mesh57Result& result, const BoundPipeline& bound,
-                                            const D3D12_DEPTH_STENCIL_DESC& depth)
-{
-    struct {
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_format;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth_stencil;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
-        Mesh57Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
-    } stream;
-    stream.root.value = result.root.Get();
-    stream.ms.value = {result.ms->GetBufferPointer(), result.ms->GetBufferSize()};
-    if (result.ps) stream.ps.value = {result.ps->GetBufferPointer(), result.ps->GetBufferSize()};
-    stream.targets.value.NumRenderTargets = pass.target_count;
-    std::copy_n(pass.target_formats, pass.target_count, stream.targets.value.RTFormats);
-    stream.depth_format.value = pass.dsv_format;
-    stream.depth_stencil.value = depth;
-    if (result.targets) stream.blend.value = bound.blend;
-    else {
-        for (auto& target : stream.blend.value.RenderTarget)
-            target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-                      D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
-                      D3D12_COLOR_WRITE_ENABLE_ALL};
-    }
-    auto& blend = stream.blend.value;
-    if (!blend.IndependentBlendEnable) {
-        for (auto& target : blend.RenderTarget) target = blend.RenderTarget[0];
-    }
-    blend.IndependentBlendEnable = TRUE;
-    for (UINT i = 0; i < pass.target_count; ++i)
-        blend.RenderTarget[i].RenderTargetWriteMask &= static_cast<UINT8>(result.write_masks[i]);
-    stream.sample.value = {1, 0};
-    stream.sample_mask.value = UINT_MAX;
-    stream.rasterizer.value.FillMode = D3D12_FILL_MODE_SOLID;
-    stream.rasterizer.value.CullMode = D3D12_CULL_MODE_NONE;
-    stream.rasterizer.value.DepthClipEnable = TRUE;
-    stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    x2w_startup::ComPtr<ID3D12Device2> device2;
-    x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
-    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(device2.GetAddressOf())))) {
-        const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
-        device2->CreatePipelineState(&desc, IID_PPV_ARGS(pipeline.GetAddressOf()));
-    }
-    return pipeline;
-}
-
-bool mesh57_surface_matches(const Pass& pass, const x2w_startup::TargetDrawCensus::Surface& surface)
-{
-    const auto& view = pass.mesh_viewport;
-    const auto& clip = pass.mesh_scissor;
-    return surface.resource && surface.width && surface.height && surface.format != DXGI_FORMAT_UNKNOWN &&
-        view.TopLeftX >= 0 && view.TopLeftY >= 0 && view.Width > 0 && view.Height > 0 &&
-        double(view.TopLeftX) + view.Width <= double(surface.width) &&
-        double(view.TopLeftY) + view.Height <= double(surface.height) &&
-        view.MinDepth >= 0 && view.MinDepth <= view.MaxDepth && view.MaxDepth <= 1 &&
-        clip.left >= 0 && clip.top >= 0 && clip.right > clip.left && clip.bottom > clip.top &&
-        static_cast<u64>(clip.right) <= surface.width && static_cast<UINT>(clip.bottom) <= surface.height;
-}
-
-const char* prepare_slot57_draw(Wrapper* self, const Pass& pass, Slot57Draw& draw)
-{
-    if (!pass.requested_mesh_key || pass.requested_mesh_pixel_stage < 0 || !pass.root ||
-        !pass.graphics_root || pass.root_heap_flags || pass.srv_bound)
-        return "slot57 mesh requires a matching request and root without heap indexing";
-    auto* device = device_of(self->own().list_device);
-    draw_lock_acquire_exclusive();
-    struct Unlock { ~Unlock() { draw_lock_release_exclusive(); } } unlock;
-
-    struct DeviceCache {
-        x2w_startup::ComPtr<ID3D12Device> owner;
-        bool supported = false;
-        std::unordered_map<u64, Mesh57Result> results;
-        using PipelineState = std::array<unsigned char, sizeof(D3D12_DEPTH_STENCIL_DESC) + sizeof(D3D12_BLEND_DESC)>;
-        using PipelineKey = std::tuple<u64, UINT, std::array<DXGI_FORMAT, 9>, PipelineState>;
-        std::map<PipelineKey, x2w_startup::ComPtr<ID3D12PipelineState>> pipelines;
-    };
-    static std::unordered_map<ID3D12Device*, DeviceCache> devices;
-    auto& cache = devices[device];
-    if (!cache.owner) {
-        cache.owner = device;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
-        cache.supported = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) &&
-            options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
-    }
-    if (!cache.supported) return "slot57 mesh requires desktop mesh shader support";
-    auto& result = cache.results[pass.requested_mesh_key];
-    if (!result.root && GetTickCount64() >= result.retry_at) {
-        Mesh57Result loaded;
-        if (load_mesh57_result(device, pass.requested_mesh_key, pass.requested_mesh_pixel_stage != 0, loaded))
-            result = std::move(loaded);
-        else
-            result.retry_at = GetTickCount64() + 1000;
-    }
-    if (!result.root) return "slot57 mesh result pending, invalid or using unverified bindings";
-
-    const PipelineInfo* info = pipeline_info(pass.pipeline);
-    for (int i = 0; info && info->path == 55 && info->base && i < 8; ++i) info = pipeline_info(info->base);
-    if (!info || info->path != 57) return "slot57 mesh pipeline metadata missing";
-    const auto chosen = x2w_pipeline_state::select_depth_stencil(true, info->state_a.data(), info->state_a.size());
-    if (!chosen.applied || chosen.depth_bounds || chosen.masks_differ)
-        return "slot57 mesh depth stencil state has no verified mapping";
-    const auto& depth = chosen.desc;
-    auto* bound = translation_for(pass.pipeline);
-    if (bound->guest_root != pass.root) return "slot57 mesh root mismatch";
-    if (result.targets && !bound->has_blend) return "slot57 mesh blend state has no verified mapping";
-    const bool wants_depth = depth.DepthEnable || depth.StencilEnable;
-    const bool has_depth = pass.dsv_format != DXGI_FORMAT_UNKNOWN;
-    if (!pass.targets_bound || !pass.viewport_set || !pass.scissor_set || !pass.targets_single_sample ||
-        pass.target_count != result.targets || has_depth != wants_depth ||
-        (!result.targets && !has_depth) || (depth.StencilEnable && !format_has_stencil(pass.dsv_format)) ||
-        (has_depth && (!mesh57_surface_matches(pass, pass.depth_surface) ||
-                       (depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL && !pass.depth_view_writable) ||
-                       (depth.StencilEnable && depth.StencilWriteMask && !pass.stencil_view_writable))))
-        return "slot57 mesh requires matching attachments, viewport and scissor";
-    const auto& size = has_depth ? pass.depth_surface : pass.target_surfaces[0];
-    for (UINT i = 0; i < pass.target_count; ++i) {
-        const auto& color = pass.target_surfaces[i];
-        if (!mesh57_surface_matches(pass, color) || color.width != size.width || color.height != size.height)
-            return "slot57 mesh requires matching attachments, viewport and scissor";
-    }
-    for (const auto& [param, word] : result.constants) {
-        if (param == UINT_MAX) {
-            draw.constants[draw.constant_count++] = 0;
-            continue;
-        }
-        if (param >= pass.root->size() || (*pass.root)[param].type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
-            word >= (*pass.root)[param].constants_count || !(pass.constant_words_bound[param] & (1u << word)))
-            return "slot57 mesh root constants are incomplete";
-        draw.constants[draw.constant_count++] = pass.constants[param][word];
-    }
-
-    std::array<DXGI_FORMAT, 9> formats{};
-    std::copy_n(pass.target_formats, pass.target_count, formats.begin());
-    formats.back() = pass.dsv_format;
-    // The key compares bytes, so copy the fields into zeroed structs: padding of the source must not make a new key.
-    D3D12_DEPTH_STENCIL_DESC depth_key{};
-    depth_key.DepthEnable = depth.DepthEnable;
-    depth_key.DepthWriteMask = depth.DepthWriteMask;
-    depth_key.DepthFunc = depth.DepthFunc;
-    depth_key.StencilEnable = depth.StencilEnable;
-    depth_key.StencilReadMask = depth.StencilReadMask;
-    depth_key.StencilWriteMask = depth.StencilWriteMask;
-    depth_key.FrontFace = depth.FrontFace;
-    depth_key.BackFace = depth.BackFace;
-    D3D12_BLEND_DESC blend_key{};
-    if (result.targets) {
-        blend_key.AlphaToCoverageEnable = bound->blend.AlphaToCoverageEnable;
-        blend_key.IndependentBlendEnable = bound->blend.IndependentBlendEnable;
-        for (UINT i = 0; i < 8; ++i) {
-            const auto& from = bound->blend.RenderTarget[i];
-            auto& to = blend_key.RenderTarget[i];
-            to.BlendEnable = from.BlendEnable;
-            to.LogicOpEnable = from.LogicOpEnable;
-            to.SrcBlend = from.SrcBlend;
-            to.DestBlend = from.DestBlend;
-            to.BlendOp = from.BlendOp;
-            to.SrcBlendAlpha = from.SrcBlendAlpha;
-            to.DestBlendAlpha = from.DestBlendAlpha;
-            to.BlendOpAlpha = from.BlendOpAlpha;
-            to.LogicOp = from.LogicOp;
-            to.RenderTargetWriteMask = from.RenderTargetWriteMask;
-        }
-    }
-    DeviceCache::PipelineState state{};
-    std::memcpy(state.data(), &depth_key, sizeof(depth_key));
-    std::memcpy(state.data() + sizeof(depth_key), &blend_key, sizeof(blend_key));
-    const DeviceCache::PipelineKey pso_key{pass.requested_mesh_key, pass.target_count, formats, state};
-    const auto [found, inserted] = cache.pipelines.try_emplace(pso_key);
-    if (inserted) found->second = create_mesh57_pipeline(device, pass, result, *bound, depth);
-    if (!found->second) return "slot57 mesh desktop pipeline creation failed";
-    draw.pipeline = found->second.Get();
-    draw.root = result.root.Get();
-    draw.set_stencil_ref = chosen.has_stencil_ref;
-    draw.stencil_ref = chosen.stencil_ref;
-    return nullptr;
 }
 
 // The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.

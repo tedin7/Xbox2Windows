@@ -10244,28 +10244,14 @@ sentinel only because of the discard. A reference without the depth writes
 stage with a colour export before its null export, a pair whose pixel stage
 does not match its key, and the mesh shapes the paired path refuses next to
 the depth-only pixel stage; it checks that `pending_keys` keeps
-the pair pending until both `.ms57.cso` and `.ps57.cso` are complete. These
-readback results use the standalone offscreen renderer.
+the pair pending until both `.ms57.cso` and `.ps57.cso` are complete. The
+runtime does not load slot 57 results yet, so these draws are not submitted
+through the guest path.
 
 The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact
 only. A missing or truncated required artifact leaves the request pending
 even if its manifest exists. In manifest-only mode the manifest completes it.
-
-The opt-in slot 57 path uses `X2W_TRANSLATED_INDIRECT_MESH57=1`. A later
-indirect mesh dispatch can load the compiled stages after the translator
-publishes a manifest with the request key, revision and bytecode digests.
-The runtime accepts resource-free shaders with optional tracked root constants.
-It creates a mesh pipeline for the guest state and bound single-sample formats.
-Set `X2W_MESH57_CENSUS=1` to report refused dispatches by request key, pixel
-stage presence and attachment dimensions and format. Both switches default off.
-
-`startup_mesh57_skeleton_runtime_warp` publishes a synthetic console triangle,
-translates it, and compares guest indirect colour and depth-only readbacks with
-the CPU rasteriser. A separate desktop shader places each group in a different
-half of the target. It expects two groups to cover eight pixels and one group to
-cover four. A mismatched scissor must leave the colour target clear. The
-runtime WARP fixture has no measured result yet.
 
 The code outside the exchanges accepts forward `s_branch` and wave-uniform
 SCC branches. A forward `s_cbranch_execz` can skip guarded lane writes, including

@@ -109,10 +109,8 @@
 #include <memory>
 #include <new>
 #include <map>
-#include <tuple>
 #include <mutex>
 #include <string>
-#include <sstream>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -284,8 +282,7 @@ void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
-u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, int& pixel_stage,
-                        bool census_only = false);
+void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -3266,8 +3263,6 @@ struct Pass {
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
-    u64 requested_mesh_key = 0;
-    int requested_mesh_pixel_stage = -1;
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
@@ -3289,7 +3284,6 @@ struct Pass {
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool targets_single_sample = false;
     bool depth_view_writable = false;
-    bool stencil_view_writable = false;
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     x2w_startup::TargetDrawCensus::Surface target_surfaces[8]{};
@@ -3305,8 +3299,6 @@ struct Pass {
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
     // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
-    D3D12_VIEWPORT mesh_viewport{};
-    D3D12_RECT mesh_scissor{};
     bool viewport_set = false;
     bool scissor_set = false;
     // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
@@ -3859,72 +3851,6 @@ bool split_indirect_dispatch_enabled()
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
 }
 
-struct Slot57Draw {
-    ID3D12PipelineState* pipeline = nullptr;
-    ID3D12RootSignature* root = nullptr;
-    std::array<UINT, 32> constants{};
-    UINT constant_count = 0;
-    bool set_stencil_ref = false;
-    UINT stencil_ref = 0;
-};
-
-const char* prepare_slot57_draw(Wrapper* self, const Pass& pass, Slot57Draw& draw);
-
-enum class MeshSurfaceRole { color, depth, none };
-using MeshRefusalSurface = std::tuple<u64, int, MeshSurfaceRole, UINT, u64, unsigned, int>;
-SRWLOCK mesh_refusal_lock = SRWLOCK_INIT;
-std::map<MeshRefusalSurface, u64> mesh_refusals;
-
-void note_mesh_refusal(const Pass& pass)
-{
-    const bool same_request = pass.pipeline == pass.requested_mesh_pipeline && pass.root == pass.requested_mesh_root;
-    u64 key = same_request ? pass.requested_mesh_key : 0;
-    int pixel = same_request ? pass.requested_mesh_pixel_stage : -1;
-    if (!key && pass.pipeline && !pass.pipeline->own().real)
-        key = request_slot57_mesh(pass.pipeline, pass.root, pixel, true);
-    const auto note = [&](MeshSurfaceRole role, UINT slot, const x2w_startup::TargetDrawCensus::Surface& surface) {
-        ++mesh_refusals[{key, pixel, role, slot, surface.width, surface.height, surface.format}];
-    };
-    x2w_startup::ExclusiveNoteLock guard(mesh_refusal_lock);
-    for (UINT i = 0; i < pass.target_count; ++i) note(MeshSurfaceRole::color, i, pass.target_surfaces[i]);
-    if (pass.bound_depth) note(MeshSurfaceRole::depth, 0, pass.depth_surface);
-    if (!pass.target_count && !pass.bound_depth) note(MeshSurfaceRole::none, 0, {});
-}
-
-template <typename Emit>
-void report_mesh_refusals(Emit emit, bool advance)
-{
-    std::map<MeshRefusalSurface, u64> rows;
-    {
-        x2w_startup::ExclusiveNoteLock guard(mesh_refusal_lock);
-        if (advance) rows.swap(mesh_refusals);
-        else rows = mesh_refusals;
-    }
-    if (rows.empty()) return;
-    std::string line = "x2w-render indirect mesh refusals";
-    for (const auto& [surface, count] : rows) {
-        const auto& [key, pixel, role, slot, width, height, format] = surface;
-        const std::string attachment = role == MeshSurfaceRole::color ? "color" + std::to_string(slot) :
-            role == MeshSurfaceRole::depth ? "depth" : "none";
-        char row[180];
-        std::snprintf(row, sizeof(row), " key=%016llx ps=%s %s=%llux%u/%d calls=%llu",
-                      key, pixel < 0 ? "unknown" : pixel ? "yes" : "none", attachment.c_str(), width, height, format, count);
-        line += row;
-    }
-    emit(line.c_str());
-}
-
-void log_mesh_refusal_window()
-{
-    report_mesh_refusals([](const char* text) {
-        // A window can contain more formats and keys than fit in log's fixed buffer.
-        std::string line = text;
-        line += "\r\n";
-        x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line.data(), static_cast<DWORD>(line.size()));
-        x2w_trap::append_log(line.data(), static_cast<DWORD>(line.size()), false);
-    }, true);
-}
-
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -3934,11 +3860,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
     Wrapper* refusal_pipeline = nullptr;
     u64 trace_call = 0;
-    const Pass* refusal_pass = nullptr;
-    const bool mesh_census = kind == IndirectCommand::dispatch_mesh && x2w_local::env_on("X2W_MESH57_CENSUS");
-    const auto refuse = [&kind, &refusal_pipeline, &trace_call, &refusal_pass, mesh_census](const char* reason, int outcome = indirect_other,
+    const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
                                                                const char* code = nullptr) {
-        if (mesh_census && refusal_pass) note_mesh_refusal(*refusal_pass);
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         if (trace_call)
             log("x2w-mesh86-trace call=%llu stage=record outcome=refused reason=%s", trace_call, reason);
@@ -3955,7 +3878,6 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
-    if (mesh_census) refusal_pass = &pass_of(self);
     if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
         const auto& pass = pass_of(self);
         if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
@@ -3996,7 +3918,6 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
     const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
         (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
-    Slot57Draw mesh57;
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
@@ -4012,8 +3933,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
                 pass.requested_mesh_pipeline = pass.pipeline;
                 pass.requested_mesh_root = pass.root;
-                pass.requested_mesh_pixel_stage = -1;
-                pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root, pass.requested_mesh_pixel_stage);
+                request_slot57_mesh(pass.pipeline, pass.root);
             } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
@@ -4024,16 +3944,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                     log("x2w-render slot86 mesh %016llx: no matching desktop pipeline/root for indirect execution",
                         pass.pipeline->own().mesh86_key);
             }
-            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real &&
-                x2w_local::env_on("X2W_TRANSLATED_INDIRECT_MESH57")) {
-                if (const char* failure = prepare_slot57_draw(self, pass, mesh57))
-                    return refuse(failure, indirect_graphics_pipeline);
-            } else {
-                return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
-                              indirect_graphics_pipeline);
-            }
+            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
+                          indirect_graphics_pipeline);
         }
-        if (!mesh57.pipeline && pass.indirect_graphics.cached_mesh) {
+        if (pass.indirect_graphics.cached_mesh) {
             const auto& pso = pass.indirect_graphics;
             if (!pass.targets_bound || !pass.viewport_set || !pass.scissor_set || !pass.targets_single_sample ||
                 pass.target_count != pso.cached_target_count || pass.dsv_format != pso.cached_depth ||
@@ -4060,9 +3974,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             }
             if (!pass.targets_single_sample)
                 return refuse("draw requires single-sample targets", indirect_other, indirect_other_refusal_code::multisample_target);
-        } else if (!mesh57.pipeline && (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
+        } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
-            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)) {
+            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set) {
             const char* code =
                 pass.target_count > 1                                 ? indirect_other_refusal_code::multiple_render_targets
                 : (!pass.targets_bound || !pass.target_count || !pass.target0) ? indirect_other_refusal_code::no_render_target
@@ -4076,7 +3990,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             return refuse("indirect rectangle list requires a non-indexed draw", indirect_other, indirect_other_refusal_code::rect_list_indexed);
         if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             return refuse("indirect draw requires triangle-list or rectangle-list topology", indirect_other, indirect_other_refusal_code::unsupported_topology);
-        if (!mesh57.pipeline && !pass.indirect_graphics.cached_mesh && !translated) {
+        if (!pass.indirect_graphics.cached_mesh && !translated) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
@@ -4238,13 +4152,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         draw_arguments = scratch;
         draw_offset = 0;
     }
-    if (mesh57.pipeline) {
-        list->SetPipelineState(mesh57.pipeline);
-        list->SetGraphicsRootSignature(mesh57.root);
-        if (mesh57.constant_count)
-            list->SetGraphicsRoot32BitConstants(0, mesh57.constant_count, mesh57.constants.data(), 0);
-        if (mesh57.set_stencil_ref) list->OMSetStencilRef(mesh57.stencil_ref);
-    } else if (graphics) {
+    if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
         if (pass.indirect_graphics.cached_mesh) {
@@ -4314,10 +4222,6 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
-    if (mesh57.pipeline) {
-        if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
-        if (mesh57.set_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
-    }
     red_producer_draw_after(self, red_samples);
     if (graphics) note_target_draw(pass, InterlockedCompareExchange(&frame_number, 0, 0));
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
@@ -4623,7 +4527,6 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.targets_bound = false;
     pass.targets_single_sample = false;
     pass.depth_view_writable = false;
-    pass.stencil_view_writable = false;
     pass.target_count = 0;
     pass.target0 = nullptr;
     std::fill_n(pass.bound_targets, 8, nullptr);
@@ -4710,7 +4613,6 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                 stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
-            pass.stencil_view_writable = !read_stencil;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
         }
@@ -4768,20 +4670,14 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
     // Only a viewport that is forwarded counts as set; a call with no viewports leaves the state as it was.
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
-        auto& pass = pass_of(self);
-        pass.viewport_set = true;
-        if (x2w_local::env_on("X2W_TRANSLATED_INDIRECT_MESH57"))
-            pass.mesh_viewport = count == 1 ? viewports[0] : D3D12_VIEWPORT{};
+        pass_of(self).viewport_set = true;
     }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
-        auto& pass = pass_of(self);
-        pass.scissor_set = true;
-        if (x2w_local::env_on("X2W_TRANSLATED_INDIRECT_MESH57"))
-            pass.mesh_scissor = count == 1 ? rects[0] : D3D12_RECT{};
+        pass_of(self).scissor_set = true;
     }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
@@ -8394,10 +8290,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     }
     null_report.emit([](const char* line) { log("%s", line); });
-    if (totals_due || null_report_due) {
+    if (totals_due || null_report_due)
         target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, 30, totals_due);
-        log_mesh_refusal_window();
-    }
     if (render_mode() && frame % 300 == 0) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
@@ -8567,7 +8461,6 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     null_report.add("x2w-render fixture %s", null_totals);
     draw_lock_release_exclusive();
     null_report.emit(emit);
-    report_mesh_refusals(emit, false);
     target_draw_snapshot(false).report(emit, InterlockedCompareExchange(&frame_number, 0, 0), 30, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
@@ -8589,7 +8482,6 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fixture_target_report(LONG thres
 {
     const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
     target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, threshold, true);
-    log_mesh_refusal_window();
 }
 
 template <int K, int N>
