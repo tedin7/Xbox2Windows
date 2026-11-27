@@ -21,6 +21,7 @@ def touch(path):
     assert shim.contiguous(base, len(pages), pages) == base, C.get_last_error()
     address = base + PAGE
     assert shim.query(address)[3] == MEM_RESERVE
+    print("pages before touch: " + " ".join(f"{shim.query(base + i * PAGE)[3]:#x}" for i in range(len(pages))), flush=True)
     print(f"touch address={address:#x}", flush=True)
     C.c_ubyte.from_address(address).value = 0xA5
     print(AFTER_TOUCH, flush=True)
@@ -32,7 +33,7 @@ def check(path, inject_failure):
     env = dict(os.environ, X2W_XMEM_LAZY_COMMIT="1")
     env.pop("X2W_XMEM_TEST_COMMIT_FAILURE", None)
     if inject_failure:
-        env["X2W_XMEM_TEST_COMMIT_FAILURE"] = "1"
+        env["X2W_XMEM_TEST_COMMIT_FAILURE"] = "touch"  # refuse the fault handler's commit, not a mapping one
     child = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), path, "child"],
                            env=env, capture_output=True, text=True, timeout=25)
     code = child.returncode & 0xFFFFFFFF
