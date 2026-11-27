@@ -1475,8 +1475,18 @@ def controls():
                "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
         formatted = HEAP_MESH.copy()
         formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
-        expect('formatted heap refused', request(tmp, formatted, root_blob=heap_root())[1],
-               'unsupported: dynamic resource heap views require a raw buffer load')
+        key, result = request(tmp, formatted, root_blob=heap_root())
+        expect('formatted heap translates', result, 'ok')
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text()
+        expect('formatted heap manifest', 'dynamic_heap_formats\n' in manifest, True)
+        expect('formatted heap info SRV', 'ByteAddressBuffer info = ResourceDescriptorHeap[heap_count];' in source
+               and 'x2w_heap_info(' in source, True)
+        rewritten = formatted.copy()
+        rewritten.insert(rewritten.index('e00c10c0'), 'be9f0380')  # s_mov_b32 s31, 0
+        rewritten[rewritten.index('bf840004')] = 'bf840005'
+        expect('rewritten formatted heap record refused', request(tmp, rewritten, root_blob=heap_root())[1],
+               'unsupported: dynamic resource heap descriptor requires four intact words')
     with tempfile.TemporaryDirectory() as group_tmp:
         key, group_result = request(group_tmp, GROUP_MESH)
         expect('numeric group index translates', group_result, 'ok')
