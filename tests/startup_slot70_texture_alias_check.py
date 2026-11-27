@@ -44,6 +44,12 @@ def check(directory, consumer):
         log = trap.read_text(errors="replace") if trap.exists() else result.stderr
         if (REFUSAL in log) != refused or f"slot70 alias descriptor changed={int(not refused)}" not in result.stdout:
             raise AssertionError(f"{name}: unexpected slot70 verdict\n{log[-5000:]}")
+        if switch == "1":
+            counts = f"alias registered 1 resolved {int(not refused)} unreadable 0"
+            if counts not in result.stdout:
+                raise AssertionError(f"{name}: missing {counts}\n{result.stdout}")
+        elif "memory SRV switches:" in result.stdout:
+            raise AssertionError(f"{name}: unexpected switch census\n{result.stdout}")
         actual = output.read_bytes()
         expected = bytes((0, 0, 0, 255)) * 32 if refused else expected_pixels(slice_index)
         if actual != expected:

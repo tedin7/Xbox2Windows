@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <array>
+#include <string>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -107,13 +108,27 @@ int draw_1d_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     return 0;
 }
 
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
+
+static void print_slot70_switch_census()
+{
+    std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    const auto first = report.find("x2w-d3d12 memory SRV switches:");
+    if (first != std::string::npos)
+        std::puts(report.substr(first, report.find('\n', first) - first).c_str());
+}
+
 int draw_unregistered_1d_address_srv(void* guest, void* list)
 {
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 44;
     const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
-    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 8u, 1,
-        1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    const bool console_layout = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", nullptr, 0) != 0;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 7u, 1, 1, 1,
+        console_layout ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8_UNORM, {1, 0},
+        console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(0x100) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_RESOURCE_FLAG_NONE};
     // A single R8 footprint consists of one row starting at offset zero.
     static std::array<unsigned char, 8> memory;
     ViewAt view{};
@@ -139,6 +154,7 @@ int draw_unregistered_1d_address_srv(void* guest, void* list)
         invoke(list, 12, 3, 1);
     }
     std::printf("unregistered 1D descriptor_changed=%d\n", std::memcmp(previous.data(), slot, previous.size()) != 0);
+    print_slot70_switch_census();
     return 0;
 }
 
@@ -1201,6 +1217,7 @@ int draw_slot70_texture_alias(void* guest, void* list)
     std::memcpy(previous.data(), descriptor, previous.size());
     invoke(guest, 70, ptr(&alias), ptr(&view), srv);
     std::printf("slot70 alias descriptor changed=%d\n", std::memcmp(previous.data(), descriptor, previous.size()) != 0);
+    print_slot70_switch_census();
 
     struct ExtendedHeap {
         D3D12_DESCRIPTOR_HEAP_DESC desc;

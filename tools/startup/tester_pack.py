@@ -602,9 +602,15 @@ NULL_TARGET_RE = re.compile(
     r"^x2w-render target [0-9a-f]+ \(\d+x\d+ format \d+\): draws (\d+), with a null input (\d+) frames -?\d+\.\.-?\d+$")
 
 
+SLOT70_SWITCH_RE = re.compile(
+    r"^x2w-d3d12 memory SRV switches: snapshot attempts (\d+) bound (\d+) [^;]*; "
+    r"alias registered \d+ resolved (\d+) [^;]*; 1D published \d+ bound (\d+) refused (\d+)(?: |$)")
+
+
 def null_inputs_section(stderr_text):
     inputs = {}
     windows = []
+    switches = []
     for line in stderr_text.splitlines():
         if match := NULL_INPUT_RE.match(line):
             key, index, cause, calls = match.groups()
@@ -615,10 +621,15 @@ def null_inputs_section(stderr_text):
                 windows.append(f"{line} ({poisoned / draws:.1%} poisoned)")
         elif line.startswith("x2w-render null census overflow:"):
             windows.append(line)
-    if not inputs and not windows:
+        elif match := SLOT70_SWITCH_RE.match(line):
+            attempts, bound, resolved, one_d_bound, one_d_refused = match.groups()
+            switches = [f"memory buffers: bound {bound} of {attempts} attempts",
+                        f"texture aliases: resolved {resolved}",
+                        f"1D textures: bound {one_d_bound}, refused {one_d_refused}"]
+    if not inputs and not windows and not switches:
         return ""
     rows = [line for _, line in sorted(inputs.values(), key=lambda row: (-row[0], row[1]))]
-    return "\n".join(["null inputs", *rows, "", "render target windows", *windows]) + "\n"
+    return "\n".join(["null inputs", *rows, "", "render target windows", *windows, *switches]) + "\n"
 
 
 def parse_symbols(text):

@@ -29,10 +29,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
 
 namespace {
 
@@ -100,10 +103,13 @@ RWByteAddressBuffer result : register(u0);
 constexpr char memory_buffer_probe[] = R"(
 struct Record { uint4 first; uint4 rest[15]; };
 StructuredBuffer<Record> source : register(t0);
-RWByteAddressBuffer result : register(u0);
-[numthreads(1, 1, 1)] void main()
+float4 vs(uint id : SV_VertexID) : SV_Position
 {
-    result.Store4(0, asuint(float4(source[0].first.xy, source[0].rest[14].zw)));
+    return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+}
+float4 main() : SV_Target
+{
+    return float4(source[0].first.xy, source[0].rest[14].zw);
 }
 )";
 
@@ -116,7 +122,8 @@ struct Context {
     ComPtr<ID3D12Fence> fence;
     UINT64 value = 0;
     HANDLE event = nullptr;
-    ComPtr<ID3D12Resource> upload, readback, probe_out;
+    ComPtr<ID3D12Resource> upload, readback, probe_out, buffer_target;
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<IUnknown> heap;
@@ -175,7 +182,7 @@ struct Context {
         list->ResourceBarrier(1, &b);
         return run();
     }
-    // Samples texel (0,0) through the desktop descriptor behind slot `index` of the guest heap.
+    // Reads the desktop descriptor behind a guest slot through a one-pixel draw or a compute dispatch.
     bool read_slot(UINT index, float (&texel)[4])
     {
         if (!begin()) return false;
@@ -183,19 +190,44 @@ struct Context {
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_real->GetGPUDescriptorHandleForHeapStart();
         gpu.ptr += std::uint64_t{index} * increment;
         list->SetDescriptorHeaps(1, &bound);
-        list->SetComputeRootSignature(root.Get());
         list->SetPipelineState(pso.Get());
-        list->SetComputeRootDescriptorTable(0, gpu);
-        list->SetComputeRootUnorderedAccessView(1, probe_out->GetGPUVirtualAddress());
-        list->Dispatch(1, 1, 1);
-        D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
-        b.Transition = {probe_out.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE};
-        list->ResourceBarrier(1, &b);
-        list->CopyBufferRegion(readback.Get(), 0, probe_out.Get(), 0, 16);
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        list->ResourceBarrier(1, &b);
+        if (buffer_target) {
+            const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+            const D3D12_RECT scissor{0, 0, 1, 1};
+            list->SetGraphicsRootSignature(root.Get());
+            list->SetGraphicsRootDescriptorTable(0, gpu);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            const float clear[4]{-1, -1, -1, -1};
+            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->DrawInstanced(3, 1, 0, 0);
+            D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+            barrier.Transition = {buffer_target.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            list->ResourceBarrier(1, &barrier);
+            D3D12_TEXTURE_COPY_LOCATION from{buffer_target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION to{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, pitch};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            list->ResourceBarrier(1, &barrier);
+        } else {
+            list->SetComputeRootSignature(root.Get());
+            list->SetComputeRootDescriptorTable(0, gpu);
+            list->SetComputeRootUnorderedAccessView(1, probe_out->GetGPUVirtualAddress());
+            list->Dispatch(1, 1, 1);
+            D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+            b.Transition = {probe_out.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE};
+            list->ResourceBarrier(1, &b);
+            list->CopyBufferRegion(readback.Get(), 0, probe_out.Get(), 0, 16);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            list->ResourceBarrier(1, &b);
+        }
         if (!run()) return false;
         void* mapped = nullptr;
         const D3D12_RANGE all{0, 16};
@@ -245,7 +277,16 @@ D3D12_SHADER_RESOURCE_VIEW_DESC texture2d_view()
     return srv;
 }
 
-int check_memory_buffer(Context& c, bool off, bool mutant)
+bool check_snapshot_counts(const char* expected)
+{
+    std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    if (report.find(expected) != std::string::npos) return true;
+    std::printf("FAIL: expected %s\n%s", expected, report.c_str());
+    return false;
+}
+
+int check_memory_buffer(Context& c, bool off, bool mutant, bool recover, bool cache_first)
 {
     using Payload = std::array<std::uint32_t, 64>;
     SYSTEM_INFO system{};
@@ -257,7 +298,7 @@ int check_memory_buffer(Context& c, bool off, bool mutant)
     } reservation;
     if (!reservation.base || system.dwPageSize < sizeof(Payload) || system.dwPageSize >= 65536) return 4;
     auto* data = VirtualAlloc(static_cast<unsigned char*>(reservation.base) + system.dwPageSize,
-                               system.dwPageSize, MEM_COMMIT, PAGE_READWRITE);
+                               system.dwPageSize, MEM_COMMIT, recover ? PAGE_NOACCESS : PAGE_READWRITE);
     if (!data) return 4;
 
     D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(Payload), 1, 1, 1,
@@ -265,6 +306,7 @@ int check_memory_buffer(Context& c, bool off, bool mutant)
     struct {
         D3D12_SHADER_RESOURCE_VIEW_DESC view;
         UINT64 address;
+        UINT64 tail[2];
     } at{};
     static_assert(offsetof(decltype(at), address) == 0x28);
     at.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -287,14 +329,28 @@ int check_memory_buffer(Context& c, bool off, bool mutant)
     const auto reference = [](const Payload& bytes) {
         return std::array<float, 4>{float(bytes[0]), float(bytes[1]), float(bytes[62]), float(bytes[63])};
     };
+    if (recover) {
+        invoke<void>(c.guest, 70, &desc, &at, c.slot(0));
+        // The first page stays reserved, so the cached witness remains valid after the protection change.
+        DWORD old_protection = 0;
+        if (!VirtualProtect(data, system.dwPageSize, PAGE_READWRITE, &old_protection)) return 4;
+    }
     std::memcpy(data, first.data(), sizeof(first));
     invoke<void>(c.guest, 70, &desc, &at, c.slot(0));
     invoke<void>(c.guest, 70, &desc, &at, c.slot(1)); // unchanged generation
-    std::memcpy(data, second.data(), sizeof(second));
-    invoke<void>(c.guest, 70, &desc, &at, c.slot(2));
+    if (!off) {
+        const char* expected = cache_first
+            ? "snapshot attempts 1 bound 0 bytes 0 not_readable 1 over_limit 0 allocation 0 view_does_not_fit 0 cached_skip 2 cached_rechecks 0;"
+            : recover ? "snapshot attempts 2 bound 2 bytes 256 not_readable 1 over_limit 0 allocation 0 "
+                        "view_does_not_fit 0 cached_skip 0 cached_rechecks 2;"
+                      : "snapshot attempts 1 bound 2 bytes 256 not_readable 0";
+        if (!check_snapshot_counts(expected)) return 4;
+    }
+    if (!recover) std::memcpy(data, second.data(), sizeof(second));
+    if (!recover) invoke<void>(c.guest, 70, &desc, &at, c.slot(2));
 
     std::array<std::array<float, 4>, 3> readback{};
-    for (UINT i = 0; i < readback.size(); ++i) {
+    for (UINT i = 0; i < (recover ? 2u : 3u); ++i) {
         float result[4]{};
         if (!c.read_slot(i, result) || !c.device_ok()) return 4;
         std::memcpy(readback[i].data(), result, sizeof(result));
@@ -305,7 +361,12 @@ int check_memory_buffer(Context& c, bool off, bool mutant)
         std::puts("slot70 switch-off control: all three publications left the null SRVs intact");
         return 0;
     }
-    if (readback[0] != reference(first) || readback[1] != reference(first)) return 1;
+    if (readback[0] != reference(first) || readback[1] != reference(first)) {
+        if (cache_first && readback == decltype(readback){})
+            std::puts("slot70 cache-first mutant: readable view still samples null");
+        return 1;
+    }
+    if (recover) return cache_first ? 2 : 0;
     if (readback[2] != reference(second)) {
         if (mutant && readback[2] == reference(first))
             std::puts("slot70 stale mutant: refreshed readback failed with the first generation");
@@ -320,7 +381,10 @@ int main(int argc, char** argv)
 {
     const bool memory_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-off") == 0;
     const bool memory_mutant = argc == 3 && std::strcmp(argv[2], "memory-buffer-stale") == 0;
-    const bool memory_buffer = memory_off || memory_mutant || (argc == 3 && std::strcmp(argv[2], "memory-buffer") == 0);
+    const bool cache_first = argc == 3 && std::strcmp(argv[2], "memory-buffer-cache-first") == 0;
+    const bool recover = cache_first || (argc == 3 && std::strcmp(argv[2], "memory-buffer-recover") == 0);
+    const bool memory_buffer = recover || memory_off || memory_mutant ||
+        (argc == 3 && std::strcmp(argv[2], "memory-buffer") == 0);
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
         (argc == 3 && !memory_buffer && std::strcmp(argv[2], "off")))
         return 2;
@@ -383,20 +447,51 @@ int main(int argc, char** argv)
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    const D3D12_ROOT_SIGNATURE_DESC root_desc{2, root_parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{memory_buffer ? 1u : 2u, root_parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     const char* shader = memory_buffer ? memory_buffer_probe : probe_shader;
     ComPtr<ID3DBlob> root_blob, errors, code;
     if (!require(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, root_blob.GetAddressOf(),
                                             errors.GetAddressOf()), "root serialize") ||
         !require(device->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&c.root)),
                  "root signature") ||
-        !require(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "main", "cs_5_1", 0, 0,
+        !require(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "main", memory_buffer ? "ps_5_1" : "cs_5_1", 0, 0,
                             code.GetAddressOf(), errors.ReleaseAndGetAddressOf()), "probe shader"))
         return 4;
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
-    pso.pRootSignature = c.root.Get();
-    pso.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    if (!require(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&c.pso)), "probe pipeline")) return 4;
+    if (memory_buffer) {
+        ComPtr<ID3DBlob> vertex;
+        if (!require(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "vs", "vs_5_1", 0, 0,
+                                vertex.GetAddressOf(), errors.ReleaseAndGetAddressOf()), "snapshot vertex shader"))
+            return 4;
+        constexpr auto format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = c.root.Get();
+        pso.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+        pso.PS = {code->GetBufferPointer(), code->GetBufferSize()};
+        pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        pso.RTVFormats[0] = format;
+        pso.SampleDesc.Count = 1;
+        const D3D12_RESOURCE_DESC target{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0},
+                                         D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        if (!require(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&c.pso)), "snapshot pipeline") ||
+            !require(device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&c.rtv_heap)), "snapshot RTV heap") ||
+            !require(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&c.buffer_target)), "snapshot render target"))
+            return 4;
+        device->CreateRenderTargetView(c.buffer_target.Get(), nullptr, c.rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    } else {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = c.root.Get();
+        pso.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        if (!require(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&c.pso)), "probe pipeline")) return 4;
+    }
 
     // A shader-visible guest heap of four SRV slots.
     const struct {
@@ -410,7 +505,7 @@ int main(int argc, char** argv)
         return 4;
     }
     c.heap_cpu = invoke<UINT64>(c.heap.Get(), 9);
-    if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant);
+    if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant, recover, cache_first);
 
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                            {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
