@@ -3555,6 +3555,7 @@ class Stage:
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
+        self.retry_scc_edges = False
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -3584,11 +3585,11 @@ class Stage:
             try:
                 self.translate()
             except Unsupported as reason:
-                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))):
+                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason)) or self.retry_scc_edge_proof(str(reason))):
                     raise
                 continue
             if refusals is not None and any(
-                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason))
+                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason) or self.retry_scc_edge_proof(reason))
                     for reason, stage in refusals[first_refusal:]):
                 del refusals[first_refusal:]
                 continue
@@ -3608,6 +3609,12 @@ class Stage:
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
+
+    def retry_scc_edge_proof(self, reason):
+        if self.kind != 'vs' or self.retry_scc_edges or not reason.startswith('src_scc with unverified SCC'):
+            return False
+        self.retry_scc_edges = True
+        return True
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
 
@@ -5721,6 +5728,7 @@ class Stage:
             # Offset of the emitted, uniform SCC write that reaches here (None: none, or not proven), and the one
             # each forward branch carries to its target.
             self.scc_def, scc_in = None, {}
+            scc_uniform_in = {}
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.exec_generation = 0
@@ -5809,6 +5817,9 @@ class Stage:
                     # last, whichever path each took (a per-lane s_cbranch_execz edge included); the SCC writes on a
                     # back edge are not known yet.
                     defs = ([self.scc_def] if falls else []) + scc_in.get(off, [])
+                    uniform_paths = ([self.scc_verified and self.scc_uniform and self.uniform_cf] if falls else []) + scc_uniform_in.get(off, [])
+                    edge_scc_uniform = (getattr(self, 'retry_scc_edges', False) and not back_targets
+                                        and bool(uniform_paths) and all(uniform_paths))
                     one_def = off not in back_targets and len(set(defs)) == 1
                     self.scc_def = defs[0] if one_def else None
                 elif not falls:
@@ -5884,6 +5895,13 @@ class Stage:
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
                     self.uniform_cmp_masks.clear()
+                    if (getattr(self, 'retry_scc_edges', False) and self.uniform_cf
+                            and not back_targets):
+                        paths = ([pre_uniform] if falls else []) + edge_since.get(off, [])
+                        if paths and all(path is not None for path in paths):
+                            common = set.intersection(*paths)
+                            kept_u |= common
+                            self.varying_s.difference_update(common)
                     self.since_join = kept_u
                     # One branch enters this block and the code above does not fall into it: the block starts with the
                     # facts that held at that branch, not with what a sibling arm laid down in program order.
@@ -5893,9 +5911,9 @@ class Stage:
                             and getattr(self, 'kind', None) == 'vs'):
                         self.since_join |= edge
                         self.varying_s.difference_update(edge)
-                    self.scc_uniform = (self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
-                                        and self.scc_def is not None)
-                    self.scc_verified = self.scc_def is not None
+                    self.scc_uniform = ((self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
+                                         and self.scc_def is not None) or edge_scc_uniform)
+                    self.scc_verified = self.scc_def is not None or edge_scc_uniform
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
                     # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
@@ -5953,9 +5971,18 @@ class Stage:
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
                         # Only what is proven here: a register can be marked varying without leaving since_join.
                         edge_since.setdefault(b_target, []).append(
-                            None if getattr(self, 'since_join', None) is None
+                            (self.defined_uniform_s - self.varying_s - self.masks
+                             if getattr(self, 'retry_scc_edges', False) else None)
+                            if getattr(self, 'since_join', None) is None
                             else self.since_join - self.varying_s - self.masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
+                        # AMD RDNA 2 ISA, 3.8 SCC and SOPP S_CBRANCH_SCC0/1:
+                        # branches leave SCC intact; only wave-uniform control can carry
+                        # a per-wave value safely into a translated vertex block.
+                        edge_uniform = (self.scc_verified and self.scc_uniform and self.uniform_cf
+                                        and (name == 's_branch' or
+                                             (name in ('s_cbranch_scc0', 's_cbranch_scc1'))))
+                        scc_uniform_in.setdefault(b_target, []).append(edge_uniform)
                         if self.firstlane_cfg and self.uniform_cf:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
                             firstlane_edges.setdefault(b_target, []).append(

@@ -583,6 +583,83 @@ def vertex_reference():
                     for _ in range(4) for x in range(4))
 
 
+def nested_words(outer, inner):
+    # Both inputs are inline scalar constants; the branch offsets are hand-written.
+    return b''.join((
+        sopc(6, 145, 145 if outer else 146), branch(SOPP_CBRANCH_SCC0, 4, 32),
+        sopc(6, 145, 145 if inner else 146), branch(SOPP_CBRANCH_SCC0, 12, 24),
+        sop1(3, 20, S_SCC), branch(SOPP_BRANCH, 20, 28), sop1(3, 20, S_SCC),
+        branch(SOPP_BRANCH, 28, 36), sop1(3, 20, S_SCC),
+        sopc(1, 20, 128), branch(SOPP_CBRANCH_SCC0, 40, 52),
+        sop1(3, 22, 129), branch(SOPP_BRANCH, 48, 56), sop1(3, 22, 130),
+        sop1(3, 21, S_SCC)))
+
+
+def nested_reference(outer, inner, wrong_scc=False):
+    saved = int(bool(inner) if outer else False)
+    scc = int(saved != 0) ^ int(wrong_scc)
+    return b''.join(struct.pack('<4f', saved if x < 2 else scc, saved, 0, 1)
+                    for _ in range(4) for x in range(4))
+
+
+def nested_controls():
+    accepted = []
+    for outer, inner in ((0, 0), (1, 0), (1, 1)):
+        code = nested_words(outer, inner)
+        retry = G.Stage.retry_scc_edge_proof
+        G.Stage.retry_scc_edge_proof = lambda self, reason: False
+        try:
+            try:
+                translate_vertex(code)
+            except G.Unsupported as error:
+                check('nested old refusal', 'src_scc with unverified SCC' in str(error), str(error))
+            else:
+                check('nested old refusal', False, 'previous proof accepted the fixture')
+            old = translate_vertex(SCALAR_WORDS)
+        finally:
+            G.Stage.retry_scc_edge_proof = retry
+        check('unchanged vertex output', old == translate_vertex(SCALAR_WORDS))
+        try:
+            shaders = translate_vertex(code)
+        except G.Unsupported as error:
+            check('nested SCC edge', False, str(error))
+            continue
+        check('nested SCC edge', True)
+        accepted.append((outer, inner, shaders))
+    for index, word, diagnostic in (
+            (0, sop2(SOP2_AND_B32, 6, 4, VCC_LO), 's_and_b32 at +0x0 yields a non-uniform value'),
+            (13, sop2(SOP2_AND_B32, 6, 4, VCC_LO), 's_and_b32 at +0x34 yields a non-uniform value'),
+            (7, branch(SOPP_BRANCH, 28, 8), 's_cmp_lg_i32 at +0x24 yields a non-uniform value')):
+        code = bytearray(nested_words(1, 1))
+        code[index * 4:index * 4 + 4] = word
+        try:
+            translate_vertex(bytes(code))
+        except G.Unsupported as error:
+            check('nested refusal ' + str(index), diagnostic in str(error), str(error))
+        else:
+            check('nested refusal ' + str(index), False, 'translated unsafe path')
+    check('mutant discriminated', nested_reference(1, 1) != nested_reference(1, 1, wrong_scc=True))
+    return accepted
+
+
+def check_nested_draw(dxc, runner, cases):
+    out = Path(here).parent / 'out'
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        for outer, inner, (vs, ps) in cases:
+            name = f'nested_{outer}_{inner}'
+            vertex = compile_hlsl(dxc, 'dxc', vs, name, 'vs_6_0', directory)
+            pixel = compile_hlsl(dxc, 'dxc', ps, name + '_ps', 'ps_6_0', directory)
+            expected = directory / (name + '.bin')
+            expected.write_bytes(nested_reference(outer, inner))
+            run = subprocess.run([runner, 'warp', '--raster-reference', str(vertex), str(pixel),
+                                  '4', '4', str(expected), 'none', 'cw'], capture_output=True, text=True)
+            if run.returncode == 77:
+                sys.exit(1 if failures else 77)
+            report = run.stdout + run.stderr
+            check(name + ' WARP readback', run.returncode == 0 and 'all 16 pixels matched' in report, report)
+
+
 def check_vertex_draw(dxc, runner, shaders):
     vs, ps = shaders
     # Flipping only the false-arm save changes green at every pixel.
@@ -615,11 +692,13 @@ elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
     shaders = pixel_controls()
     firstlane_hlsl, bindings = firstlane_pixel.check_translation()
     vertex = vertex_controls()
+    nested = nested_controls()
     whole_quad = firstlane_pixel.check_whole_quad_translation()
     if not failures:
         check_pixel_draw(*sys.argv[2:], shaders)
         check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings, whole_quad)
         check_vertex_draw(*sys.argv[2:], vertex)
+        check_nested_draw(*sys.argv[2:], nested)
 elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     for name, (source, prefix, _) in PIXEL_CASES.items():
         check(name + ' encoding', assemble(sys.argv[2], source + PIXEL_TAIL) == pixel_words(prefix))
@@ -627,6 +706,7 @@ elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
 elif len(sys.argv) == 1:
     pixel_controls()
     vertex_controls()
+    nested_controls()
     compute_controls()
 else:
     sys.exit(__doc__)
