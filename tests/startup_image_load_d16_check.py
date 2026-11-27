@@ -891,6 +891,9 @@ def check_odd_dmask_consumers():
         ('v4 predicated overwrite',
          (odd_1, 'v_cmpx_eq_u32_e32 0, v0', 'v_mov_b32_e32 v4, 0', 'v_add_nc_u32_e32 v5, 1, v4'),
          'whole-word read of v4'),
+        ('v4 reload under narrower EXEC',
+         (odd_1, 'v_cmpx_eq_u32_e32 0, v0', odd_1, 'v_mov_b32_e32 v4, 0', 'v_add_nc_u32_e32 v5, 1, v4'),
+         'whole-word read of v4'),
         ('v7 dmask 0x7 tail',
          (odd_3, 'v_add_nc_u32_e32 v5, 1, v7'),
          'whole-word read of v7'),
@@ -1201,6 +1204,45 @@ def odd_tail_hlsl(components, **options):
                       ps_hw_inputs=PACKED_INPUT, rtv_formats=rtv).hlsl_ps()
 
 
+def masked_odd_tail_hlsl(*, intervening=(), wrong_overwrite=False):
+    # Only the left four columns load and overwrite. Initialize the exported
+    # registers before narrowing EXEC so the right four columns have a reference.
+    def v_mov(dst, src):
+        return 0x7e000200 | (dst << 17) | src
+
+    load = encode_mimg(IMG_LOAD, dmask=7, vaddr=8, vdata=20, d16=1)
+    before = (
+        v_mov(29, 240),  # 0.5
+        v_mov(30, 246),  # 4.0
+        0x7da81084,  # v_cmpx_gt_u32_e32 4, v8
+    )
+    after = (
+        0xbf8c3f70,  # s_waitcnt vmcnt(0)
+        0x7e3a1715,  # v_cvt_f32_f16_e32 v29, v21
+        *intervening,
+        v_mov(21, 246 if wrong_overwrite else 242),  # 4.0 instead of 1.0 in the GPU control
+        (0x03 << 25) | (30 << 17) | (21 << 9) | 242,  # v_add_f32_e32 v30, 1.0, v21
+        0xbefe03c1,  # s_mov_b32 exec_lo, -1
+        0xf800180f,  # exp mrt0 v29, v30, v29, v30
+        0x1e1d1e1d,
+        0xbf810000,  # s_endpgm
+    )
+    program = PRE_WORDS + struct.pack('<3I', *before) + load + struct.pack(f'<{len(after)}I', *after)
+    return G.Pipeline(VS_WORDS, program, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+
+
+def masked_odd_tail_words():
+    words = []
+    for i in range(WIDTH * HEIGHT):
+        if i % WIDTH < 4:
+            low_half = f32_bits_from_f16_bits(0x4400 + i)
+            result = 0x40000000  # 1.0 + 1.0
+        else:
+            low_half, result = 0x3f000000, 0x40800000
+        words.extend((low_half, result, low_half, result))
+    return words
+
+
 def odd_tail_variants(components, *, red_only=False):
     hlsl = odd_tail_hlsl(components, red_only=red_only)
     tail = 20 + components // 2
@@ -1243,6 +1285,15 @@ def check_odd_tail_programs():
         lambda: G.Pipeline(VS_WORDS, odd_tail_program(3, red_only=True), root_blob(),
                            ps_hw_inputs=PACKED_INPUT, rtv_formats=(2,)).hlsl_ps(),
         'upper half used by exp mrt0', 'same compressed export to RGBA32_FLOAT')
+    masked_odd_tail_hlsl()
+    for label, word in (
+        ('EXEC narrowed after odd load', 0x7da81082),  # v_cmpx_gt_u32_e32 2, v8
+        ('EXEC rewritten after odd load', 0xbefe037e),  # s_mov_b32 exec_lo, exec_lo
+        ('branch after odd load', 0xbf820000),  # s_branch to the following instruction
+    ):
+        expect_refused(lambda: masked_odd_tail_hlsl(intervening=(word,)),
+                       'whole-word read of v21 after odd d16 image_load: upper half used by '
+                       'v_add_f32_e32 v30, 1.0, v21', label)
 
 
 def check_odd_tail_draw(dxc, renderer, adapter):
@@ -1266,6 +1317,18 @@ def check_odd_tail_draw(dxc, renderer, adapter):
                     run = run_d16_draw(renderer, adapter, mode, vs, ps, wrong, directory, tag + '_mutated_model')
                 assert run.returncode == 0, (run.stdout, run.stderr)
                 print(f'{tag}: readback matched expected outcome', flush=True)
+
+        expected = masked_odd_tail_words()
+        for wrong_overwrite in (False, True):
+            tag = 'masked_odd_tail_wrong_overwrite' if wrong_overwrite else 'masked_odd_tail'
+            ps = compile_hlsl(dxc, 'dxc', masked_odd_tail_hlsl(wrong_overwrite=wrong_overwrite), tag,
+                              'ps_6_0', directory)
+            run = run_d16_draw(renderer, adapter, 'rgba16f', vs, ps, expected, directory, tag)
+            if wrong_overwrite:
+                assert run.returncode == 1 and '8 of 16 pixels differ' in run.stderr, (run.stdout, run.stderr)
+            else:
+                assert run.returncode == 0, (run.stdout, run.stderr)
+            print(f'{tag}: readback matched expected outcome', flush=True)
 
 def run_d16_draw(renderer, adapter, tex_mode, vs, ps, words, directory, tag):
     expected_path = directory / f'{tag}.bin'

@@ -2986,6 +2986,8 @@ class Stage:
     loads_after_wide_exec_write = ()  # the same for a writer that is not a v_cmpx
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
+    exec_generation = 0      # advances on every EXEC write and basic-block boundary
+    low16_generation = None  # first outstanding low-half write, per VGPR
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
     align4_v = ()             # VGPRs proven to hold a multiple of 4 in every lane
     align4_s = ()             # SGPRs proven to hold a multiple of 4
@@ -3496,8 +3498,10 @@ class Stage:
                 todo.append((block + 1, state))
 
     def clear_low16(self, n):
-        if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
+        if (self.low16_generation is not None and self.low16_generation.get(n) == self.exec_generation
+                and n not in self.pinned_low16_v):
             self.low16_only_v.discard(n)
+            del self.low16_generation[n]
 
     def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
         if getattr(self, 'interp_p1', None):
@@ -3516,6 +3520,10 @@ class Stage:
             if not isinstance(self.low16_only_v, set):
                 self.low16_only_v = set()
             self.low16_only_v.add(n)
+            if self.low16_generation is None:
+                self.low16_generation = {}
+            # A later predicated low-half write may leave earlier undefined lanes intact.
+            self.low16_generation.setdefault(n, self.exec_generation)
         else:
             self.clear_low16(n)
         self.used_v.add(n)
@@ -4786,6 +4794,8 @@ class Stage:
             self.scc_def, scc_in = None, {}
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
+            self.exec_generation = 0
+            self.low16_generation = {}
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.whole_read_sites = {}  # first upper-half consumer per VGPR
             self.low16_copies = {}      # source VGPR -> copy destinations for the block-boundary guard
@@ -4831,6 +4841,7 @@ class Stage:
                 if self.exec_keep:
                     self.end_exec_keep(instruction_index, off, name, asm, targets)
                 if off in splits and off != start:
+                    self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.align4_v.clear()
                     self.align4_s.clear()
@@ -5109,6 +5120,7 @@ class Stage:
                 if self.scc_effect or not self.scc_verified:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
+                    self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
@@ -5583,6 +5595,8 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        if writes_exec(name, ops):
+            self.exec_generation += 1
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
             return self.lower_image_instruction(image, name, asm, ops, mods)
