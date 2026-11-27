@@ -1848,7 +1848,7 @@ def check_controls():
     # Store forms outside this slice (the store is the dword at +0x60 of WORDS_A: offen, soffset 0x80, s[16:19]).
     store = '001070e004050480'
     for word, fragment in (('000070e004050480', 'not proven wave-uniform'),  # off: one address, per-lane data
-                           ('002070e004050480', 'modifier idxen'),         # idxen, no offen
+                           ('003070e004050480', 'with idxen and offen'),   # mixed index and VGPR offset
                            ('005070e004050480', 'modifier glc')):          # glc offen
         # (a store through a descriptor the program also loads is lowered as one RW view: startup_compute_rw_buffer)
         refused(fragment, lambda w=word: translate('A', code=patch(WORDS_A, store, w)).hlsl_cs())
@@ -1882,11 +1882,14 @@ def check_controls():
     body = far.hlsl_cs().split('void main(', 1)[1]
     assert not any(word in body for word in ('GetDimensions', 'min(', 'if (a')), body
     assert far.manifest().splitlines()[-1] == 'uav 0 table 1 16', far.manifest()
-    # Descriptor words: a word that is overwritten, moved or modified before the store refuses it, including a word
-    # that is not the first of its s_load and a constant move. Each input below was accepted before.
-    for lines in (['s_mov_b32 s18, 0'], ['s_or_b32 s17, s17, 0x40000'], ['s_and_b32 s18, s18, 0xffff'],
-                  ['buffer_store_dword v5, v4, s[16:19], 0 offen', 's_mov_b32 s18, 4']):
-        refused('modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
+    # A constant replacement of NUM_RECORDS narrows the range. Unproved edits to the
+    # stride or to the record-count bits still refuse and name the changed word.
+    for limit in ('s_mov_b32 s18, 0', 's_mov_b32 s18, 4'):
+        hlsl = translate('A', code=splice(limit)).hlsl_cs()
+        assert 'write_count = min(' in hlsl
+    for line, index in (('s_or_b32 s17, s17, 0x40000', 1), ('s_and_b32 s18, s18, 0xffff', 2)):
+        refused('modified descriptor (word %d)' % index,
+                lambda line=line: translate('A', code=splice(line)).hlsl_cs())
     # Clearing the stride field of dword 1 (s_and with 0xc000ffff, either operand order) gives the raw descriptor a
     # byte-address store assumes: accepted, and case I runs it on the GPU. Any other mask, another dword, or the same
     # mask on an image store stays refused.
@@ -1951,7 +1954,7 @@ def check_controls():
     refusals = []
     pipe = G.ComputePipeline(splice('s_and_b32 s18, s18, 0xffff'), root_blob(), CASES['A'][2], (2, 3, 4), refusals=refusals)
     assert pipe.modified == {(('table', 1), 16)}, pipe.modified
-    assert [G.normalize_refusal(r) for r, _ in refusals] == ['buffer store through a modified descriptor'], refusals
+    assert [G.normalize_refusal(r) for r, _ in refusals] == ['buffer store through a modified descriptor (word 2)'], refusals
     # Scalar instructions in a block s_cbranch_execz skips. The wave runs the block when any lane is active, so an
     # inactive lane that skips it can differ only by reading, after the join, scalar state the block defines.
     # Live after the join: the block's s20 is read by v_mov_b32 v5, s20, so the hardware stores gid.x + 1 for every
