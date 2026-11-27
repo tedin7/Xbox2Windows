@@ -343,7 +343,6 @@ def check_end_cause():
         ("process exited with 0xffffffff after 256.1 s\n", (), "title killed externally (exit code 0xffffffff, no stop file) at 256.1 s"),
         ("process exited with 0x00000000 after 12.0 s\n", (), "title exited by itself (code 0x0) at 12.0 s"),
         ("process exited with 0xc0000005 after 40.0 s\n", (), "title crashed (exit code 0xc0000005) at 40.0 s"),
-        ("process exited with 0xe2571455 after 40.0 s\n", (), "xmem lazy commit failed (exit code 0xe2571455) at 40.0 s"),
         ("stopped at access violation (0xc0000005) at d3d12_xs+0x10 after 33.3 s\n", (), "debugger stop: access violation (0xc0000005) at 33.3 s"),
         ("timeout after 300.0 s\n", (("stall_stop.json", b'{"at_seconds": 300, "reason": "deadlock: no frame"}'),),
          "watchdog at 300 s: deadlock: no frame"),

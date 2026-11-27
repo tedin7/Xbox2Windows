@@ -3555,12 +3555,6 @@ calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_map
 injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
 can be mapped on retry. With the experimental `X2W_XMEM_LAZY_COMMIT=1`, a fresh slot waits for its first
 CPU access instead of its mapping (see [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch)).
-
-If a first-touch commit fails, the `x2w-xmem lazy commit failed: address=` line records the access, chunk,
-Windows error, process commit, job peak and limit, and system commit. The run exits with `0xE2571455`.
-Raise the job cap with `-MemoryGiB` if the cap caused the failure. Use `-NoLazyMemory` to surface a
-commit-limit error (1455) at allocation time.
-
 Caller-owned placeholders must already match the requested view size. The
 heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed

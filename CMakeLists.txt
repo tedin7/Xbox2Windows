@@ -263,9 +263,6 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_commit_check.py" "$<TARGET_FILE:xmem_shim_test_controls>" failure)
     set_tests_properties(xmem_mapped_pages_commit xmem_mapped_pages_commit_failure PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     set_tests_properties(xmem_mapped_pages_commit_failure PROPERTIES ENVIRONMENT "X2W_XMEM_TEST_COMMIT_FAILURE=1")
-    add_test(NAME xmem_lazy_commit_failure COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_commit_failure_check.py" "$<TARGET_FILE:xmem_shim_test_controls>")
-    set_tests_properties(xmem_lazy_commit_failure PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     # X2W_XMEM_LAZY_COMMIT=1: pages committed on first touch; kernel writes need x2w_xmem_commit_range (#1199).
     add_test(NAME xmem_lazy_commit COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_commit_check.py" "$<TARGET_FILE:xmem_shim>")

@@ -1,10 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#ifndef PSAPI_VERSION
-#define PSAPI_VERSION 2
-#endif
 #include <windows.h>
-#include <psapi.h>
 
 #include "era_physical.h"
 #include "xmem_slab_slots.h"
@@ -268,51 +264,6 @@ const Backing* lease_backing(UINT version, ULONG_PTR page)
     return backing && backing->committed ? backing : nullptr;
 }
 
-// End the run with a reason a tester report can name instead of an access violation in title code.
-constexpr DWORD lazy_commit_exit_code = 0xE2571455;
-volatile LONG lazy_commit_failure_reported = 0;
-
-LONG stop_after_lazy_commit_failure(const EXCEPTION_RECORD& record, ULONG_PTR chunk, SIZE_T bytes, DWORD error)
-{
-    if (InterlockedCompareExchange(&lazy_commit_failure_reported, 1, 0) == 0) {
-        const char* access = record.ExceptionInformation[0] == 1 ? "write" :
-                             record.ExceptionInformation[0] == 8 ? "execute" : "read";
-        const auto job = x2w_local::job_memory();
-        PROCESS_MEMORY_COUNTERS_EX process{};
-        process.cb = sizeof(process);
-        PERFORMANCE_INFORMATION system{};
-        system.cb = sizeof(system);
-        char used[24] = "?", peak[24] = "?", limit[24] = "?";
-        char system_used[24] = "?", system_limit[24] = "?";
-        if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process),
-                                    process.cb)) {
-            std::snprintf(used, sizeof(used), "%llu", static_cast<unsigned long long>(process.PrivateUsage) >> 20);
-        }
-        if (job.known) {
-            std::snprintf(peak, sizeof(peak), "%llu", job.peak_mib);
-            if (job.limited) std::snprintf(limit, sizeof(limit), "%llu", job.limit_mib);
-            else std::memcpy(limit, "none", sizeof("none"));
-        }
-        if (K32GetPerformanceInfo(&system, system.cb)) {
-            std::snprintf(system_used, sizeof(system_used), "%llu",
-                          (static_cast<unsigned long long>(system.CommitTotal) * system.PageSize) >> 20);
-            std::snprintf(system_limit, sizeof(system_limit), "%llu",
-                          (static_cast<unsigned long long>(system.CommitLimit) * system.PageSize) >> 20);
-        }
-        x2w_local::logf("x2w-xmem lazy commit failed: address=0x%llx (%s) chunk=0x%llx bytes=0x%llx error=%lu; "
-                        "job commit %s MiB (peak %s, limit %s), system commit %s of %s MiB: the run stops (exit 0x%08lx)",
-                        static_cast<unsigned long long>(record.ExceptionInformation[1]), access,
-                        static_cast<unsigned long long>(chunk), static_cast<unsigned long long>(bytes), error,
-                        used, peak, limit, system_used, system_limit, lazy_commit_exit_code);
-        InterlockedExchange(&lazy_commit_failure_reported, 2);
-    } else {
-        // Another thread is writing the line: let it finish (at most 2 s) so the stop does not cut it off.
-        for (int i = 0; i < 200 && InterlockedCompareExchange(&lazy_commit_failure_reported, 2, 2) != 2; ++i) Sleep(10);
-    }
-    TerminateProcess(GetCurrentProcess(), lazy_commit_exit_code);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
 LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -326,14 +277,8 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
         const bool lazy = lazy_block_at(address, base, bytes) &&
                           VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) && info.State == MEM_RESERVE;
         const bool committed = lazy && commit_block_chunks(base, bytes, address, address + 1);
-        const DWORD error = lazy && !committed ? GetLastError() : ERROR_SUCCESS;
         ReleaseSRWLockShared(&lazy_blocks.lock);
-        if (lazy) {
-            if (committed) return EXCEPTION_CONTINUE_EXECUTION;
-            const SIZE_T offset = (address - base) & ~(lazy_chunk - 1);
-            const SIZE_T chunk_bytes = bytes - offset < lazy_chunk ? bytes - offset : lazy_chunk;
-            return stop_after_lazy_commit_failure(*record, base + offset, chunk_bytes, error);
-        }
+        if (lazy) return committed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
         // Another thread committed this chunk (or the whole block, which then leaves the list) between the fault
         // and the query: committed read-write memory cannot fault, so retry once. The retry is keyed on the chunk
         // and on the release count, so a fault that stays is passed on, while a new block later placed at the same
@@ -353,23 +298,17 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
     // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
     thread_local ULONG_PTR retried = 0;
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
-    DWORD error;
-    {
-        const std::lock_guard guard(memory.mutex);
-        Backing* backing = backing_at(address);
-        if (!backing) return EXCEPTION_CONTINUE_SEARCH;
-        if (backing->committed) {
-            if (retried == page) return EXCEPTION_CONTINUE_SEARCH;
-            retried = page;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if (commit_backing(*backing)) {
-            retried = 0;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        error = GetLastError();
+    const std::lock_guard guard(memory.mutex);
+    Backing* backing = backing_at(address);
+    if (!backing) return EXCEPTION_CONTINUE_SEARCH;
+    if (backing->committed) {
+        if (retried == page) return EXCEPTION_CONTINUE_SEARCH;
+        retried = page;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
-    return stop_after_lazy_commit_failure(*record, page, page_bytes, error);
+    if (!commit_backing(*backing)) return EXCEPTION_CONTINUE_SEARCH;
+    retried = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 HANDLE section_for(ULONG_PTR page, bool need_commit = true)
