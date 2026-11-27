@@ -933,6 +933,12 @@ OperationResult run_depth_mask_swapped(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_depth_mask_color(const OperationContext& ctx)
+{
+    check_depth_mask_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_entry(const OperationContext& ctx)
 {
     auto binding = MeshConstantBinding::root;
@@ -1798,6 +1804,7 @@ const OperationSpec kOperations[] = {
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
+    {"--depth-mask-color", 6, 6, nullptr, kNoGate, run_depth_mask_color},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
