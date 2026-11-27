@@ -3242,6 +3242,12 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
   raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
   (#1806), and any pipeline layout other than the measured one.
+- A census of depth clears (`src/startup_stubs/depth_clear_census.h`, always on, log only) tells
+  whether a decoded GREATER test can pass: `x2w-render depth clear census:` lines name each of the
+  first 8 (depth, flags) pairs a title clears with, the clears the stand-in skipped by reason, and,
+  for draws with a decoded GREATER or GREATER_EQUAL test, how many met a depth view last cleared
+  to 1.0 (nothing passes), to 0.0, to another value, or never cleared. Each line prints when its
+  count reaches a power of two (`startup_depth_clear_census`).
 - Rasterizer state (#1999, item B) has a decoder for the register value only:
   `src/startup_stubs/rasterizer_state_decode.h` turns a `PA_SU_SC_MODE_CNTL` value into the cull mode,
   front-face winding and fill mode of a `D3D12_RASTERIZER_DESC`, with the field positions of the amdgpu
