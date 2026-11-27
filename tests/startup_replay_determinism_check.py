@@ -5,7 +5,8 @@ startup_replay_quad presents an animated scene every frame; its recording (X2W_R
 Checked, with every replay in its own output folder and its own shader cache:
   - two replays one after the other: present_<nnnn>.png for exactly presents 1..12 in order, every picture byte equal, and the
     replay_summary.json counters equal (calls played, presents, unknown objects, missing blobs, fence timeouts, argument bytes,
-    pages applied/written/zero/missing, and the hash of every restored title range); only the timing fields may differ;
+    pages applied/written/zero/missing, and the hash of every restored title range); only the timing and process memory
+    fields may differ;
   - two replays running at the same time (the CPU is shared, the threads and fences interleave differently): the same output again;
   - control: a recording with the last frame's clear colour changed replays to a different last picture and the same
     other pictures, so the equality above is not a comparison of nothing.
@@ -22,13 +23,14 @@ import tempfile
 
 from startup_replay_check import PRESENTS, change_last_clear, gfx2hlsl, pictures, pixel, replay, run, vertex
 
-TIMING = {"wall_s", "fps"}
+TIMING = {"wall_s", "fps", "peak_private_bytes"}  # time and process memory vary from run to run
 
 
 def summary_of(folder):
-    """The replay_summary.json of a replay without its timing fields."""
+    """The replay_summary.json of a replay without its timing and memory fields (also inside nested objects)."""
     data = json.loads((Path(folder) / "replay_summary.json").read_text())
-    return {key: value for key, value in data.items() if key not in TIMING}
+    return {key: ({k: v for k, v in value.items() if k not in TIMING} if isinstance(value, dict) else value)
+            for key, value in data.items() if key not in TIMING}
 
 
 def play(player, recording, folder, backend, env):
