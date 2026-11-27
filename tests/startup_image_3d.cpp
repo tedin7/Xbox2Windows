@@ -224,16 +224,9 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 //   half_float:      DXGI_FORMAT_R16G16B16A16_FLOAT with exactly representable finite values.
 //   red_only:        DXGI_FORMAT_R32_FLOAT target. Read R into each pixel's first output word.
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t* words, bool array, bool sampled, bool half_float,
-                                  bool red_only, const std::uint32_t* descriptor_entry,
-                                  UINT descriptor_count, bool descriptor_bound)
+                                  bool depth16, std::uint32_t words[64], bool array, bool sampled, bool half_float, bool red_only)
 {
-    constexpr UINT width = 8, height = 2;
-    const bool limits = descriptor_entry != nullptr;
-    const UINT tex_width = limits ? 4u : width;
-    const UINT tex_height = height;
-    const UINT target_height = limits ? 8u : height;
-    const UINT mip_count = limits ? 1u : 2u;
+    constexpr UINT width = 8, height = 2, d16_mips = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
         0x0000, 0x0001, 0x0003, 0x1234, 0x2aad, 0x4008, 0x5555, 0x8000,
         0x8010, 0xa018, 0xc018, 0xe00c, 0xffaf, 0xffef, 0xfffe, 0xffff,
@@ -274,7 +267,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     if (sampled && !samplers.read_manifest_line("smpl 0 0x0 0x100000 0x4000000 0x0"))
         throw std::runtime_error("invalid image_sample_lz d16 fixture sampler");
     ComPtr<ID3D12RootSignature> root;
-    check(x2w_startup::create_translated_root(device, limits ? descriptor_count : d16_entry_constants, 1, samplers, &root),
+    check(x2w_startup::create_translated_root(device, d16_entry_constants, 1, samplers, &root),
           "Create translated image_load d16 root signature");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
@@ -288,20 +281,19 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = limits ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                              : red_only ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+    pd.RTVFormats[0] = red_only ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image_load d16 PSO");
 
     const UINT slices = array ? 2u : 1u;
-    const UINT subresources = slices * mip_count;
+    const UINT subresources = slices * d16_mips;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = tex_width;
-    td.Height = tex_height;
+    td.Width = width;
+    td.Height = height;
     td.DepthOrArraySize = static_cast<UINT16>(slices);
-    td.MipLevels = static_cast<UINT16>(mip_count);
+    td.MipLevels = d16_mips;
     td.Format = depth16 ? DXGI_FORMAT_R16_UNORM
                         : half_float ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
@@ -317,17 +309,14 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     const UINT texel_bytes = depth16 ? sizeof(std::uint16_t)
                                     : half_float ? 4 * sizeof(std::uint16_t) : 4 * sizeof(std::uint32_t);
     for (UINT s = 0; s < slices; ++s) {
-        for (UINT m = 0; m < mip_count; ++m) {
-            const UINT sub = m + s * mip_count;
-            const UINT mw = tex_width >> m, mh = tex_height >> m;
+        for (UINT m = 0; m < d16_mips; ++m) {
+            const UINT sub = m + s * d16_mips;
+            const UINT mw = width >> m, mh = height >> m;
             auto* const sub_bytes = static_cast<std::uint8_t*>(mapped) + src_footprints[sub].Offset;
             for (UINT y = 0; y < mh; ++y) {
                 for (UINT x = 0; x < mw; ++x) {
                     auto* const cell = sub_bytes + y * src_footprints[sub].Footprint.RowPitch + x * texel_bytes;
-                    if (limits) {
-                        const float texel[4]{static_cast<float>(1 + x + tex_width * y), 0, 0, 0};
-                        std::memcpy(cell, texel, sizeof(texel));
-                    } else if (half_float) {
+                    if (half_float) {
                         // Per-pixel finite binary16 values, with distinct signs and magnitudes across channels.
                         const UINT pixel = y * mw + x;
                         const std::uint16_t texel[4] = {
@@ -355,7 +344,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = width;
-    rd.Height = target_height;
+    rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = pd.RTVFormats[0];
@@ -370,17 +359,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image_load d16 SRV heap");
-    const auto srv = views->GetCPUDescriptorHandleForHeapStart();
-    if (limits && !descriptor_bound) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
-        null_view.Format = td.Format;
-        null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        null_view.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(nullptr, &null_view, srv);
-    } else {
-        device->CreateShaderResourceView(texture.Get(), nullptr, srv);
-    }
+    device->CreateShaderResourceView(texture.Get(), nullptr, views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image_load d16 RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -400,11 +379,10 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     ID3D12DescriptorHeap* heaps[]{views.Get()};
     list->SetDescriptorHeaps(1, heaps);
     const std::uint32_t constants[d16_entry_constants] = {0, 0, 0, 0, depth16 ? 1u : 0u};
-    list->SetGraphicsRoot32BitConstants(0, limits ? descriptor_count : d16_entry_constants,
-                                        limits ? descriptor_entry : constants, 0);
+    list->SetGraphicsRoot32BitConstants(0, d16_entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(target_height), 0, 1};
-    const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(target_height)};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -421,7 +399,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_size)};
     check(readback->Map(0, &read, &mapped), "Map image_load d16 readback");
     const auto* const rb_bytes = static_cast<const std::uint8_t*>(mapped) + target_footprint.Offset;
-    for (UINT y = 0; y < target_height; ++y) {
+    for (UINT y = 0; y < height; ++y) {
         const auto* row = rb_bytes + y * target_footprint.Footprint.RowPitch;
         if (red_only) {
             for (UINT x = 0; x < width; ++x)
