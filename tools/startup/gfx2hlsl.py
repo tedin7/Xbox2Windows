@@ -5415,6 +5415,10 @@ class Stage:
             }
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.uniform_mask = {}    # proven VGPR -> EXEC mask id when its expression was defined
+            self.exec_mask = 0        # id of the current EXEC mask; each narrowing starts a child, a restore returns to a copy's
+            self.exec_mask_parent = {0: None}
+            self.exec_copies = {}     # SGPR -> (EXEC mask id, offset) it was set to a copy of EXEC at (until written)
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
@@ -6516,6 +6520,8 @@ class Stage:
                                                     expr)
                 if recomputed:
                     self.uniform_expr.update(temps)
+                if dst in self.uniform_expr:
+                    self.uniform_mask[dst] = self.exec_mask
         return term
 
     def quad_flow_straight(self):
@@ -6761,19 +6767,112 @@ class Stage:
             return ops[0] in ('exec', 'exec_lo') and ops[1] == ops[0]
         return False
 
+    def exec_restore_copy(self, name, ops):
+        """(mask id, kind) when the instruction sets EXEC from an SGPR (pair) that holds a copy of EXEC taken earlier and
+        not written since, else None. kind: 'mov' EXEC becomes the copy, 'else' EXEC becomes the copy AND NOT the current
+        mask (a subset of the copy), 'or' EXEC becomes the current mask OR the copy."""
+        wide = name.endswith('_b64')
+        exec_names = ('exec',) if wide else ('exec_lo', 'exec')
+        if name not in ('s_mov_b32', 's_mov_b64', 's_andn2_b32', 's_andn2_b64', 's_or_b32', 's_or_b64'):
+            return None
+        if not ops or ops[0] not in exec_names:
+            return None
+        if name.startswith('s_mov'):
+            kind, source = 'mov', ops[1] if len(ops) == 2 else None
+        elif name.startswith('s_andn2'):
+            kind, source = 'else', ops[1] if len(ops) == 3 and ops[2] in exec_names else None
+        else:
+            others = [t for t in ops[1:] if t not in exec_names] if len(ops) == 3 else []
+            kind = 'or'
+            source = others[0] if len(others) == 1 and sum(t in exec_names for t in ops[1:]) == 1 else None
+        reg = reg_range(source) if source else None
+        copies = self.exec_copies
+        if (not reg or reg[0] != 's' or reg[2] > 105 or reg[2] - reg[1] != (1 if wide else 0) or
+                any(r not in copies for r in range(reg[1], reg[2] + 1))):
+            return None
+        ids = {copies[r][0] for r in range(reg[1], reg[2] + 1)}
+        saved_at = {copies[r][1] for r in range(reg[1], reg[2] + 1)}
+        if len(ids) != 1 or len(saved_at) != 1 or not self.entered_only_from_inside(saved_at.pop(), self.pc):
+            return None
+        return ids.pop(), kind
+
+    def entered_only_from_inside(self, start, end):
+        """No branch from outside [start, end] lands inside (start, end] (and no computed jump exists): every path that
+        reaches end after start ran the instructions between, including the one that saved the copy at start."""
+        edges = getattr(self, 'branch_edges', None)
+        if edges is None:
+            edges = []
+            for off, _n, name, asm in self.ins:
+                if name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe')):
+                    edges = None
+                    break
+                if name.startswith(('s_branch', 's_cbranch')):
+                    ops = parse(asm)[1]
+                    label = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
+                    if not label:
+                        edges = None
+                        break
+                    edges.append((off, int(label[1], 16)))
+            self.branch_edges = edges if edges is not None else False
+            edges = self.branch_edges
+        if edges is False:
+            return False
+        return not any(start < target <= end and not start <= source <= end for source, target in edges)
+
+    def exec_mask_within(self, inner, outer):
+        """EXEC mask id inner is outer, or was reached from it by narrowing only."""
+        parents = self.exec_mask_parent
+        while inner is not None:
+            if inner == outer:
+                return True
+            inner = parents.get(inner)
+        return False
+
     def forget_writes(self, name, ops, drop_since=True):
         """Before an instruction runs: an EXEC write ends every recomputable expression, and an SGPR write ends the
         expressions that read it and (when drop_since is set) that SGPR's since-join mark (set_s marks it again when it proves the new value).
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
-        if writes_exec(name, ops) and not self.exec_write_only_narrows(name, ops):
-            self.uniform_expr.clear()
-            if getattr(self, 'entry_exec_proof', None) is not None:
-                self.uniform_v.clear()
         regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
         for tok in destinations(name, ops):
             r = reg_range(tok)
             if r and r[0] == 's':
                 regs.update(range(r[1], r[2] + 1))
+        copies = self.exec_copies
+        restore = self.exec_restore_copy(name, ops)
+        narrows = self.exec_write_only_narrows(name, ops)
+        if restore is not None and restore[1] == 'or' and not self.exec_mask_within(self.exec_mask, restore[0]):
+            restore = None  # the OR would add lanes the copy does not hold
+        if writes_exec(name, ops) and not narrows and restore is None:
+            self.uniform_expr.clear()
+            copies.clear()
+            self.exec_mask = len(self.exec_mask_parent)  # a mask nothing is known about: a new root
+            self.exec_mask_parent[self.exec_mask] = None
+            if getattr(self, 'entry_exec_proof', None) is not None:
+                self.uniform_v.clear()
+        elif restore is not None:
+            # EXEC returns to the saved mask (or a subset of it). Lanes that left in between did not run what was defined
+            # after the save, so those expressions go; an expression defined under the saved mask or a mask it was
+            # narrowed from was run by every lane that returns.
+            target = restore[0]
+            for v in [v for v in self.uniform_expr
+                      if not self.exec_mask_within(target, self.uniform_mask.get(v, -1))]:
+                del self.uniform_expr[v]
+            if getattr(self, 'entry_exec_proof', None) is not None:
+                self.uniform_v.clear()
+        for r in regs:
+            copies.pop(r, None)
+        copy_of_exec = (name in ('s_mov_b32', 's_mov_b64') and len(ops) == 2 and ops[1] in ('exec', 'exec_lo')
+                        or name in ('s_and_saveexec_b32', 's_and_saveexec_b64'))
+        if copy_of_exec:
+            dst = reg_range(ops[0])
+            if dst and dst[0] == 's' and dst[2] <= 105:
+                copies.update({r: (self.exec_mask, self.pc) for r in range(dst[1], dst[2] + 1)})
+        if narrows or (restore is not None and restore[1] == 'else'):
+            child = len(self.exec_mask_parent)
+            self.exec_mask_parent[child] = restore[0] if restore is not None else self.exec_mask
+            self.exec_mask = child
+        elif restore is not None:
+            self.exec_mask = restore[0]
         if not regs:
             return set()
         if drop_since and self.since_join is not None:
