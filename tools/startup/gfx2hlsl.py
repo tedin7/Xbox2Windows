@@ -5922,7 +5922,7 @@ class Stage:
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa_half(self, base, ops, mods):
-        """SDWA binary16 add, sub, subrev and mul: a selected half of each source, one rounding, one half written back.
+        """SDWA binary16 arithmetic: select a half from each source, round once and write one half.
 
         Sources: src0_sel/src1_sel WORD_0 or WORD_1 pick the half; DWORD reads the low half, as the 16-bit
         operation does. Destination: dst_sel WORD_0 or WORD_1 with dst_unused UNUSED_PAD (other half zero) or
@@ -5930,18 +5930,19 @@ class Stage:
         16-bit result is not claimed (an open question, see the low-16-only contract), and a byte selection, sext(),
         clamp and the output modifiers have no lowering here. Sources are VGPRs with the abs/neg modifiers.
         """
-        _arity, _kind, text, _result = VEC_H[base]
+        arity, _kind, text, _result = VEC_H[base]
+        allowed_fields = {'src%d_sel' % index for index in range(arity)} | {'dst_sel', 'dst_unused'}
         fields = {}
         for m in mods:
             key, _, value = m.partition(':')
-            if key in ('src0_sel', 'src1_sel', 'dst_sel', 'dst_unused') and value and key not in fields:
+            if key in allowed_fields and value and key not in fields:
                 fields[key] = value
             else:
                 raise Unsupported('%s SDWA with modifier %s' % (base, m))
-        if len(ops) != 3:
-            raise Unsupported('%s SDWA with %d operands, expected 3' % (base, len(ops)))
+        if len(ops) != arity + 1:
+            raise Unsupported('%s SDWA with %d operands, expected %d' % (base, len(ops), arity + 1))
         args = []
-        for index in range(2):
+        for index in range(arity):
             selection = fields.get('src%d_sel' % index)
             if selection not in ('DWORD', 'WORD_0', 'WORD_1'):
                 raise Unsupported('%s SDWA src%d_sel %s' % (base, index, selection))
@@ -5977,7 +5978,7 @@ class Stage:
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
 
     def sdwa(self, base, ops, mods):
-        if base in ('v_add_f16', 'v_sub_f16', 'v_subrev_f16', 'v_mul_f16'):
+        if base in ('v_add_f16', 'v_sub_f16', 'v_subrev_f16', 'v_mul_f16', 'v_exp_f16', 'v_rcp_f16'):
             return self.sdwa_half(base, ops, mods)
         if base in ('v_cvt_off_f32_i4', *VOP3_ONLY_VEC_U):
             raise Unsupported('SDWA form of %s' % base)
@@ -11413,6 +11414,7 @@ MIX32 = 'float mix32(float a, float b, float c) { precise float result = mad(a, 
 # i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
 # zero, saturate to the 16-bit range and read NaN as 0.
 VEC_H = {
+    'v_exp_f16': (1, 'h', 'exp2({0})', 'h'), 'v_rcp_f16': (1, 'h', '1.0 / {0}', 'h'),
     'v_add_f16': (2, 'h', '{0} + {1}', 'h'), 'v_sub_f16': (2, 'h', '{0} - {1}', 'h'),
     'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', 'mul16({0}, {1})', 'h'),
     'v_min_f16': (2, 'h', 'min({0}, {1})', 'h'), 'v_max_f16': (2, 'h', 'max({0}, {1})', 'h'),
@@ -13703,6 +13705,7 @@ def raise_site(error):
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
+    ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
