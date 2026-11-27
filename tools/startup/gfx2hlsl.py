@@ -3209,7 +3209,7 @@ class Stage:
             return ('alu', 'max({0}, 1u)', (stride,)) if kind == 'stride_min1' else stride
         return node
 
-    def descriptor_number(self, node, budget=None):
+    def descriptor_number(self, node, budget=None, *, fixed_only=False):
         """Materialize an immutable descriptor expression only when a numeric consumer needs it."""
         if budget is None:
             budget = [128]
@@ -3219,11 +3219,13 @@ class Stage:
         kind, *args = node
         if kind == 'alu':
             template, operands = args
-            return '(' + template.format(*(self.descriptor_number(word, budget) for word in operands)) + ')'
+            return '(' + template.format(*(self.descriptor_number(word, budget, fixed_only=fixed_only) for word in operands)) + ')'
         if kind == 'value':
             return args[0]
         if kind == 'desc':
             source, offset, word = args
+            if fixed_only and node in getattr(self, 'advanced_descriptor_words', ()):
+                raise Unsupported('cannot materialize descriptor word %d from an advanced descriptor' % word)
             if (getattr(self, 'kind', None) in ('ps', 'vs') and source[0] == 'table' and 0 <= source[1] < 16
                     and offset is not None and offset % 4 == 0 and 0 <= offset + 4 * word <= 0x7ffffffc):
                 return 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
@@ -3233,6 +3235,21 @@ class Stage:
                 return 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
             raise Unsupported('cannot materialize descriptor word %d from %s at %s' % (word, source, offset))
         raise Unsupported('cannot materialize descriptor number from %s' % args[0])
+
+    def descriptor_operand(self, token):
+        """Read a fixed descriptor word at an explicitly supported numeric use."""
+        reg = reg_range(token)
+        symbol = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
+        if symbol and symbol[0] == 'desc' and names_one_value(symbol):
+            if getattr(self, 'kind', None) in ('ps', 'vs'):
+                return self.descriptor_number(symbol[:4], fixed_only=True)
+        if symbol and symbol[0] == 'descnum' and len(symbol) == 3:
+            return self.descriptor_number(self.descriptor_number_node(symbol), fixed_only=True)
+        return self.u(token)
+
+    def mark_descriptor_scc(self):
+        if hasattr(self, 'descriptor_scc_writes'):
+            self.descriptor_scc_writes.add(self.pc)
 
     def descriptor_alu(self, template, sources, symbols):
         operands = []
@@ -4812,6 +4829,9 @@ class Stage:
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
             self.scc_data_reads = {}
+            self.advanced_descriptor_words = set()
+            self.descriptor_scc_writes = set()
+            self.descriptor_scc_selects = set()
             uniform_scc_writes, scc_dependent_writes = set(), set()
             self.address_carry_reader = None
             uniform_vcc_compares = set()
@@ -5252,6 +5272,13 @@ class Stage:
                     error.instruction = names[off]
                     raise error
                 refusals.append((reason, self.kind))
+        if self.descriptor_scc_writes:
+            for off, reason in self.descriptor_flag_refusals(dict(branches), scc_effects, uniform_scc_writes):
+                if refusals is None:
+                    error = Unsupported(reason)
+                    error.instruction = names[off]
+                    raise error
+                refusals.append((reason, self.kind))
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
                 reason = 'scc from %s in %s' % ('descriptor data' if kind == 'descriptor' else kind, name)
@@ -5345,6 +5372,34 @@ class Stage:
         for off in reads:
             if off in failures or (off in self.scc_data_reads and off not in reached_reads):
                 yield off, failures.get(off, 'no reachable SCC producer')
+
+    def descriptor_flag_refusals(self, branches, effects, uniform_writes):
+        """Check the actual reaching SCC writes, including paths through back edges."""
+        instructions = {off: (size, name, asm) for off, size, name, asm in self.ins}
+        pending = [(0, None)]
+        seen, reaching = set(), {}
+        while pending:
+            off, producer = pending.pop()
+            if (off, producer) in seen or off not in instructions:
+                continue
+            seen.add((off, producer))
+            size, name, asm = instructions[off]
+            if reads_scc(name, asm):
+                reaching.setdefault(off, set()).add(producer)
+            if off in effects:
+                producer = off
+            if off in branches:
+                pending.append((branches[off], producer))
+            if name not in ('s_branch', 's_setpc_b64', 's_endpgm'):
+                pending.append((off + size, producer))
+        for off, producers in sorted(reaching.items()):
+            if not producers & self.descriptor_scc_writes:
+                continue
+            name = instructions[off][1]
+            if off not in self.descriptor_scc_selects and name not in ('s_cbranch_scc0', 's_cbranch_scc1'):
+                yield off, 'scc from descriptor data in %s outside a scalar select or branch' % name
+            elif len(producers) != 1 or not producers <= uniform_writes:
+                yield off, 'scc from descriptor data in %s without a single wave-uniform producer' % name
 
     def descriptor_scc_reads(self, branches, effects):
         """Find reads reachable with an elided SCC write, including through joins and back edges."""
@@ -7326,6 +7381,15 @@ class Stage:
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
+                    and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
+                result = self.descriptor_alu(text, srcs, syms)
+                expr = self.descriptor_number(self.descriptor_number_node(result), fixed_only=True)
+                values = [self.descriptor_operand(t) for t in srcs]
+                self.set_scc(shift_add_carry(base, values, expr))
+                self.mark_descriptor_scc()
+                self.sym[dst[1]] = result
+                return None
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
@@ -7827,6 +7891,10 @@ class Stage:
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
         if pair and 'm0' in low:
             raise Unsupported('64-bit scalar operand m0')
+        if (not pair and hasattr(self, 'descriptor_scc_selects') and reg_range(low[0])
+                and reg_range(low[0])[0] == 's' and reg_range(low[0])[1] <= 105
+                and not any(self.is_lane_mask(token) for token in low)):
+            self.descriptor_scc_selects.add(self.pc)
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
         if low[0] == 'm0':
             self.sym.pop('m0', None)
@@ -7947,7 +8015,10 @@ class Stage:
             if waterfall and (base_off | off) & 3:
                 raise Unsupported('compute readfirstlane waterfall: descriptor table address requires dword alignment')
             for i in range(count):
-                self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
+                desc = ('desc', p[1], base_off + off, i)
+                if len(p) > 2 and hasattr(self, 'advanced_descriptor_words'):
+                    self.advanced_descriptor_words.add(desc)
+                self.sym[dst[1] + i] = desc + load
             if into_vcc:
                 self.mark_vcc_descriptor()
             return
@@ -12778,7 +12849,16 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 # instruction a refusal rather than an index error in the batch translator.
                 if len(ops) != 2:
                     raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
-                self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
+                symbols = [self.sym.get(r[1]) if (r := reg_range(t)) and r[0] == 's' else None for t in ops]
+                descriptor = (getattr(self, 'kind', None) in ('ps', 'vs')
+                              and any(s and s[0] in ('desc', 'descnum') for s in symbols))
+                if descriptor:
+                    if mods or any(self.is_lane_mask(t) or t == 'src_scc' for t in ops):
+                        raise Unsupported('scc from descriptor data in %s with a lane mask, SCC or modifier' % name)
+                    self.set_scc((cast % op).format(*(self.descriptor_operand(t) for t in ops)))
+                    self.mark_descriptor_scc()
+                else:
+                    self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):

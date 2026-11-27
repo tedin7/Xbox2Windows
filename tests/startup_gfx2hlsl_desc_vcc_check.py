@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from startup_gfx2hlsl_sload_s104_check import (
-    G, TABLE_ROOT, compile_hlsl, draw, translate, vs_words, words_text,
+    G, Pipe, TABLE_ROOT, compile_hlsl, draw, translate, vs_words, words_text,
 )
 from startup_gfx2hlsl_bit_alu_check import POST_WORDS
 
@@ -122,7 +122,30 @@ def draw_odd_sample(directory, dxc, renderer, adapter):
     assert result.returncode == 1 and 'actual=00000000,00000000,00000000,00000000' in result.stderr, result.stderr
 
 
+@patch.object(Pipe, "ud", lambda self, key: key[2] // 4, create=True)
+@patch.object(Pipe, "modified", set(), create=True)
+def check_descriptor_flags():
+    compare = 's_cmp_eq_u32 s42, 0'
+    select = 's_cselect_b32 s22, 31, 7'
+    stage = translate(LOAD, compare, select, END)
+    assert any('s22 = scc ?' in line for _, lines, _ in stage.blocks for line in lines)
+    refuse('scc from descriptor data', LOAD, compare, 's_cselect_b32 vcc_lo, 1, 0')
+    refuse('scc from descriptor data', LOAD, compare, 's_cselect_b64 exec, -1, 0')
+    refuse('without a single wave-uniform producer', LOAD, compare, 's_cbranch_scc0 label_0010',
+           's_cmp_eq_u32 s43, 0', select)
+    refuse('cannot materialize descriptor word 2 from an advanced descriptor',
+           's_add_u32 s20, s4, 64', 's_load_dwordx4 s[40:43], s[20:21], 0', compare, select)
+    refuse('numeric use of s42 holding desc', LOAD, 's_xor_b32 s42, s42, 1', compare, select)
+    for op in ('s_pack_ll_b32_b16', 's_mul_hi_u32', 's_mul_hi_i32'):
+        refuse(op + ' on descriptor data', LOAD, op + ' s22, s42, 1')
+    # Simulate the symbols a heap-indexed load supplies, then exercise each newly lifted producer.
+    for instruction in ('s_cmp_eq_u32 s42, 0', 's_lshl1_add_u32 s22, s42, 1'):
+        with patch.dict(translate.__globals__['TABLE'], {42: ('desc', ('resheap', 0, 0), 0, 2)}):
+            refuse('cannot materialize descriptor word 2', instruction, select)
+
+
 def main():
+    check_descriptor_flags()
     stage = translate(LOAD, LOW, COPY, CLOBBER, FETCH, END)
     # Manual mutant: dropping the symbol copy must fail the positive alias or this symbol check.
     assert stage.sym[106] == ('desc', ('table', 0), 0x20, 2)
