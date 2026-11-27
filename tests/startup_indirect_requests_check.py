@@ -10,6 +10,8 @@ pipeline under test, binds it on a guest list and records refused slot-61 calls 
   slot57-bound     the same pipeline bound with no call: no request (negative control)
   slot57-dispatch  the same pipeline with one Dispatch call (a compute-state refusal): no request
   desktop-draw     a slot-86 pipeline with desktop shaders and one Draw call: no lookup
+  slot57-unbound-draw  the slot 57 pipeline, three direct Draws with no render target bound: counted as
+                   "not drawn key <its real key>: 3 (targets_not_bound 3)", not under key 0
 
 Every slot-61 lookup logs "x2w-render ExecuteIndirect looks up translation for pipeline" (first 16).
 """
@@ -42,7 +44,7 @@ def run(consumer, backend, directory, mode, runs=1):
             sys.exit(77)
         if result.returncode:
             raise RuntimeError(f"{mode}: consumer failed on {backend}: {result.returncode}\n{result.stderr[-2000:]}")
-        logs.append(result.stderr)
+        logs.append(result.stderr + "\n" + result.stdout)
     found = {}
     for marker in sorted(cache.glob("req_*.a")):
         key = marker.name[4:-2]
@@ -73,6 +75,14 @@ def check(consumer, backend):
         _, logs, *_ = run(consumer, backend, temp, "desktop-draw")
         assert "stream pipeline -> REAL desktop pipeline" in logs[0], "desktop-draw: no desktop pipeline was built"
         assert not lookups(logs[0]), "desktop-draw: a desktop pipeline was looked up"
+
+        # Direct draws with no render target bound are refused before any translation lookup. They must still be
+        # counted under the pipeline's real key, never under key 0.
+        unbound, logs, *_ = run(consumer, backend, temp, "slot57-unbound-draw")
+        extra = [key for key in unbound if key != stream_key]
+        assert len(extra) == 1, f"slot57-unbound-draw: {len(extra)} requests besides the stream pipeline's, expected 1"
+        refused = [line for line in logs[0].splitlines() if line.startswith("x2w-render not drawn key ")]
+        assert refused == [f"x2w-render not drawn key {extra[0]}: 3 (targets_not_bound 3)"], refused
 
         # Two processes into one cache: the request is written once, the second process finds it.
         found, logs, vs, ps, root = run(consumer, backend, temp, "slot57-draw", runs=2)
