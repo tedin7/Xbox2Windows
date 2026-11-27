@@ -213,7 +213,7 @@ def check_pending_manifest_upgrade(failures):
             return subprocess.CompletedProcess(command, 0, '', '')
 
         def pending(configured, retry=False):
-            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None)
+            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None, None, None)
             retry_env = {'X2W_RETRY_FAILED': '1'} if retry else {}
             with fxc_environment(work, configured, os.path.join(work, 'none')), \
                  mock.patch.dict(os.environ, retry_env), \
