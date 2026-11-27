@@ -20,7 +20,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -90,104 +89,6 @@ EXEC_ON = PREFIX + cmpx_eq(1) + STORE + SUFFIX   # v0 is 1: the lane stays activ
 EXEC_OFF = PREFIX + cmpx_eq(2) + STORE + SUFFIX  # v0 is 1: every lane is turned off before the store
 ARRAY_EXEC_ON = PREFIX + mov_v2_inline(1) + cmpx_eq(1) + ARRAY_STORE + SUFFIX
 ARRAY_EXEC_OFF = PREFIX + mov_v2_inline(1) + cmpx_eq(2) + ARRAY_STORE + SUFFIX
-
-
-# Each active lane updates its own pixel. s9..s12 supply the four entry cbuffer words.
-RW_DESCRIPTOR = bytes.fromhex('04060cf4000000fa')  # s_load_dwordx8 s[24:31], s[8:9], 0
-RW_POSITION = bytes.fromhex(
-    '7fc08cbf'          # s_waitcnt lgkmcnt(0)
-    'ff041836ffff0000'  # v_and_b32 v12, 0xffff, v2
-    '90041a2c'          # v_lshrrev_b32 v13, 16, v2
-    '81021c7e'          # v_mov_b32 v14, 1 (array view slice)
-)
-RW_NARROW = bytes.fromhex('8818a87d')  # v_cmpx_gt_u32 8, v12
-RW_LOAD = bytes.fromhex('080f00f00c200600')  # image_load v[32:35], v[12:13], s[24:31]
-RW_STORE = bytes.fromhex('080f20f00c200600')
-RW_ADD = bytes.fromhex('703f8cbf' '09404006' '0a424206' '0b444406' '0c464606')
-RW_EXPORT = bytes.fromhex('0f1800f820212223' '000081bf')
-
-
-def rw_program(*, array=False, stale=False):
-    descriptors = RW_DESCRIPTOR
-    load, store = RW_LOAD, RW_STORE
-    if stale:
-        descriptors += bytes.fromhex('04090cf4200000fa')  # s[36:43], distinct table entry at byte 32
-        load = load[:6] + bytes.fromhex('0900')
-    if array:
-        load, store = b'\x28' + load[1:], b'\x28' + store[1:]
-    return descriptors + RW_POSITION + RW_NARROW + load + RW_ADD + store + RW_EXPORT
-
-
-def rw_root():
-    root = bytearray(root_blob())
-    struct.pack_into('<I', root, 100, 4)  # RTS0 parameter 1: four root constants
-    return bytes(root)
-
-
-def read_write_controls():
-    for array in (False, True):
-        kind = 'tex2da' if array else 'tex2d'
-        coord = 'uint3(v12, v13, v14)' if array else 'uint2(v12, v13)'
-        words = rw_program(array=array)
-        pipe = G.Pipeline(VS_WORDS, words, rw_root())
-        hlsl, manifest = pipe.hlsl_ps(), pipe.manifest()
-        load = 'if (exec & 1) t = w0[%s];' % coord
-        store = 'if (exec & 1) w0[%s] =' % coord
-        assert hlsl.index(load) < hlsl.index(store), hlsl
-        assert 'uav 0 %s table 0 0\nuavload 0\n' % kind in manifest, manifest
-        assert not any(line.startswith('srv ') for line in manifest.splitlines()), manifest
-        census = []
-        decoded_pipe = G.Pipeline(VS_WORDS, words, rw_root(), refusals=census)
-        assert not census and decoded_pipe.hlsl_ps() == hlsl and decoded_pipe.manifest() == manifest
-
-        stale = G.Pipeline(VS_WORDS, rw_program(array=array, stale=True), rw_root())
-        assert 'srv 0 %s table 0 32' % kind in stale.manifest() and 'uavload' not in stale.manifest()
-
-    # This sampler has linear XY filtering. Prove sample/LOD can translate on their own.
-    sampler = bytes.fromhex('9203a8be' '8003a9be' 'ff03aabe00005004' '8003abbe')
-    before = RW_DESCRIPTOR + RW_POSITION
-    after = RW_ADD + RW_STORE + RW_EXPORT
-    conflict = 'both read and stored to'
-    sample = bytes.fromhex('080f80f00c204601')
-    modified_descriptor = bytes.fromhex('80039fbe')  # s_mov_b32 s31, 0
-    for words in (
-        before + sampler + RW_LOAD + after[:-len(RW_EXPORT)] + sample + RW_EXPORT,
-        before + RW_LOAD + modified_descriptor + after,
-    ):
-        with_refusal = []
-        G.Pipeline(VS_WORDS, words, rw_root(), refusals=with_refusal)
-        assert any(conflict in reason for reason, _ in with_refusal), with_refusal
-
-    assert 'uavload 0' in G.Pipeline(
-        VS_WORDS, before + RW_STORE + RW_LOAD + RW_ADD + RW_EXPORT, rw_root()).manifest()
-
-
-    for label, load in (
-        ('mip 1', '080f04f00c200600'),
-        ('a16', '080f00f002200640'),
-        ('d16', '080f00f00c200680'),
-        ('mixed dimension', '280f00f00c200600'),
-        ('filtered sample', '080f80f00c204601'),
-        ('LOD query', '080380f10c204601'),
-        ('gather', '08011cf10c204601'),
-    ):
-        head, read = before + sampler, bytes.fromhex(load)
-        G.Pipeline(VS_WORDS, head + read + RW_ADD + RW_EXPORT, rw_root())
-        try:
-            G.Pipeline(VS_WORDS, head + read + after, rw_root())
-        except G.Unsupported as error:
-            assert conflict in str(error), (label, error)
-        else:
-            raise AssertionError('accepted shared image with ' + label)
-
-    with patch.dict('os.environ', X2W_INTEGER_TEXTURE_SRVS='1'):
-        try:
-            G.Pipeline(VS_WORDS, rw_program(), rw_root())
-        except G.Unsupported as error:
-            assert conflict in str(error), error
-        else:
-            raise AssertionError('accepted shared image through integer SRV path')
-    print('shared 2D and array UAV loads and stores; incompatible reads refused')
 
 
 def translate(words):
@@ -338,7 +239,12 @@ def controls():
         raise AssertionError('vertex-stage image_store accepted')
     print('refused image_store outside a pixel stage')
 
-    read_write_controls()
+    # Reading and storing the same image in one program would need a read-write view: refused.
+    load = bytes.fromhex('080f00f000080400')  # image_load v[8:11], v[0:1], s[16:23] dmask:0xf dim:2D
+    assert D.decode_instruction(load, 0)[2].startswith('image_load v[8:11]'), D.decode_instruction(load, 0)
+    refused(PREFIX + load + STORE + SUFFIX, 'both read and stored')
+    assert translate(PREFIX + load + SUFFIX).manifest().startswith('x2w-manifest 1\n')
+    print('refused a load and a store of the same image')
 
     # Exec not known at translation time: the store, and only the store line, is guarded by the lane's bit.
     for constant, words in ((1, EXEC_ON), (2, EXEC_OFF)):

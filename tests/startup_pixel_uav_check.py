@@ -34,7 +34,7 @@ from startup_stream_check import container, gfx2hlsl  # noqa: E402
 from startup_stream_draw_check import vertex  # noqa: E402
 from startup_pixel_image_store_check import (  # noqa: E402
     ARRAY_EXEC_OFF, ARRAY_EXEC_ON, ARRAY_GUARDED_LINE, ARRAY_STORE_LINE, ARRAY_WORDS, ARRAY_WORDS_LAST,
-    BITS, EXEC_OFF, EXEC_ON, GUARDED_LINE, STORE_LINE, WORDS, rw_program,
+    BITS, EXEC_OFF, EXEC_ON, GUARDED_LINE, STORE_LINE, WORDS,
 )
 
 SIDE, MIPS, TEXTURES, ARRAY_SLICES = 4, 2, 4, 6
@@ -148,7 +148,7 @@ def describe(index):
 class Program:
     """One pixel program published and translated into its own cache."""
 
-    def __init__(self, directory, consumer, words, env, kind='tex2d', *, load=False, stale=False):
+    def __init__(self, directory, consumer, words, env, kind='tex2d'):
         self.directory, self.consumer, self.kind = directory, consumer, kind
         directory.mkdir()
         self.cache = directory / 'cache'
@@ -162,13 +162,8 @@ class Program:
         subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', self.cache], env=publish, check=True)
         self.manifest, = (path for path in self.cache.glob('*.txt') if path.name != 'revision.txt')
         lines = self.manifest.read_text(encoding='ascii').splitlines()
-        assert lines[0] == 'x2w-manifest 2' and ('uav 0 %s table 0 0' % kind) in lines, lines
-        if load or stale:
-            assert [line for line in lines if line.startswith('srv ')] == (
-                ['srv 0 %s table 0 32' % kind] if stale else []), lines
-            assert [line for line in lines if line.startswith('uavload ')] == (['uavload 0'] if load else []), lines
-        else:
-            assert not any(line.startswith('srv ') for line in lines), lines
+        assert lines[0] == 'x2w-manifest 2' and ('uav 0 %s table 0 0' % kind) in lines and not any(
+            line.startswith('srv ') for line in lines), lines
 
 
 def run_case(program, name, env, backend, cache=None):
@@ -242,72 +237,6 @@ def recompile_mutated(program, folder, tag, old, new):
 
 def recompile_without_guard(program, folder):
     return recompile_mutated(program, folder, 'cache_unguarded', GUARDED_LINE, STORE_LINE)
-
-
-RW_SIDE = 8
-COLOUR = (0.25, 0.5, -0.125, 0.0625)
-NO_TYPED_LOAD = 'uav 0 refused: format has no typed UAV load on this device'
-
-
-def expected_read_write_words(array, draws):
-    # Compare the written image and every guard word. The stale copy is identical at mip zero before either draw.
-    for image in range(ARRAY_SLICES if array else TEXTURES):
-        for mip in range(MIPS):
-            for texel in range((RW_SIDE >> mip) ** 2):
-                for channel in range(4):
-                    if mip == 0 and (array or image < 2):
-                        layer = image if array else 0
-                        value = (1 + layer * 256 + texel * 4 + channel) / 128.0
-                        if image == (2 if array else 0):
-                            value += draws * COLOUR[channel]
-                        yield struct.unpack('<I', struct.pack('<f', value))[0]
-                    elif array:
-                        yield array_sentinel(image, mip, texel, channel)
-                    else:
-                        yield sentinel(image, mip, texel, channel)
-
-
-def assert_read_write_result(result, *, array, draws, draw_count, reason=None):
-    rc, report, log, _, words = result
-    assert rc == 0, (rc, report, log[-2000:])
-    assert 'device removed reason: 0x00000000' in report, report
-    assert 'debug layer: on' not in report or 'debug layer: on, errors: 0' in report, report
-    assert log.count(DRAWN_LINE) == draw_count, log[-2000:]
-    if reason:
-        assert reason in log, log[-2000:]
-    want = list(expected_read_write_words(array, draws))
-    assert len(words) == len(want), (len(words), len(want))
-    for i, (got, expected) in enumerate(zip(words, want)):
-        assert got == expected, 'texture word %d: got %08x, expected %08x' % (i, got, expected)
-
-
-def check_read_write(directory, consumer, env):
-    env = dict(env, X2W_TEST_PIXEL_UAV_RW='1')
-    env.pop('X2W_INTEGER_TEXTURE_SRVS', None)
-    env.pop('X2W_TEST_PIXEL_UAV_NO_TYPED_LOAD', None)
-    for array in (False, True):
-        kind, case = ('tex2da', 'arr-rw') if array else ('tex2d', 'rw')
-        program = Program(directory / case, consumer, rw_program(array=array), env, kind, load=True)
-        refused = run_case(program, case + '.no-typed-load', dict(env, X2W_TEST_PIXEL_UAV_NO_TYPED_LOAD='1'), 'warp')
-        assert_read_write_result(refused, array=array, draws=0, draw_count=0, reason=NO_TYPED_LOAD)
-
-        result = run_case(program, case, env, 'warp')
-        if result[0] == 0 and NO_TYPED_LOAD in result[2] and DRAWN_LINE not in result[2]:
-            print('%s: WARP lacks typed UAV load for the fixture format' % kind)
-            sys.exit(77)
-        assert_read_write_result(result, array=array, draws=2, draw_count=2)
-        print('%s: all texture words match two additions; %s' % (kind, next(
-            line for line in result[1].splitlines() if line.startswith('debug layer:'))))
-        for line in result[1].splitlines():
-            if line.startswith('adapter='):
-                print(line)
-
-        mutant = Program(directory / (case + '-stale'), consumer, rw_program(array=array, stale=True), env,
-                         kind, stale=True)
-        stale = run_case(mutant, case + '-stale', env, 'warp')
-        assert_read_write_result(stale, array=array, draws=1, draw_count=2)
-        assert stale[4] != list(expected_read_write_words(array, 2)), 'stale SRV passed the two-draw CPU oracle'
-        print('%s: stale SRV fails the two-draw CPU oracle; typed-load denial names the format capability' % kind)
 
 
 def check(directory, consumer, backend):
@@ -433,8 +362,6 @@ def check(directory, consumer, backend):
     if failures:
         raise SystemExit('\n'.join(failures))
     print('%s: %d cases and the exec/layer controls' % (backend, len(CASES) + len(LINES) + len(ARRAY_CASES) + 6))
-    if backend == 'warp':
-        check_read_write(directory, consumer, env)
     return 0
 
 

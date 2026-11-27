@@ -1,8 +1,10 @@
 // Experimental (docs/startup-runtime.md): which D3D12_FORMAT_SUPPORT2 bits a pixel-stage image store needs.
 //
 // tools/startup/gfx2hlsl.py writes 'uav N tex2d table P O' for every RWTexture2D<float4> a pixel program stores to,
-// and a 'uavload N' line after it for an explicit texel load from that view or a partial-mask store that
-// preserves channels. The draw requires UAV_TYPED_STORE and, when that line is present, UAV_TYPED_LOAD.
+// and a 'uavload N' line after it when the program also reads that texture through the UAV: a store whose dmask
+// selects only some channels reads the texel back, replaces those channels and writes it again. A typed UAV store
+// needs UAV_TYPED_STORE; the read-back also needs UAV_TYPED_LOAD, which many formats lack on many devices, so the
+// draw is refused by name instead of reading undefined data.
 #pragma once
 
 namespace x2w_startup {
