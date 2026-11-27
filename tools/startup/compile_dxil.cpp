@@ -72,10 +72,11 @@ static CapturedViews read_captured_views(const fs::path& request_path) {
     const auto& request = views.request;
     auto refusal = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
     if (!refusal.empty()) throw std::runtime_error(refusal);
-    const auto contract = x2w_startup::global_srv_contract(request, error);
-    if (contract == x2w_startup::GlobalSrvContract::none) throw std::runtime_error(error);
-    views.contract = contract == x2w_startup::GlobalSrvContract::typed_dword ? x2w::HeapViewContract::typed_dword
-                                                                             : x2w::HeapViewContract::raw_buffer;
+    if (request.needed != x2w_startup::GlobalSrvType::raw_buffer)
+        throw std::runtime_error(std::string("GPU-selected heap slot view type ") +
+                                 x2w_startup::global_srv_type_name(request.needed) +
+                                 " is not raw_buffer; only raw buffer heap reads are translated");
+    views.contract = x2w::HeapViewContract::raw_buffer;
     return views;
 }
 
@@ -136,7 +137,7 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
         }
         if(views.present){
             const bool heap_read=std::any_of(program.bindings.begin(),program.bindings.end(),[](const auto& b){
-                return x2w::compute_heap_binding(b.kind) || b.kind==x2w::ComputeViewKind::heap_stride_srv;});
+                return b.kind==x2w::ComputeViewKind::heap_buffer_srv || b.kind==x2w::ComputeViewKind::heap_stride_srv;});
             if(heap_read){
                 auto refusal=x2w_startup::refuse_global_srv_selection(views.request.views,views.request.selected,views.request.needed);
                 if(!refusal.empty())throw std::runtime_error(refusal);

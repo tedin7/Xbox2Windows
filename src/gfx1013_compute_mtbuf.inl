@@ -1,8 +1,7 @@
 // MTBUF uses the instruction's explicit format and the descriptor's byte range.
 // Format numbers follow tools/disasm_rdna2.py MTBUF_FORMATS. Conversion and
 // unaligned addressing follow gfx2hlsl.tbuffer / ldu, cross-checked against
-// Victory 9376fd6 format_load. Only the runtime-checked identity raw SRV is used, or
-// its byte window (the byte-address rewrite of the descriptor, read as the same raw view).
+// Victory 9376fd6 format_load. Only the runtime-checked identity raw SRV is used.
 enum class ChannelNumber { unorm, snorm, uscaled, sscaled, uint_, sint, float_ };
 struct MtbufFamily {
     unsigned first, last, bits, components;
@@ -54,11 +53,7 @@ void formatted_byte_load(const Inst &i, const State &s) {
         refuse(i.pc, "MTBUF destination tuple overflow");
     const unsigned width = family->bits;
     const auto numeric = static_cast<ChannelNumber>(unsigned(family->first_number) + format - family->first);
-    // The byte-address rewrite of a descriptor (stride cleared in word 1) is read as the same raw view, as for MUBUF.
-    const unsigned base = (i.b >> 16 & 31) * 4;
-    const auto handle = resource(i, s, base, s.at(base + 1).type == Symbol::Type::zero_stride_word
-                                                 ? ComputeViewKind::byte_window_srv
-                                                 : ComputeViewKind::raw_vector_srv, 4);
+    const auto handle = resource(i, s, (i.b >> 16 & 31) * 4, ComputeViewKind::raw_vector_srv, 4);
     const unsigned scalar_offset = i.b >> 24;
     auto addr = to_string(i.a & 4095);
     if (scalar_offset != 125 && scalar_offset != 128)

@@ -337,42 +337,23 @@ void check_pipeline_shape(const x2w::NativeComputePipeline &pipeline) {
         throw std::runtime_error("native pipeline has an unexpected binding layout");
 }
 
-// The pipeline contract a request's metadata allows; empty error when it is translated.
-x2w::HeapViewContract heap_contract(const x2w_startup::GlobalSrvRequest &request, std::string &error) {
-    const auto contract = x2w_startup::global_srv_contract(request, error);
-    return contract == x2w_startup::GlobalSrvContract::typed_dword ? x2w::HeapViewContract::typed_dword
-                                                                   : x2w::HeapViewContract::raw_buffer;
-}
-
 int record(int argc, wchar_t **argv) {
-    if (argc < 8 || argc > 11) return 2;
+    if (argc != 8 && argc != 9) return 2;
     const std::wstring expect = argv[7];
-    bool guard = true, need_given = false;
-    GlobalSrvType needed = GlobalSrvType::raw_buffer;
-    for (int a = 8; a < argc; ++a) {
-        const std::wstring_view flag = argv[a];
-        if (flag == L"--no-guard" && guard) {
-            guard = false;
-        } else if (flag == L"--need" && a + 1 < argc && !need_given) {
-            need_given = true;
-            std::string name;  // a view type name: ASCII, anything else names no type
-            for (const wchar_t c : std::wstring_view(argv[++a])) name += c < 0x80 ? static_cast<char>(c) : '?';
-            needed = x2w_startup::global_srv_type_from_name(name);
-            if (needed == GlobalSrvType::none) return 2;
-        } else {
-            return 2;
-        }
-    }
-    if (expect != L"ok" && expect != L"refused") return 2;
+    const bool guard = !(argc == 9 && std::wstring_view(argv[8]) == L"--no-guard");
+    if ((argc == 9 && guard) || (expect != L"ok" && expect != L"refused")) return 2;
     const unsigned selector = static_cast<unsigned>(std::stoul(argv[6]));
     const fs::path cdx = argv[4];
     Rig rig;
     if (int skip = rig.open(argv[5])) return skip;
     try {
         x2w::ShaderDxilCompiler compiler(argv[2]);
+        auto pipeline = x2w::create_native_compute_pipeline(rig.device.Get(), compiler, cdx, 0, argv[3], true,
+                                                            x2w::HeapViewContract::raw_buffer);
+        check_pipeline_shape(pipeline);
         rig.create_io();
         x2w_startup::GlobalSrvRequest request;
-        request.needed = needed;
+        request.needed = GlobalSrvType::raw_buffer;
         request.views.push_back(rig.add_slot(0, GlobalSrvType::raw_buffer, slot_words * 4));
         request.views.push_back(rig.add_slot(1, GlobalSrvType::raw_buffer, slot_words * 4));
         request.views.push_back(rig.add_slot(2, GlobalSrvType::texture, 0));
@@ -384,25 +365,14 @@ int record(int argc, wchar_t **argv) {
         auto views_path = cdx;
         views_path.replace_extension(L".views");
         std::ofstream(views_path, std::ios::binary) << x2w_startup::encode_global_srv_request(request);
-        std::printf("captured select=%u need=%s views=%s\n", request.selected,
-                    x2w_startup::global_srv_type_name(request.needed), views_path.string().c_str());
-        // The contract depends on the captured views, not on the selection: the shader is translated for every record,
-        // a refused selection included.
-        std::string error;
-        const auto contract = heap_contract(request, error);
-        if (!error.empty()) {
-            std::printf("refused: %s\n", error.c_str());
-            return refused_path(rig, expect == L"ok");
-        }
-        auto pipeline = x2w::create_native_compute_pipeline(rig.device.Get(), compiler, cdx, 0, argv[3], true, contract);
-        check_pipeline_shape(pipeline);
+        std::printf("captured select=%u need=raw_buffer views=%s\n", request.selected, views_path.string().c_str());
         const auto diagnostic = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
         if (!diagnostic.empty() && guard) {
             std::printf("refused select=%u: %s\n", request.selected, diagnostic.c_str());
             return refused_path(rig, expect == L"ok");
         }
-        if (request.selected >= slot_count || request.views[request.selected].type != request.needed)
-            throw std::runtime_error("--no-guard only dispatches a slot of the needed view type");
+        if (request.selected >= slot_count || request.views[request.selected].type != GlobalSrvType::raw_buffer)
+            throw std::runtime_error("--no-guard only dispatches a raw buffer slot");
         rig.dispatch(pipeline, nullptr, rig.slots[request.selected].Get());
         if (expect == L"refused") {
             // Discrimination control: without the guard the shader ran, so the output must have changed.
@@ -440,14 +410,16 @@ int replay(int argc, wchar_t **argv) {
         }
         if (error.empty())
             error = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
-        auto contract = x2w::HeapViewContract::raw_buffer;
-        if (error.empty()) contract = heap_contract(request, error);
+        if (error.empty() && request.needed != GlobalSrvType::raw_buffer)
+            error = std::string("GPU-selected heap slot view type ") + x2w_startup::global_srv_type_name(request.needed) +
+                    " is not raw_buffer; only raw buffer heap reads are translated";
         if (!error.empty()) {
             std::printf("refused: %s\n", error.c_str());
             return refused_path(rig, expect == L"ok");
         }
         x2w::ShaderDxilCompiler compiler(argv[2]);
-        auto pipeline = x2w::create_native_compute_pipeline(rig.device.Get(), compiler, cdx, 0, argv[3], true, contract);
+        auto pipeline = x2w::create_native_compute_pipeline(rig.device.Get(), compiler, cdx, 0, argv[3], true,
+                                                            x2w::HeapViewContract::raw_buffer);
         check_pipeline_shape(pipeline);
         std::ifstream shader(cso, std::ios::binary);
         if (!shader) throw std::runtime_error("missing compiled shader " + cso.string());
@@ -483,6 +455,7 @@ int wmain(int argc, wchar_t **argv) {
         return 4;
     }
     std::fputs("usage: native_global_srv_heap_replay root OUT.root | record SDK CACHE REQ.cdx ADAPTER SELECTOR ok|refused "
-               "[--no-guard] [--need raw_buffer|typed_buffer] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT [EXPECTED_WORDS]\n", stderr);
+               "[--no-guard] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT "
+               "[EXPECTED_WORDS]\n", stderr);
     return 2;
 }

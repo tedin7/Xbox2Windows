@@ -381,19 +381,6 @@ def main():
         broken[10] = 0xbf800000  # Leave NUM_RECORDS in elements instead of bytes.
         check("byte-count-missing-product", "gfx1013-container-ps",
               patched_pixel(len(broken), broken, table=True), "non-contiguous resource descriptor")
-        # The same rewrite in compute, read by MTBUF loads through s[28:31] (v_mov_b32 v5, 0 as the offset):
-        # tbuffer_load_format_x v8, v5, s[28:31], 0 format:[BUF_FMT_32_UINT] offen and
-        # tbuffer_load_format_xyzw v[8:11], v5, s[28:31], 0 format:[BUF_FMT_8_8_8_8_UNORM] offen.
-        tbuffer_view = [*byte_view[:13], 0x7e0a0280]
-        check("compute-tbuffer-byte-window", cs, compute(words(*tbuffer_view, 0xe8a01000, 0x80070805, end), table=True))
-        check("compute-tbuffer-byte-window-unorm", cs,
-              compute(words(*tbuffer_view, 0xe9c31000, 0x80070805, end), table=True))
-        # Over-acceptance control only: without the byte-count product the window fields do not match.
-        tbuffer_broken = tbuffer_view.copy()
-        tbuffer_broken[10] = 0xbf800000
-        check("compute-tbuffer-byte-count-missing-product", cs,
-              compute(words(*tbuffer_broken, 0xe8a01000, 0x80070805, end), table=True),
-              "non-contiguous resource descriptor")
         # Convert v11 to a half in the high word of v6, retaining v6.low.
         # Widen the selected high word back from a scalar source into v7.
         halves = [0x7e0c02ff, 0xa5a53600, 0x7e1602ff, 0x3f801000, 0x7e0c14f9, 0x06150b,

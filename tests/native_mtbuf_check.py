@@ -15,19 +15,10 @@ CASES = [(24, 2, 0), (24, 2, 4), (56, 4, 3), (60, 4, 7), (13, 1, 12),
 PACKED = struct.pack("<6I", 0x7fff8000, 0x40008001, 0x007fff81, 0xfc003c00, 0x0001bc00, 0x42987ec5)
 
 
-# The byte-address rewrite of the SRV descriptor s[32:35] in place (LLVM 15): s_waitcnt lgkmcnt(0);
-# s_bfe_u32 s40, s33, 0xe0010 (stride); s_max_u32 s40, s40, 1; s_mul_i32 s34, s34, s40 (byte count);
-# s_and_b32 s33, s33, 0xc000ffff (stride cleared); s_and_b32 s35, s35, 0xcfffffff; s_or_b32 s35, s35, 0x30000000.
-BYTE_WINDOW = [0xbf8cc07f, 0x93a8ff21, 0x000e0010, 0x84a88128, 0x93222822, 0x8721ff21, 0xc000ffff,
-               0x8723ff23, 0xcfffffff, 0x8823ff23, 0x30000000]
-
-
-def program(unsigned, window=False):
+def program(unsigned):
     # Load a raw SRV and UAV from separate table parameters. One writer per group.
-    # With window, every MTBUF load reads the byte window of the SRV (same raw view, same expected values).
     words = [sop1(3, 20, 4), sop1(3, 21, 128), sop1(3, 22, 5), sop1(3, 23, 128),
              0xf4080000 | 32 << 6 | 10, 0xfa000020, 0xf4080000 | 36 << 6 | 11, 0xfa000020,
-             *(BYTE_WINDOW if window else ()),
              scalar(0x1e, 7, 6, 135), vmove(8, 7), sop1(3, 126, 129)]
     pos = 0
     for index, (fmt, channels, disp) in enumerate(CASES):
@@ -85,8 +76,8 @@ def main(cli, gpu, sdk):
             start = 8 + 32 * group
             row = expected(group)
             reference[start:start + len(row)] = row
-        for unsigned, window in ((False, False), (True, False), (False, True)):
-            words = program(unsigned, window)
+        for unsigned in (False, True):
+            words = program(unsigned)
             marker = write_request(work, words, root.read_bytes(), sa)
             dest = work / "result.bin"
             run = subprocess.run([gpu, sdk, marker, work/"cache", "0", dest, "--direct"])
@@ -99,7 +90,6 @@ def main(cli, gpu, sdk):
                 assert differences and set(differences) <= {8, 9, 40, 41}, differences
             else:
                 assert not differences, [(i, hex(actual[i]), hex(reference[i])) for i in differences]
-        words = program(False)  # the guards below change the plain (non-window) program
         insn = next(i for i, w in enumerate(words) if w >> 26 == 0x3a)
         for op, error in ((words[insn] | (1 << 13), "without index"),
                           (0xe8001000 | 24 << 19 | 3 << 16, "absent component")):
@@ -109,8 +99,7 @@ def main(cli, gpu, sdk):
             reject = subprocess.run([cli, sdk, work/"cache", "gfx1013-direct-cs@0", marker, work/"bad.cso"],
                                     capture_output=True, text=True)
             assert reject.returncode and error in reject.stderr and not (work/"bad.cso").exists(), reject.stderr
-        print(f"MTBUF matched {2 * len(row)} result words, also through the SRV byte window, and all guards; "
-              "changed format, index and component controls passed.")
+        print(f"MTBUF matched {2 * len(row)} result words and all guards; changed format, index and component controls passed.")
 
 
 if __name__ == "__main__":
