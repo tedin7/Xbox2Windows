@@ -767,7 +767,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             InterlockedIncrement(&compute_aliased_input_copies);
         }
     }
-    ID3D12DescriptorHeap* view_heap = draw_heap;
+    ID3D12DescriptorHeap* view_heap = draw_heaps[0].heap;
     UINT first = 0;
     if (!reason && tr->dynamic_heap) {
         if (dispatch.signature) reason = "translated indirect Dispatch requires fixed-table raw buffers";
@@ -781,6 +781,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!view_heap) reason = "the dynamic resource heap could not be bound";
         }
     }
+    const UINT twins = static_cast<UINT>(tr->integer_srvs.twins.size());
+    const UINT extra_srvs = tr->integer_srvs.descriptors();
+    const UINT n = static_cast<UINT>(count) + extra_srvs;
+    if (!reason && !tr->dynamic_heap) reason = allocate_draw_table(self, n, view_heap, first);
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -796,16 +800,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (!dispatch.signature && first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16))
             log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return reason;
-    }
-    const UINT twins = static_cast<UINT>(tr->integer_srvs.twins.size());
-    const UINT extra_srvs = tr->integer_srvs.descriptors();
-    const UINT n = static_cast<UINT>(count) + extra_srvs;
-    if (!tr->dynamic_heap) {
-        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
-        if (first + n > draw_heap_size) {
-            first = 0;
-            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
-        }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
@@ -854,9 +848,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (tr->dynamic_heap || !pass.heap_set) {
+    if (tr->dynamic_heap || pass.bound_view_heap != view_heap) {
         x2w_startup::bind_translated_heaps(list, view_heap, nullptr);
-        pass.heap_set = !tr->dynamic_heap;
+        pass.bound_view_heap = tr->dynamic_heap ? nullptr : view_heap;
         pass.bound_sampler_heap = nullptr;
     }
     list->SetPipelineState(tr->pipeline.Get());
