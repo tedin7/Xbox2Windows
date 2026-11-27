@@ -20896,7 +20896,7 @@ def translate_mesh57(out_dir, key):
     sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
     if ps:
         sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
-    manifest = pipe.manifest()
+    manifest = pipe.manifest().replace('\n', '\nkey %016x\n' % key, 1)
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
     compile_enabled = os.environ.get('X2W_FXC') != ''

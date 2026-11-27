@@ -4022,7 +4022,8 @@ struct IndirectIndexView {
     bool upload = false;
 };
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument,
-                                     u64 offset, const IndirectIndexView& indices);
+                                     u64 offset, const IndirectIndexView& indices, bool mesh);
+bool is_slot57_mesh_pipeline(Wrapper* pipeline, const std::vector<RootParameter>* root);
 struct TranslatedDispatch {
     D3D12_DISPATCH_ARGUMENTS groups{};
     ID3D12CommandSignature* signature = nullptr;
@@ -4217,11 +4218,18 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
-    const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
-        (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+    const bool translated_mesh = mesh && pass.pipeline && !pass.pipeline->own().real && pass.root &&
+        is_slot57_mesh_pipeline(pass.pipeline, pass.root);
+    const bool translated = translated_mesh || ((command == IndirectCommand::draw || indexed) && pass.pipeline &&
+        !pass.pipeline->own().real && (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW"));
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
+    if (translated_mesh && (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
+        pass.requested_mesh_pipeline = pass.pipeline;
+        pass.requested_mesh_root = pass.root;
+        request_slot57_mesh(pass.pipeline, pass.root);
+    }
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -4406,7 +4414,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     }
     if (translated) {
         const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource,
-                                                       offset, index_view);
+                                                       offset, index_view, translated_mesh);
         if (failure) return refuse(failure, indirect_graphics_pipeline);
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
         return;
