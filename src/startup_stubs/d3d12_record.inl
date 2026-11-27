@@ -41,9 +41,20 @@ LONG64 volatile calls_written, blobs_stored;
 u64 bytes_written;
 LONG volatile stop_requested, cap_reached;
 u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the file is this large
+// X2W_REPLAY_PREFIX_MAX_MIB (0 = off, the legacy single cap): the prefix before the window has its own cap and the window
+// cap above counts from the size the file had when the window opened, so a large prefix cannot eat the window's room.
+u64 prefix_max_bytes = 0, window_base_bytes = 0;
+bool window_base_set = false;
 // The thunk checks active before doing any recorder work. Window and prefix
 // selection is published by present(); the prefix ends when the window opens.
 std::atomic<bool> window_open{false}, prefix_open{false};
+inline bool cap_exceeded(u64 extra = 0)
+{
+    const u64 total = bytes_written + extra;
+    if (!prefix_max_bytes) return total >= max_bytes;
+    if (!window_base_set) return prefix_open.load() ? total >= prefix_max_bytes : total >= max_bytes;
+    return total - window_base_bytes >= max_bytes;
+}
 std::atomic<unsigned> memory_epoch{0};
 constexpr LONG memory_cache_presents = 16;
 // "slow": the window opens at the first present after slow_after_s whose gap to the previous present is at least
@@ -116,7 +127,13 @@ bool in_window()
 void update_window()
 {
     window_open = in_window();
-    if (window_open) prefix_open = false;
+    if (window_open) {
+        if (!window_base_set) {
+            window_base_bytes = prefix_open ? bytes_written : 0;
+            window_base_set = true;
+        }
+        prefix_open = false;
+    }
 }
 
 // The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
@@ -519,7 +536,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
         drain(b);
-        if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+        if (cap_exceeded() && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
         ReleaseSRWLockExclusive(&file_lock);
     }
     ReleaseSRWLockExclusive(&b.lock);
@@ -621,6 +638,12 @@ void flush_all(bool at_exit)
 // so a large cache cannot hold the exit up. file_lock held.
 void write_shader_cache(bool at_exit)
 {
+    // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
+    char shaders[8]{};
+    if (GetEnvironmentVariableA("X2W_REPLAY_SHADERS", shaders, sizeof(shaders)) && shaders[0] == '0') {
+        if (!at_exit) log("x2w-replay record: shader cache not written (X2W_REPLAY_SHADERS=0)");
+        return;
+    }
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH - 4) return;
@@ -801,6 +824,9 @@ void install()
     const DWORD c = GetEnvironmentVariableA("X2W_REPLAY_MAX_MIB", cap, sizeof(cap));
     const unsigned long long cap_mib = c && c < sizeof(cap) ? std::strtoull(cap, nullptr, 10) : 0;
     if (cap_mib) max_bytes = cap_mib << 20;
+    char prefix_cap[24]{};
+    const DWORD pc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_MAX_MIB", prefix_cap, sizeof(prefix_cap));
+    if (pc && pc < sizeof(prefix_cap)) prefix_max_bytes = std::strtoull(prefix_cap, nullptr, 10) << 20;
     file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         log("x2w-replay record: cannot create %s (error %lu)", path, GetLastError());

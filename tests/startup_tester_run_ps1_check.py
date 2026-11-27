@@ -468,7 +468,8 @@ def check_shell(shell):
         auto_zip = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(auto_zip) as z:
             auto_env = json.loads(z.read("manifest.json").decode("utf-8-sig"))["env"]
-        assert auto_env["X2W_REPLAY_RECORD"] == "slow" and auto_env["X2W_REPLAY_MAX_MIB"] == "400", auto_env
+        assert auto_env["X2W_REPLAY_RECORD"] == "slow" and auto_env["X2W_REPLAY_MAX_MIB"] == "400" \
+                and auto_env["X2W_REPLAY_SHADERS"] == "0" and auto_env["X2W_REPLAY_PREFIX_MAX_MIB"] == "512", auto_env
         assert "uploaded" not in auto.stdout and "UPLOAD_THESE_FILES" not in auto.stdout, "-NoUpload keeps the recording local"
         rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64")
         assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])

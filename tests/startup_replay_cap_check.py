@@ -86,7 +86,8 @@ def main(scene, backend):
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
         for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_DIR", "X2W_REPLAY_MAX_MIB",
-                     "X2W_PRESENT_PICTURES", "X2W_TEST_REPLAY_RECORDER", "X2W_TEST_INPUT_LAYOUT", "X2W_REPLAY_PAGES"):
+                     "X2W_PRESENT_PICTURES", "X2W_TEST_REPLAY_RECORDER", "X2W_TEST_INPUT_LAYOUT", "X2W_REPLAY_PAGES",
+                     "X2W_REPLAY_SHADERS", "X2W_REPLAY_PREFIX_MAX_MIB"):
             env.pop(name, None)
         args = [scene, vs, ps, root, backend]
         code, text, _ = timed(args + [1], env)
@@ -125,6 +126,29 @@ def main(scene, backend):
         print("replay prefix cap: %d calls at XEND, zero recorder calls afterward" % calls)
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
+
+        # X2W_REPLAY_SHADERS=0: no SHDR chunk and no shader cache line; without it the cache files are embedded.
+        with_shaders = directory / "with_shaders.x2wr"
+        code, text, _ = timed(args + [12], dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(with_shaders)))
+        assert code == 0, text[-2000:]
+        assert b"SHDR" in with_shaders.read_bytes(), "the control recording holds no shader cache"
+        bare = directory / "bare.x2wr"
+        code, text, _ = timed(args + [12], dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(bare),
+                                               X2W_REPLAY_SHADERS="0"))
+        assert code == 0, text[-2000:]
+        assert b"SHDR" not in bare.read_bytes(), "X2W_REPLAY_SHADERS=0 still wrote shader chunks"
+        end_totals(bare)
+
+        # X2W_REPLAY_PREFIX_MAX_MIB: the prefix has its own cap and the window cap counts from the window's start, so the
+        # same prefix that the 1 MiB cap above stops before the window now lets the window open and record its presents.
+        windowed = directory / "windowed.x2wr"
+        code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="f5,3", X2W_REPLAY_RECORD_FILE=str(windowed),
+                                                      X2W_REPLAY_MAX_MIB=str(CAP_MIB), X2W_REPLAY_PREFIX_MAX_MIB="64",
+                                                      X2W_TEST_REPLAY_RECORDER="cap", X2W_REPLAY_SHADERS="0"))
+        assert code == 0, text[-3000:]
+        assert "BEFORE the window opened" not in text, "the prefix hit a cap that is not its own:\n" + text[-3000:]
+        _, _, _, window_presents = end_totals(windowed)
+        assert window_presents > 0, "the window recorded no present"
 
         # "slow": the window opens at the first present after a gap of 300 ms or more, lasts 0.15 s, and the file ends with
         # its XEND. The 400 ms pause before frame 15 makes present 16 such a present; a loaded machine can stall 300 ms
