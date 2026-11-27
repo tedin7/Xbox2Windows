@@ -11,6 +11,7 @@
 
 The zip holds every file the run wrote in its log folder (stdout, stderr, events, finished, threads, files, trap.log,
 translate, translate_err, window*.png, bink_luma.png ...), the debugger summary (`<logdir>.out`) and manifest.json.
+The zip includes `REPORT.txt` with the producer capture summary derived from stderr.
 Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
 `shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
 of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason, and for a key the
@@ -31,6 +32,9 @@ import os
 import sys
 import zipfile
 import zlib
+from bisect import bisect_left
+from collections import Counter, defaultdict
+from itertools import groupby
 
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
@@ -568,6 +572,212 @@ HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
 
 
+REPORT_NAME = "REPORT.txt"
+READBACK_RE = re.compile(
+    r"^x2w-render presented surface .*?mean level ([0-9.]+)/255, spread ([0-9.]+)")
+ARMED_RE = re.compile(r"\bcapture=(\d+)\.\.(\d+)(?:\s|$)")
+
+
+def interpolate(value, points):
+    """Interpolate between logged heartbeats, without extrapolating beyond them."""
+    right = bisect_left(points, (value,))
+    if right < len(points) and points[right][0] == value:
+        return points[right][1]
+    if 0 < right < len(points):
+        x0, y0 = points[right - 1]
+        x1, y1 = points[right]
+        return y0 + (value - x0) * (y1 - y0) / (x1 - x0)
+    return None
+
+
+def capture_picture_lines(first, last, beats, pictures, timeline_text):
+    times = sorted(dict((frame, seconds) for _, frame, seconds in beats).items())
+    t1, t2 = (interpolate(frame, times) for frame in (first, last))
+    seconds = "..".join("unknown" if t is None else f"{t:.2f}" for t in (t1, t2))
+    if not pictures:
+        # The window timeline has timestamps, while the stderr readbacks have
+        # only a readback counter. Never interpret that counter as a present.
+        frames = sorted(dict((seconds, frame) for _, frame, seconds in beats).items())
+        for second, mean in sorted(PICTURE_RE.findall(timeline_text), key=lambda row: float(row[0])):
+            frame = interpolate(float(second), frames)
+            if frame is not None:
+                pictures.append((round(frame), round(frame), float(mean), None))
+
+    before = next((mean for lo, hi, mean, _ in reversed(pictures)
+                   if hi is not None and hi < first), None)
+    inside = dict.fromkeys(mean for lo, hi, mean, _ in pictures
+                           if lo >= first and hi is not None and hi <= last)
+    phase = "the run's last picture phase is unknown"
+    if pictures:
+        start = pictures[0]
+        for picture in pictures[1:]:
+            if abs(picture[2] - start[2]) > 2 or picture[3] != start[3]:
+                start = picture
+        lo, hi, mean, _ = start
+        present = str(lo) if lo == hi else f"{lo}..{hi if hi is not None else '?'}"
+        if lo > last:
+            gap = str(lo - last) if lo == hi else (
+                f"at least {lo - last}" if hi is None else f"{lo - last}..{hi - last}")
+            relation = f"BEFORE it by {gap} presents"
+        elif hi is not None and hi <= first:
+            relation = "INSIDE it"
+        elif lo >= first and hi is not None and hi <= last:
+            relation = "overlaps its start"
+        else:
+            relation = "timing relative to its start is uncertain"
+        phase = f"the run's last picture phase starts at present {present} (mean {mean:g}) : capture is {relation}"
+    previous = "unknown" if before is None else f"{before:g}"
+    levels = ", ".join(f"{mean:g}" for mean in inside) or "none observed"
+    return (f"capture: presents {first}..{last} = seconds {seconds}; picture before it: mean {previous}; "
+            f"pictures inside it: {levels}; {phase}")
+
+
+def producer_report(stderr_text, timeline_text=""):
+    rows = defaultdict(list)
+    readbacks, beats, anchors, trees, reasons = [], [], [], [], []
+    armed = None
+    for index, line in enumerate(stderr_text.splitlines()):
+        beat = HEARTBEAT_RE.match(line)
+        if beat:
+            frame, seconds = beat.groups()
+            beats.append((index, int(frame), float(seconds)))
+            anchors.append((index, int(frame)))
+        picture = READBACK_RE.match(line)
+        if picture:
+            mean, spread = map(float, picture.groups())
+            present = re.search(r"\bpresent(?:=| )([0-9]+)\b", line)
+            readbacks.append((index, int(present[1]) if present else None, mean, spread < 4))
+        if not line.startswith("x2w-red "):
+            continue
+        kind, _, payload = line[len("x2w-red "):].partition(" ")
+        fields = dict(re.findall(r"(\w+)=(\S+)", payload))
+        if kind in {"present", "producer", "flat", "attachments", "input"}:
+            rows[kind].append(fields)
+        if armed is None and line.startswith("x2w-red auto armed "):
+            match = ARMED_RE.search(line)
+            if match and int(match[1]) <= int(match[2]):
+                armed = (*map(int, match.groups()), fields)
+        if kind == "tree":
+            trees.append(line)
+        if kind == "WARNING" or line.startswith("x2w-red not armed"):
+            reasons.append(line)
+        if kind in ("auto", "sample") and fields.get("published_at", "").isdigit():
+            anchors.append((index, int(fields["published_at"])))
+
+    lines = ["Producer capture"]
+    if armed is None:
+        lines.append("capture: nothing armed — " + ("; ".join(reasons) or "no auto armed line"))
+    else:
+        first, last, trigger = armed
+        pictures = []
+        for index, present, mean, flat in readbacks:
+            right = bisect_left(anchors, (index,))
+            lo = anchors[right - 1][1] if right else 1
+            hi = anchors[right][1] if right < len(anchors) else None
+            pictures.append((lo, hi, mean, flat) if present is None else (present, present, mean, flat))
+        lines.append(capture_picture_lines(first, last, beats, pictures, timeline_text))
+        lines.append("Picture phases use observed readbacks; seconds between heartbeats are interpolated.")
+        lines.extend(capture_writer_lines(rows, first, last, trigger))
+    if trees:
+        lines.extend(["tree:", *trees])
+    return "\n".join(lines) + "\n"
+
+
+def capture_writer_lines(rows, first, last, trigger):
+    def in_capture(row, field):
+        return row.get(field, "").isdigit() and first <= int(row[field]) <= last
+
+    def writer(row):
+        return "clear" if row["op"].startswith("clear-") else row["key"]
+
+    present_targets = {row["target"].lower() for row in rows["present"] if "target" in row}
+    producer_fields = {"order", "ordinal", "record", "submit", "target", "op", "key", "rt", "rgba", "before"}
+    producers = sorted(
+        (r for r in rows["producer"] if producer_fields <= r.keys()
+         and all(r[k].isdigit() for k in ("order", "ordinal", "record", "submit"))),
+        key=lambda r: (int(r["submit"]), int(r["order"]), int(r["ordinal"])),
+    )
+    lines = []
+    changed = next((r for r in producers if r["rgba"] != r["before"]), None)
+    if changed:
+        r = changed
+        lines.append("first op that wrote the target colour (any target): "
+                     f"op {r['op']} key {r['key']} rt {r['rt']} target {r['target']}, "
+                     f"record {r['record']} submit {r['submit']} -> rgba {r['rgba']}")
+        lines.append(f"before: rgba {r['before']}")
+    onset = next((r for r in rows["flat"] if {"previous_present", "sampled_present", "previous_rgba"} <= r.keys()), None)
+    if onset:
+        lines.append(f"first present turning: {onset['sampled_present']} "
+                     f"(previous present {onset['previous_present']}, rgba {onset['previous_rgba']})")
+    elif "sampled_present" in trigger:
+        lines.append(f"first present turning: {trigger['sampled_present']}")
+
+    # Readbacks have submission order and a submit frame. Attachment rows
+    # describe recording only, so they cannot establish the back-buffer order.
+    frames, other, sources = defaultdict(list), defaultdict(Counter), {}
+    for r in producers:
+        if not in_capture(r, "submit"):
+            continue
+        target = r["target"].lower()
+        label = writer(r)
+        if target not in present_targets:
+            other[target][label] += 1
+            continue
+        rgb, before = (r[field].rsplit(",", 1)[0] for field in ("rgba", "before"))
+        frames[int(r["submit"])].append((label, rgb if rgb != before else "unchanged"))
+        sources.setdefault((target, r["key"]), set())
+
+    for labels, group in groupby(range(first, last + 1), key=lambda f: frames.get(f, [])):
+        start = stop = next(group)
+        for stop in group:
+            pass
+        if labels:
+            chain = ", then ".join(f"{key} (centre {rgb})" for key, rgb in labels)
+            lines.append(f"presents {start}..{stop}: back buffer written by {chain}")
+        else:
+            lines.append(f"presents {start}..{stop}: no back-buffer writer recorded")
+    for target, counts in other.items():
+        labels = ", ".join(f"{key} x{count}" for key, count in counts.items())
+        lines.append(f"other targets written: {target} by {labels}")
+
+    passes, writes = defaultdict(list), defaultdict(lambda: defaultdict(list))
+    multi = 0
+    for r in rows["attachments"]:
+        if (not in_capture(r, "record") or not r.get("targets", "").isdigit()
+                or "key" not in r or "dsv" not in r):
+            continue
+        frame, count = int(r["record"]), int(r["targets"])
+        colours = [r.get(f"rt{i}", "-/-").rsplit("/", 1) for i in range(min(count, 8))]
+        passes[r["key"]].append((frame, "+".join(parts[-1] for parts in colours) or "-",
+                                 r["dsv"].rsplit("/", 1)[-1]))
+        multi += count > 1
+        for target in {parts[0].lower() for parts in colours if parts[0] != "-"}:
+            writes[target][r["key"]].append(frame)
+
+    for r in rows["input"]:
+        # Input discovery can happen before arming and is logged once per source.
+        if r.get("record", "").isdigit() and int(r["record"]) <= last and "source" in r:
+            pair = (r.get("target", "").lower(), r.get("key"))
+            if pair in sources:
+                sources[pair].add(r["source"].lower())
+    for (target, key), inputs in sources.items():
+        if not inputs:
+            lines.append(f"inputs for {key} target {target}: no sources recorded")
+        for source in sorted(inputs):
+            summary = ", ".join(f"{k} ({len(frames)} rows, first present {min(frames)})"
+                                for k, frames in sorted(writes[source].items()))
+            lines.append(f"input for {key} target {target} source {source}: "
+                         + (summary or "no draw wrote it inside the capture"))
+
+    lines.append("Pass and input-writer counts use recorded draw attachments.")
+    lines.append(f"passes: {len(passes)} distinct pipeline keys; {multi} draws with more than one colour target")
+    for key, draws in sorted(passes.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+        frames, colours, depths = zip(*draws)
+        lines.append(f"pass {key}: {len(draws)} rows, {len(set(frames))} frames, "
+                     f"colour formats {', '.join(sorted(set(colours)))}, depth format {', '.join(sorted(set(depths)))}")
+    return lines
+
+
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
     """One row per `window` seconds: frames presented and fps in that window (from the cumulative 'heartbeat' lines of the
     stand-in) and the mean level of the last window picture inside it, so the phases of a run read in one place instead of
@@ -829,7 +1039,8 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                 texts[name] = handle.read()
     if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
         add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
-    files = log_files(logdir)
+    add(REPORT_NAME, producer_report(texts.get("stderr.txt", ""), texts.get("timeline.txt", "")).encode("utf-8"))
+    files = [entry for entry in log_files(logdir) if entry[0] != REPORT_NAME]
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:
         for member, data in chunks(name, path, chunk_bytes):
