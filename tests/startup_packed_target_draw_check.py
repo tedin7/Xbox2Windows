@@ -76,7 +76,9 @@ def check_placeholder(work, consumer, dxc, vs, ps, root, image, env, key):
         if mode == "clipped":
             assert pixels == clear and pixels != reference, "clipped draw must fail the CPU colour comparison"
         else:
-            assert pixels == reference, f"{mode}, marked={marked}: unexpected RGBA8 readback"
+            colours = sorted({tuple(pixels[i:i + 4]) for i in range(0, len(pixels), 4)})[:6]
+            assert pixels == reference, (f"{mode}, marked={marked}: unexpected RGBA8 readback, {len(pixels)} bytes, "
+                                         f"colours {colours}\n{result.stderr[-1500:]}")
     print("startup placeholder WARP: marked and unmarked 8x8 readbacks matched; clipped draw failed the comparison")
 
 
