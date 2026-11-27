@@ -4869,7 +4869,7 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
-    # gfx2hlsl v_permlane16_b32 in a straight-line compute program, exchanged through groupshared memory (Run O audit).
+    # gfx2hlsl lane permutes in proven converged compute blocks, exchanged through groupshared memory.
     add_test(NAME startup_compute_permlane16_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py")
     foreach(adapter IN ITEMS warp hardware)

@@ -20,6 +20,8 @@ def cross(dst, src, low=P.S_LOW, high=P.S_HIGH, flags=0):
 
 PROGRAM = b''.join([
     P.HEAD,
+    P.sopc(P.S_CMP_EQ_U32, 7, BASE.INLINE_0), P.sopp(0x04, 1),
+    P.vop1(P.V_MOV_B32, 6, 256),
     P.sop1(P.S_MOV_B32, P.S_LOW, P.LITERAL, LOW),
     P.sop1(P.S_MOV_B32, P.S_HIGH, P.LITERAL, HIGH),
     cross(8, 5, flags=2),
@@ -67,6 +69,12 @@ def check_controls():
     one = cross(8, 5) + P.S_ENDPGM
     P.refused('v_permlanex16_b32 in a compute program requires a group of whole 32-lane row pairs',
               lambda: translate(one, (16, 1, 1)))
+    branch = b''.join([P.sopc(P.S_CMP_EQ_U32, 7, BASE.INLINE_0), P.sopp(0x04, 1),
+                       P.vop1(P.V_MOV_B32, 3, 256), one])
+    flow = translate(branch)
+    assert 'GroupMemoryBarrierWithGroupSync();' in flow
+    skipped = b''.join([P.sopc(P.S_CMP_EQ_U32, 7, BASE.INLINE_0), P.sopp(0x04, 2), one])
+    P.refused('requires a straight-line compute program with entry EXEC', lambda: translate(skipped))
     bad = bytearray(one); bad[1] |= 0x20
     P.refused('unsupported', lambda: translate(bytes(bad)))
     P.refused('unsupported', lambda: translate(cross(8, 5, 256, P.S_HIGH) + P.S_ENDPGM))

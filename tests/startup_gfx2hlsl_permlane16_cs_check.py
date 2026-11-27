@@ -10,7 +10,7 @@
 v_permlane16_b32 vdst, vsrc0, ssrc1, ssrc2 (AMD RDNA 2 ISA reference, VOP3 lane permutes; LLVM 15 gfx10): inside each row of
 16 lanes, lane i reads vsrc0 of lane sel[i] of the same row; sel[i] is 4-bit field i of ssrc1 for lanes 0..7 and field i - 8
 of ssrc2 for lanes 8..15. The reference below is a scalar lane oracle written from that rule, not from the translated text.
-The exchange goes through a groupshared array behind group barriers, only in a straight-line compute program with entry EXEC
+The exchange goes through a groupshared array behind group barriers, only in a compute program with proven entry EXEC
 in a group of whole rows (so the op_sel fetch-inactive and bound_ctrl flags, which only decide what a disabled lane reads,
 decide nothing).
 """
@@ -97,9 +97,11 @@ def check_controls():
     # whole rows only
     for bad in ((4, 1, 1), (12, 1, 1), (8, 1, 1)):
         refused('requires a group of whole rows', lambda g=bad: translate(code=one, group=g).hlsl_cs())
-    # straight-line code with entry EXEC only
+    # A converged block is safe; a path that skips the exchange is not.
     branchy = b''.join([sopc(S_CMP_EQ_U32, 7, BASE.INLINE_0), sopp(0x04, 1), vop1(V_MOV_B32, 3, 256), one])
-    refused('requires a straight-line compute program with entry EXEC', lambda: translate(code=branchy).hlsl_cs())
+    assert 'GroupMemoryBarrierWithGroupSync();' in translate(code=branchy).hlsl_cs()
+    skipped = b''.join([sopc(S_CMP_EQ_U32, 7, BASE.INLINE_0), sopp(0x04, 2), one])
+    refused('requires a straight-line compute program with entry EXEC', lambda: translate(code=skipped).hlsl_cs())
     # an SGPR source is a word the decoder reports as unsupported, so it is refused too
     sgpr_source = struct.pack('<2I', 0xd4000000 | V_PERMLANE16_B32 << 16 | 8, 6 | S_LOW << 9 | S_HIGH << 18)
     refused('unsupported', lambda: translate(code=sgpr_source + S_ENDPGM).hlsl_cs())

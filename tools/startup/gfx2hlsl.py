@@ -5624,7 +5624,8 @@ class Stage:
                         pending.extend(succ[block])
         self.compute_dpp_entry = {}
         if (getattr(self, 'kind', None) == 'cs' and
-                any(name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT
+                any((name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT) or
+                    name in ('v_permlane16_b32', 'v_permlanex16_b32')
                     for name in names.values())):
             self.compute_dpp_entry = self.compute_dpp_sites(branches, names)
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
@@ -12596,7 +12597,7 @@ class Stage:
         """v_permlane16_b32 vdst, vsrc0, ssrc1, ssrc2 (RDNA 2 ISA, VOP3 lane permutes; LLVM 15 gfx10): inside each row of
         16 lanes, lane i reads vsrc0 of lane sel[i] of the same row, where sel[i] is the 4-bit field i of ssrc1 (lanes
         0..7) or of ssrc2 (lanes 8..15). The op_sel flags (fetch-inactive, bound_ctrl) only decide what a disabled lane
-        reads, so the form is taken only where every lane is enabled: a straight-line compute program with entry EXEC
+        reads, so the form is taken only where every lane is enabled: a compute program with proven entry EXEC
         in a group of whole rows. Exchanged through groupshared memory like the DPP swaps (compute_quad_gate)."""
         self.permlane16(ops, mods, cross_row=False)
 
@@ -12614,7 +12615,7 @@ class Stage:
             raise Unsupported('%s outside a compute program' % name)
         if cross_row and math.prod(self.pipe.group) % 32:
             raise Unsupported('v_permlanex16_b32 in a compute program requires a group of whole 32-lane row pairs')
-        self.compute_quad_gate(name, row_ror8=True)
+        self.compute_quad_gate(name, row_ror8=True, allow_flow=True)
         x, y, _z = self.pipe.group
         flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
         lane = '(%s & 15u)' % flat
