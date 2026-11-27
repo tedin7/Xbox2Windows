@@ -1430,6 +1430,7 @@ def mesh_root_layout_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
+    group_reference_controls()
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, HEAP_MESH, root_blob=heap_root())
         expect('heap branch translates', result, 'ok')
@@ -1506,6 +1507,8 @@ def controls():
         expect('published files', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
         expect('a translated request is not pending', G.pending_keys(tmp, False), [])
         manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+        expect('mesh manifest identifies request key', [line for line in manifest if line.startswith('key ')],
+               ['key %016x' % key])
         expect('paired manifest stage information',
                [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
                ['params 1', 'targets 0'])
@@ -1850,6 +1853,18 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
+
+
+def group_reference_controls():
+    """Check that the runtime fixture's negative controls have distinct images."""
+    points, colours, indices = geometry()
+    full = rasterise(points, colours, indices, len(points), len(indices))
+    group_zero = rasterise(points, colours, indices[:2], len(points), 2)
+    no_constants = rasterise(points, colours, indices, 0, 0)
+    clear = [(0, 0, 0, 255)] * (SIDE * SIDE)
+    expect('one group differs from two groups', group_zero != full, True)
+    expect('zero entry counts leave the target clear', no_constants, clear)
+    expect('zero entry counts differ from two groups', no_constants != full, True)
 
 
 def lane_mask_reference(label, full, mutant=None):

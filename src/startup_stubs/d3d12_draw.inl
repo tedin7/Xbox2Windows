@@ -160,6 +160,8 @@ struct Translation {
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     bool placeholder = false;
+    bool mesh = false;
+    bool mesh_pixel = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
@@ -515,6 +517,46 @@ bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
     return read;
 }
 
+// Mesh manifests have a separate suffix and never take the synchronous first-read path.
+x2w_startup::ManifestPrefetch& mesh_manifest_prefetch()
+{
+    static x2w_startup::ManifestPrefetch source([] {
+        x2w_startup::ManifestPrefetch::Io io;
+        io.list = [] {
+            std::vector<u64> keys;
+            wchar_t dir[MAX_PATH], pattern[MAX_PATH + 16];
+            const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+            if (!n || n >= MAX_PATH) return keys;
+            swprintf(pattern, MAX_PATH + 16, L"%s\\*.ms57.txt", dir);
+            WIN32_FIND_DATAW found;
+            HANDLE find = FindFirstFileW(pattern, &found);
+            if (find == INVALID_HANDLE_VALUE) return keys;
+            do {
+                if (wcslen(found.cFileName) != 25) continue;
+                wchar_t* end = nullptr;
+                const u64 key = wcstoull(found.cFileName, &end, 16);
+                if (end == found.cFileName + 16) keys.push_back(key);
+            } while (FindNextFileW(find, &found));
+            FindClose(find);
+            return keys;
+        };
+        io.read = [](u64 key, std::string& text) {
+            wchar_t path[MAX_PATH];
+            return cache_path(path, L"", key, L".ms57.txt") && read_text(path, text);
+        };
+        return io;
+    }());
+    static const HANDLE worker = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        for (;;) {
+            auto& prefetch = mesh_manifest_prefetch();
+            const std::size_t loaded = prefetch.has_wanted() ? prefetch.scan() : 0;
+            Sleep(loaded ? 50 : 250);
+        }
+    }, nullptr, 0, nullptr);
+    (void)worker;
+    return source;
+}
+
 bool read_text(const wchar_t* path, std::string& out)
 {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -603,12 +645,16 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt")) return;
-    if (!lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, false)) {
+    if (!cache_path(path, L"", tr.key, tr.mesh ? L".ms57.txt" : L".txt")) return;
+    const bool present = tr.mesh ? mesh_manifest_prefetch().fetch(tr.key, manifest)
+                                 : lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, false);
+    if (!present) {
         if (!tr.retry_manifest_at) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
-            if (rtv_request.empty() && first_calls(missing, 12))
+            if (tr.mesh)
+                log("x2w-draw slot57 mesh %016llx: translation pending", tr.key);
+            else if (rtv_request.empty() && first_calls(missing, 12))
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
         }
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
@@ -617,16 +663,49 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     // The writer publishes this marker last. A malformed published result stays rejected.
     const bool previously_missing = tr.retry_manifest_at != 0;
     tr.retry_manifest_at = 0;
-    bool matched_rtv = false;
+    bool matched_rtv = false, mesh_version = false, mesh_key = false, mesh_no_ps = false;
+    int mesh_ud_count = -1;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
         if (end == std::string::npos) end = manifest.size();
         std::string line = manifest.substr(at, end - at);
         if (!line.empty() && line.back() == '\r') line.pop_back();
         at = end + 1;
+        if (tr.mesh && !line.empty()) {
+            static const char* prefixes[] = {"x2w-manifest ", "key ", "ud ", "udsrc ", "srv ",
+                "srvtypes ", "srvint ", "srvuse ", "d16srv ", "uav ", "uavload ", "smp ", "smpc ", "smpl ",
+                "smpheap ", "params ", "targets ", "ps ", "wmask ", "placeholder "};
+            bool known = line == "dynamic_heap";
+            for (const char* prefix : prefixes)
+                if (line.compare(0, std::strlen(prefix), prefix) == 0) { known = true; break; }
+            if (!known) {
+                log("x2w-draw slot57 mesh %016llx: unknown manifest line: %s", tr.key, line.c_str());
+                return;
+            }
+        }
         int i = 0, x = 0, y = 0;
         char kind[16] = "", source[16] = "";
-        if (line.compare(0, 12, "placeholder ") == 0) {
+        if (tr.mesh && line.compare(0, 13, "x2w-manifest ") == 0) {
+            if (mesh_version || (line != "x2w-manifest 1" && line != "x2w-manifest 2" && line != "x2w-manifest 3")) {
+                log("x2w-draw slot57 mesh %016llx: unsupported manifest version", tr.key);
+                return;
+            }
+            mesh_version = true;
+        } else if (tr.mesh && line.compare(0, 3, "ud ") == 0) {
+            int count = -1, consumed = 0;
+            if (mesh_ud_count >= 0 || std::sscanf(line.c_str(), "ud %d%n", &count, &consumed) != 1 ||
+                consumed != static_cast<int>(line.size()) || count < 0 || count > 32) {
+                log("x2w-draw slot57 mesh %016llx: invalid ud count", tr.key);
+                return;
+            }
+            mesh_ud_count = count;
+        } else if (tr.mesh && line == "ps none") {
+            if (mesh_no_ps || tr.mesh_pixel) {
+                log("x2w-draw slot57 mesh %016llx: pixel stage mismatch", tr.key);
+                return;
+            }
+            mesh_no_ps = true;
+        } else if (line.compare(0, 12, "placeholder ") == 0) {
             // The rest of the line is the original pixel-stage refusal.
             tr.placeholder = true;
         } else if (line.compare(0, 5, "rtv1 ") == 0) {
@@ -635,6 +714,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
+        } else if (tr.mesh && line.compare(0, 4, "key ") == 0) {
+            char expected[32];
+            std::snprintf(expected, sizeof(expected), "key %016llx", tr.key);
+            if (mesh_key || line != expected) {
+                log("x2w-draw slot57 mesh %016llx: manifest key mismatch", tr.key);
+                return;
+            }
+            mesh_key = true;
         } else if (line.compare(0, 13, "x2w-manifest ") == 0 &&
                    line != "x2w-manifest 1" && line != "x2w-manifest 2" && line != "x2w-manifest 3") {
             // Version 2 adds UAV bindings. Version 3 adds scalar descriptor entry words.
@@ -665,8 +752,23 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 ud.kind = Translation::desc_word;
             }
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
+            if (tr.mesh && (i < 0 || static_cast<std::size_t>(i) != tr.uds.size() || ud.kind < 0 ||
+                (ud.kind == Translation::root_constant && (fields != 4 || x < 0 || y < 0)) ||
+                ((ud.kind == Translation::stride || ud.kind == Translation::d16_unorm16 || ud.kind == Translation::desc_word3) && fields != 3))) {
+                log("x2w-draw slot57 mesh %016llx: invalid udsrc line: %s", tr.key, line.c_str());
+                return;
+            }
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
-        } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
+        } else if (const int fields = std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y); fields >= 4) {
+            if (tr.mesh && (i < 0 || static_cast<std::size_t>(i) != tr.srvs.size() || x < 0 ||
+                (std::strcmp(kind, "buf") && std::strcmp(kind, "tex2d") && std::strcmp(kind, "tex2da") &&
+                 std::strcmp(kind, "tex3d") && std::strcmp(kind, "tex1d")) ||
+                (std::strcmp(source, "table") && std::strcmp(source, "vb") && std::strcmp(source, "root")) ||
+                (!std::strcmp(source, "table") && (fields != 5 || y < 0)) ||
+                (std::strcmp(source, "table") && fields != 4))) {
+                log("x2w-draw slot57 mesh %016llx: invalid srv line: %s", tr.key, line.c_str());
+                return;
+            }
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
@@ -714,16 +816,25 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             tr.uavs.push_back(uav);
+        } else if (tr.mesh && (line.compare(0, 6, "udsrc ") == 0 || line.compare(0, 4, "srv ") == 0 ||
+                              line.compare(0, 3, "ps ") == 0)) {
+            log("x2w-draw slot57 mesh %016llx: invalid manifest line: %s", tr.key, line.c_str());
+            return;
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
         }
     }
+    if (tr.mesh && (!mesh_version || mesh_ud_count < 0 || static_cast<std::size_t>(mesh_ud_count) != tr.uds.size() ||
+                    mesh_no_ps == tr.mesh_pixel)) {
+        log("x2w-draw slot57 mesh %016llx: incomplete or inconsistent manifest", tr.key);
+        return;
+    }
     if (matched_rtv != !rtv_request.empty()) {
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
-    if ((!tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if ((!tr.mesh && !tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
     if (!tr.integer_srvs.valid(static_cast<UINT>(tr.srvs.size()), static_cast<UINT>(tr.uds.size()),
                               [&](UINT i) { return tr.srvs[i].kind != 0; })) return;
     const UINT twins = static_cast<UINT>(tr.integer_srvs.twins.size());
@@ -732,9 +843,32 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
             return;
     }
-    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
-    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u),
+    const auto load_stage = [&](const wchar_t* suffix, ID3DBlob** blob) {
+        if (!cache_path(path, L"", tr.key, suffix)) return false;
+        if (tr.mesh) {
+            WIN32_FILE_ATTRIBUTE_DATA info{};
+            if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info) || info.nFileSizeHigh ||
+                !info.nFileSizeLow || info.nFileSizeLow > (1u << 20)) return false;
+        }
+        return SUCCEEDED(D3DReadFileToBlob(path, blob));
+    };
+    if (!load_stage(tr.mesh ? L".ms57.cso" : L".vs.cso", &tr.vs) ||
+        ((!tr.mesh || tr.mesh_pixel) && !load_stage(tr.mesh ? L".ps57.cso" : L".ps.cso", &tr.ps))) {
+        if (tr.mesh) log("x2w-draw slot57 mesh %016llx: missing or invalid bytecode", tr.key);
+        return;
+    }
+    if (tr.mesh) {
+        const D3D12_SHADER_BYTECODE ms{tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
+        const D3D12_SHADER_BYTECODE ps = tr.ps ? D3D12_SHADER_BYTECODE{tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()}
+                                                : D3D12_SHADER_BYTECODE{};
+        if (desktop_dxil_mesh_stage(ms) != DxilMeshStage::mesh ||
+            (tr.ps && desktop_dxil_mesh_stage(ps) != DxilMeshStage::pixel)) {
+            log("x2w-draw slot57 mesh %016llx: bytecode stage mismatch", tr.key);
+            return;
+        }
+    }
+    const UINT constants = static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u);
+    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), tr.mesh && !constants ? 1 : constants,
         static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
@@ -745,6 +879,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw pipeline %016llx placeholder ps: %s", tr.key, tr.placeholder_ps.c_str());
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
+    if (tr.mesh) log("x2w-draw slot57 mesh %016llx: translation ready", tr.key);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
@@ -901,28 +1036,30 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+struct Slot57MeshRequest {
+    u64 key = 0;
+    std::vector<unsigned char> root_blob, mesh, pixel;
+};
+
+bool read_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, Slot57MeshRequest& request)
 {
-    wchar_t marker[MAX_PATH];
-    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    if (!bound_root) return false;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return false;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return;  // VS at +0x48
+    if (words[9] || words[10]) return false;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return;
-    std::vector<unsigned char> root_blob;
+    if (!root || root_info(root) != bound_root) return false;
     {
         note_lock_acquire(false);
-        if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
+        if (const auto found = root_blobs().find(root); found != root_blobs().end()) request.root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return;
-    std::vector<unsigned char> mesh, pixel;
+    if (request.root_blob.empty()) return false;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
         const auto bytes = words[field + 1];
@@ -931,9 +1068,22 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    if (!copy_stage(13, true, request.mesh) || !copy_stage(5, false, request.pixel)) return false;
     const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
-    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, seed)));
+    request.key = fnv_part(request.root_blob, fnv_part(request.pixel, fnv_part(request.mesh, seed)));
+    return true;
+}
+
+void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+{
+    wchar_t marker[MAX_PATH];
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    Slot57MeshRequest request;
+    if (!read_slot57_mesh_request(pipeline, bound_root, request)) return;
+    const auto& root_blob = request.root_blob;
+    const auto& mesh = request.mesh;
+    const auto& pixel = request.pixel;
+    const u64 key = request.key;
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
@@ -1210,6 +1360,20 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         if (!root_blob.empty() && a_bytes && b_bytes && a_bytes <= (1u << 20) && b_bytes <= (1u << 20) && x2w_local::readable(a, a_bytes) &&
             x2w_local::readable(b, b_bytes)) {
             result = cached_translation(a, a_bytes, b, b_bytes, root_blob);
+        } else if (bound->guest_root) {
+            Slot57MeshRequest request;
+            if (read_slot57_mesh_request(pipeline, bound->guest_root, request)) {
+                static std::unordered_map<u64, Translation*> mesh_translations;
+                auto& entry = mesh_translations[request.key];
+                if (!entry) {
+                    entry = new Translation;
+                    entry->key = request.key;
+                    entry->mesh = true;
+                    entry->mesh_pixel = !request.pixel.empty();
+                    load_translation(*entry);
+                }
+                result = entry;
+            }
         }
     }
     by_pipeline[pipeline] = bound;
@@ -1278,6 +1442,14 @@ bool needs_rtv_variant(DXGI_FORMAT format)
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
+    if (base->mesh) {
+        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at) load_translation(*base);
+        if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+            log("x2w-draw slot57 mesh %016llx: target format specialization unavailable", base->key);
+            return nullptr;
+        }
+        return base;
+    }
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
@@ -1308,6 +1480,12 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
+template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Value>
+struct alignas(void*) MeshStreamValue {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Value value{};
+};
+
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
@@ -1324,7 +1502,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
-    desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
+    if (tr.ps) desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
     if (indexed_rect) {
         if (!tr.indexed_rect_geometry_attempted) {
             tr.indexed_rect_geometry_attempted = true;
@@ -1355,6 +1533,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (bound.has_rasterizer) {
         desc.RasterizerState = bound.rasterizer;
     } else {
+        // Slot 57 currently has no decoded rasterizer, so it uses this same translated-draw default.
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         desc.RasterizerState.DepthClipEnable = TRUE;
@@ -1366,7 +1545,40 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     X2W_ZONE("desktop pipeline creation");
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+    HRESULT hr;
+    if (tr.mesh) {
+        struct MeshStream {
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
+            MeshStreamValue<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
+        } stream;
+        stream.root.value = desc.pRootSignature;
+        stream.ms.value = desc.VS;
+        stream.ps.value = desc.PS;
+        stream.blend.value = desc.BlendState;
+        stream.mask.value = desc.SampleMask;
+        stream.raster.value = desc.RasterizerState;
+        stream.depth.value = desc.DepthStencilState;
+        stream.topology.value = desc.PrimitiveTopologyType;
+        stream.targets.value.NumRenderTargets = desc.NumRenderTargets;
+        std::copy(desc.RTVFormats, desc.RTVFormats + desc.NumRenderTargets, stream.targets.value.RTFormats);
+        stream.dsv.value = desc.DSVFormat;
+        stream.sample.value = desc.SampleDesc;
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+        x2w_startup::ComPtr<ID3D12Device2> device2;
+        hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device2));
+        if (SUCCEEDED(hr)) hr = device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&pipeline));
+    } else {
+        hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+    }
     log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
         pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
         static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
@@ -3721,6 +3933,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
+    // Mesh recording is not wired to this draw entry yet.
+    if (tr && tr->mesh) {
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, 1);
+    }
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;
