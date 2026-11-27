@@ -2536,34 +2536,38 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Pixel-stage image stores.** In a pixel stage, `image_store` with `dim:SQ_RSRC_IMG_2D` and
   `dmask:0xf` becomes a typed store to a `RWTexture2D<float4>` at its own `u` register, under the
   lane's exec bit, and the manifest becomes version 2 with a
-  `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
-  channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
-  `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
-  and stores the same image are refused by name. A
+  `uav <index> tex2d table <table> <offset>` line. 2D arrays use `tex2da`. The cache-policy
+  bits are accepted. A partial channel mask reads the original texel to preserve the other channels.
+  A pixel stage can also load mip zero with plain `image_load` and store through the same fixed eight-word
+  table descriptor. The translator retries with one read-write binding for that image. Both operations
+  use the lane's exec bit. Writes by other pixels in the draw are unordered.
+  Shared views require matching dimensions and full-width load addresses and data. Explicit mip,
+  integer-view, filtered, gather and LOD-query loads cannot share a stored view. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
   texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
 - **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
   as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
   view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
-  mip 0 of a 2D texture, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
+  mip 0 of a 2D texture or the slices named by a 2D-array view. The texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
   with their reason and nothing is bound in place of the view. When the manifest is loaded, the
   translation is not used for another image kind, a buffer line (`uav N raw table P O`,
   the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
   `channels`, an index out of order or more than eight views. At draw time,
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
   entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
-  array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
-  sRGB or non-colour format, a format without typed UAV store (or, for a store whose dmask selects only some
-  channels, which reads the texel back and is marked by a `uavload N` line after its `uav` line, without
-  typed UAV load; `tests/startup_pixel_uav_support_check.cpp`), and a texture that is also an SRV,
+  array for a 2D view, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
+  sRGB or non-colour format, a format without typed UAV store (or without typed UAV load when the manifest
+  has a `uavload N` line for that view; `tests/startup_pixel_uav_support_check.cpp`), and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
-  written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
-  draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
+  written or any texture changes state. Indirect draws refuse a translation with a `uav` line. A resource-specific
+  UAV barrier before a draw with `uavload N` orders earlier writes to that resource. `tests/startup_pixel_uav_check.py`
   draws the program above through the runtime with four 4x4 two-mip textures in which every word is
   a distinct sentinel. The texel lands only in the texture the table names, and every other word of
   the four textures stays unchanged; each refusal leaves every word unchanged. The exec-off variant
-  leaves the texel, and must fail once recompiled without its guard. Run
+  leaves the texel and fails once recompiled without its guard. The WARP suite also draws twice into a patterned
+  8×8 2D image and an array slice. It checks every texture word against a CPU reference, requires a stale
+  SRV copy to miss the second addition, and masks typed-load support to verify the runtime refusal. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_uav_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
