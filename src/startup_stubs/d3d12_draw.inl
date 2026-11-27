@@ -1575,6 +1575,7 @@ bool bigbind_once_enabled()
 struct BigBinding {
     std::size_t bytes = 0;
     bool readable = false;
+    bool fallback_failed = false;
     UploadReservation slice;
 };
 
@@ -1616,6 +1617,7 @@ struct GpuMirror {
 using GpuMirrorKey = std::pair<u64, std::pair<u64, std::size_t>>;
 std::map<GpuMirrorKey, GpuMirror> gpu_mirrors;
 std::size_t gpu_mirror_bytes;
+bool gpu_mirror_ring_exhausted;  // Protected by draw_lock and cleared at Present.
 
 // allocator_lock held. Reuse is safe after the old recording becomes unreplayable
 // and all queues that may still be reading it have finished.
@@ -1695,6 +1697,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         return owner ? found->second.resource.Get() : nullptr;
     }
 
+    if (gpu_mirror_ring_exhausted) return nullptr;
     bool valid = false;
     AcquireSRWLockShared(&allocator_lock);
     const bool idle = found == gpu_mirrors.end() || gpu_mirror_idle(found->second);
@@ -1739,6 +1742,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         };
         std::vector<DirtyBlock> dirty;
         std::vector<u64> hashes((bytes + gpu_mirror_block_bytes - 1) / gpu_mirror_block_bytes);
+        dirty.reserve(hashes.size());
         const auto* title = reinterpret_cast<const unsigned char*>(address);
         static const bool skip_updates = x2w_local::env_on("X2W_TEST_GPU_MIRROR_STALE");
         for (std::size_t i = 0; i < hashes.size(); ++i) {
@@ -1748,17 +1752,26 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
             if (valid && offset < mirror.bytes &&
                 length == (std::min)(mirror.bytes - offset, gpu_mirror_block_bytes) &&
                 (skip_updates || hashes[i] == mirror.hashes[i])) continue;
-            const auto padded = (length + 3) & ~std::size_t{3};
-            auto slice = reserve_upload_ring(self, padded);
-            if (!slice.mapped) return nullptr;
-            std::memcpy(slice.mapped, title + offset, length);
-            std::memset(slice.mapped + length, 0, padded - length);
-            dirty.push_back({offset, length, slice});
+            dirty.push_back({offset, length, {}});
         }
 
-        // Allocate tracking space before recording any barriers or copies, so failure can fall back.
+        // Finish all potentially allocating bookkeeping before taking ring space.
         auto& states = pass_of(self).states;
         states.reserve(states.size() + 1);
+        for (auto& block : dirty) {
+            const auto padded = (block.bytes + 3) & ~std::size_t{3};
+            block.slice = reserve_upload_ring(self, padded);
+            if (!block.slice.mapped) {
+                // Earlier slices are held by this list. Stop staging new mirrors until Present.
+                gpu_mirror_ring_exhausted = true;
+                return nullptr;
+            }
+        }
+        for (const auto& block : dirty) {
+            const auto padded = (block.bytes + 3) & ~std::size_t{3};
+            std::memcpy(block.slice.mapped, title + block.offset, block.bytes);
+            std::memset(block.slice.mapped + block.bytes, 0, padded - block.bytes);
+        }
         if (!dirty.empty()) {
             require_state(self, resource, D3D12_RESOURCE_STATE_COPY_DEST);
             auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
@@ -1803,6 +1816,7 @@ std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
 
 void finish_bigbind_frame(LONG frame)
 {
+    gpu_mirror_ring_exhausted = false;
     if (!bigbind_no_reset_mutant()) big_bindings.clear();
     if (big_binding_chunks && !bigbind_no_reset_mutant()) {
         AcquireSRWLockExclusive(&allocator_lock);
@@ -1818,6 +1832,16 @@ void finish_bigbind_frame(LONG frame)
     if (report && big_binding_counts.trims)
         log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
             big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    if (report) {
+        static const bool two_lists = [] {
+            char mode[16]{};
+            GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+            return std::strcmp(mode, "once-mirror-two") == 0;
+        }();
+        if (two_lists)
+            log("x2w-draw mirror fixture frame %ld: %ld drawn, %ld refused, %ld oversize",
+                frame, translated_draws, untranslated_draws, upload_ring_oversize);
+    }
     big_binding_counts = {};
 }
 
@@ -3605,12 +3629,19 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 have = true;
             }
         }
+        // Match the switch-off view size if this recording cannot use the mirror.
+        const bool uncapped_mirror_fallback = mirror_candidate && [] {
+            static const bool on = x2w_local::env_on("X2W_TEST_GPU_MIRROR_UNCAPPED");
+            return on;
+        }();
+        if (mirror_candidate && !have && !uncapped_mirror_fallback)
+            bytes = (std::min)(bytes, gpu_mirror_min_bytes);
         if (readable_range && cached && !have) {
             auto& slice = cached->slice;
             if (slice.mapped) {
                 have = bind_upload_slice(self, slice);
                 if (have) InterlockedIncrement64(&big_copies_reused);
-            } else {
+            } else if (!cached->fallback_failed) {
                 slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
                 if (slice.mapped) {
                     std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
@@ -3623,6 +3654,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (have) {
                 offset = slice.offset;
                 chunk = slice.resource;
+            } else if (mirror_candidate && !uncapped_mirror_fallback) {
+                cached->fallback_failed = true;
             } else {
                 // A retry needs a fresh readability check before it can read title memory.
                 big_bindings.erase(bigbind_key(address, full_bytes));
