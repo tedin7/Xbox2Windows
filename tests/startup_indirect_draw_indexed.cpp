@@ -634,7 +634,7 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_scissor, mesh_pending, overflowing_count, rect_live_compute };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -819,7 +819,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
          const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
-         const PlainIndexDraw* plain_index = nullptr, ShadowIndexDraw* shadow = nullptr)
+         const PlainIndexDraw* plain_index = nullptr, ShadowIndexDraw* shadow = nullptr,
+         const std::array<std::uint32_t, width * height>* slot57_reference = nullptr)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -991,7 +992,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Index = void (WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
-    const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
+    const D3D12_RECT scissor{rect ? 1 : 0, 0,
+        static_cast<LONG>(width + (refusal == Refusal::mesh_scissor ? 1u : 0u)), height};
     if (cached_depth_only) {
         slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
         list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -1019,7 +1021,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (leased) {
         using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
         slot<RootSrv>(wrapped, 44)(wrapped, 0, leased->address);
-    } else if (cached_mesh_targets || cached_depth_only) {
+    } else if (cached_mesh_targets || cached_depth_only || slot57_reference) {
         using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
         const UINT values[]{17, 29};
         slot<Constants>(wrapped, 40)(wrapped, 0, 1, values, 0);
@@ -1277,6 +1279,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
                 auto wanted = drawn ? (cached_depth_only ? depth_word :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (slot57_reference)
+                    wanted = writer && refusal == Refusal::none ? (*slot57_reference)[y * width + x] : background;
                 if (plain_index)
                     wanted = refusal == Refusal::none && plain_index_cpu_covers(*plain_index, x, y) ? red : black;
                 if (shadow) {
@@ -2638,9 +2642,20 @@ int main(int argc, char** argv) try
         const void* ps = exchange_size ? static_cast<const void*>(source_ps.data()) : default_ps.data();
         const auto ms_size = exchange_size ? source_ms.size() : sizeof(default_ms);
         const auto ps_size = exchange_size ? source_ps.size() : sizeof(default_ps);
+        char mode[24]{};
+        GetEnvironmentVariableA("X2W_TEST_MESH57_REPLAY", mode, sizeof(mode));
+        const bool replay = mode[0] != 0;
+        const bool replay_depth = std::strncmp(mode, "depth", 5) == 0;
         const auto make_pso = [&](bool with_pixel, bool with_vertex, bool incomplete_pixel) {
             std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
+            std::array<UINT, 0x200 / sizeof(UINT)> state{};
+            // Depth test LESS, depth writes enabled.
+            if (!with_pixel) state[0xb8 / sizeof(UINT)] = 0x16;
             fields[0] = reinterpret_cast<UINT64>(root.Get());
+            if (replay) {
+                fields[1] = reinterpret_cast<UINT64>(state.data());
+                fields[2] = sizeof(state);
+            }
             fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps) : 0;
             fields[6] = with_pixel && !incomplete_pixel ? ps_size : 0;
             fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps) : 0;
@@ -2662,6 +2677,36 @@ int main(int argc, char** argv) try
             return run(device.Get(), guest.Get(), writer.Get(), nullptr, bound_root, pso, signature.Get(),
                        DrawKind::mesh, false, Refusal::none, label);
         };
+        if (replay) {
+            const auto pso = make_pso(!replay_depth, false, false);
+            const bool one_group = std::strcmp(mode, "one-group") == 0;
+            const bool refused = std::strcmp(mode, "off") == 0 || std::strcmp(mode, "depth-off") == 0 ||
+                std::strcmp(mode, "invalid") == 0;
+            const bool translated_replay = std::strstr(mode, "translated") != nullptr;
+            const auto expected_pixels = translated_replay
+                ? read_stage(replay_depth ? L"depth-translated.bin" : L"color-translated.bin")
+                : read_stage(replay_depth ? L"depth.bin" : L"color.bin");
+            std::array<std::uint32_t, width * height> reference{};
+            if (expected_pixels.size() != reference.size() * sizeof(reference[0])) return 1;
+            std::memcpy(reference.data(), expected_pixels.data(), expected_pixels.size());
+            const auto work = writer_pipeline(device.Get(), writer.Get(),
+                one_group ? "write_one_mesh_group" : "write_two_mesh_groups");
+            const auto verify = [&](Refusal expected, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                    DrawKind::mesh, !one_group, expected, label, nullptr, false, nullptr, false, false,
+                    0, replay_depth, false, nullptr, nullptr, false, nullptr, nullptr, &reference);
+            };
+            // The one-group control deliberately compares against the two-group pixel reference.
+            if (one_group)
+                return verify(Refusal::none, "slot57 one-group control") ? 1 : 0;
+            const bool ok = refused
+                ? verify(Refusal::mesh_pending, "slot57 refused result")
+                : verify(Refusal::none, replay_depth ? "slot57 depth" : "slot57 color") &&
+                  verify(replay_depth ? Refusal::mesh_attachment_count : Refusal::mesh_scissor,
+                         "slot57 mismatching attachments or scissor");
+            x2w_d3d12_fixture_target_report(0);
+            return ok ? 0 : 1;
+        }
         const auto pair = make_pso(true, false, false);
         const auto depth = make_pso(false, false, false);
         const auto aliased_vertex = make_pso(true, true, false);
