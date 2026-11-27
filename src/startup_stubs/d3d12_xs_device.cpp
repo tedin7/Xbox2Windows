@@ -44,6 +44,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/d3d12_replay_slots.h"
 #include "startup_stubs/list_upload_pages.h"
+#include "startup_stubs/descriptor_ring_segments.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
@@ -218,6 +219,7 @@ struct alignas(16) WrapperOwn {
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
+    UINT descriptor_run_heap, descriptor_run_next, descriptor_run_remaining; // allocator_lock
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
@@ -1661,6 +1663,21 @@ struct ComputeInputSnapshot {
     std::vector<std::pair<ID3D12Fence*, UINT64>> submits;
 };
 
+constexpr UINT draw_heap_size = 1u << 18;
+constexpr UINT draw_segment_size = 512;
+constexpr UINT draw_heap_limit = 4;
+using DrawSegments = x2w_startup::DescriptorRingSegments<draw_heap_size / draw_segment_size>;
+struct DrawHeap {
+    ID3D12DescriptorHeap* heap = nullptr;
+    DrawSegments segments;
+};
+struct DrawSegmentHold {
+    UINT heap;
+    DrawSegments::Run run;
+};
+std::array<DrawHeap, draw_heap_limit> draw_heaps;
+UINT draw_heap_count; // Growth under draw_lock, then allocator_lock.
+
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
 // stands for a pool of desktop allocators. A list records on the pool's current one. In render
@@ -1684,6 +1701,7 @@ struct DesktopAllocator {
     // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
     // queue that ran it has passed its fence (the allocator is reused only when idle).
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
+    std::vector<DrawSegmentHold> descriptor_runs; // Released on idle Reset, like scratches.
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1823,7 +1841,7 @@ void release_upload_recording(Wrapper* list)
     retire_list_arena(list);
     detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
+    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
         if (found->second) --found->second->lists;
         list_recordings.erase(found);
     }
@@ -1848,6 +1866,13 @@ bool allocator_idle(const DesktopAllocator* allocator)
     for (const auto& submit : allocator->submits)
         if (submit.first->GetCompletedValue() < submit.second) return false;
     return true;
+}
+
+// allocator_lock held, after successful Reset of an idle desktop allocator.
+void release_draw_segments(DesktopAllocator& allocator)
+{
+    for (const auto& hold : allocator.descriptor_runs) draw_heaps[hold.heap].segments.release(hold.run);
+    allocator.descriptor_runs.clear();
 }
 
 // allocator_lock held. A recording retains its descriptor snapshots behind the same fences as its upload pages.
@@ -2018,6 +2043,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             recycle_arenas(*next);
             next->indexed_validation.clear();
             next->scratches.clear();
+            release_draw_segments(*next);
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -2224,6 +2250,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                     recycle_arenas(*spare);
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
+                    release_draw_segments(*spare);
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -2271,6 +2298,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (compute_title_inputs_enabled()) compute_input_recordings.erase(self);
             retire_list_arena(self);
             state.list_scratch = nullptr;
+            state.descriptor_run_remaining = 0;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -3412,7 +3440,7 @@ struct Pass {
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
     ID3D12Resource* bound_depth = nullptr;
-    bool heap_set = false;
+    ID3D12DescriptorHeap* bound_view_heap = nullptr;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
@@ -4639,7 +4667,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     // The clear needs the GPU descriptor's own heap bound; the next translated draw binds its heaps again.
     ID3D12DescriptorHeap* bound[] = {view_heap};
     list->SetDescriptorHeaps(1, bound);
-    pass_of(self).heap_set = false;
+    pass_of(self).bound_view_heap = nullptr;
     const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     replay_dump::note(self, target);

@@ -694,6 +694,11 @@ target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi)
 add_test(NAME startup_view_desc COMMAND startup_view_desc)
 add_test(NAME startup_view_desc_warp COMMAND startup_view_desc warp)
 set_tests_properties(startup_view_desc_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+add_executable(startup_descriptor_ring_segments tests/startup_descriptor_ring_segments_check.cpp)
+target_include_directories(startup_descriptor_ring_segments PRIVATE src)
+target_compile_features(startup_descriptor_ring_segments PRIVATE cxx_std_17)
+add_test(NAME startup_descriptor_ring_segments COMMAND startup_descriptor_ring_segments)
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_srv_wrapper_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_srv_wrapper_check.py")
@@ -5277,6 +5282,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_descriptor_ring_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_descriptor_ring_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_descriptor_ring_${adapter} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(adapter STREQUAL "hardware")
+            set_tests_properties(startup_descriptor_ring_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})

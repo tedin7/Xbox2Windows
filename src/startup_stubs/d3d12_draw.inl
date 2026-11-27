@@ -1476,24 +1476,93 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     return pipeline;
 }
 
-// Private shader-visible heap for the translated draws' tables, used as a ring.
-constexpr UINT draw_heap_size = 1u << 18;
-ID3D12DescriptorHeap* draw_heap;
 Wrapper* draw_heap_device;
 UINT draw_heap_increment;
-volatile LONG draw_heap_cursor;
 
+// draw_lock and allocator_lock held.
+bool create_draw_heap(Wrapper* device)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    auto& heap = draw_heaps[draw_heap_count].heap;
+    if (FAILED(device_of(device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)))) return false;
+    ++draw_heap_count;
+    return true;
+}
+
+// draw_lock held. The translated pipelines and heaps are scoped to the startup device.
 bool ensure_draw_heap(Wrapper* device)
 {
-    // The translated pipeline and upload ring are scoped to the current
-    // startup render device. A list from another device cannot use this heap.
     if (!device || device != the_device) return false;
-    if (draw_heap) return device == draw_heap_device;
-    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
+    if (draw_heap_count) return device == draw_heap_device;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const bool created = create_draw_heap(device);
+    ReleaseSRWLockExclusive(&allocator_lock);
+    if (!created) return false;
     draw_heap_device = device;
-    draw_heap_increment = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    draw_heap_increment = device_of(device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
+}
+
+// allocator_lock held. Attach each run before exposing descriptors from it.
+const char* reserve_draw_segments(Wrapper* self, UINT views)
+{
+    static LONG missing_recording, oversized, heap_full, create_failed, retain_failed;
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (!state.list_open || found == list_recordings.end() || !found->second) {
+        if (first_calls(missing_recording, 1)) log("x2w-draw descriptor ring: no tracked recording");
+        return "no tracked descriptor recording";
+    }
+    if (views > draw_heap_size) {
+        if (first_calls(oversized, 1)) log("x2w-draw descriptor ring: table too large (%u descriptors)", views);
+        return "descriptor table too large";
+    }
+    const UINT segments = (views + draw_segment_size - 1) / draw_segment_size;
+    for (UINT i = 0; ; ++i) {
+        if (i == draw_heap_count) {
+            if (i == draw_heap_limit) {
+                if (first_calls(heap_full, 4))
+                    log("x2w-draw descriptor ring full (%u heaps, all segments held by unfinished recordings)", i);
+                return "descriptor ring full";
+            }
+            if (!create_draw_heap(state.list_device)) {
+                if (first_calls(create_failed, 4)) log("x2w-draw descriptor ring: heap creation failed");
+                return "descriptor ring heap creation failed";
+            }
+        }
+        auto& pool = draw_heaps[i].segments;
+        if (const auto run = pool.acquire(segments)) {
+            try {
+                found->second->descriptor_runs.push_back({i, *run});
+            } catch (const std::bad_alloc&) {
+                pool.release(*run);
+                if (first_calls(retain_failed, 4)) log("x2w-draw descriptor ring: could not retain run");
+                return "could not retain descriptor run";
+            }
+            state.descriptor_run_heap = i;
+            state.descriptor_run_next = run->first * draw_segment_size;
+            state.descriptor_run_remaining = run->count * draw_segment_size;
+            return nullptr;
+        }
+    }
+}
+
+// draw_lock held. List reset clears the cursor; only allocator reset releases its runs.
+const char* allocate_draw_table(Wrapper* self, UINT views, ID3D12DescriptorHeap*& heap, UINT& first)
+{
+    if (!views) return nullptr;
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const char* reason = views > state.descriptor_run_remaining ? reserve_draw_segments(self, views) : nullptr;
+    if (!reason) {
+        heap = draw_heaps[state.descriptor_run_heap].heap;
+        first = state.descriptor_run_next;
+        state.descriptor_run_next += views;
+        state.descriptor_run_remaining -= views;
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return reason;
 }
 
 // A recorded table is immutable. Keep it alive until its submission completes,
@@ -3503,6 +3572,7 @@ static const char* const not_drawn_names[] = {
     "targets_not_bound",
     "unsupported_topology",
     "rect_draw_unsupported",
+    "descriptor_ring_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
 constexpr int buffer_copy_failed_site = 15;
@@ -3515,7 +3585,8 @@ constexpr int no_pipeline_set_site = 21;
 constexpr int targets_not_bound_site = 22;
 constexpr int unsupported_topology_site = 23;
 constexpr int rect_draw_unsupported_site = 24;
-static_assert(not_drawn_sites == 25, "the not-drawn site numbers are fixed");
+constexpr int descriptor_ring_unavailable_site = 25;
+static_assert(not_drawn_sites == 26, "the not-drawn site numbers are fixed");
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -3945,7 +4016,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT srv_count = n + tr->integer_srvs.descriptors();
     const UINT views = srv_count + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
-    ID3D12DescriptorHeap* view_heap = draw_heap;
+    ID3D12DescriptorHeap* view_heap = draw_heaps[0].heap;
     UINT first = 0;
     if (tr->dynamic_heap) {
         if (!indirect) {
@@ -3960,12 +4031,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             draw_lock_release_exclusive();
             return not_drawn(pass, list, not_drawn_key, dynamic_resource_heap_unavailable_site);
         }
-    } else {
-        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
-        if (first + views > draw_heap_size) {
-            first = 0;
-            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
-        }
+    } else if (allocate_draw_table(self, views, view_heap, first)) {
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, descriptor_ring_unavailable_site);
     }
     std::uint32_t strides[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
@@ -4651,9 +4719,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
     if (!tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
-    if (tr->dynamic_heap || !pass.heap_set || pass.bound_sampler_heap != samplers) {
+    if (tr->dynamic_heap || pass.bound_view_heap != view_heap || pass.bound_sampler_heap != samplers) {
         x2w_startup::bind_translated_heaps(list, view_heap, samplers);
-        pass.heap_set = !tr->dynamic_heap;
+        pass.bound_view_heap = tr->dynamic_heap ? nullptr : view_heap;
         pass.bound_sampler_heap = samplers;
     }
     if (tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
