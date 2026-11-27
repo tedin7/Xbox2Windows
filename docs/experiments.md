@@ -15623,6 +15623,41 @@ The R16_UNORM control with the restore removed must mismatch. The Python control
 Linux x86-64 with Python 3.14.8. The Windows readbacks are pending. Select the draw with
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_interp_f16_exec_halves_(warp|hardware)$' -V`.
 
+The pixel scan also accepts lane-local reads of an omitted partial interpolant when a
+whole-register overwrite covered the live mask, even if the original EXEC alias was
+overwritten. The live mask must come from entry EXEC and may only shrink in place. The
+scan propagates stale helper-lane values through vector operations. A whole write from
+clean sources under an EXEC covering the original interpolant's EXEC clears taint. A whole
+write under a whole-quad EXEC that contains the proven live mask also clears taint. This
+includes restoring a saved copy of that whole-quad EXEC. Derivative operations, cross-lane
+reads, mask writes and memory writes that may run in helper lanes reject tainted operands.
+Plain and comparison samples use the existing explicit-level check on the lowered call.
+[RDNA 2 ISA, SOP1](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf),
+[D3D11.3 functional specification, §16.13](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#PixelShaderDiscardedPixelsandHelperPixels),
+[Shader Model 6.7 helper lane rules](https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_7_Wave_Ops_Include_Helper_Lanes.html)
+
+The Python checks passed on Linux x86-64 with Python 3.14.8 using
+`nice -n 15 python3 -B tests/startup_gfx2hlsl_interp_f16_check.py` and
+`nice -n 15 python3 -B tests/startup_gfx2hlsl_interp_p2_hi_check.py`.
+Against `f18dedec3`, 22 distinct legacy HLSL outputs matched byte for byte and the four new
+positive cases reproduced the old `v_sub_f32` refusal. Removing taint propagation, allowing a
+whole write under exact EXEC to clear taint, and keeping the live proof across an arbitrary
+write each made its Python refusal control fail. Against `c953f83f5`, 26 distinct HLSL
+outputs matched byte for byte. The new clobbered-mask fixture reproduced the old
+`v_sub_f32` refusal on that revision. Allowing a clear under WQM from an unrelated mask
+made the implicit-sample control fail. Dropping the subset check made its independently
+shrunk mask control fail.
+
+The WARP leg compares all 64 RGBA32F pixels against a CPU reference for an 8 × 8 target,
+including the triangle edge through partial quads and the coverage removed by the live
+mask shrink. The five draws cover the interpolation lerp, a whole-quad clear before implicit
+sampling, explicit level zero, plain sampling lowered to level zero, and the lerp after
+`s_buffer_load_dwordx2` clobbers the original EXEC copy. The last reference has 25 shaded
+pixels and 39 clear pixels. Changing the lerp weight or the coordinate after the whole-quad
+clear must cause a pixel mismatch. The Windows readbacks are pending. Select the controls and
+WARP draw with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_interp_f16_(controls|helper_taint_warp)$' -V`.
+
 The startup pixel stage lowers DPP16 quad swaps (#2125 item B): `v_mov_b32_dpp` and the VOP2 forms in the integer and binary32 operation tables with `quad_perm:[1,0,3,2]`, `[2,3,0,1]` or `[3,2,1,0]` and full `row_mask`/`bank_mask` read the source from the neighbouring pixel of the 2x2 quad (X, Y or diagonal), written as `QuadReadAcrossX`, `QuadReadAcrossY` and `QuadReadAcrossDiagonal` (SM 6.0, helper lanes included). The second source of a VOP2 keeps the lane's own register. The form needs a straight-line pixel stage at entry EXEC, proven whole-quad by an earlier `s_wqm_b64 exec, exec` (a partly covered quad has inactive source lanes that the hardware masks and `QuadReadAcross*` does not; a later write to EXEC or a restored older copy drops the proof), and plain VGPR operands. A binary32 source may carry the `neg`/`abs` modifier (`-vN`, `|vN|`, `-|vN|`): the permuted word is read from the neighbour first and the modifier applies to that value (RDNA 2 ISA 12.19, LLVM 15 prints them on the `_dpp` spelling), while integer sources, SGPR sources and every other modifier stay refused. Vertex stages, broadcast and pair selections (items A and C), row shifts, mirrors, DPP8, partial masks and operations without a table entry are refused. `fi:1` (fetch inactive) is accepted under the same whole-quad proof, where no source lane is disabled, and gives the same translation. FXC ps_5_1 has no quad intrinsic, so `translate_to` compiles a pair that uses one with DXC as vs_6_0/ps_6_0 (`X2W_DXC`, then PATH) and refuses it when no DXC exists. `tests/startup_gfx2hlsl_dpp_quad_swap_check.py` builds three pixel programs from the lane rule (OR and move forms, plus `v_min_u32_dpp` of the exchanged and own positions, #2023 item H, whose reference is the integer unsigned minimum and which also rejects a maximum) (the packed position in v0, the neighbour at x^1, y^1 or both, an own-lane control), draws 16 x 16 pixels and compares every word with an integer reference; three wrong exchanges, a missing exchange and (for the minimum) a maximum must read a different image, and a reference with one swap dropped must be rejected. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_quad_swap_' -V`. The Python controls run on Linux; the draws need DXC and `offscreen_check` on Windows. `startup_gfx2hlsl_dpp_quad_swap_controls` checks `-v0` and `|v0|` against the emitted `QuadReadAcrossX` text and keeps an integer `-v0` refused; the draw mode also checks all 256 pixels of a binary32 multiply-by-one fixture. Its three channels use NEG, ABS and NEG+ABS on different neighbours, and each dropped modifier produces a mismatch. The binary mode reassembles the modified DPP source words. [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
 
 For startup pixel `v_add_f32_dpp`, the three full-mask quad swaps also lower after an EXEC write when every
