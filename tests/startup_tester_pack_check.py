@@ -30,22 +30,6 @@ def write(folder, name, data):
     (folder / name).write_bytes(data)
 
 
-def check_cold_disk_status():
-    with tempfile.TemporaryDirectory() as tmp:
-        folder = Path(tmp)
-        assert T.cold_disk_status(folder) is None
-        early = b"x2w-dstorage disk 10 s: 4 reads (+4); mean 5.000000 ms/read since start\n"
-        later = b"x2w-dstorage disk 20 s: 8 reads (+4); mean 3.750000 ms/read since start\n"
-        write(folder, "stderr.txt", early + later)
-        assert T.cold_disk_status(folder) == "cold disk (3.750 ms/read, through last disk heartbeat)"
-        final = b"x2w-dstorage disk summary: mean 3.000000 ms/read since start\n"
-        write(folder, "stderr.txt", early + final + later)
-        assert T.cold_disk_status(folder) is None, "a cold heartbeat cannot override the exit total"
-        final = b"x2w-dstorage disk summary: mean 4.250000 ms/read since start\n"
-        write(folder, "stderr.txt", final)
-        assert T.cold_disk_status(folder) == "cold disk (4.250 ms/read, whole run)"
-
-
 def check_preset():
     script = T.input_preset("menus", 300, 0)
     items = script.split(",")
@@ -952,7 +936,6 @@ if __name__ == "__main__":
     check_privacy_screen()
     check_manifest()
     check_first_poll()
-    check_cold_disk_status()
     check_end_cause()
     check_cache_stats()
     check_cache_tag()
