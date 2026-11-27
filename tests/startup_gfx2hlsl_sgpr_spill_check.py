@@ -171,15 +171,16 @@ def controls():
         ('lane mask value (vcc_lo)', ['v_writelane_b32 v10, vcc_lo, 3']),
         ('lane mask value (exec_lo)', ['v_writelane_b32 v10, exec_lo, 3']),
         ('destination outside the plain SGPRs', ['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 vcc_lo, v10, 3']),
-        ('spill VGPR also used as a vector (before)', ['v_mov_b32 v10, 1.0', 'v_writelane_b32 v10, s0, 3']),
         ('spill VGPR also used as a vector (after)',
          ['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 s1, v10, 3', 'v_add_f32 v1, v10, v2']),
-        ('spill VGPR inside a register range', ['v_writelane_b32 v10, s0, 3', 'v_mov_b32 v9, v[9:10]']),
         ('modifier', ['v_writelane_b32 v10, s0, 3 clamp']),
     ]
     for label, program in cases:
         reason = refused(program)
         check('refused: %s (%s)' % (label, reason), reason is not None)
+    for vector_op in ('v_mov_b32 v10, 1.0', 'v_mov_b32 v9, v[9:10]'):
+        reason = refused([vector_op, 'v_writelane_b32 v10, s0, 3'], kind='ms')
+        check('mesh spill VGPR used by %s is refused' % vector_op, 'also used as a vector' in (reason or ''), str(reason))
     check('a vertex stage is accepted', refused(ok, kind='vs') is None, str(refused(ok, kind='vs')))
     check('a compute stage is accepted', refused(ok, kind='cs') is None, str(refused(ok, kind='cs')))
     check('refused: a kind outside pixel, vertex, mesh and compute (%s)' % refused(ok, kind='gs'), refused(ok, kind='gs') is not None)

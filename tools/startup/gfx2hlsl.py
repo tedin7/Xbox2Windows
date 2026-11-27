@@ -2975,7 +2975,7 @@ class Stage:
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
             self.low16_only_v.discard(n)
 
-    def set_v(self, n, expr, *, low16_only=False, align4=False):
+    def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
@@ -2995,7 +2995,7 @@ class Stage:
         else:
             self.clear_low16(n)
         self.used_v.add(n)
-        self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
+        self.emit('v%d = %s;' % (n, expr) if self.exec_known or ignore_exec else 'if (exec & 1) v%d = %s;' % (n, expr))
         temps = getattr(self, 'uniform_temps', None)
         if temps is not None:  # a uniform load past the entry block (one()): every lane keeps the words
             temps[n] = 'ul%x_%d' % (self.pc, n)
@@ -9501,7 +9501,8 @@ class Stage:
     # and `v_readlane_b32 sD, vN, k` reads it back (AMD RDNA 2 ISA reference, VOP3 lane ops; LLVM 15
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
-    # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
+    # and no other lane is ever read. A mixed-use VGPR instead needs a per-lane write. Constant-lane
+    # reloads of a mixed-use VGPR still need a separate proof because ordinary vector writes can change the slot.
     # Lanes 0..63 cover a wave64 program. A wave32 program uses only bits 4:0 of the lane select (RDNA 2 ISA,
     # v_readlane/v_writelane: the lane is taken modulo the wave size), so k and k + 32 name one slot there and two in
     # wave64; the translator does not know the wave size, so a VGPR whose lanes include such a pair is refused.
@@ -9662,10 +9663,14 @@ class Stage:
         if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
                                             (kind not in ('ps', 'cs') or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
-        self.require_spill_only(vreg[1], name)
-        if kind in ('ps', 'vs', 'cs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
-            self.require_spill_lanes_apart(vreg[1], name)
-        return vreg[1], sreg, lane
+        n = vreg[1]
+        vector_op = self.spill_vector_use(n)
+        if vector_op:
+            if name != 'v_writelane_b32' or kind == 'ms':
+                raise Unsupported('%s: v%d is also used as a vector (%s)' % (name, n, vector_op))
+        elif kind != 'ms':  # slot 57 mesh is always wave64, so k and k + 32 are two slots
+            self.require_spill_lanes_apart(n, name)
+        return n, sreg, lane, vector_op is not None
 
     def require_spill_lanes_apart(self, n, name):
         """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
@@ -9684,8 +9689,8 @@ class Stage:
                 raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64'
                                   % (name, n, lane, lane + 32))
 
-    def require_spill_only(self, n, name):
-        """Refuse unless every instruction naming v<n> is a lane write or read of it."""
+    def spill_vector_use(self, n):
+        """Return the first ordinary vector use of a lane register."""
         # Mesh: scan the pre-skeleton program. The accepted group-memory exchanges rewrite to
         # x2w_mesh_* / s_nop, which would hide ordinary use of exchange VGPRs (v5 and temps).
         source = getattr(self, 'mesh_source_ins', None) or getattr(self, 'ins', ())
@@ -9695,10 +9700,15 @@ class Stage:
             for lo, hi, single in re.findall(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', asm):
                 a, b = (int(lo), int(hi)) if lo else (int(single), int(single))
                 if a <= n <= b:
-                    raise Unsupported('%s: v%d is also used as a vector (%s)' % (name, n, op))
+                    return op
 
     def op_v_writelane_b32(self, ops, mods):
-        n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
+        n, src, lane, vector_use = self.spill_operands('v_writelane_b32', ops, mods)
+        if vector_use and self.has_branches:
+            _, block_of, _, regions = self.spill_cfg
+            block = block_of[self.descriptor_instruction_index]
+            if any(block in blocks and off not in self.uniform_branches for off, blocks in regions.items()):
+                raise Unsupported('v_writelane_b32 vector update in divergent control flow')
         mask = False
         if src is None:
             # Slot 57 mesh keeps ordinary scalar spills only (R0Y00 on #2637). Raw EXEC words are not
@@ -9733,6 +9743,29 @@ class Stage:
                 sym = held if held[0] == 'const' else None
                 uniform = self.uniform_source(ops[1])
                 proven = False
+        if vector_use:
+            if value is None or mask or not uniform:
+                raise Unsupported('v_writelane_b32 vector update requires a uniform numeric source')
+            index = 'WaveGetLaneIndex()'
+            wave_size = None
+            if self.kind == 'cs':
+                x, y, z = self.pipe.group
+                if x * y * z > 32:
+                    raise Unsupported('v_writelane_b32 vector update requires at most 32 threads per group')
+                index = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                wave_size = self.pipe.wave_size
+            if lane >= 32:
+                if wave_size is None and wave32_exec_proof(self.ins):
+                    wave_size = 32
+                if wave_size is None:
+                    raise Unsupported('v_writelane_b32 vector update lane %d requires a known guest wave size' % lane)
+                lane %= wave_size
+            # This is a read-modify-write that ignores EXEC. Unselected lanes retain their old bits and
+            # any outstanding low-half-only restriction. The new value is no longer proven uniform.
+            self.set_v(n, '(%s == %du) ? %s : v%d' % (index, lane, value, n),
+                       low16_only=n in (getattr(self, 'low16_only_v', None) or ()), ignore_exec=True)
+            getattr(self, 'uniform_expr', {}).pop(n, None)
+            return
         slots = self.__dict__.setdefault('spill_slots', {})
         slots[(n, lane)] = (sym, uniform, proven, mask)
         if getattr(self, 'spill_reach', None) is not None:
@@ -9799,7 +9832,7 @@ class Stage:
         if lane and lane[0] == 's' and lane[1] == lane[2] and getattr(self, 'sym', {}).get(lane[1]) == ('first_lane',):
             self.read_first_lane(ops, mods)
             return
-        n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
+        n, dst, lane, _ = self.spill_operands('v_readlane_b32', ops, mods)
         if getattr(self, 'has_branches', False):
             sym, uniform, proven, mask = self.spill_join(n, lane)
         else:
@@ -13684,6 +13717,7 @@ def raise_site(error):
 LIFTED_REASONS = (
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
+    ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
