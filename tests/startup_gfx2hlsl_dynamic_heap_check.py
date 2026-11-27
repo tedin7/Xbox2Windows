@@ -58,6 +58,25 @@ IMAGE_UNALIGNED_PS = bytes.fromhex('80038bbe' '05040cf410000010' '7fc08cbf' + IM
 IMAGE_AS_BUFFER_PS = bytes.fromhex(IMAGE_HEAD + '480120f4000000fa' '7fc08cbf'  # s_buffer_load_dword s5, s[16:19], 0
                                    '0502087e' '0f1800f804040404' '000081bf')  # v_mov_b32 v4, s5; exp mrt0 v4 x4; s_endpgm
 
+# The index register s12 is first written without a uniformity proof (it is a word of a heap record loaded in an arm
+# that root constant s9 skips), then rewritten from s8 in the block after that join, which every path runs. A second
+# uniform branch follows, and the record is loaded through s12 at its join: only the rewrite can define s12 there.
+S9_SKIP = lambda words: '098106bf' '%02x0085bf' % words  # s_cmp_eq_u32 s9, 1; s_cbranch_scc1 +words
+ARM_RECORD = '05030cf400000010' '7fc08cbf'  # s_load_dwordx8 s[12:19], s[10:11], s8; s_waitcnt lgkmcnt(0)
+S12_FROM_S8 = '08038cbe'                   # s_mov_b32 s12, s8
+S12_FROM_MASK = '8000847d' '6a038cbe'      # v_cmp_eq_u32 vcc_lo, 0, v0; s_mov_b32 s12, vcc_lo (a lane mask)
+LOAD_S12 = '05040cf400000018' '7fc08cbf'   # s_load_dwordx8 s[16:23], s[10:11], s12; s_waitcnt lgkmcnt(0)
+V8_ZERO = '8002107e'                       # v_mov_b32 v8, 0
+REWRITE_PS = bytes.fromhex('80038bbe' + S9_SKIP(3) + ARM_RECORD + S12_FROM_S8 + S9_SKIP(1) + V8_ZERO + LOAD_S12
+                           + IMAGE_LOAD + IMAGE_TAIL)
+# Still refused: the rewrite comes before the unproven write; the rewrite is itself unproven; the rewrite sits in the
+# second arm only, so the other path into the load's join still carries the unproven write.
+REWRITE_REFUSED = {
+    'rewrite before the write': '80038bbe' + S12_FROM_S8 + S9_SKIP(3) + ARM_RECORD + S9_SKIP(1) + V8_ZERO,
+    'rewrite unproven': '80038bbe' + S9_SKIP(3) + ARM_RECORD + S12_FROM_MASK + S9_SKIP(1) + V8_ZERO,
+    'rewrite in one arm': '80038bbe' + S9_SKIP(3) + ARM_RECORD + S9_SKIP(2) + S12_FROM_S8 + V8_ZERO,
+}
+
 
 def translate_image():
     pipe = G.Pipeline(VS_WORDS, IMAGE_PS, root_blob())
@@ -76,6 +95,21 @@ def translate_image():
             assert fragment in str(reason), (fragment, str(reason))
         else:
             raise AssertionError('accepted, expected a refusal naming %r' % fragment)
+    return pipe, ps
+
+
+def translate_rewrite():
+    """The index rewritten by a proven write that every path runs after the unproven one; the refused orders."""
+    pipe = G.Pipeline(VS_WORDS, REWRITE_PS, root_blob())
+    ps = pipe.hlsl_ps()
+    assert 'Texture2D<float4> heap_tex_' in ps and 's12 = ud1;' in ps, ps
+    for label, head in REWRITE_REFUSED.items():
+        try:
+            G.Pipeline(VS_WORDS, bytes.fromhex(head + LOAD_S12 + IMAGE_LOAD + IMAGE_TAIL), root_blob())
+        except G.Unsupported as reason:
+            assert 'register offset through' in str(reason), (label, str(reason))
+        else:
+            raise AssertionError('accepted: ' + label)
     return pipe, ps
 
 
@@ -143,11 +177,21 @@ def main(offscreen, dxc):
         shifted = compile_shader(dxc, directory, 'ps_6_6', mutate(image_source, '(ud1 + 0u) >> 5;', '(ud1 + 32u) >> 5;'))
         draw(offscreen, vs, shifted, 96, first, count, negative=True, heap_count=5)
 
+        # The index rewritten after the arm's record load (s9 is 0, so the arm runs): the view follows the rewrite.
+        rewrite_pipe, rewrite_source = translate_rewrite()
+        rewrite_count = len(rewrite_pipe.uds)
+        rewrite = compile_shader(dxc, directory, 'ps_6_6', rewrite_source)
+        draw(offscreen, vs, rewrite, 96, first, rewrite_count, heap_count=5)
+        draw(offscreen, vs, rewrite, 128, second, rewrite_count, heap_count=5)
+        stale = compile_shader(dxc, directory, 'ps_6_6', mutate(rewrite_source, 's12 = ud1;', 's12 = ud1 + 32u;'))
+        draw(offscreen, vs, stale, 96, first, rewrite_count, negative=True, heap_count=5)
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         translate()
         translate_image()
+        translate_rewrite()
     else:
         main(*sys.argv[1:])
     print('dynamic graphics heap: readback and controls matched' if len(sys.argv) > 1

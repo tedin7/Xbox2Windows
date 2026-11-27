@@ -4072,8 +4072,25 @@ class Stage:
             self.scc_from_uniform_input = not self.scc_uniform and self.scalar_expr_uniform(source, assume_scc=True)
         self.emit('scc = %s;' % expr)
 
+    def note_bad_sgpr(self, n):
+        """Marks SGPR n as written without a uniformity proof, remembering which instruction wrote it."""
+        self.bad_sgprs.add(n)
+        self.__dict__.setdefault('bad_write_pcs', {}).setdefault(n, set()).add(getattr(self, 'pc', 0))
+
+    def bad_write_reaches(self, reg, target):
+        """True if an unproven write of reg can still be the register's definition at the branch target. In a program
+        without back edges only an earlier write can reach it, and a proven write after it whose block dominates the
+        target (so it runs on every path into the target) replaces it."""
+        index, block_of, _succ, dom, _writes, _reached = self.flow
+        target_block = block_of[index[target]]
+        proven = self.__dict__.get('uniform_write_pcs', {}).get(reg, ())
+        return any(write < target and not any(write < later < target and block_of[index[later]] in dom[target_block]
+                                              for later in proven)
+                   for write in self.__dict__.get('bad_write_pcs', {}).get(reg, ()))
+
     def record_scalar_uniformity(self, n, uniform):
         if uniform:
+            self.__dict__.setdefault('uniform_write_pcs', {}).setdefault(n, set()).add(getattr(self, 'pc', 0))
             self.varying_s.discard(n)
             if self.defined_uniform_s is not None:
                 self.defined_uniform_s.add(n)
@@ -4086,7 +4103,7 @@ class Stage:
             if self._uniform_written is not None:
                 self._uniform_written.discard(n)
             if self.bad_sgprs is not None:
-                self.bad_sgprs.add(n)
+                self.note_bad_sgpr(n)
         # Only a proved assignment can add an SGPR to since_join. Unmodelled writes drop any stale mark.
         if getattr(self, 'since_join', None) is not None:
             (self.since_join.add if uniform else self.since_join.discard)(n)
@@ -5476,6 +5493,7 @@ class Stage:
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
+            self.bad_write_pcs, self.uniform_write_pcs = {}, {}
             bad_at_target = {}
             tentative_kept = set()
             materialize = {}
@@ -5820,6 +5838,15 @@ class Stage:
                     self.descriptor_block_first = instruction_index + 1
 
             new_bad = self.bad_sgprs - force_unproven
+            if getattr(self, 'kind', None) == 'ps' and not back_targets and getattr(self, 'flow', None) is not None:
+                # No loop can bring a later write back to an earlier join: block a register only at the joins its
+                # unproven write can still reach, so a proven rewrite further down lets it be trusted again.
+                for reg in [r for r in new_bad if isinstance(r, int) and r in self.__dict__.get('bad_write_pcs', {})]:
+                    new_bad.discard(reg)
+                    for target in targets:
+                        if (target in self.flow[0] and self.bad_write_reaches(reg, target)
+                                and reg not in force_at.get(target, set())):
+                            bad_at_target.setdefault(target, set()).add(reg)
             new_at = {k: v - force_at.get(k, set()) for k, v in bad_at_target.items() if v - force_at.get(k, set())}
             if (new_bad or new_at) and tentative_kept:
                 force_unproven.update(new_bad)
@@ -6549,7 +6576,7 @@ class Stage:
                         (self.defined_uniform_s is not None and r not in self.defined_uniform_s)):
                     if self.defined_uniform_s is not None:
                         self.defined_uniform_s.discard(r)
-                    self.bad_sgprs.add(r)
+                    self.note_bad_sgpr(r)
         if dst is not None:
             self.uniform_v.update(loaded_regs or (dst,))
             for reg in loaded_regs:
