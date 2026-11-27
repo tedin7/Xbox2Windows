@@ -149,8 +149,16 @@ inline float depth_at(const unsigned char* pixel, int format)
 // A depth plane to grey. The clear value is the more common of exactly 0 and exactly 1: 0 means reversed Z (near is
 // large). The background (the clear value) is black; the rest is normalised between its minimum and maximum so that
 // the nearest geometry is 255 and the farthest geometry is geometry_floor. Non-finite values are background.
+// What a depth picture saw: the range of the geometry values (not the clear value) and how many sampled pixels are geometry.
+struct DepthStats {
+    bool valid = false, reversed = false;
+    float low = 0, high = 0;
+    std::size_t geometry = 0, sampled = 0;
+    double covered_percent() const { return sampled ? 100.0 * static_cast<double>(geometry) / static_cast<double>(sampled) : 0.0; }
+};
+
 inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned ow, unsigned oh, unsigned step, int format,
-                          std::vector<unsigned char>& rgba)
+                          std::vector<unsigned char>& rgba, DepthStats* stats = nullptr)
 {
     const unsigned bytes = plane_bytes(format);
     const auto at = [&](unsigned x, unsigned y) { return depth_at(data + static_cast<std::size_t>(y) * step * pitch + static_cast<std::size_t>(x) * step * bytes, format); };
@@ -171,6 +179,7 @@ inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned
             low = v < low ? v : low;
             high = v > high ? v : high;
         }
+    std::size_t geometry = 0;
     rgba.assign(static_cast<std::size_t>(ow) * oh * 4, 255);
     for (unsigned y = 0; y < oh; ++y)
         for (unsigned x = 0; x < ow; ++x) {
@@ -180,10 +189,12 @@ inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned
                 const float n = high > low ? (v - low) / (high - low) : 1.0f;  // 0 = smallest depth value
                 const float near_ness = reversed ? n : 1.0f - n;
                 grey = geometry_floor + static_cast<int>(near_ness * float(255 - geometry_floor) + 0.5f);
+                ++geometry;
             }
             unsigned char* out = &rgba[(static_cast<std::size_t>(y) * ow + x) * 4];
             out[0] = out[1] = out[2] = static_cast<unsigned char>(grey);
         }
+    if (stats) *stats = {true, reversed, geometry ? low : 0.0f, geometry ? high : 0.0f, geometry, static_cast<std::size_t>(ow) * oh};
 }
 
 inline void color_pixel(const unsigned char* in, int format, unsigned char* out)
@@ -233,14 +244,14 @@ inline unsigned step_for(unsigned width, unsigned limit = 1024) { return width >
 // The copied plane (rows `pitch` bytes apart) to RGBA8, sampling every `step`-th pixel: the picture is ow x oh with
 // ow = ceil(width / step). False for a format that is not read.
 inline bool to_rgba(const unsigned char* data, std::size_t pitch, unsigned width, unsigned height, unsigned step, int format,
-                    std::vector<unsigned char>& rgba, unsigned& ow, unsigned& oh)
+                    std::vector<unsigned char>& rgba, unsigned& ow, unsigned& oh, DepthStats* stats = nullptr)
 {
     const unsigned bytes = plane_bytes(format);
     if (!bytes || !width || !height || !step) return false;
     ow = (width + step - 1) / step;
     oh = (height + step - 1) / step;
     if (is_depth_format(format)) {
-        depth_to_rgba(data, pitch, ow, oh, step, format, rgba);
+        depth_to_rgba(data, pitch, ow, oh, step, format, rgba, stats);
         return true;
     }
     rgba.assign(static_cast<std::size_t>(ow) * oh * 4, 0);
