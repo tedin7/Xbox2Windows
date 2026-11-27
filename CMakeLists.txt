@@ -625,6 +625,18 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Presenter allocator reuse: pure decisions and a real queue held beyond two seconds.
+add_executable(startup_presenter_fence tests/startup_presenter_fence.cpp)
+target_include_directories(startup_presenter_fence PRIVATE src)
+target_compile_features(startup_presenter_fence PRIVATE cxx_std_17)
+target_link_libraries(startup_presenter_fence PRIVATE d3d12 dxgi)
+add_test(NAME startup_presenter_fence COMMAND startup_presenter_fence)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_presenter_fence_${backend} COMMAND startup_presenter_fence ${backend})
+    set_tests_properties(startup_presenter_fence_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 # Device slot 15 (GetDescriptorHandleIncrementSize, #870) next to a desktop device on the same adapter.
 add_executable(startup_descriptor_increment tests/startup_descriptor_increment.cpp)
 target_compile_features(startup_descriptor_increment PRIVATE cxx_std_17)
@@ -661,10 +673,24 @@ target_compile_features(startup_view_dimension PRIVATE cxx_std_17)
 add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
 add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
 set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+add_executable(startup_target_view_check tests/startup_target_view_check.cpp)
+target_include_directories(startup_target_view_check PRIVATE src)
+target_compile_features(startup_target_view_check PRIVATE cxx_std_17)
+target_link_libraries(startup_target_view_check PRIVATE d3d12 dxgi)
+add_test(NAME startup_target_view_check COMMAND startup_target_view_check)
+add_executable(startup_target_views_device tests/startup_target_views_device.cpp)
+target_compile_features(startup_target_views_device PRIVATE cxx_std_17)
+target_link_libraries(startup_target_views_device PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_target_views_${backend} COMMAND startup_target_views_device ${backend})
+    set_tests_properties(startup_target_views_${backend} PROPERTIES TIMEOUT 60
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+set_tests_properties(startup_target_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(startup_view_desc tests/startup_view_desc_check.cpp)
 target_include_directories(startup_view_desc PRIVATE src)
 target_compile_features(startup_view_desc PRIVATE cxx_std_17)
-target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi)
+target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi d3dcompiler)
 add_test(NAME startup_view_desc COMMAND startup_view_desc)
 add_test(NAME startup_view_desc_warp COMMAND startup_view_desc warp)
 set_tests_properties(startup_view_desc_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
@@ -1453,6 +1479,20 @@ target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_executable(startup_debug_present tests/startup_debug_present.cpp)
 target_compile_features(startup_debug_present PRIVATE cxx_std_17)
 target_link_libraries(startup_debug_present PRIVATE d3d12_xs_shim d3d12 dxgi)
+add_executable(startup_viewport tests/startup_viewport_check.cpp)
+target_include_directories(startup_viewport PRIVATE src)
+target_compile_features(startup_viewport PRIVATE cxx_std_17)
+add_test(NAME startup_viewport COMMAND startup_viewport)
+add_executable(startup_viewport_device tests/startup_viewport_device.cpp)
+target_compile_features(startup_viewport_device PRIVATE cxx_std_17)
+target_link_libraries(startup_viewport_device PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_viewport_device_${backend} COMMAND startup_viewport_device ${backend})
+    set_tests_properties(startup_viewport_device_${backend} PROPERTIES TIMEOUT 60
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+endforeach()
+set_tests_properties(startup_viewport_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(startup_slot57_depth tests/startup_slot57_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_slot57_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_slot57_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -1857,6 +1897,10 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_indexed_alias_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_alias_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
+add_test(NAME startup_indirect_exit_totals_warp
+    COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_exit_totals_check.py"
+            "$<TARGET_FILE:startup_indirect_draw_indexed>")
+set_tests_properties(startup_indirect_exit_totals_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware
     startup_indirect_rectlist_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)
@@ -1979,6 +2023,21 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+add_executable(startup_debug_noise_check tests/startup_debug_noise_check.cpp)
+target_include_directories(startup_debug_noise_check PRIVATE src)
+target_compile_features(startup_debug_noise_check PRIVATE cxx_std_17)
+add_test(NAME startup_debug_noise_check COMMAND startup_debug_noise_check)
+
+# Replay title descriptor increments on a device with a different stride.
+add_executable(startup_title_stride_heap tests/startup_title_stride_heap.cpp)
+target_compile_features(startup_title_stride_heap PRIVATE cxx_std_17)
+target_link_libraries(startup_title_stride_heap PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_title_stride_heap_${backend} COMMAND startup_title_stride_heap ${backend})
+    set_tests_properties(startup_title_stride_heap_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 # Resource slot 10: GetDesc on console resource wrappers.
 add_executable(startup_resource_desc tests/startup_resource_desc.cpp)
 target_compile_features(startup_resource_desc PRIVATE cxx_std_17)
@@ -1988,6 +2047,16 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_resource_desc_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+
+add_executable(startup_debug_noise_device tests/startup_debug_noise_device.cpp)
+target_compile_features(startup_debug_noise_device PRIVATE cxx_std_17)
+target_link_libraries(startup_debug_noise_device PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_debug_noise_device_${backend} COMMAND startup_debug_noise_device ${backend})
+    set_tests_properties(startup_debug_noise_device_${backend} PROPERTIES TIMEOUT 60
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+set_tests_properties(startup_debug_noise_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 # List slot 51: ClearDepthStencilView on a console command list, read back on the desktop device.
 add_executable(startup_clear_depth_stencil tests/startup_clear_depth_stencil.cpp)
@@ -2294,6 +2363,21 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp tests/mesh_heap_sampler_draw.cpp)
+add_executable(startup_sampler_desc_check tests/startup_sampler_desc_check.cpp)
+target_include_directories(startup_sampler_desc_check PRIVATE src)
+target_compile_features(startup_sampler_desc_check PRIVATE cxx_std_17)
+add_test(NAME startup_sampler_desc_check COMMAND startup_sampler_desc_check)
+
+add_executable(startup_sampler_device tests/startup_sampler_device.cpp)
+target_compile_features(startup_sampler_device PRIVATE cxx_std_17)
+target_link_libraries(startup_sampler_device PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_sampler_device_${backend} COMMAND startup_sampler_device ${backend})
+    set_tests_properties(startup_sampler_device_${backend} PROPERTIES TIMEOUT 60
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+set_tests_properties(startup_sampler_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 # Sampler word decoding, manifest lines and title sampler snapshots behind those draws
 # (src/startup_stubs/translated_sampler_bindings.h), without a device. The mutated run is the negative control.
 add_executable(startup_translated_sampler_bindings_check tests/startup_translated_sampler_bindings_check.cpp)
@@ -2446,6 +2530,12 @@ add_test(NAME startup_manifest_prefetch_open_under_lock_control COMMAND startup_
 set_tests_properties(startup_manifest_prefetch_open_under_lock_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_manifest_prefetch_retry_under_lock_control COMMAND startup_manifest_prefetch_check --mutate retry-under-lock)
 set_tests_properties(startup_manifest_prefetch_retry_under_lock_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_locked_open_retry_check tests/startup_locked_open_retry_check.cpp)
+target_include_directories(startup_locked_open_retry_check PRIVATE src)
+target_compile_features(startup_locked_open_retry_check PRIVATE cxx_std_17)
+add_test(NAME startup_locked_open_retry COMMAND startup_locked_open_retry_check)
+add_test(NAME startup_locked_open_retry_no_retry_control COMMAND startup_locked_open_retry_check --mutate no-retry)
+set_tests_properties(startup_locked_open_retry_no_retry_control PROPERTIES WILL_FAIL TRUE)
 # A range is judged committed and readable from VirtualQuery alone (src/startup_stubs/committed_range.h); the mutated run
 # touches the memory instead and faults on a reserved page, so it must fail.
 add_executable(startup_committed_range_check tests/startup_committed_range_check.cpp)
@@ -2478,7 +2568,7 @@ add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_c
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
-foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start)
+foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start all-a)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
@@ -2770,6 +2860,11 @@ target_compile_features(startup_d16_image_format_check PRIVATE cxx_std_17)
 add_test(NAME startup_d16_image_format COMMAND startup_d16_image_format_check)
 add_test(NAME startup_d16_image_format_accept_uint_control COMMAND startup_d16_image_format_check --mutate accept-uint)
 set_tests_properties(startup_d16_image_format_accept_uint_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_compute_output_view tests/startup_compute_output_view_check.cpp)
+target_include_directories(startup_compute_output_view PRIVATE src)
+target_compile_features(startup_compute_output_view PRIVATE cxx_std_17)
+add_test(NAME startup_compute_output_view COMMAND startup_compute_output_view)
+
 # Typed UAV support a pixel image store needs; a partial-dmask store also needs typed load ('uavload N').
 add_executable(startup_pixel_uav_support_check tests/startup_pixel_uav_support_check.cpp)
 target_include_directories(startup_pixel_uav_support_check PRIVATE src)
@@ -3934,6 +4029,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_join_check.py" draw "${DXC_EXECUTABLE}"
         "$<TARGET_FILE:offscreen_check>")
     set_tests_properties(startup_gfx2hlsl_src_scc_join_draw_warp PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    # SCC of a uniform compare mask ANDed with EXEC (entry EXEC, or a stretch past a per-lane execz test).
+    add_test(NAME startup_gfx2hlsl_uniform_cmp_scc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_uniform_cmp_scc_check.py")
+    add_test(NAME startup_gfx2hlsl_uniform_cmp_scc_draw_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_uniform_cmp_scc_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>")
+    set_tests_properties(startup_gfx2hlsl_uniform_cmp_scc_draw_warp PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     # image_sample_c_lz with sampler word 2 bits 28-30 set (#1723).
     add_test(NAME startup_gfx2hlsl_sample_c_lz_mip COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sample_c_lz_mip_check.py")
@@ -5551,6 +5653,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_join_symbols_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         set_tests_properties(startup_gfx2hlsl_join_symbols_folded_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "control OUTSIDE: 3 in all four channels")
+        # A lane mask joined with a pointer on other paths, read as S & ~exec, with the SCC branches voted (MASK_JOIN).
+        add_test(NAME startup_gfx2hlsl_join_symbols_maskjoin_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py" maskjoin "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_join_symbols_maskjoin_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
     # Startup shader translator: s_load with a register offset holding a known constant reaches the heap descriptor (#1723).
     add_test(NAME startup_gfx2hlsl_sload_const_offset COMMAND "${INTAKE_PYTHON}" -B
@@ -5600,6 +5707,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_msvc_throw_info_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
+    add_test(NAME startup_run_ps1_no_cleanup_retry_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py" --mutate no-cleanup-retry)
+    set_tests_properties(startup_run_ps1_no_cleanup_retry_control PROPERTIES WILL_FAIL TRUE)
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
     add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")

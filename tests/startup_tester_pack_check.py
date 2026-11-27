@@ -494,6 +494,41 @@ def check_cache_results():
             assert manifest["cache_keys"] == 12 and manifest["files"][T.RESULTS_NAME]["bytes"] == len(text.encode())
 
 
+def check_refused_dispatch_keys():
+    compute, mesh = "2000000000000001", "3000000000000002"
+    stderr = (
+        f"x2w-render compute refused key {compute}: 2 dispatches, first refusal: no translation\n"
+        f"x2w-render mesh57 refused key {mesh}: 1 dispatches, 30 groups, 0 unknown group counts, first refusal: no matching pipeline\n"
+        f"x2w-render compute refused key {compute}: 3 dispatches, first refusal: no translation\n"
+        f"x2w-render mesh57 refused key {mesh}: 3 dispatches, 54 groups, 1 unknown group counts, first refusal: no matching pipeline\n"
+        f"x2w-render compute census key {compute}: 8 dispatches, 7 translated, first refusal: old diagnostic\n"
+    )
+    assert T.refused_dispatch_keys(stderr) == {
+        ("compute", compute): (3, None, None, "no translation"),
+        ("mesh57", mesh): (3, 54, 1, "no matching pipeline"),
+    }
+    assert T.key_weights(stderr) == {compute: 3, mesh: 3}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        run, cache = tmp / "run", tmp / "cache"
+        run.mkdir()
+        cache.mkdir()
+        make_run(run, 1)
+        make_cache(cache)
+        write(run, "stderr.txt", stderr.encode())
+        archive = tmp / "with.zip"
+        T.pack(str(run), MANIFEST, str(archive), cache_dir=str(cache))
+        with zipfile.ZipFile(archive) as z:
+            rows = z.read(T.RESULTS_NAME).decode().splitlines()
+            assert any(row.startswith(f"{compute} compute refused ") and
+                       row.endswith("skipped_dispatches=3 first_runtime_refusal=no translation") for row in rows)
+            assert any(row.startswith(f"{mesh} mesh57 refused ") and row.endswith(
+                "skipped_dispatches=3 mesh_groups=54 unknown_group_counts=1 first_runtime_refusal=no matching pipeline"
+            ) for row in rows)
+            ranked = json.loads(z.read("manifest.json"))["request_files"]["ranked"]
+            assert {row["key"]: row["weight"] for row in ranked} == {compute: 3, mesh: 3}
+
+
 def check_request_files():
     """The request files of the worst refused keys travel in their own zip folder: ranked by draws not drawn / dispatches
     without a translation, refused keys only, whole keys within the byte cap, listed in the manifest."""
@@ -982,6 +1017,7 @@ if __name__ == "__main__":
     check_seed_cache()
     check_cache_results()
     check_key_use()
+    check_refused_dispatch_keys()
     check_request_files()
     check_request_code_files()
     check_mail_ready_parts()

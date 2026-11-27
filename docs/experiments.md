@@ -497,16 +497,19 @@ Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for th
 - `R32G32B32A32_FLOAT` mapped (w, 0, x, 1);
 - `R8G8B8A8_UNORM` mapped (z, 1, 0, w).
 
-An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
+These two tests run with `X2W_EXTENDED_BUFFER_FORMATS=0`, so an `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
 
 The runtime logs the DXGI
 format number and component mapping on the first view refusal per pipeline
-and SRV slot (`X2W_FORMATTED_BUFFER_DIAGNOSTICS=0` turns it off). Set `X2W_EXTENDED_BUFFER_FORMATS=1` in both the runtime and the
-translator to enable 25 additional formats for translated draws. The expanded
-graphics cache keys are scoped to that setting. The default uses the
-existing keys and shader source.
+and SRV slot (`X2W_FORMATTED_BUFFER_DIAGNOSTICS=0` turns it off). Translated
+draws decode 25 additional formats by default, among them `R32_UINT`; set
+`X2W_EXTENDED_BUFFER_FORMATS=0` in both the runtime and the translator to
+go back to the smaller table. Graphics and mesh cache keys hash the feature
+word `extended-buffer-formats1` after the revision when the table is on, so
+the two settings never share a cached translation.
 
-`startup_formatted_view_draw_extended_warp` compares the 25 added formats
+`startup_formatted_view_draw_extended_warp` runs without the switch (the
+default) and compares the 25 added formats
 against a CPU byte decode, with identity and swizzled mappings. It reads the
 words back from an integer colour target. It also checks the 16 MiB draw
 copy limit and reruns a signed byte with the adjacent unsigned FORMAT case
@@ -15905,6 +15908,30 @@ every lane. In the singleton model lanes 0 and 1 exit early with 1 and 2. Lanes 
 guarded block and take the latch until the counter reaches 4. The translator reports
 `loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
+### Scalar run before the EXEC restore at a compute exit target (#2645 T3)
+
+The 104-byte gfx1013 fixture `EXIT_RUN_*` in `tests/startup_gfx2hlsl_compute_check.py` narrows
+EXEC to lanes with `tid.x < 6` before a guarded block. Inside it, `s_andn2_b32` removes the
+breaking lanes from a saved EXEC mask and `s_cbranch_scc0` tests that mask. The staying path
+installs the same mask into EXEC before its vector work. Both paths reach a scalar descriptor
+load and wait, followed by `s_mov_b32 exec_lo, s21` to restore EXEC.
+
+For groups of up to 32 threads (`x * y * z <= 32`; larger workgroups are rejected and left for
+follow-up work), the translator accepts this straight exit when the staying path's vector work is
+lane-local and predicated off for exiting lanes. The shared run allows scalar ALU, loads and waits
+with regular SGPRs. It must reach a restore from an unchanged copy of EXEC, and the two paths must
+agree on the run's inputs and any scalar state used afterward.
+The wave and singleton traces both produce `[9, 9, 9, KEY^3, KEY^4, KEY^5, KEY^6, KEY^7]`.
+With three threads, the whole wave also takes the exit and both traces produce `[9, 9, 9]`.
+
+The wrong remask and a bypassed scalar write produce different values for lane 0 and are
+refused. Additional controls cover unsafe scalar effects, incoming EXEC and live SCC, clobbered
+and missing restores, invalid targets, and control flow or vector work in the run. The T2 loop
+keeps its backward-latch diagnostic. Removing its latch still leaves two different remasks and
+scalar counter work on the staying path, outside this proof. Run
+`python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
 ### Startup compute formatted buffer reads

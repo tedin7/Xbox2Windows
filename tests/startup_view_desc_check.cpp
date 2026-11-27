@@ -1,12 +1,15 @@
-// Synthetic SRV regression. Mutant: make check() return Refusal::none without changing
-// the descriptor. The pure test must fail on the reported mip shape even if WARP accepts it.
+// Synthetic SRV regression. Mutants: make check() return Refusal::none without changing the descriptor (the pure test
+// fails on the reported mip shape even if WARP accepts it); refuse MipLevels 0 again, or read a UAV token as SRV bytes
+// (pure checks and the WARP readback of every mip go red).
 #include "startup_stubs/create_srv.h"
 #include "startup_stubs/address_texture.h"
 
 #include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -121,10 +124,19 @@ static bool pure_checks()
     if (union_mismatch.Texture2D.MostDetailedMip != 13 || union_mismatch.Texture2D.MipLevels != 0) return false;
     if (check(union_mismatch, resource) != srv::Refusal::mip_range) return false;
 
-    auto zero_mips = view_desc(0, 0);
+    // MipLevels 0 on a mipped texture (the draw-texture shape): repaired to -1, every level from MostDetailedMip.
+    auto zero_mips = view_desc(3, 0);
+    UINT zero_from = 1, zero_to = 0;
+    const auto zero_refusal = srv::check(zero_mips, resource, 0, [&](srv::Field field, UINT from, UINT to) {
+        if (field == srv::Field::mip_levels) zero_from = from, zero_to = to;
+    });
     auto bad_start = view_desc(8, 1);
-    if (check(zero_mips, resource) != srv::Refusal::mip_range ||
-        check(bad_start, resource) != srv::Refusal::mip_range) return false;
+    if (zero_refusal != srv::Refusal::none || zero_mips.Texture2D.MipLevels != ~0u ||
+        zero_mips.Texture2D.MostDetailedMip != 3 || zero_from != 0 || zero_to != ~0u ||
+        check(bad_start, resource) != srv::Refusal::mip_range) {
+        std::puts("FAIL: MipLevels 0 must be repaired to -1 and an out-of-range MostDetailedMip refused");
+        return false;
+    }
 
     auto valid = view_desc(2, 3);
     auto all_mips = view_desc(7, ~0u, D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 5));
@@ -171,6 +183,49 @@ static bool pure_checks()
     resource.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     return unchanged(valid, resource) && check(reported, resource) == srv::Refusal::mip_range &&
         srv::check_default(resource) == srv::Refusal::format;
+}
+
+static D3D12_SHADER_RESOURCE_VIEW_DESC from_record(unsigned slot, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uav)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC out{};
+    if (!srv::recorded_srv(slot, &uav, sizeof(uav), out)) out.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    return out;
+}
+
+// A sampled texture token that names an unordered access view: the draw reads the UAV's mip as an SRV.
+static bool uav_record_checks()
+{
+    const auto resource = texture_desc();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D = {2, 0};
+    auto plain = from_record(19, uav);
+    if (plain.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || plain.Texture2D.MostDetailedMip != 2 ||
+        plain.Texture2D.MipLevels != 1 || !unchanged(plain, resource)) return false;
+
+    auto layered = texture_desc();
+    layered.DepthOrArraySize = 4;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    uav.Texture2DArray = {1, 2, 2, 0};
+    auto array = from_record(19, uav);
+    if (array.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY || array.Texture2DArray.MostDetailedMip != 1 ||
+        array.Texture2DArray.MipLevels != 1 || array.Texture2DArray.FirstArraySlice != 2 ||
+        array.Texture2DArray.ArraySize != 2 || !unchanged(array, layered)) return false;
+
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    if (from_record(19, uav).ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC shaped{};
+    const auto single = view_desc(1, 2);
+    if (!srv::as_dimension(single, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, shaped) ||
+        shaped.Texture2DArray.MostDetailedMip != 1 || shaped.Texture2DArray.MipLevels != 2 ||
+        shaped.Texture2DArray.ArraySize != 1 || !unchanged(shaped, layered)) return false;
+    auto back = shaped;
+    if (!srv::as_dimension(shaped, D3D12_SRV_DIMENSION_TEXTURE2D, back) || std::memcmp(&back, &single, sizeof(back)))
+        return false;
+    shaped.Texture2DArray.FirstArraySlice = 1;
+    return !srv::as_dimension(shaped, D3D12_SRV_DIMENSION_TEXTURE2D, back) &&
+        !srv::as_dimension(single, D3D12_SRV_DIMENSION_TEXTURECUBE, back);
 }
 
 static D3D12_RESOURCE_DESC depth_stencil_desc()
@@ -324,6 +379,159 @@ static bool stencil_census_check(ID3D12Device* device, const D3D12_HEAP_PROPERTI
         "plane_requested=1 plane_used=1 count=4");
 }
 
+static UINT mip_texel(UINT mip, UINT x, UINT y)
+{
+    return 0xff000000u | (mip * 0x50u + 0x20u) << 16 | (y * 0x30u + 0x10u) << 8 | (x * 0x30u + 0x08u);
+}
+
+static bool run_and_wait(ID3D12Device* device, ID3D12GraphicsCommandList* list)
+{
+    ComPtr<ID3D12CommandQueue> queue;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(list->Close()) || FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return false;
+    ID3D12CommandList* lists[] = {list};
+    queue->ExecuteCommandLists(1, lists);
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const bool waited = done && SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
+        SUCCEEDED(fence->SetEventOnCompletion(1, done)) && WaitForSingleObject(done, 10000) == WAIT_OBJECT_0;
+    if (done) CloseHandle(done);
+    return waited && fence->GetCompletedValue() == 1;
+}
+
+// The draw-texture shape on the GPU: a 4x4 texture with 3 mips, sampled through the repaired MipLevels-0 view (t0, every
+// level) and through the SRV made from a UAV of mip 1 (t1). Each texel read back must equal the uploaded one.
+static bool mip_zero_readback(ID3D12Device* device)
+{
+    constexpr UINT side = 4, mips = 3, pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, out_bytes = 4 * 4 * 4 * 16;  // 4x4x4 threads, 16 bytes each
+    const auto heap = [](D3D12_HEAP_TYPE type) { D3D12_HEAP_PROPERTIES p{}; p.Type = type; return p; };
+    const auto buffer = [&](D3D12_HEAP_TYPE type, UINT64 bytes, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                       D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
+        const auto properties = heap(type);
+        ComPtr<ID3D12Resource> r;
+        device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&r));
+        return r;
+    };
+    auto upload = buffer(D3D12_HEAP_TYPE_UPLOAD, pitch * side * mips, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto out = buffer(D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto back = buffer(D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_RESOURCE_DESC tex{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, mips, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                  {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    const auto defaults = heap(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> texture;
+    if (!upload || !out || !back || FAILED(device->CreateCommittedResource(&defaults, D3D12_HEAP_FLAG_NONE, &tex,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)))) return false;
+    unsigned char* mapped = nullptr;
+    if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return false;
+    for (UINT mip = 0; mip < mips; ++mip)
+        for (UINT y = 0; y < (side >> mip); ++y)
+            for (UINT x = 0; x < (side >> mip); ++x) {
+                const UINT texel = mip_texel(mip, x, y);
+                std::memcpy(mapped + pitch * (side * mip + y) + 4 * x, &texel, 4);
+            }
+    upload->Unmap(0, nullptr);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heaps;
+    if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heaps)))) return false;
+    const UINT step = device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    auto cpu = heaps->GetCPUDescriptorHandleForHeapStart();
+    auto all_levels = view_desc(0, 0);
+    if (!x2w_startup::x2w_create_srv(device, texture.Get(), &all_levels, cpu, "fixture-draw-texture")) {
+        std::puts("FAIL: the MipLevels 0 view of a mipped texture was refused");
+        return false;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D.MipSlice = 1;
+    auto from_uav = from_record(19, uav);
+    cpu.ptr += step;
+    if (!x2w_startup::x2w_create_srv(device, texture.Get(), &from_uav, cpu, "fixture-uav-token")) return false;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    raw.Buffer.NumElements = out_bytes / 4;
+    raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    cpu.ptr += step;
+    device->CreateUnorderedAccessView(out.Get(), nullptr, &raw, cpu);
+
+    static const char source[] =
+        "Texture2D<float4> all_levels : register(t0); Texture2D<float4> uav_mip : register(t1);\n"
+        "RWByteAddressBuffer dst : register(u0);\n"
+        "[numthreads(4, 4, 4)] void main(uint3 id : SV_DispatchThreadID)\n"
+        "{ float4 v = id.z < 3 ? all_levels.Load(int3(int2(id.xy >> id.z), int(id.z))) : uav_mip.Load(int3(int2(id.xy >> 1), 0));\n"
+        "  dst.Store4(((id.z * 4 + id.y) * 4 + id.x) * 16, asuint(v)); }\n";
+    ComPtr<ID3DBlob> code, signature, errors;
+    if (FAILED(D3DCompile(source, sizeof(source) - 1, "mip_zero", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)))
+        return false;
+    const D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+                                              {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = {2, ranges};
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3D12RootSignature> root;
+    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)) ||
+        FAILED(device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&root))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipe{};
+    pipe.pRootSignature = root.Get();
+    pipe.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateComputePipelineState(&pipe, IID_PPV_ARGS(&pipeline))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
+                                         IID_PPV_ARGS(&list)))) return false;
+    for (UINT mip = 0; mip < mips; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        to.SubresourceIndex = mip;
+        D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        from.PlacedFootprint.Offset = UINT64{pitch} * side * mip;
+        from.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, side >> mip, side >> mip, 1, pitch};
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
+    const auto transition = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+        list->ResourceBarrier(1, &b);
+    };
+    transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12DescriptorHeap* bound[] = {heaps.Get()};
+    list->SetDescriptorHeaps(1, bound);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRootDescriptorTable(0, heaps->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch(1, 1, 1);
+    transition(out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(back.Get(), 0, out.Get(), 0, out_bytes);
+    if (!run_and_wait(device, list.Get())) return false;
+
+    const float* read = nullptr;
+    if (FAILED(back->Map(0, nullptr, reinterpret_cast<void**>(const_cast<float**>(&read))))) return false;
+    int bad = 0;
+    for (UINT z = 0; z < 4; ++z)
+        for (UINT y = 0; y < side; ++y)
+            for (UINT x = 0; x < side; ++x) {
+                const UINT mip = z < 3 ? z : 1;
+                const UINT shift = z < 3 ? z : 1;
+                const UINT texel = mip_texel(mip, x >> shift, y >> shift);
+                const float* got = read + ((z * 4 + y) * 4 + x) * 4;
+                for (int c = 0; c < 4; ++c) {
+                    const float expected = static_cast<float>((texel >> (8 * c)) & 255u) / 255.0f;
+                    if (std::fabs(got[c] - expected) > 1e-4f && bad++ < 3)
+                        std::printf("FAIL: view %u (%u,%u) channel %d read %f, expected %f\n", z, x, y, c, got[c], expected);
+                }
+            }
+    back->Unmap(0, nullptr);
+    return bad == 0;
+}
+
 static int warp_check()
 {
     ComPtr<ID3D12Debug> debug;
@@ -392,14 +600,17 @@ static int warp_check()
         std::printf("FAIL: stencil SRV census, last line: %s\n", last_log);
         return 1;
     }
-    if (FAILED(device->GetDeviceRemovedReason())) return 1;
-    std::puts("PASS: WARP created the repaired color and stencil SRVs and the null SRV");
+    if (!mip_zero_readback(device.Get()) || FAILED(device->GetDeviceRemovedReason())) {
+        std::puts("FAIL: WARP readback through the repaired MipLevels 0 view and the UAV-token view");
+        return 1;
+    }
+    std::puts("PASS: WARP created the repaired color and stencil SRVs and the null SRV, and sampled every mip");
     return 0;
 }
 
 int main(int argc, char** argv)
 {
-    if (!buffer_checks() || !alias_checks() || !pure_checks()) {
+    if (!buffer_checks() || !alias_checks() || !pure_checks() || !uav_record_checks()) {
         std::puts("FAIL: texture, alias mip and buffer SRV descriptor checks");
         return 1;
     }

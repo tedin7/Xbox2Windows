@@ -53,6 +53,7 @@ EXPECTED = {
     "st_ref_restore": (GREEN, GREEN),
     "st_ref_reset": (GREEN, GREEN),
     "st_refused": (GREEN, GREEN),
+    "stream_no_dsv": (GREEN, GREEN),
 }
 # Pipelines whose state block is taken (switch on), per case: log lines "depth-stencil from state block A".
 REFUSED_PIPELINES = 3  # rz_refused: two pipelines, st_refused: one

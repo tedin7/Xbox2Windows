@@ -354,6 +354,18 @@ to a real present. The contract under the switch:
 
   Neither line is the composited window picture.
 
+The diagnostic readback publishes pixels only after its queue fence reaches
+the submitted value without reporting device removal. A timeout, a failed
+event registration or an incomplete fence after the event registers a drain:
+a threadpool wait on the submitted fence value that releases the held surface
+and queue references once the fence completes and publishes no pixels, so a
+final sample no longer keeps them for the module lifetime. The drain releases
+only the submission it was registered for (a later sample owns its own) and
+never releases pending, failed-signal or device-removed work; a failed signal
+or removed device disables further diagnostic readback for the module
+lifetime. `startup_present_readback` exercises the completion policy and the
+ownership retirement without a GPU.
+
 The first presents and every 300th log each plane:
 
 ```text
@@ -577,6 +589,23 @@ An unset constant reads as zero in the translated draw. Slot 40
 calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table and writes a
 root constant into the blue channel. It checks the original bindings, the same signature, a switched signature and
 six out-of-range calls. The switched case clears both inputs to the shader.
+
+## Refused compute and mesh57 dispatches
+
+The runtime logs cumulative `x2w-render compute refused key` and
+`x2w-render mesh57 refused key` rows at powers of two of each kind's refusal
+total and on normal teardown. Each snapshot lists up to 40 keys by skipped
+dispatches, with the first runtime refusal for each key.
+
+For mesh57, the group total is the sum of X×Y×Z from CPU-readable indirect
+argument snapshots. Unreadable or invalid arguments increment the unknown
+group count. These snapshots measure the arguments observed at record time.
+The tester archive adds the latest counts to `shader_results.txt` and ranks
+refused shader requests by skipped dispatches.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(refused_dispatch_census|tester_pack|gfx2hlsl_retry_lifted)$'
+```
 
 ## Null bindings in translated draws
 
@@ -1375,7 +1404,7 @@ Beside the totals line, one line counts every `ExecuteIndirect` call (command-li
 x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; other: drawindexed 3
 ```
 
-`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
+`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. Totals also appear in changed five-second reports, fixture census exports, and at process exit; pipeline refusal details use a bounded per-reason census. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
 
 ### Optional: Tracy zones
 
@@ -2013,6 +2042,7 @@ When a present ends the recording, a finisher thread writes the `SHDR` files and
 on meanwhile; a later stop waits for it, and if the process exits first the file ends at its last whole chunk followed by
 `XEND`. The same holds when the exit finds the file lock held by a thread that is gone: the file is cut back to its last
 whole chunk (kept up to date after every written buffer) and closed with `XEND`.
+Before cutting at exit, the recorder waits up to 10 seconds for the finisher thread and its pending I/O.
 
 `X2W_REPLAY_PAGES_AT_SUBMIT=1` scans registered title-memory pages before `ExecuteCommandLists` inside the recording
 window. Use `X2W_REPLAY_RECORD=all` for a workload without Present. The first submit can initialize the page store.
@@ -2145,6 +2175,8 @@ output. For an output buffer that aliases title memory, record with
 `X2W_REPLAY_TITLE_RANGES=1` and `X2W_REPLAY_PAGES_AT_SUBMIT=1` to capture raw heap descriptors and placed buffers.
 Play with `--dump HEX_ADDRESS:BYTES` to write up to 64 MiB of a reserved title range to `dump.bin` after the recorded calls
 and before trailing page updates. Wait for GPU completion in the recorded workload before either readback.
+Recorded descriptor increments are declared to the layer before replay. Title CPU and GPU handles map by descriptor index to the replay device's heaps, and a CPU handle inside title descriptor memory the layer could not back (another stride) is refused instead of reaching D3D12.
+
 Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
 The recorder uses the layouts in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h)
@@ -2357,7 +2389,9 @@ reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resour
 sampler holds its own reference to the presented surface until the copy's fence has passed; a title
 may release the surface right after the present. If `Signal` fails after the copy was submitted,
 sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
-process. It publishes them in a named block,
+process. A removed device (the fence reporting `UINT64_MAX`) is never treated as a completion:
+the readback is not mapped, no sample is published, sampling stops, and the surface stays referenced
+for the rest of the process. It publishes them in a named block,
 `Local\x2w_present_signature_<process id>`, so other tools can read it too
 (`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
 formats are read; for others it logs
@@ -2671,6 +2705,13 @@ These are measured on one executable; treat them as hypotheses for others.
   lanes of the desktop wave. This follows the packing contract of the wave reductions. `sD` has no run-time value,
   and any other read of it is refused ([the note](experiments/startup-gfx2hlsl-pixel-first-lane.md)). Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_pixel_first_lane"`.
+  [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
+- **Select on descriptor data.** In a compute stage, `s_cselect_b32 sD, a, b` with one source a number computed
+  from a descriptor (`descnum`) and the others constants, such as `sX, 0, sX`, emits no HLSL. sD keeps both arms as
+  a symbol with no run-time value. A numeric read, scalar ALU other than a move, or a descriptor operand holding it
+  (also as a word joined at a branch target) is refused, so an arm that zeroes a buffer's size is never dropped
+  ([the note](experiments/startup-gfx2hlsl-cselect-descnum.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_cselect_descnum"`.
   [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
@@ -3776,8 +3817,10 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. By default, a mismatched or interior view overlapping a live resource preserves the destination descriptor.
+Linear `0x100` 2D views bind a live resource with the same description and base address.
+The single-texel path can also publish its texel from the address.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
+linear mode `0x100` without a live texture (apart from single texels), three-dimensional and cube views, multisampled
 textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 
@@ -3945,6 +3988,23 @@ descriptions with:
   synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
+
+The process-wide `x2w-slot70 buffer_unavailable split` line logs cumulative totals at powers
+of two and on device teardown. A is a stride mismatch against a cached 64 KiB-aligned upload
+copy. B is an alias overlap introduced by page rounding. C is a stride mismatch inside a title
+placed buffer. D is overlap with the requested byte range. E–M name the remaining checks in
+the line. The first four calls per reason log the request and the conflicting range, when
+available. Cache hits count under their original reason, and successful shadow recovery
+does not count as a refusal.
+
+The census tracks distinct starts and distinct (64 KiB page, element size, offset in page
+modulo element size) keys in two fixed 4,096-entry tables. The exact-copy estimate sums
+the largest observed span per tracked address, rounded up to 64 KiB. Each truncation flag
+marks the corresponding distinct count as a lower bound. Address truncation also makes
+the copy estimate a lower bound.
+
+The synthetic split fixture and its all-A negative control run with
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_buffer(_all-a_control)?$' -V`.
 
 With `X2W_SLOT70_MEMORY_BUFFER=1`, a structured view with first element 0, count 1 and
 stride equal to the buffer width can recover from `buffer_unavailable` if its exact byte range

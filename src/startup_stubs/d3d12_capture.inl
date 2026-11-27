@@ -32,7 +32,7 @@ struct ViewRecord {
 };
 struct HeapInfo {
     u64 wrapper;
-    std::uint32_t type, count, increment, logical_count;
+    std::uint32_t type, count, increment, title_increment, logical_count;
     u64 title_cpu, desktop_cpu, desktop_gpu;
     u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
@@ -51,6 +51,7 @@ struct ResourceInfo {
     D3D12_RESOURCE_STATES initial_state{};
     const Wrapper* texture_alias_device{};
     u64 texture_alias_bytes{};
+    x2w_startup::BufferSrvBacking buffer_srv_backing{};  // last: positional initializers above stay valid
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
@@ -352,12 +353,13 @@ void index_resource(const Wrapper* w, const ResourceInfo& info)
     x2w_startup::note_placement_change();
 }
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes,
-                   const Wrapper* texture_alias_device = nullptr, u64 texture_alias_bytes = 0)
+                   const Wrapper* texture_alias_device = nullptr, u64 texture_alias_bytes = 0,
+                   x2w_startup::BufferSrvBacking backing = x2w_startup::BufferSrvBacking::committed)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
     x2w_startup::note_placement_change();
-    const ResourceInfo info{*console, bytes, Placement::none, nullptr, {}, texture_alias_device, texture_alias_bytes};
+    const ResourceInfo info{*console, bytes, Placement::none, nullptr, {}, texture_alias_device, texture_alias_bytes, backing};
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
         resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
@@ -382,7 +384,8 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false,
+                                     x2w_startup::BufferRefusalDetail* overlap = nullptr)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
@@ -399,6 +402,10 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
                 continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
+            if (overlap) {
+                overlap->base = base;
+                overlap->bytes = info.bytes;
+            }
             if (result.owner || start < base || bytes > info.bytes - (start - base)) {
                 result = {nullptr, nullptr, true}; // Ambiguous or crossing an allocation.
                 break;
@@ -420,11 +427,11 @@ const ResourceInfo* resource_info(const Wrapper* w)
     ReleaseSRWLockShared(&note_lock);
     return info;
 }
-void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
+void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, UINT title_increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
                u64 title_sampler_cpu)
 {
     note_lock_acquire(true);
-    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
+    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, title_increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -807,7 +814,7 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     HeapInfo heap{};
     note_lock_acquire(false);
     for (const HeapInfo& h : heap_infos())
-        if (h.desktop_gpu && gpu_handle >= h.desktop_gpu && gpu_handle < h.desktop_gpu + u64{h.count} * h.increment) heap = h;
+        if (h.desktop_gpu && gpu_handle >= h.desktop_gpu && gpu_handle < h.desktop_gpu + u64{h.count} * h.title_increment) heap = h;
     ReleaseSRWLockShared(&note_lock);
     if (!heap.wrapper) {
         struct { std::uint32_t sequence, slot, parameter, entries; u64 gpu_handle, heap, index; } header{
@@ -817,7 +824,7 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     }
     object(reinterpret_cast<Wrapper*>(heap.wrapper));
     const u64 offset = gpu_handle - heap.desktop_gpu;
-    const u64 index = offset / heap.increment;
+    const u64 index = offset / heap.title_increment;
     if (index + entries > heap.count) entries = static_cast<std::uint32_t>(heap.count - index);
     std::vector<std::uint32_t> ids(entries * 2);  // [shadow ids + 1][token ids + 1]
     for (std::uint32_t i = 0; i < entries; ++i) ids[i] = heap.shadow ? heap.shadow[index + i] : 0;

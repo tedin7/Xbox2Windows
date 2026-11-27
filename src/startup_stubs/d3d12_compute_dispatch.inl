@@ -59,6 +59,29 @@ struct ComputeTranslation {
     }
 };
 
+// Device support is adapter-specific. The shim keeps a singleton desktop device.
+unsigned compute_output_format_support(ID3D12Device* device, DXGI_FORMAT format)
+{
+    static std::mutex mutex;
+    static ID3D12Device* cached_device = nullptr;
+    static unsigned bits[256]{};
+    static bool filled[256]{};
+    const unsigned index = static_cast<unsigned>(format);
+    if (index >= 256) return 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (cached_device != device) {
+        std::memset(filled, 0, sizeof(filled));
+        cached_device = device;
+    }
+    if (!filled[index]) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        bits[index] = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+            ? static_cast<unsigned>(support.Support2) : 0;
+        filled[index] = true;
+    }
+    return bits[index];
+}
+
 // Formats a `float` typed output may be viewed with: the program stores float4.
 bool float_output_format(DXGI_FORMAT format)
 {
@@ -430,6 +453,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
     if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
         InterlockedIncrement(&compute_dispatches_untranslated);
+        note_refused_compute_dispatch(key, "no translation");
         return "no translation";
     }
     const char* reason = nullptr;
@@ -601,40 +625,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
             else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
                 reason = "an output texture view was not created on the desktop";
-            else if (slot.array) {
-                // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
-                const auto& a = desc.Texture2DArray;
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
-                    reason = "an output texture view is not a 2D array";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
-                         a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
-                         !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
-                    reason = "an output texture array view is outside the resource";
-            } else if (slot.dimension == 1) {
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE1D)
-                    reason = "an output texture view is not 1D";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Texture1D.MipSlice >= resource.MipLevels)
-                    reason = "an output texture view is outside the resource";
-            } else if (slot.dimension == 3) {
-                // The W coordinate in HLSL is relative to FirstWSlice: retain the caller's complete view.
-                const auto& v = desc.Texture3D;
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D)
-                    reason = "an output texture view is not 3D";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || v.MipSlice >= resource.MipLevels ||
-                         !v.WSize || v.FirstWSlice >= (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) ||
-                         (v.WSize != 0xffffffffu && v.WSize > (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) - v.FirstWSlice))
-                    reason = "an output texture view is outside the resource";
-            } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
-                               : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
-                reason = "an output texture view is not 2D";
+            else reason = x2w_startup::compute_output_shape_reason(resource, desc, described, slot.array, slot.dimension);
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            if (!reason && slot.load) {
-                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-                auto* device = device_of(self->own().list_device);
-                const unsigned bits = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
-                                                                         sizeof(support))) ? 0 : support.Support2;
-                reason = x2w_startup::pixel_uav_support_reason(bits, true);
+            if (!reason) {
+                const unsigned bits = compute_output_format_support(device_of(self->own().list_device), format);
+                reason = x2w_startup::compute_output_support_reason(bits, slot.load);
             }
             // A texture bound as both SRV and UAV needs two states at once. The input is bound from a copy taken before
             // the dispatch (below), which reads what the title's own input read. Two outputs of one texture (two mips)
@@ -795,6 +791,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         phases.end();
         timer.finish(x2w_phase::refused);
         draw_lock_release_exclusive();
+        note_refused_compute_dispatch(key, reason);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;

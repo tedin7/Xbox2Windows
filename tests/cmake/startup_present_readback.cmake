@@ -1,0 +1,4 @@
+add_executable(startup_present_readback_check tests/startup_present_readback_check.cpp)
+target_compile_features(startup_present_readback_check PRIVATE cxx_std_17)
+target_include_directories(startup_present_readback_check PRIVATE src)
+add_test(NAME startup_present_readback COMMAND startup_present_readback_check)

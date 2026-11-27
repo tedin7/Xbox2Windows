@@ -86,7 +86,7 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "dynamic ComparisonFunc", d.ComparisonFunc, 1);
     for (float component : d.BorderColor)
         if (component != 0.0f) fail(name, "dynamic BorderColor", 1, 0);
-    lod_range(name, "dynamic", d.MipLODBias, d.MinLOD, d.MaxLOD, min_lod, max_lod);
+    lod_range(name, "dynamic", d.MipLODBias, d.MinLOD, d.MaxLOD, (std::min)(min_lod, max_lod), max_lod);
     if (failures != before) std::printf("  words %08x %08x %08x %08x\n", words[0], words[1], words[2], words[3]);
 }
 
@@ -170,6 +170,8 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    const auto reversed_lod = dynamic_sampler({0, 1024u | (512u << 12), 0, 0});
+    expect("reversed lod", "minimum clamped", reversed_lod.MinLOD <= reversed_lod.MaxLOD, true);
     expect("constants", "table entries", translated_sampler_count, 2048);
     expect("constants", "table space", translated_sampler_space, 1);
     expect("constants", "fallback entry", translated_sampler_fallback, 2047);
@@ -212,8 +214,7 @@ int main(int argc, char** argv)
     decoded("min lod 2", {0, 0x200u | 0xfffu << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 2.0f, 15.99609375f);
     decoded("max lod 1", {0, 0x100u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.0f, 1.0f);
     decoded("lod fractions", {0, 0x140u | 0x1c0u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.25f, 1.75f);
-    // MIN_LOD above MAX_LOD is passed through unchanged: D3D12 documents MaxLOD >= MinLOD, and no source here
-    // says what the console sampler does with that pair, so the decoder does not pick one. Device-free only.
+    // The decoder preserves the two fields; dynamic creation clamps the minimum to the maximum.
     decoded("min lod above max lod", {0, 0x1c0u | 0x140u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
     decoded("lod smallest steps", {0, 0x001u | 0x001u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.00390625f,
             0.00390625f);

@@ -408,6 +408,7 @@ constexpr UINT draw_covered = 3;   // scissor leaves the last row and column unt
 constexpr int draw_seed = 77;
 constexpr UINT draw_clear_pixel = 0xffff00ffu;  // ClearRenderTargetView({1, 0, 1, 1}) in R8G8B8A8_UNORM
 constexpr char draw_revision[] = "x2w-startup-shader-28";  // d3d12_draw.inl cached_translation
+constexpr char draw_feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
 
 constexpr char draw_vertex_shader[] = R"(
 struct Varying { float4 position : SV_Position; };
@@ -497,6 +498,7 @@ bool prepare_draw_translation(Context& c, ComPtr<IUnknown>& root, ComPtr<IUnknow
     static std::uint32_t vertex_key[] = {0x7a1b0001, 0x2c3d4e5f};
     static std::uint32_t pixel_key[] = {0x7a1b0002, 0x5e4d3c2b};
     std::uint64_t key = fnv_bytes(draw_revision, sizeof(draw_revision) - 1);
+    key = fnv_bytes(draw_feature, sizeof(draw_feature) - 1, key);
     key = fnv_bytes(vertex_key, sizeof(vertex_key), key);
     key = fnv_bytes(pixel_key, sizeof(pixel_key), key);
     key = fnv_bytes(blob->GetBufferPointer(), blob->GetBufferSize(), key);

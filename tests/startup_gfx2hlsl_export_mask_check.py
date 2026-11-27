@@ -118,7 +118,8 @@ runtime = os.path.join(HERE, '..', 'src', 'startup_stubs', 'd3d12_draw.inl')
 with open(runtime, 'rb') as runtime_file:
     revision = re.search(rb'constexpr char revision\[\] = "([^"]+)";', runtime_file.read())
 key = G.pipeline_key(VS_WORDS, exp(0, 0x5, (0, 1, 2, 3)) + S_ENDPGM, root_blob())
-check('offline and runtime use the same partial export cache key', bool(revision and key == revision_key(revision[1])))
+check('offline and runtime use the same partial export cache key',
+      bool(revision and key == G.fnv(root_blob(), G.fnv(exp(0, 0x5, (0, 1, 2, 3)) + S_ENDPGM, G.fnv(VS_WORDS, G.shader_cache_seed(revision[1]))))))
 check('older zero-filled export cache is not reused', key != revision_key(b'x2w-startup-shader-6'))
 whole = translate(exp(0, 0xf, (0, 1, 2, 3)))
 check('uncompressed full export: no wmask line', isinstance(whole, tuple) and masks(whole[1]) == [], repr(whole))

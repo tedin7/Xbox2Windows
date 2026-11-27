@@ -40,7 +40,7 @@ def check(directory, consumer, backend):
     actual = output.read_bytes()
     assert actual == want, (actual.hex(), want.hex())
     log = trap_log.read_text(errors='replace')
-    for diagnostic in ('missing hardware descriptor 0', 'unsupported FORMAT 2', 'unresolved buffer'):
+    for diagnostic in ('missing hardware descriptor 0', 'unsupported FORMAT 3', 'unresolved buffer'):
         assert f'formatted buffer refused ({diagnostic})' in log, (diagnostic, log)
     print(f'{backend}: missing metadata, unsupported FORMAT and unresolved storage stayed blue; valid zero and one drew black and red')
     return 0

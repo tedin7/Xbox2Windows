@@ -61,11 +61,23 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 }
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
+// Linear mip alignment is unknown: only bind a live resource with the same address and description.
+// Slot 70 does not publish its bytes from the supplied address.
+bool console_linear_texture_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && static_cast<UINT>(r.Layout) == 0x100 &&
+           r.Width && r.Height && r.DepthOrArraySize && r.MipLevels && r.MipLevels <= x2w_startup::gfx10::max_mips &&
+           r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
+           !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !x2w_startup::address_depth_format(r.Format) &&
+           v.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING &&
+           x2w_startup::address_view_fits(r, v);
+}
+
 // The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
 // addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
-    if (supports_placed_memory_srv(r, v)) return true;
+    if (supports_placed_memory_srv(r, v) || console_linear_texture_srv(r, v)) return true;
     return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
 }
 
@@ -224,7 +236,7 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
 }
 
 // An unmatched or interior view must not reinterpret bytes owned by a live resource.
-bool address_resource_overlap(u64 address, u64 span)
+bool address_resource_overlap(u64 address, u64 span, x2w_startup::BufferRefusalDetail* detail = nullptr)
 {
     X2W_ZONE("srv address_resource_overlap scan");
     bool found = false;
@@ -235,7 +247,10 @@ bool address_resource_overlap(u64 address, u64 span)
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
             : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
-        return found = x2w_startup::address_span_touches(address, span, reinterpret_cast<u64>(wrapper->own().title_memory), bytes);
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        found = x2w_startup::address_span_touches(address, span, base, bytes);
+        if (found && detail) *detail = {x2w_startup::BufferRefusalReason::title_overlap, base, bytes};
+        return found;
     });
     ReleaseSRWLockShared(&note_lock);
     return found;
@@ -394,7 +409,7 @@ bool gpu_written_overlap(u64 address, UINT texel_bytes)
     return found;
 }
 
-Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
+Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes, bool& from_placement)
 {
     X2W_ZONE("srv existing_memory_buffer scan");
     if (!address || !bytes) return nullptr;
@@ -406,6 +421,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
         if (!info || info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info->console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
             return nullptr;
+        from_placement = true;
         return const_cast<Wrapper*>(placed.owner);
     }
     Wrapper* match = nullptr;
@@ -448,6 +464,15 @@ struct UnplacedBufferEntry {
 
 std::mutex unplaced_buffer_mutex;
 std::vector<UnplacedBufferEntry> unplaced_buffers;
+x2w_startup::BufferSrvRefusalCensus buffer_srv_refusal_census;
+
+void note_buffer_srv_refusal(x2w_startup::BufferRefusalDetail detail, u64 address, u64 span, u64 stride)
+{
+    std::lock_guard lock(unplaced_buffer_mutex);
+    const auto emit = [](const char* line) { log("%s", line); };
+    if (buffer_srv_refusal_census.note(detail, address, span, stride, emit))
+        buffer_srv_refusal_census.report(emit);
+}
 
 // Each distinct byte snapshot gets immutable backing. Copied descriptors and in-flight lists can
 // still reference older generations, so keep them until device teardown and refuse at the budget.
@@ -544,6 +569,7 @@ Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOUR
 void clear_unplaced_buffers(Wrapper* device)
 {
     std::lock_guard lock(unplaced_buffer_mutex);
+    buffer_srv_refusal_census.report([](const char* line) { log("%s", line); });
     for (auto it = memory_buffer_snapshots.begin(); it != memory_buffer_snapshots.end();) {
         if (it->device != device) {
             ++it;
@@ -573,23 +599,27 @@ void clear_unplaced_buffers(Wrapper* device)
     }
 }
 
-// refusal (out, optional): when a nullptr answer is exactly provable, the proof that keeps a cached copy of it exact
+// refusal carries the diagnostic detail and, when the nullptr answer is exactly provable, its cache proof
 // (srv_refusal_cache.h): decided by the request and stand-in state alone (independent), by a fully committed
 // allocation the buffer does not fit (fully_committed), or by one page that is not committed (witness_page).
 // A nullptr from a later step carries no proof (proven stays false).
 Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
-                                u64 elem_bytes, x2w_startup::SrvRefusalProof* refusal = nullptr)
+                                u64 elem_bytes, x2w_startup::SrvRefusalProof& refusal)
 {
-    if (refusal) *refusal = x2w_startup::SrvRefusalProof{};
+    using Reason = x2w_startup::BufferRefusalReason;
     const auto prove = [&](x2w_startup::SrvRefusalKind kind, u64 witness = 0, u64 base = 0) {
-        if (refusal) *refusal = x2w_startup::SrvRefusalProof{kind, witness, base, true};
+        refusal.kind = kind;
+        refusal.witness = witness;
+        refusal.base = base;
+        refusal.proven = true;
     };
-    if (address_resource_overlap(address, span_bytes)) {
+    if (address_resource_overlap(address, span_bytes, &refusal.detail)) {
         prove(x2w_startup::SrvRefusalKind::independent);
         return nullptr;
     }
     u64 page_start = 0, page_span = 0;
     if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span)) {
+        refusal.detail = {Reason::extent};
         prove(x2w_startup::SrvRefusalKind::independent);
         return nullptr;
     }
@@ -597,6 +627,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     x2w_startup::PlacedBufferRange memory{};
     if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
         !memory.covered) {
+        refusal.detail = {Reason::not_covered};
         if (memory.region_info)
             prove(x2w_startup::SrvRefusalKind::fully_committed);
         else if (memory.witness)
@@ -604,8 +635,10 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
     }
 
-    const auto nearby = placed_buffer_range(device, page_start, page_span, true);
+    x2w_startup::BufferRefusalDetail overlap;
+    const auto nearby = placed_buffer_range(device, page_start, page_span, true, &overlap);
     if (nearby.reject || nearby.owner) {
+        refusal.detail = x2w_startup::buffer_overlap_refusal(address, span_bytes, overlap.base, overlap.bytes);
         prove(x2w_startup::SrvRefusalKind::independent);
         return nullptr;
     }
@@ -620,7 +653,10 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     }
 
     auto* desktop = device_of(device);
-    if (!desktop) return nullptr;
+    if (!desktop) {
+        refusal.detail = {Reason::no_device};
+        return nullptr;
+    }
 
     std::lock_guard lock(unplaced_buffer_mutex);
     for (auto& entry : unplaced_buffers) {
@@ -720,10 +756,16 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         }
     }
 
-    if (!native_resource) return nullptr;
+    if (!native_resource) {
+        refusal.detail = {Reason::backing_failed};
+        return nullptr;
+    }
 
     Wrapper* w = wrap(native_resource.Get(), resource_kind);
-    if (!w) return nullptr;
+    if (!w) {
+        refusal.detail = {Reason::wrap_failed};
+        return nullptr;
+    }
     w->own().title_memory = reinterpret_cast<void*>(page_start);
     D3D12_RESOURCE_DESC rdesc{};
     rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -736,7 +778,9 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
-    note_resource(w, &rdesc, page_span);
+    using Backing = x2w_startup::BufferSrvBacking;
+    const auto backing = exact ? Backing::exact_copy : is_upload ? Backing::page_copy : Backing::page_alias;
+    note_resource(w, &rdesc, page_span, nullptr, 0, backing);
     if (!is_upload) {
         w->own().budget = x2w_budget::resource(desktop, native_resource.Get(), x2w_budget::placed);
         w->own().backing_budget = backing_budget;
@@ -1298,14 +1342,15 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
         const auto refusal_stamp = buffer_refusal_stamp(input->address);
-        const bool cached_refusal = buffer_refusal_cache().hit(
-            refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted);
-        Wrapper* buffer = nullptr;
         x2w_startup::SrvRefusalProof refusal_proof;
+        const bool cached_refusal = buffer_refusal_cache().hit(
+            refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted, &refusal_proof.detail);
+        Wrapper* buffer = nullptr;
+        bool from_placement = false;
         if (!cached_refusal) {
-            buffer = existing_memory_buffer(self, input->address, span_bytes);
+            buffer = existing_memory_buffer(self, input->address, span_bytes, from_placement);
             if (!buffer)
-                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, &refusal_proof);
+                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, refusal_proof);
         }
         static const bool shadow_enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_BUFFER");
         // The cached proof covers the regular buffer lookup, not the smaller snapshot range.
@@ -1321,6 +1366,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             }
         }
         if (cached_refusal) {
+            note_buffer_srv_refusal(refusal_proof.detail, input->address, span_bytes, elem_bytes);
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
@@ -1331,8 +1377,17 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
             // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
-            if (buffer) refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
+            if (buffer) {
+                refusal_proof = {x2w_startup::SrvRefusalKind::independent, 0, 0, true};
+                if (info) {
+                    using Backing = x2w_startup::BufferSrvBacking;
+                    refusal_proof.detail = x2w_startup::buffer_view_fit_refusal(input->address, elem_bytes,
+                        reinterpret_cast<u64>(buffer->own().title_memory), info->console.Width,
+                        from_placement ? Backing::placed : info->buffer_srv_backing);
+                }
+            }
             buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), refusal_proof);
+            note_buffer_srv_refusal(refusal_proof.detail, input->address, span_bytes, elem_bytes);
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;

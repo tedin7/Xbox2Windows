@@ -341,6 +341,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-28";
+    constexpr char feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
@@ -352,6 +353,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         for (std::size_t i = 0; i < bytes; ++i) key = (key ^ p[i]) * 1099511628211ull;
     };
     add(revision, sizeof(revision) - 1);
+    add(feature, sizeof(feature) - 1);
     add(&vertex_id, sizeof(vertex_id));
     add(&pixel_id, sizeof(pixel_id));
     add(root_blob->GetBufferPointer(), root_blob->GetBufferSize());
@@ -3233,6 +3235,26 @@ int main(int argc, char** argv) try
         if (line != expected) {
             std::fprintf(stderr, "indirect line mismatch:\n  got      '%s'\n  expected '%s'\n", line.c_str(), expected.c_str());
             return 1;
+        }
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
+        const char* reasons[] = {
+            "placeholder-signature: missing or placeholder signature",
+            "graphics-pipeline: indirect graphics requires a direct list wit",
+            "compute-pipeline: requires a desktop compute pipeline and root",
+        };
+        if (report.find(line + "\n") == std::string::npos ||
+            report.find("x2w-d3d12 indirect-pipeline refusals: total 3; distinct keys 1, distinct pairs 3 (overflow calls 0)\n") == std::string::npos) {
+            std::fprintf(stderr, "indirect fixture totals or pipeline census mismatch\n");
+            return 1;
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+            const std::string entry = std::string("x2w-d3d12 indirect-pipeline refusal ") + std::to_string(i + 1) +
+                ": key=0000000000000000 reason=" + reasons[i] + " calls=1\n";
+            if (report.find(entry) == std::string::npos) {
+                std::fprintf(stderr, "missing pipeline census entry: %s", entry.c_str());
+                return 1;
+            }
         }
         std::printf("%s\n", line.c_str());
     }

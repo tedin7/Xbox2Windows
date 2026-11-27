@@ -592,8 +592,18 @@ bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
 
 bool read_text(const wchar_t* path, std::string& out)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    const bool opened = x2w_startup::open_with_lock_retry(
+        [&]() -> unsigned {
+            file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            return file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        },
+        Sleep,
+        [path](int tries, unsigned code, bool succeeded) {
+            log("x2w-draw manifest %ls busy (error %lu), %d tries, %s",
+                path, static_cast<unsigned long>(code), tries, succeeded ? "opened" : "failed");
+        });
+    if (!opened) return false;
     char buffer[8192];
     DWORD got = 0;
     while (ReadFile(file, buffer, sizeof(buffer), &got, nullptr) && got) out.append(buffer, got);
@@ -613,11 +623,12 @@ bool extended_buffer_formats()
 {
     static const bool enabled = [] {
         const DWORD saved = GetLastError();
+        // Default on: typed buffer views such as R32_UINT decode in translated draws. Only "0" opts out.
         char value[2]{};
-        const bool on = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
-                        value[0] == '1';
+        const bool off = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
+                         value[0] == '0';
         SetLastError(saved);
-        return on;
+        return !off;
     }();
     return enabled;
 }
@@ -625,7 +636,7 @@ bool extended_buffer_formats()
 u64 shader_cache_seed(const char* revision, std::size_t bytes)
 {
     const u64 seed = fnv_bytes(revision, bytes);
-    // Keep graphics bytecode with extended cases out of the default request namespace.
+    // Translations with and without the extended cases (X2W_EXTENDED_BUFFER_FORMATS=0) never share a request key.
     constexpr char feature[] = "extended-buffer-formats1";
     return extended_buffer_formats() ? fnv_bytes(feature, sizeof(feature) - 1, seed) : seed;
 }
@@ -979,27 +990,27 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
-    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return 0;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return;  // VS at +0x48
+    if (words[9] || words[10]) return 0;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return;
+    if (!root || root_info(root) != bound_root) return 0;
     std::vector<unsigned char> root_blob;
     {
         note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return;
+    if (root_blob.empty()) return 0;
     std::vector<unsigned char> mesh, pixel;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
@@ -1009,13 +1020,13 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
     const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, seed)));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
-    if (written.count(key)) return;
+    if (written.count(key)) return key;
     const unsigned char none = 0;
     if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
@@ -1026,6 +1037,7 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
     }
+    return key;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -1411,10 +1423,10 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
-// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+// Only the depth view actually bound to this pass determines the draw format.
 inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
 {
-    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    return x2w_startup::draw_dsv_format(pass.bound_depth != nullptr, pass.dsv_format, bound.dsv_format);
 }
 
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
@@ -1423,8 +1435,8 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
-    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    // No depth or stencil state is meaningful without a bound depth view.
+    const bool use_depth_stencil = x2w_startup::draw_depth_state_enabled(bound.has_depth_stencil, dsv_format);
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
@@ -4102,10 +4114,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // shared MostDetailedMip and MipLevels in all supported texture views
             if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+            // A token of an unordered access view (slot 19) holds a UAV description: it is read as the SRV of its mip.
             // What the shader does with this view (manifest srvuse; absent = unknown) and the view the title made decide
             // whether the texture may lose its top mip levels when it is materialized by this bind (texture_drop_mips.h).
             D3D12_SHADER_RESOURCE_VIEW_DESC title_view{};
-            if (record.desc_bytes >= sizeof(title_view)) std::memcpy(&title_view, record.desc, sizeof(title_view));
+            const bool described = srv_check::recorded_srv(record.slot, record.desc, record.desc_bytes, title_view);
             x2w_startup::drop_mips::ViewFacts drop_view;
             drop_view.most_detailed_mip = title_view.Texture2D.MostDetailedMip;
             drop_view.min_lod_clamp = title_view.Texture2D.ResourceMinLODClamp;
@@ -4116,8 +4129,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
                 texture = sampled_address_texture(resource);
             }
-            if (texture && record.desc_bytes >= sizeof(desc)) {
-                std::memcpy(&desc, record.desc, sizeof(desc));
+            if (texture && described) {
+                desc = title_view;
                 desc.Format = desktop_format(desc.Format);
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
@@ -4164,12 +4177,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
-            auto* view = record.desc_bytes >= sizeof(desc) ? &desc : nullptr;
+            auto* view = described ? &desc : nullptr;
             if (texture) {
                 const auto real_desc = texture->GetDesc();
+                // A single-slice array view and its plain form name the same texels: take the type the shader declares.
+                if (view && view->ViewDimension != dimension) srv_check::as_dimension(desc, dimension, desc);
                 if ((view && view->ViewDimension != dimension) ||
                     (!view && srv_check::default_dimension(real_desc) != dimension)) {
                     log_srv_refusal(srv_check::Refusal::dimension);
+                    static LONG mismatch_shown;
+                    if (first_calls(mismatch_shown, 6))
+                        log("x2w-draw   %016llx srv %u: the shader declares view dimension %d; the slot %u view has %d "
+                            "(resource dim=%d array=%u samples=%u): binding null",
+                            tr->key, i, static_cast<int>(dimension), record.slot,
+                            view ? static_cast<int>(view->ViewDimension) : static_cast<int>(srv_check::default_dimension(real_desc)),
+                            static_cast<int>(real_desc.Dimension), real_desc.DepthOrArraySize, real_desc.SampleDesc.Count);
                     texture = nullptr;
                     mismatched = true;
                 } else {
@@ -4823,7 +4845,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
-                                                                   heap.increment, heap.desktop_gpu);
+                                                                   heap.title_increment, heap.desktop_gpu);
                     heap_entries = static_cast<UINT>((std::min)(u64{heap.logical_count}, heap_records.bytes / 32));
                 }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
@@ -4853,7 +4875,7 @@ x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
         if (pass.source_view_heap && heap.wrapper != pass.source_view_heap) continue;
         if (!pass.source_view_heap && heap.logical_count > heap.count) continue;
-        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.increment, gpu_handle);
+        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.title_increment, gpu_handle);
         if (table.address) break;
     }
     ReleaseSRWLockShared(&note_lock);

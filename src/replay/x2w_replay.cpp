@@ -20,8 +20,7 @@
 //     output arguments: OUTP);
 //   - argument memory is copied out of the recording into memory the replay owns, pointers between those copies are
 //     rewritten (ARGM parent/word), and words inside them naming a wrapper or a descriptor handle are rewritten too;
-//   - descriptor handles: a heap's CPU/GPU start returned on the recorded run maps to the one returned now, over the
-//     heap's size (its descriptor count from the creation, times the increment the replay device reports);
+//   - descriptor handles map heap starts over the recorded descriptor count and increment;
 //   - a fence's completed value is waited for until it reaches the recorded one (10 s at most).
 //   - a buffer's mapped address and GPU address map to the replay's over the buffer's width;
 //   - a struct-returning slot called as (return buffer, object) is played the same way, with a buffer of its own.
@@ -59,6 +58,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 
 extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
     void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
+extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
 namespace x2w_replay {
@@ -92,6 +92,7 @@ struct Range {
 };
 
 struct Player {
+    UINT recorded_increments[4] = {};
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
     std::vector<ReservedSpan> descriptor_backings;  // exact ranges of heaps created so far
@@ -343,7 +344,8 @@ void learn_after(Player& p, const Recording& r, const Played& call)
         u64 span = 1ull << 20;
         if (heap != p.heaps.end()) {
             const u64 a[call_args] = {heap->second.type};
-            const u64 increment = call_slot(reinterpret_cast<u64>(p.device), device_increment_size, a) & 0xffffffffu;
+            const u64 increment = heap->second.type < 4 && p.recorded_increments[heap->second.type] ? p.recorded_increments[heap->second.type] :
+                call_slot(reinterpret_cast<u64>(p.device), device_increment_size, a) & 0xffffffffu;
             span = static_cast<u64>(heap->second.count) * (increment ? increment : 64);
         }
         p.handles[old_value] = Range{new_value, span ? span : 1};
@@ -1034,6 +1036,22 @@ int run(const Options& o)
         // XOBJ: devices the recorder saw made outside the recorded slots (D3D12XboxCreateDevice) are the player's device.
         for (const auto& [kind, object] : r.live_objects)
             if (kind == device_kind) p.objects[object] = reinterpret_cast<u64>(p.device);
+    }
+    bool increment_conflict[4] = {};
+    for (const StepRef& ref : r.steps) {
+        const CallRecord c = r.call_of(ref);
+        if (c.kind != device_kind || c.slot != device_increment_size || c.args[0] >= 4) continue;
+        const UINT type = static_cast<UINT>(c.args[0]), value = static_cast<UINT>(c.ret);
+        if (!value) continue;
+        if (!p.recorded_increments[type]) p.recorded_increments[type] = value;
+        else if (p.recorded_increments[type] != value && !increment_conflict[type]) {
+            increment_conflict[type] = true;
+            say("x2w-replay: heap type %u recorded increments differ (%u, %u)", type, p.recorded_increments[type], value);
+        }
+    }
+    for (UINT type = 0; type < 4; ++type) if (p.recorded_increments[type]) {
+        say("x2w-replay: heap type %u recorded increment %u", type, p.recorded_increments[type]);
+        x2w_d3d12_replay_title_increment(type, p.recorded_increments[type]);
     }
     phase = "playing";
     const auto started = ReplayClock::now();
