@@ -8552,7 +8552,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     x2w_startup::NullInputCensus::Batch null_report;
-    const bool totals_due = render_mode() && frame % 300 == 0;
+    const bool totals_due = census_due;  // every 300 frames and every 10 s of wall time (259356f52), as the censuses below
     const bool null_report_due = render_mode() && now - last_null_report >= 10000;
     if (totals_due || null_report_due) {
         if (null_report_due) last_null_report = now;
