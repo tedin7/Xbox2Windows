@@ -119,7 +119,18 @@ int create_scene(void* device, Scene& s)
     // arguments after the device, the output last), so a recording must carry more than seven argument words. The
     // word after them (the caller's stack, which the slot ignores) points at the output variable too, as a title's
     // stack can: the replay must take the new object from the output the call wrote, not from that copy.
-    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
+    // X2W_TEST_REPLAY_CREATE133=1: the target is placed at a title address by device slot 133 (CreatePlacedResourceX:
+    // address, desc, state, clear, IID, out) with no desktop heap placement, the way a title makes most of its
+    // resources. A window that opens after it must still carry its description, IID and output.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE133", nullptr, 0)) {
+        constexpr SIZE_T bytes = 64 * 1024;
+        static_assert(width * height * 4 <= bytes, "the title memory holds the target");
+        void* memory = VirtualAlloc(reinterpret_cast<void*>(0x21000000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!memory || FAILED(static_cast<HRESULT>(invoke(device, 133, arg(memory), arg(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                                          arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) ||
+            !s.target)
+            return 29;
+    } else if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
         using Create = HRESULT (*)(void*, const void*, UINT, const void*, UINT, const void*, void*, UINT, const void*, const GUID*, void**,
                                    void**);
         const auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[127]);
