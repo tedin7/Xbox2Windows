@@ -14,6 +14,13 @@ HLSL = (
 )
 RED = bytes((255, 0, 0, 255))
 BLUE = bytes((0, 0, 255, 255))
+COUNT_FIELDS = r"(\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes, (\d+) failed reservations"
+FRAME_COUNTS = re.compile(r"large bindings frame (\d+): " + COUNT_FIELDS)
+TOTAL_COUNTS = re.compile(r"large bindings totals \(frame (\d+)\): " + COUNT_FIELDS)
+
+
+def read_counts(log, pattern=FRAME_COUNTS):
+    return [tuple(map(int, match)) for match in pattern.findall(log.read_text(errors="replace"))]
 
 
 def run(directory, consumer, backend, mode):
@@ -70,16 +77,15 @@ def check_once(directory, consumer, backend):
     log = directory / "trap.log"
     pixels = draw_texture(directory, consumer, backend, shader, {
         "X2W_TEST_FRAME_COPY": "once", "X2W_TRAP_LOG": str(log),
-        "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+        "X2W_BIGBIND_ONCE": "1", "X2W_BIGBIND_POOL": "0", "X2W_BIG_COPY_REUSE": "0",
     }, binding="srv 0 buf table 0 0")
     if pixels is None:
         return 77
     expected = (RED * 4 + BLUE * 4) * 4
     if pixels != expected:
         raise AssertionError(f"once: actual {pixels.hex()} expected {expected.hex()}")
-    frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
-                        log.read_text(errors="replace"))
-    expected_frames = [(str(frame), "1", "1", "3", str(16 << 20)) for frame in (1, 2)]
+    frames = read_counts(log)
+    expected_frames = [(frame, 1, 1, 3, 16 << 20, 0) for frame in (1, 2)]
     if frames != expected_frames:
         raise AssertionError(f"once: frame counters {frames!r}, expected {expected_frames!r}")
     print(f"{backend} once: 32 pixels exact, 1 trim and 1 full 16 MiB copy per frame, 3 hits per frame")
@@ -96,7 +102,7 @@ def check_once(directory, consumer, backend):
             folder = directory / "keys_mutant"
         folder.mkdir()
         pixels = draw_texture(folder, consumer, backend, keys_shader, {
-            "X2W_TEST_FRAME_COPY": "once-keys", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", **extra,
+            "X2W_TEST_FRAME_COPY": "once-keys", "X2W_BIGBIND_ONCE": "1", "X2W_BIGBIND_POOL": "0", "X2W_BIG_COPY_REUSE": "0", **extra,
         }, binding="srv 0 buf table 0 0")
         if pixels is None:
             return 77
@@ -110,11 +116,60 @@ def check_once(directory, consumer, backend):
     folder = directory / "no_reset"
     folder.mkdir()
     pixels = draw_texture(folder, consumer, backend, shader, {
-        "X2W_TEST_FRAME_COPY": "once", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", "X2W_TEST_BIGBIND_NO_RESET": "1",
+        "X2W_TEST_FRAME_COPY": "once", "X2W_BIGBIND_ONCE": "1", "X2W_BIGBIND_POOL": "0", "X2W_BIG_COPY_REUSE": "0", "X2W_TEST_BIGBIND_NO_RESET": "1",
     }, binding="srv 0 buf table 0 0")
     if pixels != RED * 8 * 4:
         raise AssertionError(f"once, no reset at Present: actual {pixels.hex() if pixels else pixels} expected all red")
     print(f"{backend} once, no reset at Present (mutant): second frame shows the old bytes, as the control expects")
+    return check_ring_full(directory, consumer, backend)
+
+
+def check_ring_full(directory, consumer, backend):
+    trimmed = (16 << 20) - 4352
+    shader = f"""ByteAddressBuffer payload : register(t0);
+float4 main(float4 position : SV_Position) : SV_Target {{
+    float head = asfloat(payload.Load(36));
+    float tail = asfloat(payload.Load({trimmed - 4}));
+    return float4(head, tail > 0 ? 1.0 : 0.0, tail < 0 ? 1.0 : 0.0, 1.0);
+}}
+"""
+    # CPU reference for the two payloads and the untouched blue clear value.
+    colors = tuple(bytes((int(head * 255), 255 * (tail > 0), 255 * (tail < 0), 255))
+                   for head, tail in ((0, 1), (1, -1)))
+    copied = (1, 1, 3, trimmed, 0)
+    refused = (1, 0, 3, 0, 4)
+    revalidated = (4, 0, 0, 0, 4)
+    cases = (
+        ("pool", "1", "32", "4096", "0", colors, (copied, copied)),
+        ("pool_full", "1", "16", "4096", "0", (colors[0], BLUE), (copied, refused)),
+        ("ring_fallback", "1", "16", "65536", "0", colors, (copied, copied)),
+        ("pool_off", "0", "32", "4096", "0", (BLUE, BLUE), (refused, refused)),
+        ("drop_failed_mutant", "0", "32", "4096", "1", (BLUE, BLUE), (revalidated, revalidated)),
+    )
+    for name, pool, cap, ring, mutant, frame_colors, frame_counts in cases:
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-ring-full", "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "1", "X2W_BIGBIND_POOL": pool, "X2W_BIGBIND_POOL_MIB": cap,
+            "X2W_TEST_UPLOAD_RING_MAX_KIB": ring, "X2W_TEST_BIGBIND_DROP_FAILED": mutant,
+            "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        expected_pixels = b"".join(color * 4 for color in frame_colors) * 4
+        if pixels != expected_pixels:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {expected_pixels.hex()}")
+        counts = read_counts(log)
+        expected_counts = [(frame, *values) for frame, values in enumerate(frame_counts, 1)]
+        if counts != expected_counts:
+            raise AssertionError(f"{name}: frame counters {counts!r}, expected {expected_counts!r}")
+        totals = read_counts(log, TOTAL_COUNTS)
+        expected_totals = [(300, *(sum(values) for values in zip(*frame_counts)))]
+        if totals != expected_totals:
+            raise AssertionError(f"{name}: totals {totals!r}, expected {expected_totals!r}")
+        print(f"{backend} once-ring-full {name}: 32 pixels exact, frame counters {counts}")
     return 0
 
 

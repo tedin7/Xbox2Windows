@@ -191,6 +191,7 @@ struct alignas(16) WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
+    UploadChunkMask large_upload_buffers;  // Dedicated buffers referenced by this recording.
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Cached address SRV backed by guest memory.
@@ -1608,6 +1609,14 @@ void detach_gpu_mirror_recording(Wrapper* list)
 
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+std::vector<UploadRingChunk> large_upload_buffers;
+
+void discard_recording_uploads(WrapperOwn& state)
+{
+    discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+    discard_upload_chunks(state.large_upload_buffers, large_upload_buffers.data());
+}
+
 // Pages of finished list arenas, handed to the next arenas (allocator_lock).
 x2w_upload::FreePages free_upload_pages;
 
@@ -1705,7 +1714,7 @@ void release_upload_recording(Wrapper* list)
 {
     forget_compute_snapshot_recording(list);
     AcquireSRWLockExclusive(&allocator_lock);
-    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    discard_recording_uploads(list->own());
     retire_list_arena(list);
     detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
@@ -1942,10 +1951,15 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         }
     }
     UploadChunkMask chunks = 0;
-    for (auto* list : lists) chunks |= list->own().upload_chunks;
+    UploadChunkMask large_buffers = 0;
+    for (auto* list : lists) {
+        chunks |= list->own().upload_chunks;
+        large_buffers |= list->own().large_upload_buffers;
+    }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
     submit.submitted(chunks, signaled);
+    submit.submitted(large_buffers, signaled, max_upload_chunks);
     if (signaled) {
         for (Wrapper* list : lists) {
             if (auto* arena = list->own().list_uploads) arena->submitted(fence, value);
@@ -2127,7 +2141,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
-            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            discard_recording_uploads(state);
             retire_list_arena(self);
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -2169,7 +2183,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
-        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        discard_recording_uploads(state);
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2831,6 +2845,94 @@ u64 upload_ring_max_bytes()
     return bytes;
 }
 
+// Caller holds allocator_lock. Publish the resource only after it is mapped and tracked.
+bool append_upload_buffer(std::vector<UploadRingChunk>& chunks, u64 chunk_bytes)
+{
+    auto* device = the_device ? device_of(the_device) : nullptr;
+    if (device) {
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = chunk_bytes;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* created = nullptr;
+        void* base = nullptr;
+        if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created)))) {
+            auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
+            if (SUCCEEDED(created->Map(0, nullptr, &base))) {
+                try {
+                    chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
+                    return true;
+                } catch (const std::bad_alloc&) {
+                    created->Unmap(0, nullptr);
+                    if (budget) budget->end_use();
+                    created->Release();
+                }
+            } else {
+                if (budget) budget->end_use();
+                created->Release();
+            }
+        }
+    }
+    return false;
+}
+
+u64 large_upload_pool_limit()
+{
+    static constexpr u64 mib = 1ull << 20;
+    static const u64 limit = [] {
+        char value[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_BIGBIND_POOL_MIB", value, sizeof(value));
+        if (!n || n >= sizeof(value) || value[0] < '0' || value[0] > '9') return 512 * mib;
+        char* end = nullptr;
+        const u64 parsed = std::strtoull(value, &end, 10);
+        return *end == '\0' && parsed <= UINT64_MAX / mib ? parsed * mib : 512 * mib;
+    }();
+    return limit;
+}
+
+UploadReservation reserve_large_upload(Wrapper* list, std::size_t bytes, UploadChunkMask& frame_hold)
+{
+    constexpr u64 mib = 1ull << 20;
+    const u64 limit = large_upload_pool_limit();
+    if (!bytes || bytes > limit) return {};
+    const u64 rounded = (static_cast<u64>(bytes) + mib - 1) & ~(mib - 1);
+    static u64 allocated_bytes = 0;
+
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& buffers = large_upload_buffers;
+    const auto finish = [&](unsigned index, UploadReservation slice) {
+        buffers[index].hold(list->own().large_upload_buffers, index);
+        buffers[index].hold(frame_hold, index);
+        slice.dedicated = true;
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return slice;
+    };
+    for (unsigned i = 0; i < buffers.size(); ++i) {
+        if (buffers[i].capacity != rounded) continue;
+        const auto slice = reuse_upload_chunk(buffers[i], max_upload_chunks + i, rounded, queue_submits);
+        if (slice.mapped) return finish(i, slice);
+    }
+    if (buffers.size() < max_large_upload_buffers && rounded <= limit - allocated_bytes &&
+        append_upload_buffer(buffers, rounded)) {
+        allocated_bytes += rounded;
+        return finish(static_cast<unsigned>(buffers.size() - 1), reserve_upload_chunk(buffers.back(), rounded));
+    }
+    // A completed larger resource can also hold the copy at offset zero.
+    for (unsigned i = 0; i < buffers.size(); ++i) {
+        if (buffers[i].capacity <= rounded) continue;
+        const auto slice = reuse_upload_chunk(buffers[i], max_upload_chunks + i, rounded, queue_submits);
+        if (slice.mapped) return finish(i, slice);
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return {};
+}
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
 {
     const u64 ring_max_bytes = upload_ring_max_bytes();
@@ -2863,38 +2965,10 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
         u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
-        auto* device = the_device ? device_of(the_device) : nullptr;
-        if (device) {
-            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-            D3D12_RESOURCE_DESC buffer{};
-            buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            buffer.Width = chunk_bytes;
-            buffer.Height = 1;
-            buffer.DepthOrArraySize = 1;
-            buffer.MipLevels = 1;
-            buffer.SampleDesc.Count = 1;
-            buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ID3D12Resource* created = nullptr;
-            void* base = nullptr;
-            if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created)))) {
-                auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
-                if (SUCCEEDED(created->Map(0, nullptr, &base))) {
-                    try {
-                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
-                        total_bytes += chunk_bytes;
-                        reservation = reserve_upload_chunk(chunks.back(), rounded);
-                        return finish(static_cast<unsigned>(chunks.size() - 1));
-                    } catch (const std::bad_alloc&) {
-                        created->Unmap(0, nullptr);
-                        if (budget) budget->end_use();
-                        created->Release();
-                    }
-                } else {
-                    if (budget) budget->end_use();
-                    created->Release();
-                }
-            }
+        if (append_upload_buffer(chunks, chunk_bytes)) {
+            total_bytes += chunk_bytes;
+            reservation = reserve_upload_chunk(chunks.back(), rounded);
+            return finish(static_cast<unsigned>(chunks.size() - 1));
         }
     }
     // Allocation failed or the cap was reached. Older unused tails are still safe.
