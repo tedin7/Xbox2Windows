@@ -12,6 +12,9 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
+extern "C" __declspec(dllimport) void x2w_d3d12_upload_page_stats(unsigned long long* live, unsigned long long* free,
+                                                                   unsigned long long* created, unsigned long long* reused,
+                                                                   unsigned long long* recycled_early);
 
 namespace {
 using namespace x2w_budget;
@@ -246,7 +249,14 @@ int check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool co
     buffer_heap.Reset();
     if (!snap(actual)) return 5;
     active.live[upload] = baseline.live[upload];
-    if (!matches(active, actual, "allocator reset and shared heap released")) return 5;
+    if (!matches(active, actual, "allocator reset and shared heap released")) {
+        // Where the list's upload page went: still in an arena, in the free pool, or released.
+        unsigned long long live = 0, free = 0, created = 0, reused = 0, recycled = 0;
+        x2w_d3d12_upload_page_stats(&live, &free, &created, &reused, &recycled);
+        std::printf("upload pages live=%llu free=%llu created=%llu reused=%llu recycled_early=%llu\n", live, free, created,
+                    reused, recycled);
+        return 5;
+    }
     const auto first_bytes = resource_bytes(first.Get());
     first.Reset();
     active.live[placed].bytes -= first_bytes;
