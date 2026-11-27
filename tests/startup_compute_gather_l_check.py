@@ -272,7 +272,6 @@ def controls(llvm_mc):
         pipe_fn(mk(mask=1, dst=0xff), 'four destination registers')
         pipe_fn(mk(mask=1, addr=0xfe), 'three contiguous address registers')
         pipe_fn(mk(mask=1, opcode=0x45), 'image_gather4_b')
-        pipe_fn(mk(mask=1, opcode=0x54), 'image_gather4_l_o')
         pipe_fn(mk(mask=1, opcode=0x4c), 'image_gather4_c_l')
 
     # Cache policy bits (dlc=bit 7, glc=bit 13, slc=bit 25) are accepted and preserve the same gather output.

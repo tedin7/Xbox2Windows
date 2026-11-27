@@ -259,6 +259,7 @@ jobs:
             tests/startup_compute_image_store_check.py \
             tests/startup_compute_image_store_d16_check.py \
             tests/startup_compute_gather_l_check.py \
+            tests/startup_compute_gather_l_o_check.py \
             tests/startup_compute_buffer_atomics_check.py \
             tests/startup_compute_store_d16_x_check.py \
             tests/startup_compute_store_format_xyzw_check.py \
