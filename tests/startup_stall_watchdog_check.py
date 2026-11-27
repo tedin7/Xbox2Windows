@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "tools" / "startup"))
@@ -124,6 +125,76 @@ class Decision(unittest.TestCase):
             sample["cpu"], sample["storage"] = t * 1.5, 1000 * t
             return sample
         self.assertEqual(first_stop(busy), (None, None))
+
+
+class PresentDump(unittest.TestCase):
+    def test_floor_and_stall_threshold(self):
+        for first_frame, expected in ((5, [30]), (20, [35])):
+            with self.subTest(first_frame=first_frame):
+                watch = Watch(stall_seconds=0, memory_percent=0)
+                fired = []
+                for t in range(0, 55, STEP):
+                    self.assertIsNone(watch.decide(t, {"present": 7 if t == first_frame else None, "cpu": t}))
+                    if watch.wants_present_dump(t):
+                        fired.append(t)
+                        self.assertFalse(watch.wants_present_dump(t))
+                self.assertEqual(fired, expected)
+
+    def test_rearms_on_frames_and_caps_at_three(self):
+        watch = Watch()
+        fired = []
+        for t in range(0, 140, STEP):
+            watch.decide(t, {"present": None if t < 15 else 1 + (t - 15) // 30})
+            if watch.wants_present_dump(t):
+                fired.append(t)
+        self.assertEqual(fired, [30, 60, 90])
+
+    def test_no_dump_without_a_frame_count(self):
+        watch = Watch()
+        for t in range(0, 100, STEP):
+            watch.decide(t, {"storage": t})
+            self.assertFalse(watch.wants_present_dump(t))
+
+    def test_off_and_stop_decisions(self):
+        enabled, disabled = Watch(), Watch(present_dump_seconds=0)
+        dumps, stops = [], []
+        for t in range(0, 400, STEP):
+            sample = starved(t)
+            reason = enabled.decide(t, sample)
+            self.assertEqual(reason, disabled.decide(t, sample))
+            self.assertFalse(disabled.wants_present_dump(t))
+            if enabled.wants_present_dump(t):
+                dumps.append(t)
+            if reason:
+                stops.append(t)
+        self.assertEqual(dumps, [315])
+        self.assertEqual(stops[0], 390)
+
+    def test_request_names(self):
+        parse = stall_watchdog.dump_request_filename
+        self.assertEqual(parse("threads_present_stall_1.txt\n"), "threads_present_stall_1.txt")
+        self.assertEqual(parse("threads_other_0.txt"), "threads_other_0.txt")
+        for invalid in ("", "threads\n", "threads_.txt", "threads_BAD.txt", "threads_a.txt\nthreads_b.txt",
+                        "../threads_a.txt", "C:\\threads_a.txt", "sub/threads_a.txt", "threads_a.txt.bak"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(parse(invalid), "threads_stall.txt")
+
+    def test_main_writes_request_and_keeps_sampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logdir = Path(tmp)
+            (logdir / "events.txt").touch()
+            with (patch.object(stall_watchdog, "parent_alive", side_effect=[True, True, True, False]),
+                  patch.object(stall_watchdog.time, "time", side_effect=[100, 100, 130, 135]),
+                  patch.object(stall_watchdog.time, "sleep") as sleep,
+                  patch.object(stall_watchdog, "take_sample", return_value={"present": 7}) as sample,
+                  patch("builtins.print") as say):
+                self.assertEqual(stall_watchdog.main([tmp, "--stall-seconds", "0", "--memory-percent", "0"]), 0)
+            self.assertEqual(sample.call_count, 3)
+            self.assertEqual(sleep.call_count, 3)
+            self.assertEqual((logdir / "dump_request").read_text(), "threads_present_stall_1.txt")
+            self.assertFalse((logdir / "stop").exists())
+            say.assert_called_once_with(
+                "tester_run: threads dump at 30 s: no frame presented for 30 s (threads_present_stall_1.txt)", flush=True)
 
 
 class Process(unittest.TestCase):

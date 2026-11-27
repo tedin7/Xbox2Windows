@@ -303,7 +303,8 @@ def check_shell(shell):
             raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
         assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
-                         "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
+                         "-MemoryStopPercent", "0", "-PresentDumpSeconds", "0",
+                         extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
         assert "STALL STOP" not in off.stdout, off.stdout
         nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
         assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)

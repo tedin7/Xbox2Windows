@@ -1314,6 +1314,14 @@ Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 
 ## Iterating on start-up runs
 
+The tester stall watchdog requests a diagnostic threads dump after it has seen
+a frame count, the count stays unchanged for 15 seconds, and the run is at
+least 30 seconds old. The run continues. The watchdog re-arms when the count
+changes and saves up to three dumps as `threads_present_stall_1.txt` through
+`threads_present_stall_3.txt` in the report archive. Set `-PresentDumpSeconds 0`
+to turn off these diagnostics. The deadlock stop rule still requests
+`threads_stall.txt`.
+
 This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
 
 ### 1. Run the executable in a disposable VM
