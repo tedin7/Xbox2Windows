@@ -354,6 +354,18 @@ to a real present. The contract under the switch:
 
   Neither line is the composited window picture.
 
+The diagnostic readback publishes pixels only after its queue fence reaches
+the submitted value without reporting device removal. A timeout, a failed
+event registration or an incomplete fence after the event registers a drain:
+a threadpool wait on the submitted fence value that releases the held surface
+and queue references once the fence completes and publishes no pixels, so a
+final sample no longer keeps them for the module lifetime. The drain releases
+only the submission it was registered for (a later sample owns its own) and
+never releases pending, failed-signal or device-removed work; a failed signal
+or removed device disables further diagnostic readback for the module
+lifetime. `startup_present_readback` exercises the completion policy and the
+ownership retirement without a GPU.
+
 The first presents and every 300th log each plane:
 
 ```text
@@ -577,6 +589,23 @@ An unset constant reads as zero in the translated draw. Slot 40
 calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table and writes a
 root constant into the blue channel. It checks the original bindings, the same signature, a switched signature and
 six out-of-range calls. The switched case clears both inputs to the shader.
+
+## Refused compute and mesh57 dispatches
+
+The runtime logs cumulative `x2w-render compute refused key` and
+`x2w-render mesh57 refused key` rows at powers of two of each kind's refusal
+total and on normal teardown. Each snapshot lists up to 40 keys by skipped
+dispatches, with the first runtime refusal for each key.
+
+For mesh57, the group total is the sum of X×Y×Z from CPU-readable indirect
+argument snapshots. Unreadable or invalid arguments increment the unknown
+group count. These snapshots measure the arguments observed at record time.
+The tester archive adds the latest counts to `shader_results.txt` and ranks
+refused shader requests by skipped dispatches.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(refused_dispatch_census|tester_pack|gfx2hlsl_retry_lifted)$'
+```
 
 ## Null bindings in translated draws
 
@@ -2357,7 +2386,9 @@ reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resour
 sampler holds its own reference to the presented surface until the copy's fence has passed; a title
 may release the surface right after the present. If `Signal` fails after the copy was submitted,
 sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
-process. It publishes them in a named block,
+process. A removed device (the fence reporting `UINT64_MAX`) is never treated as a completion:
+the readback is not mapped, no sample is published, sampling stops, and the surface stays referenced
+for the rest of the process. It publishes them in a named block,
 `Local\x2w_present_signature_<process id>`, so other tools can read it too
 (`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
 formats are read; for others it logs
@@ -2671,6 +2702,13 @@ These are measured on one executable; treat them as hypotheses for others.
   lanes of the desktop wave. This follows the packing contract of the wave reductions. `sD` has no run-time value,
   and any other read of it is refused ([the note](experiments/startup-gfx2hlsl-pixel-first-lane.md)). Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_pixel_first_lane"`.
+  [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
+- **Select on descriptor data.** In a compute stage, `s_cselect_b32 sD, a, b` with one source a number computed
+  from a descriptor (`descnum`) and the others constants, such as `sX, 0, sX`, emits no HLSL. sD keeps both arms as
+  a symbol with no run-time value. A numeric read, scalar ALU other than a move, or a descriptor operand holding it
+  (also as a word joined at a branch target) is refused, so an arm that zeroes a buffer's size is never dropped
+  ([the note](experiments/startup-gfx2hlsl-cselect-descnum.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_cselect_descnum"`.
   [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use

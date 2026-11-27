@@ -605,11 +605,12 @@ bool extended_buffer_formats()
 {
     static const bool enabled = [] {
         const DWORD saved = GetLastError();
+        // Default on: typed buffer views such as R32_UINT decode in translated draws. Only "0" opts out.
         char value[2]{};
-        const bool on = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
-                        value[0] == '1';
+        const bool off = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
+                         value[0] == '0';
         SetLastError(saved);
-        return on;
+        return !off;
     }();
     return enabled;
 }
@@ -617,7 +618,7 @@ bool extended_buffer_formats()
 u64 shader_cache_seed(const char* revision, std::size_t bytes)
 {
     const u64 seed = fnv_bytes(revision, bytes);
-    // Keep graphics bytecode with extended cases out of the default request namespace.
+    // Translations with and without the extended cases (X2W_EXTENDED_BUFFER_FORMATS=0) never share a request key.
     constexpr char feature[] = "extended-buffer-formats1";
     return extended_buffer_formats() ? fnv_bytes(feature, sizeof(feature) - 1, seed) : seed;
 }
@@ -971,27 +972,27 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
-    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return 0;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return;  // VS at +0x48
+    if (words[9] || words[10]) return 0;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return;
+    if (!root || root_info(root) != bound_root) return 0;
     std::vector<unsigned char> root_blob;
     {
         note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return;
+    if (root_blob.empty()) return 0;
     std::vector<unsigned char> mesh, pixel;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
@@ -1001,13 +1002,13 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
     const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, seed)));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
-    if (written.count(key)) return;
+    if (written.count(key)) return key;
     const unsigned char none = 0;
     if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
@@ -1018,6 +1019,7 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
     }
+    return key;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one

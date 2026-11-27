@@ -6,6 +6,9 @@
                                           run the translated pixel bodies in a compute wrapper and compare the words
   control <dxc> <offscreen_check> <warp|hardware>
                                           the same with the old folded statement, which must give the folded value
+  maskjoin <dxc> <offscreen_check> <warp|hardware>
+                                          draw the lane-mask join (MASK_JOIN_*) on a 4x4 target against the CPU
+                                          reference; a mutant that reads the joined mask without EXEC must differ
 
 Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between
 a branch and its target. This check covers what that leaves: symbols that are not constants (descriptor words,
@@ -36,6 +39,17 @@ The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
   translator's one-lane model, not something this check proves. The words are built here from the SOP2, SOPP and
   VOP3 field layouts and checked against the decoder's text; they are not in SOURCES, so `binary` does not
   assemble them.
+- MASK_JOIN_<mode> (wave64, v0 = x | y << 16, c = x & 1, mode a constant): a switch on the mode whose arms 1 and 3
+  narrow EXEC with s_and_saveexec_b64, test `s_andn2_b64 s[44:45], s[44:45], exec` with s_cbranch_scc1 and set
+  s[40:41] to 0 or -1 on that path only; s[40:41] holds a table pointer on every other path. At the join
+  `s_andn2_b64 s[42:43], s[40:41], exec` reads it, and the export is (s42 ? 1.0 : 0.0, c, 0, 1). The guest gives
+  keep = 1 (mode 0), 1 - c (modes 1 and 3), c (mode 2) whatever the other lanes of the wave hold. The SCC branch is a
+  vote over the wave (some lane has the bit), and the read is taken because every path arrives with EXEC 1 or with an
+  exact lane mask in s40 (lane_mask_read_exact). Refused: no EXEC restore before the join, `s_and_b64` instead of
+  andn2, a 32-bit write of s40, a backward branch, and an SCC from a mask that is not an EXEC copy (no vote).
+- CMP_U64, CMP_F16: s_cmp_eq/lg_u64 (both words, an inline -1 sign-extended, a literal below 2^31) and
+  v_cmp_{lt,eq,ge,neq}_f16 (the low half only, -0 == 0, a binary16 denormal, inline 1.0, e32 and e64) set one bit
+  each of the exported word: 62 and 125.
 """
 import re
 import struct
@@ -193,10 +207,37 @@ SOURCES = {
                     '04040cf4000000fa7fc08cbf080f00f000040400703f8cbf0f1800f804050607000081bf'),
     'USER_ONE_PATH': ('s_mov_b32 s30, 0\ns_cmp_eq_u32 s30, 0\ns_cbranch_scc1 1\ns_mov_b32 s12, 2\nv_mov_b32 v0, s12\n'
                       + EXPORT, '80039ebe1e8006bf010085bf82038cbe0c02007e' + EXPORT_WORDS),
+    # Wave64. Bit k of v0 is one compare: (5,7) == (5,8) 0, != 2, (5,7) == (5,7) 4, (4,7) != (5,7) 8,
+    # (-1,-1) == inline -1 16, (0x1234,0) == literal 0x1234 32.
+    'CMP_U64': ('s_mov_b32 s20, 5\ns_mov_b32 s21, 7\ns_mov_b32 s22, 5\ns_mov_b32 s23, 8\ns_cmp_eq_u64 s[20:21], s[22:23]\n'
+                's_cselect_b32 s24, 1, 0\ns_cmp_lg_u64 s[20:21], s[22:23]\ns_cselect_b32 s25, 2, 0\ns_mov_b32 s23, 7\n'
+                's_cmp_eq_u64 s[20:21], s[22:23]\ns_cselect_b32 s26, 4, 0\ns_mov_b32 s22, 4\ns_cmp_lg_u64 s[20:21], s[22:23]\n'
+                's_cselect_b32 s27, 8, 0\ns_mov_b32 s20, -1\ns_mov_b32 s21, -1\ns_cmp_eq_u64 s[20:21], -1\n'
+                's_cselect_b32 s28, 16, 0\ns_mov_b32 s20, 0x1234\ns_mov_b32 s21, 0\ns_cmp_eq_u64 s[20:21], 0x1234\n'
+                's_cselect_b32 s29, 32, 0\ns_or_b32 s24, s24, s25\ns_or_b32 s24, s24, s26\ns_or_b32 s24, s24, s27\n'
+                's_or_b32 s24, s24, s28\ns_or_b32 s24, s24, s29\nv_mov_b32 v0, s24\n' + EXPORT,
+                '850394be870395be850396be880397be141612bf81801885141613bf82801985870397be141612bf84801a85840396be'
+                '141613bf88801b85c10394bec10395be14c112bf90801c85ff0394be34120000800395be14ff12bf34120000a0801d85'
+                '18191888181a1888181b1888181c1888181d18881802007e' + EXPORT_WORDS),
+    # Wave64, binary16 halves: v1 1.0, v2 -1.0, v3 1.0 under the upper word 0x1234, v4 the smallest denormal, v5 -0.
+    # -1 < 1 1, 0 < -1 (e64) 0, v3 == v1 4, 0 < denormal 8, 0 == -0 16, inline 1.0 >= v3 32, 1 != -1 64.
+    'CMP_F16': ('v_mov_b32 v1, 0x3c00\nv_mov_b32 v2, 0xbc00\nv_mov_b32 v3, 0x12343c00\nv_mov_b32 v4, 1\n'
+                'v_mov_b32 v5, 0x8000\nv_cmp_lt_f16 vcc, v2, v1\nv_cndmask_b32_e64 v0, 0, 1, vcc\n'
+                'v_cmp_lt_f16_e64 s[20:21], 0, v2\nv_cndmask_b32_e64 v6, 0, 2, s[20:21]\nv_or_b32 v0, v0, v6\n'
+                'v_cmp_eq_f16 vcc, v3, v1\nv_cndmask_b32_e64 v6, 0, 4, vcc\nv_or_b32 v0, v0, v6\nv_cmp_lt_f16 vcc, 0, v4\n'
+                'v_cndmask_b32_e64 v6, 0, 8, vcc\nv_or_b32 v0, v0, v6\nv_cmp_eq_f16 vcc, 0, v5\n'
+                'v_cndmask_b32_e64 v6, 0, 16, vcc\nv_or_b32 v0, v0, v6\nv_cmp_ge_f16 vcc, 1.0, v3\n'
+                'v_cndmask_b32_e64 v6, 0, 32, vcc\nv_or_b32 v0, v0, v6\nv_cmp_neq_f16 vcc, v1, v2\n'
+                'v_cndmask_b32_e64 v6, 0, 64, vcc\nv_or_b32 v0, v0, v6\n' + EXPORT,
+                'ff02027e003c0000ff02047e00bc0000ff02067e003c34128102087eff020a7e008000000203927d000001d58002a901'
+                '1400c9d480040200060001d580045100000d00380303947d060001d58008a901000d00388008927d060001d58010a901'
+                '000d0038800a947d060001d58020a901000d0038f2069c7d060001d58040a901000d00380105da7d060001d58080a901'
+                '000d0038' + EXPORT_WORDS),
 }
 CS_RSRC2, CS_GROUP = 7 << 1 | 0 << 11, (8, 1, 1)  # s0-s3, two root constants, one table; v0 = tid.x
-# The results by instruction semantics (COUNT with a root constant of 3; OUTSIDE adds 1, then 5 twice).
-EXPECTED = {'OUTSIDE': 11}
+# The results by instruction semantics (COUNT with a root constant of 3; OUTSIDE adds 1, then 5 twice; the compare
+# bits listed at CMP_U64 and CMP_F16).
+EXPECTED = {'OUTSIDE': 11, 'CMP_U64': 2 + 4 + 8 + 16 + 32, 'CMP_F16': 1 + 4 + 8 + 16 + 32 + 64}
 # The folded statements main emitted, and what they give: the folded loops run to the guard and export nothing.
 OLD = {'OUTSIDE': ('        s25 = s25 + s23;\n', '        s25 = s25 + 0x00000001u;\n', 3)}
 
@@ -467,9 +508,176 @@ def check_exec_join():
           'skips to is read; %d refusal controls and the old behaviour hold' % REFUSALS[0])
 
 
+# MASK_JOIN_<mode> (see the docstring): labelled wave64 sources for the label-aware assembler of
+# tests/startup_image_sample_b_flow_check.py; the words below are its llvm-mc-19 output (`binary` reassembles them).
+MASK_JOIN = """\
+s_mov_b64 s[40:41], s[8:9]
+s_mov_b32 s16, {mode}
+v_and_b32_e32 v1, 1, v0
+v_cvt_f32_u32_e32 v2, v1
+s_mov_b64 s[46:47], exec
+v_cmp_lt_f32_e32 vcc, 0.5, v2
+s_cmp_lg_i32 s16, 2
+s_cbranch_scc0 BB7
+s_cmp_eq_i32 s16, 3
+s_cbranch_scc0 BB3
+s_not_b64 s[44:45], vcc
+s_and_saveexec_b64 s[44:45], s[44:45]
+s_cbranch_execz BB2
+s_andn2_b64 s[44:45], s[44:45], exec
+s_cbranch_scc1 BB1
+s_mov_b64 s[42:43], -1
+s_branch BB8
+BB1:
+s_mov_b64 s[40:41], -1
+BB2:
+s_mov_b64 exec, s[44:45]
+v_cmp_gt_f32_e32 vcc, 0.5, v2
+s_branch BB7
+BB3:
+s_cmp_eq_i32 s16, 1
+s_cbranch_scc0 BB6
+s_and_saveexec_b64 s[44:45], vcc
+s_cbranch_execz BB5
+s_andn2_b64 s[44:45], s[44:45], exec
+s_cbranch_scc1 BB4
+s_mov_b64 s[42:43], 0
+s_branch BB8
+BB4:
+s_mov_b64 s[40:41], 0
+BB5:
+s_mov_b64 exec, s[44:45]
+v_cmp_gt_f32_e32 vcc, 0.5, v2
+s_branch BB7
+BB6:
+s_mov_b64 vcc, -1
+BB7:
+s_andn2_b64 s[42:43], s[40:41], exec
+s_and_b64 s[44:45], vcc, exec
+s_or_b64 s[42:43], s[42:43], s[44:45]
+BB8:
+s_mov_b64 exec, s[46:47]
+v_cndmask_b32_e64 v0, 0, 1.0, s[42:43]
+v_mov_b32_e32 v3, 0
+v_mov_b32_e32 v4, 1.0
+exp mrt0 v0, v2, v3, v4 done vm
+s_endpgm
+"""
+MASK_SOURCES = {'MASK_JOIN_%d' % mode: MASK_JOIN.format(mode=mode) for mode in range(4)}
+MASK_THREE = MASK_SOURCES['MASK_JOIN_3']
+MASK_SOURCES.update({
+    'MASK_JOIN_NO_RESTORE': MASK_THREE.replace('BB2:\ns_mov_b64 exec, s[44:45]\n', 'BB2:\ns_nop 0\n'),
+    'MASK_JOIN_AND': MASK_THREE.replace('s_andn2_b64 s[42:43], s[40:41], exec', 's_and_b64 s[42:43], s[40:41], exec'),
+    'MASK_JOIN_B32': MASK_THREE.replace('BB1:\ns_mov_b64 s[40:41], -1\n', 'BB1:\ns_mov_b32 s40, -1\n'),
+    'MASK_JOIN_LOOP': MASK_THREE.replace('s_branch BB7\nBB3:', 's_cbranch_vccnz BB2\ns_branch BB7\nBB3:'),
+    'MASK_JOIN_VCC_ANDN2': MASK_THREE.replace('s_andn2_b64 s[44:45], s[44:45], exec\ns_cbranch_scc1 BB1',
+                                              's_andn2_b64 s[44:45], vcc, exec\ns_cbranch_scc1 BB1'),
+})
+MASK_TAIL = ('81000236010d047e7e04aebef004027c108201bf1a0084bf108300bf0b0084bf6a08acbe2c24acbe050088bf2c7eac8a'
+             '020085bfc104aabe140082bfc104a8be2c04febef004087c0d0082bf108100bf0a0084bf6a24acbe050088bf2c7eac8a'
+             '020085bf8004aabe080082bf8004a8be2c04febef004087c010082bfc104eabe287eaa8a6a7eac872a2caa882e04febe'
+             '000001d580e4a9008002067ef202087e0f1800f800020304000081bf')
+MASK_WORDS = {'MASK_JOIN_%d' % mode: '0804a8be8%d0390be' % mode + MASK_TAIL for mode in range(4)}
+MASK_WORDS.update({
+    'MASK_JOIN_NO_RESTORE': MASK_WORDS['MASK_JOIN_3'].replace('2c04febef004087c0d0082bf', '000080bff004087c0d0082bf'),
+    'MASK_JOIN_AND': MASK_WORDS['MASK_JOIN_3'].replace('287eaa8a', '287eaa87'),
+    'MASK_JOIN_B32': MASK_WORDS['MASK_JOIN_3'].replace('c104a8be', 'c103a8be'),
+    'MASK_JOIN_LOOP': ('0804a8be830390be81000236010d047e7e04aebef004027c108201bf1b0084bf108300bf0c0084bf6a08acbe'
+                       '2c24acbe050088bf2c7eac8a020085bfc104aabe150082bfc104a8be2c04febef004087cfdff87bf0d0082bf'
+                       '108100bf0a0084bf6a24acbe050088bf2c7eac8a020085bf8004aabe080082bf8004a8be2c04febef004087c'
+                       '010082bfc104eabe287eaa8a6a7eac872a2caa882e04febe000001d580e4a9008002067ef202087e0f1800f8'
+                       '00020304000081bf'),
+    'MASK_JOIN_VCC_ANDN2': MASK_WORDS['MASK_JOIN_3'].replace('050088bf2c7eac8a', '050088bf6a7eac8a', 1),
+})
+ABSORBED = '        s42 = (s40 & ~exec) & 1;'
+VOTE = 'WaveActiveAnyTrue((s44 & 1u) != 0u)'
+JOINED_S40 = 'numeric use of s40 holding joined at a branch target'
+MASK_REFUSED = {
+    'MASK_JOIN_NO_RESTORE': JOINED_S40,   # a lane may reach the join with EXEC 0 and the pointer in s40
+    'MASK_JOIN_AND': JOINED_S40,          # S & exec keeps the pointer's bit where the lane is active
+    'MASK_JOIN_B32': JOINED_S40,          # a 32-bit write of s40 is no wave64 lane mask
+    'MASK_JOIN_LOOP': JOINED_S40,         # a backward branch into the switch: the forward proof stops
+    'MASK_JOIN_VCC_ANDN2': 'wave-wide read in a program with a branch (s_cbranch_scc1) that is neither wave-uniform '
+                           'nor an EXEC / VCC vote',   # vcc & ~exec may have bits outside the wave's lanes: no vote
+}
+# Binary-compare refusals, each followed by the export: (words, reason).
+CMP_REFUSED = (
+    ('14ff12bf00000080', 's_cmp_eq_u64 with the literal 0x80000000'),   # zero- and sign-extension disagree
+    ('1400c4d483000200' '141612bf', 's_cmp_eq_u64 on a lane mask'),       # v_cmp_gt_u32_e64 s[20:21], 3, v0 first
+    ('6a00c9d401050220', 'v_cmp_lt_f16 source -v1'),                    # neg modifier
+    ('8104927d', 'v_cmp_lt_f16 source 1'),                              # inline integer 1: a binary16 denormal pattern
+    ('01059a7d', 'v_cmp_lg_f16'),                                       # needs the NaN test on the halves
+    ('f904927d01000504', 'v_cmp_lt_f16_sdwa'),
+)
+
+
+def mask_pipeline(name):
+    from startup_image_sample_b_flow_check import PS_INPUTS
+    return G.Pipeline(VS_WORDS, bytes.fromhex(MASK_WORDS[name]), root('t', 1), ps_hw_inputs=PS_INPUTS)
+
+
+def mask_reference(mode):
+    """The guest's export for a 4x4 target, row by row: (keep, c, 0, 1) with c = x & 1 and keep as in the docstring."""
+    keep = {0: lambda c: 1, 1: lambda c: 1 - c, 2: lambda c: c, 3: lambda c: 1 - c}[mode]
+    return b''.join(struct.pack('<4f', keep(x & 1), x & 1, 0.0, 1.0) for _y in range(4) for x in range(4))
+
+
+def check_mask_join():
+    for mode in range(4):
+        ps = mask_pipeline('MASK_JOIN_%d' % mode).hlsl_ps().splitlines()
+        assert ps.count(ABSORBED) == 1 and sum(VOTE in line for line in ps) == 2, ps
+    for name, reason in MASK_REFUSED.items():
+        try:
+            mask_pipeline(name).hlsl_ps()
+        except G.Unsupported as error:
+            assert str(error) == reason, (name, str(error))
+        else:
+            raise AssertionError('%s accepted' % name)
+    for words, reason in CMP_REFUSED:
+        try:
+            G.Pipeline(VS_WORDS, bytes.fromhex(words + EXPORT_WORDS), root_blob()).hlsl_ps()
+        except G.Unsupported as error:
+            assert str(error) == reason, (words, str(error))
+        else:
+            raise AssertionError('%s accepted' % words)
+    print('mask join: the joined s40 is read under an EXEC 1 or exact-mask proof and the SCC branches are votes in all '
+          'four modes; %d mask and %d compare refusals hold' % (len(MASK_REFUSED), len(CMP_REFUSED)))
+
+
+def check_mask_draw(dxc, runner, adapter):
+    from startup_image_3d_check import compile_hlsl
+    check_mask_join()
+    runner = str(Path(runner).resolve())
+    out = Path(__file__).resolve().parents[1] / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        runs = []
+        for mode in range(4):
+            pipe = mask_pipeline('MASK_JOIN_%d' % mode)
+            runs.append(('mode%d' % mode, mode, pipe.hlsl_vs(), pipe.hlsl_ps(), 0))
+        # Reading s40 without EXEC gives the active odd columns of mode 3 the -1 of the other lanes' path.
+        _label, _mode, vs, ps, _ = runs[3]
+        runs.append(('mode3_mutant', 3, vs, ps.replace(ABSORBED, '        s42 = (s40) & 1;'), 8))
+        for label, mode, vs, ps, differ in runs:
+            vertex = compile_hlsl(dxc, 'dxc', vs, label + '_vs', 'vs_6_0', directory)
+            pixel = compile_hlsl(dxc, 'dxc', ps, label + '_ps', 'ps_6_0', directory)
+            expected = directory / (label + '.bin')
+            expected.write_bytes(mask_reference(mode))
+            result = subprocess.run([runner, adapter, '--raster-reference', str(vertex), str(pixel), '4', '4',
+                                     str(expected), 'none', 'cw'], capture_output=True, text=True)
+            print(result.stdout, end='')
+            if result.returncode == 77:
+                sys.exit(77)
+            want = '%d of 16 pixels differ' % differ if differ else 'all 16 pixels matched'
+            report = result.stdout + result.stderr
+            assert result.returncode == int(bool(differ)) and want in report.splitlines(), (label, report)
+            print('%s %s: %s' % (adapter, label, want))
+
+
 def check_binary(llvm_mc):
     for name, (source, words) in SOURCES.items():
-        if name.startswith('EXEC_DESC'):  # 64-bit exec mask forms: wave64
+        if name.startswith(('EXEC_DESC', 'CMP_')):  # 64-bit exec / vcc forms: wave64
             run = subprocess.run([llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64', '-show-encoding'],
                                  input=source, capture_output=True, text=True, check=True)
             built = ''.join(bytes(int(b, 16) for b in m.group(1).split(',')).hex() for m in
@@ -477,6 +685,10 @@ def check_binary(llvm_mc):
         else:
             built = assemble(llvm_mc, source).hex()
         assert built == words, '%s: assembled %s, recorded %s' % (name, built, words)
+    from startup_image_sample_b_flow_check import assemble as assemble_labels
+    for name, source in MASK_SOURCES.items():
+        built = assemble_labels(llvm_mc, source).hex()
+        assert built == MASK_WORDS[name], '%s: assembled %s, recorded %s' % (name, built, MASK_WORDS[name])
     print('fixture words match llvm-mc')
 
 
@@ -508,6 +720,8 @@ def check_dispatch(dxc, runner, adapter, control=False):
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         for name, want in EXPECTED.items():
+            if control and name not in OLD:
+                continue
             hlsl = translate(name).hlsl_ps()
             if control:
                 old, new, folded = OLD[name]
@@ -546,9 +760,12 @@ if __name__ == '__main__':
     if len(sys.argv) == 1:
         check_controls()
         check_exec_join()
+        check_mask_join()
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         check_binary(sys.argv[2])
     elif len(sys.argv) == 5 and sys.argv[1] in ('dispatch', 'control'):
         check_dispatch(*sys.argv[2:], control=sys.argv[1] == 'control')
+    elif len(sys.argv) == 5 and sys.argv[1] == 'maskjoin':
+        check_mask_draw(*sys.argv[2:])
     else:
         sys.exit(__doc__)

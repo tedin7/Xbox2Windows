@@ -25,6 +25,7 @@
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/present_readback_state.h"
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
@@ -71,6 +72,7 @@
 #include "startup_stubs/create_srv.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
+#include "startup_stubs/refused_dispatch_census.h"
 #include "startup_stubs/rect_indirect_args.h"
 #include "startup_stubs/split_indirect_dispatch.h"
 #include "startup_stubs/profile_zone.h"
@@ -300,7 +302,7 @@ void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -2335,6 +2337,92 @@ void complete_when_reached(Wrapper* fence, UINT64 value)
     SetThreadpoolWait(wait, pending->event, nullptr);
 }
 
+// The queued diagnostic readback's ownership: the submitted surface and queue references, the
+// recording objects and the completion state, module-lifetime storage guarded by a mutex the
+// sampling path and the drain below serialize through. The sample's wait event is created lazily
+// with the recording, not at module load.
+struct PresentedReadback {
+    std::mutex mutex;
+    x2w_startup::PresentReadbackState completion;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    ID3D12Resource* readback = nullptr;
+    UINT64 readback_bytes = 0, fence_value = 0;
+    ID3D12Resource* submitted_surface = nullptr;
+    ID3D12CommandQueue* submitted_queue = nullptr;
+    HANDLE wait_event = nullptr;
+} presented_readback;
+
+// Releases the ownership a completed submission held (exactly once, through retire); the caller
+// must hold the mutex and have seen a completed observation.
+void release_readback_ownership()
+{
+    presented_readback.submitted_surface->Release();
+    presented_readback.submitted_queue->Release();
+    presented_readback.submitted_surface = nullptr;
+    presented_readback.submitted_queue = nullptr;
+}
+
+// Hold the fence and shim module until the asynchronous callback returns.
+struct PendingDrain {
+    ID3D12Fence* fence;
+    std::uint64_t value;
+    HANDLE event;
+    HMODULE module;
+};
+
+// Retire only the registered submission; never publish a late diagnostic image.
+void CALLBACK readback_drained(PTP_CALLBACK_INSTANCE instance, void* context, PTP_WAIT wait, TP_WAIT_RESULT)
+{
+    std::unique_ptr<PendingDrain> pending{static_cast<PendingDrain*>(context)};
+    CloseThreadpoolWait(wait);
+    {
+        const std::lock_guard lock(presented_readback.mutex);
+        if (presented_readback.fence == pending->fence)
+            presented_readback.completion.retire(pending->fence->GetCompletedValue(), release_readback_ownership,
+                                                 pending->value);
+    }
+    pending->fence->Release();
+    CloseHandle(pending->event);
+    FreeLibraryWhenCallbackReturns(instance, pending->module);
+}
+
+// Caller holds the readback mutex. On registration failure, retain ownership.
+void drain_readback_when_complete()
+{
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&presented_readback),
+                            &module)) {
+        log("x2w-render readback drain unavailable: no shim module reference");
+        return;
+    }
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    auto* pending = event ? new (std::nothrow) PendingDrain{presented_readback.fence, presented_readback.fence_value,
+                                                            event, module}
+                          : nullptr;
+    PTP_WAIT wait = pending ? CreateThreadpoolWait(&readback_drained, pending, nullptr) : nullptr;
+    if (!pending || !wait) {
+        if (event) CloseHandle(event);
+        delete pending;
+        if (wait) CloseThreadpoolWait(wait);
+        FreeLibrary(module);
+        log("x2w-render readback drain unavailable: event, wait or context allocation failed");
+        return;
+    }
+    presented_readback.fence->AddRef();
+    const HRESULT hr = presented_readback.fence->SetEventOnCompletion(pending->value, pending->event);
+    if (FAILED(hr)) {
+        presented_readback.fence->Release();
+        delete pending;
+        CloseHandle(event);
+        CloseThreadpoolWait(wait);
+        FreeLibrary(module);
+        log("x2w-render readback drain registration failed 0x%08lx", static_cast<unsigned long>(hr));
+        return;
+    }
+    SetThreadpoolWait(wait, pending->event, nullptr);
+}
 // The presented surface, read back and reduced for the window (BGRA, top-down).
 constexpr int shown_width = 960, shown_height = 540;
 std::vector<std::uint32_t> shown_pixels;
@@ -2385,12 +2473,38 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         static LONG raw_failures;
         if (first_calls(raw_failures, 4)) log("x2w-render raw plane %d (not composited): %s", raw_plane, failure);
     };
-    static ID3D12CommandAllocator* allocator;
-    static ID3D12GraphicsCommandList* list;
-    static ID3D12Fence* fence;
-    static ID3D12Resource* readback;
-    static UINT64 readback_bytes, fence_value;
-    static HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const std::lock_guard lock(presented_readback.mutex);
+    auto& completion = presented_readback.completion;
+    auto& allocator = presented_readback.allocator;
+    auto& list = presented_readback.list;
+    auto& fence = presented_readback.fence;
+    auto& readback = presented_readback.readback;
+    auto& readback_bytes = presented_readback.readback_bytes;
+    auto& fence_value = presented_readback.fence_value;
+    auto& submitted_surface = presented_readback.submitted_surface;
+    auto& submitted_queue = presented_readback.submitted_queue;
+    HANDLE& event = presented_readback.wait_event;
+    const auto discard_recording = [&] {
+        if (list) { list->Release(); list = nullptr; }
+        if (allocator) { allocator->Release(); allocator = nullptr; }
+        if (fence) { fence->Release(); fence = nullptr; }
+        fence_value = 0;
+    };
+    if (completion.unusable()) {
+        std::snprintf(failure, sizeof(failure), "readback unavailable after fence failure");
+        report_failure();
+        return;
+    }
+    if (completion.pending()) {
+        const auto state = completion.retire(fence->GetCompletedValue(), release_readback_ownership);
+        if (state != x2w_startup::FenceCompletion::completed) {
+            std::snprintf(failure, sizeof(failure), "%s",
+                          state == x2w_startup::FenceCompletion::removed ?
+                          "readback fence reported device removal" : "previous readback still in flight");
+            report_failure();
+            return;
+        }
+    }
     ID3D12Device* device = device_of(the_device);
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -2431,6 +2545,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     if (SUCCEEDED(hr)) hr = allocator->Reset();
     if (SUCCEEDED(hr)) hr = list->Reset(allocator, nullptr);
     if (FAILED(hr)) {
+        discard_recording();
         std::snprintf(failure, sizeof(failure), "readback setup failed 0x%08lx", static_cast<unsigned long>(hr));
         report_failure();
         return;
@@ -2444,19 +2559,71 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     to.PlacedFootprint = footprint;
     list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     transition(list, surface, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    list->Close();
+    hr = list->Close();
+    if (FAILED(hr)) {
+        discard_recording();
+        std::snprintf(failure, sizeof(failure), "readback close failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
+    // The sample's wait event is created with the first submission that needs it, not at load.
+    if (!event) event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (fence_value == UINT64_MAX - 1 || !event || !ResetEvent(event)) {
+        std::snprintf(failure, sizeof(failure), "readback fence or event unavailable");
+        report_failure();
+        return;
+    }
+    // ExecuteCommandLists does not retain the resources referenced by recorded commands.
+    surface->AddRef();
+    queue->AddRef();
+    submitted_surface = surface;
+    submitted_queue = queue;
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence, ++fence_value);
-    fence->SetEventOnCompletion(fence_value, event);
+    hr = queue->Signal(fence, ++fence_value);
+    if (FAILED(hr)) {
+        completion.signal_failed();
+        std::snprintf(failure, sizeof(failure), "readback fence signal failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
+    completion.submitted(fence_value);
+    hr = fence->SetEventOnCompletion(fence_value, event);
+    if (FAILED(hr)) {
+        // The submission is signalled but the sample's own event registration failed. Hand it to
+        // the drain (which registers its own event) instead of keeping the ownership unbounded.
+        drain_readback_when_complete();
+        std::snprintf(failure, sizeof(failure), "readback completion event failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
     if (WaitForSingleObject(event, 3000) != WAIT_OBJECT_0) {
+        // The fence has not reported completion to the sample. Hand the submission to the drain,
+        // which retires its ownership once the fence completes and publishes no pixels.
+        drain_readback_when_complete();
         std::snprintf(failure, sizeof(failure), "readback timed out");
+        report_failure();
+        return;
+    }
+    const auto completed = completion.retire(fence->GetCompletedValue(), release_readback_ownership);
+    if (completed != x2w_startup::FenceCompletion::completed) {
+        // A removed device cannot confirm completion: keep the ownership and disable reuse. A
+        // still-pending fence after the event was reported is drained rather than released.
+        if (completed == x2w_startup::FenceCompletion::pending) drain_readback_when_complete();
+        std::snprintf(failure, sizeof(failure), "%s",
+                      completed == x2w_startup::FenceCompletion::removed ?
+                      "readback fence reported device removal" : "readback fence incomplete after wait");
         report_failure();
         return;
     }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
-    if (FAILED(readback->Map(0, &range, &mapped))) return;
+    hr = readback->Map(0, &range, &mapped);
+    if (FAILED(hr) || !mapped) {
+        std::snprintf(failure, sizeof(failure), "readback map failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
     if (!raw) {
         AcquireSRWLockExclusive(&shown_lock);
         shown_pixels.resize(shown_width * shown_height);
@@ -3359,6 +3526,7 @@ struct Pass {
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
+    u64 requested_mesh_key = 0;
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
@@ -3968,6 +4136,60 @@ bool split_indirect_dispatch_enabled()
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
 }
 
+using RefusedDispatchCensus = x2w_startup::RefusedDispatchCensus;
+
+struct RuntimeRefusedDispatchCensus {
+    SRWLOCK lock = SRWLOCK_INIT;
+    RefusedDispatchCensus* census = nullptr;
+
+    void note(RefusedDispatchCensus::Kind kind, u64 key, const char* reason, std::optional<u64> groups)
+    {
+        x2w_startup::ExclusiveNoteLock guard(lock);
+        if (!census) census = new RefusedDispatchCensus(kind);
+        if (census->note(key, reason, groups))
+            census->report([](const char* line) { log("%s", line); });
+    }
+
+    ~RuntimeRefusedDispatchCensus()
+    {
+        // Process termination can stop a recorder while it owns the lock.
+        if (!TryAcquireSRWLockExclusive(&lock)) return;
+        if (census) {
+            census->report([](const char* line) {
+                char text[400];
+                const int bytes = std::snprintf(text, sizeof(text), "%s\r\n", line);
+                if (bytes > 0 && bytes < static_cast<int>(sizeof(text)))
+                    x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(bytes));
+            });
+            if (!x2w_startup::d3d12_process_terminating) delete census;
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+};
+
+RuntimeRefusedDispatchCensus refused_compute_dispatches, refused_mesh57_dispatches;
+
+void note_refused_compute_dispatch(u64 key, const char* reason)
+{
+    refused_compute_dispatches.note(RefusedDispatchCensus::Kind::compute, key, reason, {});
+}
+
+std::optional<u64> read_mesh57_groups(void* argument, u64 offset)
+{
+    const Wrapper* buffer = as_wrapper(argument);
+    if (!buffer || buffer->own().kind != resource_kind || (offset & 3)) return {};
+    const auto* info = resource_info(buffer);
+    const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
+    D3D12_DISPATCH_MESH_ARGUMENTS args{};
+    if (!info || info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        offset > info->console.Width || sizeof(args) > info->console.Width - offset ||
+        !base || offset > ~u64{} - base || sizeof(args) - 1 > ~u64{} - (base + offset))
+        return {};
+    // The refused command never executes. Only a CPU-readable argument snapshot can contribute groups.
+    if (!x2w_local::guarded_memcpy(&args, reinterpret_cast<const void*>(base + offset), sizeof(args), true)) return {};
+    return x2w_startup::mesh_dispatch_groups(args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+}
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -4046,11 +4268,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
             // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
             // nothing is drawn.
-            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real &&
-                (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
-                pass.requested_mesh_pipeline = pass.pipeline;
-                pass.requested_mesh_root = pass.root;
-                request_slot57_mesh(pass.pipeline, pass.root);
+            static constexpr char reason[] = "indirect graphics requires a direct list with a matching desktop pipeline and root";
+            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real) {
+                if (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root) {
+                    pass.requested_mesh_pipeline = pass.pipeline;
+                    pass.requested_mesh_root = pass.root;
+                    pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root);
+                }
+                if (pass.requested_mesh_key)
+                    refused_mesh57_dispatches.note(RefusedDispatchCensus::Kind::mesh57, pass.requested_mesh_key,
+                                                   reason, read_mesh57_groups(argument, offset));
             } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
@@ -4061,8 +4288,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                     log("x2w-render slot86 mesh %016llx: no matching desktop pipeline/root for indirect execution",
                         pass.pipeline->own().mesh86_key);
             }
-            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
-                          indirect_graphics_pipeline);
+            return refuse(reason, indirect_graphics_pipeline);
         }
         if (pass.indirect_graphics.cached_mesh) {
             const auto& pso = pass.indirect_graphics;

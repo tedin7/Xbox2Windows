@@ -1,0 +1,3 @@
+add_executable(startup_refused_dispatch_census_check tests/startup_refused_dispatch_census_check.cpp)
+target_compile_features(startup_refused_dispatch_census_check PRIVATE cxx_std_17)
+add_test(NAME startup_refused_dispatch_census COMMAND startup_refused_dispatch_census_check)

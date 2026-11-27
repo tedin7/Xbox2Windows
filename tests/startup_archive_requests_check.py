@@ -16,6 +16,7 @@ carved whole. A request whose .root cannot be written must leave no .a and no te
 the run fail. An archive without any pair must make the run fail. 65 MiB of consecutive streams
 must be split into two joined runs. A second run must write nothing new.
 """
+import os
 import re
 import struct
 import subprocess
@@ -27,8 +28,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / 'tools' / 'startup' / 'archive_requests.py'
 
-REVISION = re.search(rb'constexpr char revision\[\] = "([^"]+)";',
-                     (ROOT / 'src' / 'startup_stubs' / 'd3d12_draw.inl').read_bytes()).group(1)
+RUNTIME = (ROOT / 'src' / 'startup_stubs' / 'd3d12_draw.inl').read_bytes()
+REVISION = re.search(rb'constexpr char revision\[\] = "([^"]+)";', RUNTIME).group(1)
+# shader_cache_seed hashes this word after the revision unless X2W_EXTENDED_BUFFER_FORMATS=0 (default on).
+FEATURE = b'' if os.environ.get('X2W_EXTENDED_BUFFER_FORMATS') == '0' else re.search(
+    rb'constexpr char feature\[\] = "(extended-buffer-formats[^"]*)";', RUNTIME).group(1)
 PREFETCH = bytes.fromhex('0300a0bf')  # s_inst_prefetch 0x3
 CODE_END = bytes.fromhex('00009fbf')
 ENDPGM = struct.pack('<I', 0xbf810000)
@@ -47,7 +51,7 @@ def runtime_key(a, b, root):
     the cache keys depend on it, so it is reproduced as written. The revision text is read from the
     runtime source, so a revision bump there is followed here and checked against the tool."""
     h = 1469598103934665603
-    for part in (REVISION, a, b, root):
+    for part in (REVISION, FEATURE, a, b, root):
         for byte in part:
             h = ((h ^ byte) * 1099511628211) & 0xffffffffffffffff
     return h

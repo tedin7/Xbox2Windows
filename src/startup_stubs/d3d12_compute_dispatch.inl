@@ -430,6 +430,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
     if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
         InterlockedIncrement(&compute_dispatches_untranslated);
+        note_refused_compute_dispatch(key, "no translation");
         return "no translation";
     }
     const char* reason = nullptr;
@@ -795,6 +796,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         phases.end();
         timer.finish(x2w_phase::refused);
         draw_lock_release_exclusive();
+        note_refused_compute_dispatch(key, reason);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;

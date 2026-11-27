@@ -150,6 +150,15 @@ with tempfile.TemporaryDirectory() as tmp:
                       'x2w-render compute census key %016x: 7 dispatches, 7 translated\n' % 2 +
                       'x2w-render key use %016x 1.0 2.0 3\nother line\n' % 1, encoding='utf-8')
     expect('weights from the last run', G.run_weights(str(stderr)), {6: 40, 5: 90, 2: 0})
+    refused = d / 'refused_stderr.txt'
+    refused.write_text(
+        'x2w-render compute refused key 0000000000000005: 2 dispatches, first refusal: no translation\n'
+        'x2w-render compute refused key 0000000000000005: 9 dispatches, first refusal: no translation\n'
+        'x2w-render compute census key 0000000000000005: 4 dispatches, 2 translated\n'
+        'x2w-render mesh57 refused key 0000000000000008: 7 dispatches, 54 groups, 0 unknown group counts, first refusal: no pipeline\n',
+        encoding='ascii')
+    expect('refusal weights take precedence over the legacy compute census', G.run_weights(str(refused)), {5: 9, 8: 7})
+    expect('dispatch-only logs also qualify as a scene census', G.scene_weights(refused), {5: 9, 8: 7})
     killed = d.parent / ('%s_killed.txt' % d.name)
     killed.write_text('x2w-render key use compute %016x first 1.0 s last 9.0 s uses 1443\n' % 7 +
                       'x2w-render key use graphics %016x first 1.0 s last 9.0 s uses 12\n' % 6 +

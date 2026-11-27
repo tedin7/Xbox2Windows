@@ -10,13 +10,17 @@
 // presented surface right after the present. The sampler therefore holds its own reference to the
 // surface from submission until the copy's fence has passed. If Signal fails after the list was
 // submitted, nothing can tell when the copy ends: the sampler stops sampling and keeps the surface,
-// allocator, list and readback buffer referenced for the rest of the process ("stranded").
+// allocator, list and readback buffer referenced for the rest of the process ("stranded"). A removed
+// device (the fence reports UINT64_MAX) is the same case, never a completion: no readback is mapped,
+// no sample is published, and the source stays held.
 //
 // Sampling is opt-in: a sampler made with always = false records copies only while the block's
 // sampling_wanted is set (a script with a picture wait asks for it); otherwise it creates no GPU
 // objects and submits nothing, and only counts presents.
 #pragma once
 #include "resource_budget.h"
+
+#include "startup_stubs/fence_completion.h"
 
 #include "startup_stubs/present_signature.h"
 #include "startup_stubs/present_view_format.h"
@@ -50,44 +54,63 @@ public:
     explicit Sampler(int every, bool always = true, bool capture_center = false, bool check_flat = false)
         : capture_center_(capture_center || check_flat), check_flat_(check_flat), every_(every), always_(always) {}
 
-    // Called once per present with the presented surface. Returns true when this call published a sample.
+    // Called once per present with the presented surface. Returns true when this call published a
+    // sample. A removed fence (device removal reports UINT64_MAX) never counts as completion: the
+    // readback is not mapped, nothing is published, and the copy's source stays held.
     bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
     {
         bool published = false;
-        if (in_flight_ && fence_->GetCompletedValue() >= fence_value_) {
-            in_flight_ = false;
-            if (capture_center_) {
-                last_present_ = copied_present_;
-                last_format_ = format_;
-                last_surface_ = source_;
-            }
-            retire_source();
-            void* mapped = nullptr;
-            const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
-            if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
-                const auto* base = static_cast<const unsigned char*>(mapped);
-                if (capture_center_)
-                    std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
-                if (check_flat_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                    last_flat_ = true;
-                    for (int band = 0; band < cells_y && last_flat_; ++band) {
-                        const auto* row = base + row_stride_ * band;
-                        for (UINT x = 0; x < width_ && last_flat_; ++x) {
-                            for (unsigned c = 0; c < 3; ++c)
-                                if (std::abs(int(row[x * 4 + c]) - int(last_rgba_[c])) > onset_rgb_tolerance)
-                                    last_flat_ = false;
+        if (in_flight_) {
+            // One observation per present decision: device removal (UINT64_MAX) is never a
+            // completion, exactly like a failed Signal.
+            switch (x2w_startup::fence_completion(fence_->GetCompletedValue(), fence_value_)) {
+            case x2w_startup::FenceCompletion::completed:
+                in_flight_ = false;
+                if (capture_center_) {
+                    last_present_ = copied_present_;
+                    last_format_ = format_;
+                    last_surface_ = source_;
+                }
+                retire_source();
+                {
+                    void* mapped = nullptr;
+                    const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
+                    if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
+                        const auto* base = static_cast<const unsigned char*>(mapped);
+                        if (capture_center_)
+                            std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
+                        if (check_flat_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                            last_flat_ = true;
+                            for (int band = 0; band < cells_y && last_flat_; ++band) {
+                                const auto* row = base + row_stride_ * band;
+                                for (UINT x = 0; x < width_ && last_flat_; ++x) {
+                                    for (unsigned c = 0; c < 3; ++c)
+                                        if (std::abs(int(row[x * 4 + c]) - int(last_rgba_[c])) > onset_rgb_tolerance)
+                                            last_flat_ = false;
+                                }
+                            }
                         }
+                        std::uint8_t luma[cells];
+                        for (int band = 0; band < cells_y; ++band) reduce_row(base + row_stride_ * band, width_, layout_, luma + band * cells_x);
+                        if (rows_ > cells_y)
+                            for (int band = 0; band < fine_y; ++band)
+                                reduce_row(base + row_stride_ * (cells_y + band), width_, layout_, fine_ + band * fine_x, fine_x);
+                        const D3D12_RANGE none{0, 0};
+                        readback_->Unmap(0, &none);
+                        if (block) publish(block, luma, copied_present_, rows_ > cells_y ? fine_ : nullptr);
+                        published = true;
                     }
                 }
-                std::uint8_t luma[cells];
-                for (int band = 0; band < cells_y; ++band) reduce_row(base + row_stride_ * band, width_, layout_, luma + band * cells_x);
-                if (rows_ > cells_y)
-                    for (int band = 0; band < fine_y; ++band)
-                        reduce_row(base + row_stride_ * (cells_y + band), width_, layout_, fine_ + band * fine_x, fine_x);
-                const D3D12_RANGE none{0, 0};
-                readback_->Unmap(0, &none);
-                if (block) publish(block, luma, copied_present_, rows_ > cells_y ? fine_ : nullptr);
-                published = true;
+                break;
+            case x2w_startup::FenceCompletion::removed:
+                // Device removal: the copy's end cannot be seen. Publish nothing (the readback
+                // is stale) and keep the prior historical sample state as it is, as a failed
+                // Signal does: stranded, so the destructor retains every object the copy uses.
+                in_flight_ = false;
+                stranded_ = failed_ = true;
+                break;
+            case x2w_startup::FenceCompletion::pending:
+                break;
             }
         }
         if (block) note_present(block, present_number);
@@ -164,14 +187,22 @@ public:
 
     // Waits (at most 10 s) for a copy in flight; if it cannot be seen to end, or the sampler is
     // stranded, the objects the copy uses stay referenced instead of being released under the GPU.
+    // A removed fence never counts as completion: the source is kept, and nothing is mapped.
     ~Sampler()
     {
-        if (in_flight_ && !stranded_ && fence_->GetCompletedValue() < fence_value_) {
+        if (in_flight_ && !stranded_ &&
+            x2w_startup::fence_completion(fence_->GetCompletedValue(), fence_value_) == x2w_startup::FenceCompletion::pending) {
             HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (event && SUCCEEDED(fence_->SetEventOnCompletion(fence_value_, event))) WaitForSingleObject(event, 10000);
             if (event) CloseHandle(event);
         }
-        if (stranded_ || (in_flight_ && fence_->GetCompletedValue() < fence_value_)) return;
+        // Re-observe after the wait: a copy that completed while it ran releases normally, but
+        // the removal sentinel never becomes completion, so a fence that reports it (or never
+        // reached its value in 10 s) keeps every object the copy uses.
+        if (stranded_ || (in_flight_ &&
+                          x2w_startup::fence_completion(fence_->GetCompletedValue(), fence_value_) !=
+                              x2w_startup::FenceCompletion::completed))
+            return;
         retire_source();
         for (IUnknown* object : {static_cast<IUnknown*>(readback_), static_cast<IUnknown*>(fence_),
                                  static_cast<IUnknown*>(list_), static_cast<IUnknown*>(allocator_)})
