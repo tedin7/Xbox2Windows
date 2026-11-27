@@ -22,6 +22,7 @@ struct Tracker {
         x2w_debug_present::Candidate info;
         unsigned sequence = 0;
         unsigned long long draws = 0;  // translated draws that wrote it since the last take
+        unsigned long long classes[5] = {};  // of those, by depth_class (depth buffers only)
     };
     SRWLOCK lock = SRWLOCK_INIT;
     x2w_debug_present::Spec spec;
@@ -77,7 +78,7 @@ struct Tracker {
     }
 
     // A translated draw wrote these targets: count it for each one that is a candidate.
-    void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth)
+    void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth, unsigned depth_class = 0)
     {
         if (!enabled()) return;
         AcquireSRWLockExclusive(&lock);
@@ -85,6 +86,7 @@ struct Tracker {
         for (Entry& e : entries) {
             if (!e.resource) continue;
             bool hit = e.resource == depth;
+            if (hit && depth_class < 5) ++e.classes[depth_class];
             for (UINT i = 0; i < count && !hit; ++i) hit = e.resource == targets[i];
             if (hit) ++e.draws;
         }
@@ -103,7 +105,7 @@ struct Tracker {
     // (want_w x want_h), then the biggest, then the latest. The entries are cleared; the choice is kept for an interval
     // with no new binds.
     ID3D12Resource* take(unsigned long long want_w, unsigned want_h, x2w_debug_present::Candidate& out,
-                         unsigned long long* draws_out = nullptr)
+                         unsigned long long* draws_out = nullptr, unsigned long long* classes_out = nullptr)
     {
         AcquireSRWLockExclusive(&lock);
         Entry* best = nullptr;
@@ -127,6 +129,7 @@ struct Tracker {
         ID3D12Resource* resource = kept.resource;
         out = kept.info;
         if (draws_out) *draws_out = kept.draws;
+        if (classes_out) for (int i = 0; i < 5; ++i) classes_out[i] = kept.classes[i];
         if (resource) resource->AddRef();
         ReleaseSRWLockExclusive(&lock);
         return resource;
@@ -310,10 +313,22 @@ void note_bound(ID3D12Resource* const* targets, const x2w_startup::TargetDrawCen
 }
 
 // A translated draw wrote the targets of the current pass.
-void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth)
+void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth, unsigned depth_class)
 {
     Tracker& tracker = global_tracker();
-    if (tracker.enabled()) tracker.note_draw(targets, count, depth);
+    if (tracker.enabled()) tracker.note_draw(targets, count, depth, depth_class);
+}
+
+// How a translated draw treats the depth buffer it was drawn with: the classes the log counts.
+enum DepthClass : unsigned { depth_writes = 0, depth_test_only = 1, depth_test_off = 2, no_depth_state = 3, depth_view_read_only = 4 };
+
+// "depth writes 12, test only 3, test off 0, no depth state 280, view read-only 0".
+std::string classes_text(const unsigned long long (&n)[5])
+{
+    char text[160];
+    std::snprintf(text, sizeof(text), "depth writes %llu, test only %llu, test off %llu, no depth state %llu, view read-only %llu",
+                  n[depth_writes], n[depth_test_only], n[depth_test_off], n[no_depth_state], n[depth_view_read_only]);
+    return text;
 }
 
 // The depth statistics line text: "spread 0.25..0.75 covered 75.0%".
@@ -361,16 +376,16 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
     ID3D12Resource* real_surface = surface && surface->own().kind == resource_kind
                                        ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const D3D12_RESOURCE_DESC surface_desc = real_surface ? real_surface->GetDesc() : D3D12_RESOURCE_DESC{};
-    unsigned long long interval_draws = 0;
-    ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info, &interval_draws);
+    unsigned long long interval_draws = 0, classes[5] = {};
+    ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info, &interval_draws, classes);
     const char* reason = !source ? "no pass has bound a matching target yet" : "no presented surface";
     bool ok = false;
     if (source && real_surface) {
         AcquireSRWLockExclusive(&lock);
         ok = show(painter, device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), source, info, real_surface, reason);
         if (ok && (source != last_shown || info.width != last_info.width || info.format != last_info.format)) {
-            log("x2w-render debug present: showing %s (presented surface %llux%u, %llu draws in the interval)", describe(info).c_str(),
-                static_cast<unsigned long long>(surface_desc.Width), surface_desc.Height, interval_draws);
+            log("x2w-render debug present: showing %s (presented surface %llux%u, %llu draws in the interval; %s)", describe(info).c_str(),
+                static_cast<unsigned long long>(surface_desc.Width), surface_desc.Height, interval_draws, classes_text(classes).c_str());
             last_shown = source;
             last_info = info;
         }
@@ -379,9 +394,9 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
         const ULONGLONG now_tick = GetTickCount64();
         if (ok && painter.stats.valid && now_tick - last_stats_tick >= 10000) {
             last_stats_tick = now_tick;
-            log("x2w-render debug present: depth %s (%s, %llu draws in the interval, %zu of %zu sampled pixels are geometry%s)",
-                stats_text(painter.stats).c_str(), describe(info).c_str(), interval_draws, painter.stats.geometry,
-                painter.stats.sampled, painter.stats.reversed ? ", reversed Z" : "");
+            log("x2w-render debug present: depth %s (%s, %llu draws in the interval, %zu of %zu sampled pixels are geometry%s); "
+                "the draws by depth state: %s", stats_text(painter.stats).c_str(), describe(info).c_str(), interval_draws,
+                painter.stats.geometry, painter.stats.sampled, painter.stats.reversed ? ", reversed Z" : "", classes_text(classes).c_str());
         }
         ReleaseSRWLockExclusive(&lock);
     }
