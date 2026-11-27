@@ -117,8 +117,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
                           {"X2W_TEST_ADDRESS_SRV_LINEAR": "1", "X2W_TRAP_LOG": str(trap_log)})
     if actual is None:
         raise AssertionError("linear WARP fixture unexpectedly skipped")
-    # A mip 0/1 = 0/0.25; B mip 0/1 = 0.5/1.0, converted to UNORM8.
-    samples = ((0, 64), (128, 255), (0, 64), (0, 64))
+    # Literal UNORM8 reference for A and B, alternating mip 0 and mip 1.
+    samples = ((51, 102), (153, 204), (51, 102), (51, 102))
     expected = bytes(c for y in range(4) for x in range(8)
                      for c in (samples[x // 2][y % 2], 0, 0, 255))
     if actual != expected:

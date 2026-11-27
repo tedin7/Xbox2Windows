@@ -2247,9 +2247,6 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
     const auto* original = resource_info(resource);
-    // Console linear mip footprints are unknown; preserve the live resource's GPU contents.
-    if (original && original->console.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-        static_cast<UINT>(original->console.Layout) == 0x100) return true;
     const bool placed_1d = resource->own().tiled_address_srv && original &&
                            original->console.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     const bool tiled_address = resource->own().tiled_address_srv && !placed_1d;

@@ -1,6 +1,5 @@
 #include <windows.h>
 #include <d3d12.h>
-#include <algorithm>
 #include <array>
 #include <string>
 #include <cstddef>
@@ -1267,50 +1266,36 @@ int draw_slot70_texture_alias(void* guest, void* list)
     return 0;
 }
 
-// Copy known values to real placed textures: title memory is only their identity, not their contents.
-int draw_linear_address_srvs(void* guest, void* list)
+// Fill title memory using the desktop footprints consumed by placed-texture uploads.
+int draw_linear_address_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
-    static std::array<unsigned char, 4096> addresses[3]{};
+    static std::vector<unsigned char> addresses[3];
     const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 2, 1, 3,
         DXGI_FORMAT_R32_FLOAT, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x100),
         static_cast<D3D12_RESOURCE_FLAGS>(0x300000)};
+    auto desktop_desc = desc;
+    desktop_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desktop_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[3]{};
+    UINT rows[3]{};
+    UINT64 row_bytes[3]{}, total = 0;
+    desktop->GetCopyableFootprints(&desktop_desc, 0, 3, 0, footprints, rows, row_bytes, &total);
+    if (!total || total == ~UINT64{0}) return 40;
+    const float values[2][3] = {{51.0f / 255.0f, 102.0f / 255.0f, 1.0f},
+                                {153.0f / 255.0f, 204.0f / 255.0f, 1.0f}};
     void* textures[2]{};
-    for (UINT i = 0; i < 2; ++i)
-        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(addresses[i].data()), ptr(&desc),
-                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i]))))) return 40;
-
-    using Create = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
-                                    const void*, void*, UINT, const void*, const GUID*, void**);
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 3072, 1, 1, 1,
-        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
-    void* upload = nullptr;
-    const auto create = reinterpret_cast<Create>((*static_cast<void***>(guest))[127]);
-    if (FAILED(create(guest, &heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
-                      nullptr, nullptr, 0, nullptr, &__uuidof(ID3D12Resource), &upload))) return 41;
-    void* mapped = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, ptr(&mapped)))) || !mapped) return 42;
-    const float values[2][3] = {{0.0f, 0.25f, 0.0f}, {0.5f, 1.0f, 0.0f}};
+    for (UINT i = 0; i < 3; ++i) addresses[i].resize(static_cast<std::size_t>(total));
     for (UINT i = 0; i < 2; ++i) {
         for (UINT mip = 0; mip < 3; ++mip) {
-            const UINT width = (std::max)(1u, 4u >> mip), height = (std::max)(1u, 2u >> mip);
-            const UINT offset = (i * 3 + mip) * 512;
-            for (UINT y = 0; y < height; ++y)
-                for (UINT x = 0; x < width; ++x)
-                    std::memcpy(static_cast<unsigned char*>(mapped) + offset + y * 256 + x * sizeof(float),
+            if (row_bytes[mip] % sizeof(float)) return 40;
+            for (UINT y = 0; y < rows[mip]; ++y)
+                for (UINT64 x = 0; x < row_bytes[mip]; x += sizeof(float))
+                    std::memcpy(addresses[i].data() + footprints[mip].Offset +
+                                    y * footprints[mip].Footprint.RowPitch + x,
                                 &values[i][mip], sizeof(float));
         }
-    }
-    invoke(upload, 9, 0, 0);
-    for (UINT i = 0; i < 2; ++i) {
-        for (UINT mip = 0; mip < 3; ++mip) {
-            D3D12_TEXTURE_COPY_LOCATION from{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            from.PlacedFootprint = {(i * 3 + mip) * 512ull, {DXGI_FORMAT_R32_FLOAT,
-                (std::max)(1u, 4u >> mip), (std::max)(1u, 2u >> mip), 1, 256}};
-            D3D12_TEXTURE_COPY_LOCATION to{static_cast<ID3D12Resource*>(textures[i]), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            to.SubresourceIndex = mip;
-            invoke(list, 16, ptr(&to), 0, 0, 0, ptr(&from), 0);
-        }
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(addresses[i].data()), ptr(&desc),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i]))))) return 41;
     }
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 43;

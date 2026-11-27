@@ -62,7 +62,7 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
 // Linear mip alignment is unknown: only bind a live resource with the same address and description.
-// Never read its bytes from the supplied address.
+// Slot 70 does not publish its bytes from the supplied address.
 bool console_linear_texture_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && static_cast<UINT>(r.Layout) == 0x100 &&
@@ -1285,8 +1285,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         return;
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
-    if (!console_linear_texture_srv(*resource, input->view) &&
-        x2w_startup::supports_single_element_srv(*resource, input->view)) {
+    if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
         note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
         if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
             refuse_memory_srv(refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
