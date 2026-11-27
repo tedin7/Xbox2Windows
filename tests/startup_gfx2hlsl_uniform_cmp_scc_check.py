@@ -4,9 +4,9 @@ usage: startup_gfx2hlsl_uniform_cmp_scc_check.py
        startup_gfx2hlsl_uniform_cmp_scc_check.py draw <dxc> <offscreen_check>
        startup_gfx2hlsl_uniform_cmp_scc_check.py binary <llvm-mc>
 
-Compilers test a wave-uniform condition with a vector compare: `v_cmp_neq_f32_e64 s34, s16, 0` with s16 from a
-constant buffer, then `s_and_b64 s[34:35], s[34:35], exec` and a branch on SCC, and later `s_mov_b32 s31, src_scc`
-past the join. Every active lane compares the same two values and gets the same bit b, so the AND is b ? EXEC : 0
+Compilers test a wave-uniform condition with a vector compare into an SGPR pair whose sources are scalar (a
+constant-buffer word against a literal), then AND that mask with EXEC (`s_and_b64 s[N:N+1], s[N:N+1], exec`),
+branch on SCC, and read SCC with src_scc past the join. Every active lane compares the same two values and gets the same bit b, so the AND is b ? EXEC : 0
 and SCC is b whenever EXEC is not zero. The single-lane model computes SCC from this thread's bit alone, which is b
 only on threads whose lane is active; the src_scc read past the join was refused as a non-uniform SCC.
 
