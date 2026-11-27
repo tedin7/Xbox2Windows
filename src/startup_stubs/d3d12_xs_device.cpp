@@ -72,6 +72,7 @@
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/png_write.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
@@ -2192,6 +2193,25 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
+std::uint64_t process_ms();  // d3d12_draw.inl
+
+// Which translated draw last wrote each render target, for the `x2w-render present source` line: direct-mapped by resource pointer,
+// written under the draw lock, read without a lock by the present thread (a torn read only blurs a diagnostic).
+struct TargetWriter {
+    const void* resource;
+    u64 key, draws;
+    unsigned slot, format;
+};
+TargetWriter target_writers[256];
+void note_target_writer(const void* resource, u64 key, unsigned slot, unsigned format)
+{
+    TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(resource) >> 6) & 255];
+    if (w.resource != resource) w = TargetWriter{resource, 0, 0, 0, 0};
+    w.key = key;
+    w.slot = slot;
+    w.format = format;
+    ++w.draws;
+}
 // raw_plane < 0: the baseline capture of the presented surface (plane 0), reduced for the window and
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
@@ -2372,6 +2392,19 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     }
     was_flat = flat_now;
     if (periodic || moved || timed) {
+        {
+            // What produced this picture: the translated draw that last wrote this surface (key, target slot, format, draws into it
+            // since it was first seen as a target), or "no translated draw", then the picture is a copy/clear/other writer.
+            const TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(surface) >> 6) & 255];
+            if (!raw && (periodic || moved)) {
+                if (w.resource == surface)
+                    log("x2w-render present source at %.1f s: last translated draw into the presented surface key %016llx (target %u, format %u, %llu draws into it); mean level %.2f/255",
+                        process_ms() / 1000.0, static_cast<unsigned long long>(w.key), w.slot, w.format, static_cast<unsigned long long>(w.draws), sum / (3.0 * shown_width * shown_height));
+                else
+                    log("x2w-render present source at %.1f s: no translated draw wrote the presented surface (copy, clear or untranslated writer); mean level %.2f/255",
+                        process_ms() / 1000.0, sum / (3.0 * shown_width * shown_height));
+            }
+        }
         if (moved && !periodic) {
             ++change_lines;
             log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
@@ -2388,6 +2421,8 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
+#include "startup_stubs/d3d12_record.inl"
+#include "startup_stubs/d3d12_present_pictures.inl"
 
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
@@ -7790,6 +7825,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
+        replay_record::present();
+        present_pictures::present(self, surface, frame);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
@@ -7844,9 +7881,20 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
+    // The render totals and the censuses print every 300 frames AND at least every 10 s of wall time: after the cliff (0.3 fps in Run S)
+    // 300 frames take 17 minutes and nothing printed while the dispatch storm ran.
+    static ULONGLONG last_wall_census;
+    if (!last_wall_census) last_wall_census = now;   // the first wall tick comes 10 s after the first present
+    const bool census_frames = render_mode() && frame % 300 == 0;
+    const bool census_wall = render_mode() && !census_frames && now - last_wall_census >= 10000;
+    const bool census_due = census_frames || census_wall;
+    if (census_due) {
+        last_wall_census = now;
+        log("x2w-render census tick at %.1f s, frame %ld (%s)", process_ms() / 1000.0, frame, census_frames ? "every 300 frames" : "10 s of wall time");
+    }
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
@@ -7855,7 +7903,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
-    if (render_mode() && frame % 300 == 0)
+    if (census_due)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
@@ -7869,7 +7917,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
         static long last[9];
@@ -7885,7 +7933,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         std::memcpy(last, now_values, sizeof(last));
         log("%s", text);
     }
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
@@ -8194,6 +8242,7 @@ void build_tables()
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
+    replay_record::install();  // last: it wraps the slots installed above
 }
 
 SRWLOCK written_lock = SRWLOCK_INIT;

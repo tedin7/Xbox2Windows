@@ -1883,6 +1883,62 @@ allow unordered access are never in the retire class.
 ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
 ```
 
+## D3D12 replay record
+
+`X2W_REPLAY_RECORD=all`, `<start s>,<seconds>` or `f<first present>,<presents>` records every call the title
+makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `<X2W_REPLAY_DIR>\replay.x2wr` when that folder is
+set, else `replay.x2wr`; it stops with its end chunk once the file reaches `X2W_REPLAY_MAX_MIB`, default 2048), so a replayer can feed the
+same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
+Unset, no slot is wrapped and nothing changes.
+
+Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
+the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, seven argument words, return value, time,
+present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
+are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
+shader's is), and the wrapper an argument's memory holds after the call (a creation's
+result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
+written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
+closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
+
+File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
+`CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
+`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
+Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
+and anything past 512 MiB in total are left out and counted in the log; `X2W_REPLAY_SHADERS=0` writes none).
+Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
+parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
+passed first, the object second), its memory after the call is `ARGM` argument 7.
+Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
+
+`X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
+present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
+GPU round trip per present. A recorded run and its replay write the same names.
+
+### Replayer
+
+`x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a
+device through the stand-in (loaded late, after it has set every recorded `XENV` setting this process does not set
+itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache), writes the recording's
+`SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
+(the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
+`replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
+recording, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+accepted and ignored in this version.
+
+Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
+memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
+heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
+completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
+map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
+with a buffer of the replayer's. Not replayed yet: memory written through mapped pointers or into placed-resource
+memory, float arguments passed by value, one thread per recorded thread.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
+```
+
 ## D3D12 view census
 
 The stand-in keeps one record per distinct view: slot, resource, counter,
