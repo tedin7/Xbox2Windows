@@ -4090,6 +4090,43 @@ def mesh_coherent_exec(name, args, masks):
             or (name == 's_or_b64' and args[1] == 'exec' and args[2] in masks))
 
 
+def mesh_mask_scc_votes(ins, source, target, candidates, mask_ops):
+    """Find every reader reached by a voted definition, including across forward branches."""
+    effects = [scalar_effects(name, asm) for _, _, name, asm in ins]
+    successors = lane_mask_cfg(ins)
+    if not successors:
+        raise mesh_wave_block_error('SCC of a mask operation is read')
+    # Some scalar handlers write SCC even when scalar_effects only reports a
+    # possible write. Keep those definitions as alternatives at the reader.
+    preserves_scc = {'s_mov_b32', 's_mov_b64', 's_movk_i32', 's_cmovk_i32',
+                     's_cmov_b32', 's_cmov_b64', 's_cselect_b32', 's_cselect_b64'}
+    possible = [may - must if name not in preserves_scc and name not in SCALAR_LOADS else set()
+                for (_, _, name, _), (_, must, may) in zip(ins, effects)]
+    incoming = reaching_mask_words(successors, [writes for _, writes, _ in effects], possible, {'scc'})
+    readers = {i: [] for i in candidates}
+    for i, paths in enumerate(incoming):
+        if paths is None or not ('scc' in effects[i][0] or reads_scc(*ins[i][2:])):
+            continue
+        definitions = paths['scc']
+        for writer in definitions & candidates.keys():
+            if definitions != {writer} or not source < i < target or i in mask_ops:
+                raise mesh_wave_block_error('SCC of a mask operation is read')
+            readers[writer].append(i)
+
+    votes = {}
+    for writer, word in candidates.items():
+        uses = readers[writer]
+        if not uses:
+            raise mesh_wave_block_error('SCC of a mask operation is read')
+        if uses == [writer + 1] and ins[uses[0]][2] in MESH_SCC_BRANCHES:
+            branch = uses[0]
+            votes[branch] = word, ins[branch][2] == 's_cbranch_scc0'
+        else:
+            # None marks a vote followed by fall-through with a new SCC.
+            votes[writer] = word, None
+    return votes
+
+
 def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
     """Prove a wave-uniform PC and exact per-lane EXEC/VCC on each forward edge.
 
@@ -4120,7 +4157,7 @@ def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
             raise mesh_wave_block_error('a scalar load address is not wave-uniform')
         if ins[i][2].startswith(('s_cmp', 's_bitcmp')):
             raise mesh_wave_block_error('SCC is not proven wave-uniform')
-    votes, mask_ops, uniform = {}, set(), set()
+    votes, mask_ops, uniform, mask_scc = {}, set(), set(), {}
     for i in range(source + 1, target):
         name, asm = ins[i][2:]
         _, args, mods = parse(asm)
@@ -4135,7 +4172,12 @@ def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
             votes[i] = word, name in ('s_cbranch_execz', 's_cbranch_vccz')
         elif exec_write or lane_mask_instruction(name, args, masks):
             if 'scc' in writes and live_at_join('scc', i + 1):
-                raise mesh_wave_block_error('SCC of a mask operation is read')
+                # The result is a pure lane bit and is zero on inactive lanes.
+                # SCC reduces the result, including when EXEC itself is the destination.
+                if name != 's_and_b64' or 'exec' not in args[1:]:
+                    raise mesh_wave_block_error('SCC of a mask operation is read')
+                dst = lane_mask_pair(args[0])
+                mask_scc[i] = dst if dst in ('exec', 'vcc') else 's%d' % reg_range(dst)[1]
             if 'scc' in reads:
                 uniform.add(i)
             mask_ops.add(i)
@@ -4161,6 +4203,8 @@ def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
                 uniform.add(i)
         else:
             raise mesh_wave_block_error('an unsupported scalar or memory instruction (%s)' % name)
+    if mask_scc:
+        votes.update(mesh_mask_scc_votes(ins, source, target, mask_scc, mask_ops))
     return votes, mask_ops, uniform
 
 
@@ -5142,6 +5186,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         if (index not in mask_instructions and name != 's_and_saveexec_b64' and not complement and index not in nested_restores and not mask_select
                 and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
+        if index in coherent_votes:
+            wave_votes[off] = coherent_votes[index]
         if index in edges:
             if scc_stale and reads_scc(name, asm):
                 raise Unsupported('slot 57 mesh: an unmodelled SCC is read by a branch')
@@ -5152,9 +5198,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                 if mask != index - 1 or not cmp or int(cmp[2]) != thread:
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
-            if index in coherent_votes:
-                wave_votes[off] = coherent_votes[index]
-            elif index in inner_execz:
+            if index not in coherent_votes and index in inner_execz:
                 wave_votes[off] = ('exec', True)
             if index in inner_vcc:
                 # Keep the legacy branch text. The purity proof distinguishes both wave vote conditions.
@@ -8078,6 +8122,9 @@ class Stage:
         wave_loads = getattr(self, 'mesh_wave_loads', {})
         wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values() if bound is not None}
         mesh_votes = getattr(self, 'mesh_wave_votes', {})
+        mask_scc_writes = {off for off, (_, zero) in mesh_votes.items() if zero is None}
+        mask_scc_writes.update(self.ins[i - 1][0] for i, (off, _, name, _) in enumerate(self.ins)
+                               if off in mesh_votes and name in MESH_SCC_BRANCHES)
         wave_scalars = getattr(self, 'mesh_wave_scalars', ())
         wave_scalar_joins = getattr(self, 'mesh_wave_scalar_joins', {})
         mask_arm_sites = getattr(self, 'mesh_mask_arm_sites', ())
@@ -8374,6 +8421,7 @@ class Stage:
             start = 0
             raised_unsupported = None
             self.mesh_collect_reads, self.mesh_collect_votes = {}, {}
+            self.mesh_collect_scc = set()
             self.mesh_collect_masks = {}
             self.exec_keep = {}  # registers whose body-arm descriptor symbol is kept after an execz join (rule R1)
 
@@ -8725,7 +8773,7 @@ class Stage:
                             if not (self.scc_verified and self.scc_uniform):
                                 raise mesh_wave_block_error('SCC is not proven wave-uniform')
                             if (name in MESH_SCC_BRANCHES or name.startswith(('s_cselect', 's_cmov'))) and (
-                                    self.scc_def not in scc_compares):
+                                    self.scc_def not in scc_compares | mask_scc_writes):
                                 raise mesh_wave_block_error('SCC is not from a scalar compare')
                         if any(
                             not (self.scc_verified and self.scc_uniform) if reg == 'scc' else
@@ -8818,7 +8866,10 @@ class Stage:
                     if off in mesh_votes:
                         word, zero = mesh_votes[off]
                         self.mesh_collect_votes[start] = word
-                        term = ('branch', 'mesh_vote %s 0u' % ('==' if zero else '!='), term[2])
+                        if zero is None:
+                            self.mesh_collect_scc.add(start)
+                        else:
+                            term = ('branch', 'mesh_vote %s 0u' % ('==' if zero else '!='), term[2])
                     elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
                 except PixelImageConflict:
@@ -8859,6 +8910,9 @@ class Stage:
                             carried_masks.update(dests)
                         else:
                             carried_masks.difference_update(dests)
+                if off in mask_scc_writes:
+                    self.scc_effect = 'emitted'
+                    self.scc_verified = self.scc_uniform = True
                 if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
                     # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
                     # value (descriptor_scc_reads follows every path from here to the reader).
@@ -8872,7 +8926,7 @@ class Stage:
                             scc_dependent_writes.add(off)
                 if self.scc_effect or not self.scc_verified:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
-                if term:
+                if term or off in mesh_votes and mesh_votes[off][1] is None:
                     self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
@@ -17968,6 +18022,8 @@ class Stage:
                         % (i, i, word),
                         '    if (pc == %d) {' % i,
                         '        uint mesh_vote = mesh_vote_%d;' % i]
+                if off in self.mesh_collect_scc:
+                    out.append('        scc = mesh_vote != 0u;')
             nxt = i + 1 if i + 1 < len(blocks) else 0xffff
             if not term:
                 out.append('        pc = %d;' % nxt)
