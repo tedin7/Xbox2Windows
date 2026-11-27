@@ -1945,8 +1945,8 @@ def check_pair_phi_controls():
         decoded = G.decode(program)
         pair = 'vcc' if name == 'phi64-vcc' else 's[24:25]'
         if edit != '000086bf':  # VCC votes are mask operands but cannot follow a per-lane join.
-            assert pair not in G.pure_lane_mask_pairs(decoded)
-            assert pair in G.pure_lane_mask_pairs(G.decode(CASES[name][1]))
+            assert not any(pair in web for web in G.lane_mask_webs(decoded).values())
+            assert any(pair in web for web in G.lane_mask_webs(G.decode(CASES[name][1])).values())
 
     name = 'phi64-sgpr'
     high_only = CASES[name][1].replace(bytes.fromhex('050001d583006200'), bytes.fromhex('19020a7e'), 1)

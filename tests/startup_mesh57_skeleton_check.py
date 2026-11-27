@@ -294,6 +294,58 @@ MASK_CONTROLS = (
 )
 
 
+# This pair holds ordinary data before the compare and again after the saved
+# EXEC's last use. Both numeric reads have their own reaching definitions.
+WEB_REUSE = lane_mask_mesh(prefix=MASK_PREFIX + ' beae0484 7e66022e',
+                           exports='beae0488 7e66022f 7e280228 7e2a0307')
+WEB_NUMERIC_EDGE = lane_mask_mesh(right='beae0389')
+WEB_NUMERIC_READ = lane_mask_mesh(setup='7e66022f')
+STANDALONE_SELECT = 'bf068006 85ea80c1 d5010007 01a9e480'
+STANDALONE_MESH = vertex_red(STANDALONE_SELECT)
+STANDALONE_WAVE_MESH = wave_load_mesh(body=WAVE_LOAD_BODY + ' ' + STANDALONE_SELECT)
+
+
+def mask_region(head, then, tail):
+    """Encode an execz to the complement after the then-arm words."""
+    body = then.split()
+    return ' '.join(head.split() + [branch(0xbf88, 0, len(body) + 1)] + body + tail.split())
+
+
+def multiple_regions(nested, renarrow=False):
+    first_head = 'd4c40034 00020086 beb62434'
+    second = mask_region('d4c40038 00020083 beba2438', '7e0e02f2', '8afe7e3a 7e0e02ff 3e800000 88fe3a7e')
+    first_then = MASK_LOAD + ' bf8cc07f 7e0e02f2'
+    if nested:
+        first_then += ' ' + second
+    close = '87fe3c36' if renarrow else '88fe367e'  # from saved block EXEC, optionally narrowed by s[60:61]
+    first = mask_region(first_head, first_then, '8afe7e36 7e0e02ff 3e800000 ' + close)
+    if nested:
+        return wave_load_mesh(MASK_PREFIX, first)
+    before = 'd4c4003c 000200c0 ' if renarrow else ''  # s[60:61] = thread < 64
+    return wave_load_mesh(MASK_PREFIX, before + first + ' ' + second.rsplit(' ', 1)[0])
+
+
+ROUND2_ACCEPTED = (
+    ('reused numeric pair', WEB_REUSE),
+    ('standalone wave-load select', STANDALONE_WAVE_MESH),
+    ('sequential mask regions', multiple_regions(False)),
+    ('nested mask regions', multiple_regions(True)),
+    ('re-narrowed mask regions', multiple_regions(False, renarrow=True)),
+)
+ROUND2_DRAWS = ROUND2_ACCEPTED + (
+    ('standalone select', STANDALONE_MESH),
+    ('standalone carry select', vertex_red('bf068006 85ea80c1 7e660280 d5283c32 01aa66c1 d5010007 00f1e480')),
+)
+ROUND2_REFUSED = (
+    ('numeric definition reaches the joined mask', WEB_NUMERIC_EDGE, 'a lane mask is also read as a number'),
+    ('live mask high word read as data', WEB_NUMERIC_READ, 'a lane mask is also read as a number'),
+    ('standalone VCC read as a number', vertex_red(STANDALONE_SELECT + ' 7e66026b'),
+     's_cselect_b64 on a wave mask is not covered'),
+    ('standalone select with unverified SCC', vertex_red(STANDALONE_SELECT.split(' ', 1)[1]),
+     's_cselect_b64 on a wave mask is not covered'),
+)
+
+
 WAVE_LOAD_MESH = wave_load_mesh()
 WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 WAVE_LOAD_REFUSALS = (
@@ -781,7 +833,7 @@ def depth_only_controls():
 
 
 def lane_mask_controls(tmp):
-    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC:
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
         key, result = request(tmp, mesh)
         expect(label + ' translates', result, 'ok')
         if result == 'ok':
@@ -791,6 +843,8 @@ def lane_mask_controls(tmp):
                 expect(label + ' mutant changes a CPU image', any(
                     lane_mask_reference(label, full, mutant)[-1] != lane_mask_reference(label, full)[-1]
                     for full in (False, True)), True)
+    for label, mesh, reason in ROUND2_REFUSED:
+        expect(label, reason in request(tmp, mesh)[1], True)
     for label, mesh, reason in MASK_CONTROLS:
         expect(label, request(tmp, mesh)[1], f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
 
@@ -801,12 +855,12 @@ def lane_mask_controls(tmp):
 
     # m3 ignores a numeric use before running the purity proof. The classifier's
     # c1 assertion would fail under this mutant, independently of the emitter.
-    ins = G.MeshPipeline(code(MASK_CASES[0][1]), code(PIXEL), root()).vs.mesh_source_ins
-    numeric = next(i for i, item in enumerate(ins) if item[2] == 's_not_b64')
-    bad = list(ins)
-    bad.insert(numeric, (0, 4, 's_bcnt1_i32_b64', 's_bcnt1_i32_b64 s54, s[46:47]'))
-    expect('c1 checks pair purity', 's[46:47]' in G.pure_lane_mask_pairs(bad), False)
-    expect('m3 ignoring the whole-word read fails c1', 's[46:47]' in G.pure_lane_mask_pairs(ins), True)
+    def compare_web(mesh):
+        ins = G.decode(code(mesh))
+        i = next(i for i, item in enumerate(ins) if item[2] == 's_not_b64')
+        return 's[46:47]' in G.lane_mask_webs(ins).get(i, ())
+    expect('c1 checks pair purity', compare_web(MASK_CONTROLS[0][1]), False)
+    expect('m3 ignoring the whole-word read fails c1', compare_web(MASK_CASES[0][1]), True)
 
 
 def controls():
@@ -987,6 +1041,14 @@ def assemble(mc, text):
 
 def lane_mask_binary(mc):
     """Verify the opcodes and independently assemble the mixed/empty S1 draw."""
+    expect('standalone select words', assemble(mc, """
+s_cmp_eq_u32 s6, 0
+s_cselect_b64 vcc, -1, 0
+v_cndmask_b32_e64 v7, 0, 1.0, vcc
+"""), STANDALONE_SELECT.split())
+    expect('re-narrowed EXEC words',
+           assemble(mc, 'v_cmp_gt_u32_e64 s[60:61], 64, v0\ns_and_b64 exec, s[54:55], s[60:61]'),
+           'd4c4003c 000200c0 87fe3c36'.split())
     source = """
 s_mov_b32 s40, 0x3e808081
 s_lshl_b32 s41, s6, 2
@@ -1129,6 +1191,8 @@ def lane_mask_reference(label, full, mutant=None):
     memory = label in ('tbuffer', 'image')
     for first in (0, 64):
         limit = 6 if memory else 128
+        if label == 'standalone wave-load select':
+            limit = 6
         if label == 'S4 CMPX' and mutant != 'dropped CMPX':
             limit = 8
         outer = [tid < limit for tid in range(first, first + 64)]
@@ -1150,6 +1214,18 @@ def lane_mask_reference(label, full, mutant=None):
                 lane, slot = tid & 63, tid & 15
                 runs = then[lane] if mutant == 'per-lane EXEC branch' else any(then)
                 red = loaded[first // 64] if runs else 64
+                if label == 'standalone wave-load select':
+                    green = 255 if tid < 6 and mutant != 'opposite SCC select' else 0
+                    colours[slot] = (red, green, *colours[slot][2:])
+                    continue
+                if label.endswith('mask regions'):
+                    green = 255 if tid < 3 else 64
+                    colours[slot] = (red, green, *colours[slot][2:])
+                    continue
+                if label in ('standalone select', 'standalone carry select'):
+                    red = 255 if (tid < 64) != (mutant == 'opposite SCC select') else 0
+                    colours[slot] = (red, *colours[slot][1:])
+                    continue
                 if label.startswith('generic'):
                     red = 255 if tid < 6 or mutant == 'wrong generic mask' else 0
                     colours[slot] = (red, *colours[slot][1:])
@@ -1167,6 +1243,13 @@ def lane_mask_reference(label, full, mutant=None):
 
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label.endswith('mask regions'):
+        expect(label + ' has two votes', source.count('mesh_vote == 0u'), 2)
+        return [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
+    if label.startswith('standalone'):
+        old, new = 'vcc = (scc ?', 'vcc = (!scc ?'
+        expect(label + ' mutant site is unique', source.count(old), 1)
+        return [('opposite SCC select', source.replace(old, new))]
     if label.startswith('generic'):
         old, new = (('s46 = 0x00000000u;', 's46 = 0xffffffffu;') if label == 'generic live' else
                     ('if (exec & 1) v7 = 0x00000000u;', 'if (exec & 1) v7 = 0x3f800000u;'))
@@ -1199,7 +1282,7 @@ def lane_mask_mutants(label, source):
 def draw_lane_masks(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
-    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC:
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
         # A group has two guest waves. A second S1 draw changes wave 1 from
         # empty to full so the reference exercises all three kinds of wave.
         programs = [(False, mesh)]

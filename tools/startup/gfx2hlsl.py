@@ -7,7 +7,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 """
 import bisect
 import copy
-from collections import Counter
+from collections import Counter, deque
 from contextlib import suppress
 from copy import deepcopy
 import functools
@@ -2511,74 +2511,153 @@ def lane_mask_operands(name, ops):
 def lane_mask_words(token):
     """Scalar words touched by an operand, accounting for VCC/SGPR aliases."""
     aliases = {'vcc': 's106', 'vcc_hi': 's107'}
+    if token == 'src_vccz':
+        return {'s106', 's107'}
     return {aliases.get(word, word) for word in scalar_tokens(token)}
 
 
-def pure_lane_mask_pairs(ins):
-    """Prove pair purity across every write and access, including overlapping single words."""
-    candidates, accesses = set(), []
-    for _, _, name, asm in ins:
-        if name.startswith(('s_movrel', 'v_movrel')):
-            return {'exec'}  # an indirect scalar access may alias any mask
-        _, ops, _ = parse(asm)
-        ops = lane_mask_operands(name, ops)
-        writes, reads = lane_mask_positions(name, ops)
-        dest = lane_mask_pair(ops[writes[0]]) if writes else None
+def lane_mask_cfg(ins, edges=None):
+    """Build instruction successors, including untaken conditional edges."""
+    index = {off: i for i, (off, *_rest) in enumerate(ins)}
+    jumps = dict(edges or ())
+    if edges is None:
+        for i, (_, _, name, asm) in enumerate(ins):
+            if name.startswith(('s_branch', 's_cbranch')):
+                jumps[i] = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+    if None in jumps.values():
+        return ()
+    return [tuple(j for j in (jumps.get(i), i + 1 if name not in ('s_branch', 's_endpgm') else None)
+                  if j is not None and j < len(ins)) for i, (_, _, name, _) in enumerate(ins)]
+
+
+def lane_mask_flow_supported(successors):
+    """Decline a backward edge when its target is not a proven single entry."""
+    for src, successors_of_src in enumerate(successors):
+        for dst in successors_of_src:
+            if dst >= src or dst == 0:
+                continue
+            pending, seen = [0], {dst}
+            while pending:
+                i = pending.pop()
+                if i in seen:
+                    continue
+                if i == src:
+                    return False
+                seen.add(i)
+                pending.extend(successors[i])
+    return True
+
+
+def reaching_mask_words(successors, writes, possible_writes, words):
+    """Track the last definitions of each relevant scalar word on every incoming edge."""
+    incoming = [None] * len(successors)
+    incoming[0] = {word: {-1} for word in words}
+    pending = deque([0])
+    queued = {0}
+    while pending:
+        i = pending.popleft()
+        queued.remove(i)
+        after = incoming[i].copy()
+        for word in possible_writes[i] & words:
+            after[word] = after[word] | {i}
+        after.update({word: {i} for word in writes[i] & words})
+        for j in successors[i]:
+            before = incoming[j]
+            joined = after if before is None else {w: before[w] | after[w] for w in words}
+            if joined != before:
+                incoming[j] = joined
+                if j not in queued:
+                    pending.append(j)
+                    queued.add(j)
+    return incoming
+
+
+def lane_mask_accesses(ins):
+    """Normalize mask operands and account for full pair, half, and alias writes."""
+    accesses, writes, possible_writes, candidates = [], [], [], {}
+    for i, (_, _, name, asm) in enumerate(ins):
+        ops = lane_mask_operands(name, parse(asm)[1])
+        dests, sources = lane_mask_positions(name, ops)
+        dest = lane_mask_pair(ops[dests[0]]) if dests else None
+        read, must, may = scalar_effects(name, asm)
+        written = lane_mask_words(' '.join(must))
         if dest and dest != 'exec':
-            candidates.add(dest)
-        accesses.append((ops, writes, reads, dest))
-    masks = candidates | {'exec'}
-    by_word = {}
-    for pair in candidates:
-        for word in lane_mask_words(pair):
-            by_word.setdefault(word, set()).add(pair)
-    while True:
-        invalid = set()
-        values = masks | {'0', '-1'}
-        for ops, writes, reads, dest in accesses:
-            legal = {i for i in writes + reads if lane_mask_pair(ops[i]) in masks}
-            if dest and any(ops[i] not in values for i in reads):
-                legal.clear()
-            for i, token in enumerate(ops):
-                pairs = set().union(*(by_word.get(word, ()) for word in lane_mask_words(token))) & masks
-                invalid.update(pairs - {token} if i in legal else pairs)
-        if not invalid:
-            return masks
-        masks -= invalid
+            written |= lane_mask_words(dest)
+            if all(lane_mask_pair(ops[j]) or ops[j] in ('0', '-1') for j in sources):
+                candidates[i] = dest
+        read_words = lane_mask_words(' '.join(read))
+        if not dests and ops and lane_mask_words(ops[0]) <= written:
+            if not lane_mask_words(ops[0]) & read_words or ops[0] in ops[1:]:
+                dests = (0,)
+        explicit = set().union(*(lane_mask_words(token) for j, token in enumerate(ops) if j not in dests))
+        accesses.append((ops, dests, sources, read_words - explicit))
+        writes.append(written)
+        possible_writes.append(lane_mask_words(' '.join(may)) - written)
+    return accesses, writes, possible_writes, candidates
+
+
+def lane_mask_webs(ins, edges=None, *, readers=None):
+    """Map each instruction to its pure mask operands, using reaching values of both words."""
+    if any(name.startswith(('s_setpc', 's_swappc', 's_movrel', 'v_movrel')) for _, _, name, _ in ins):
+        return {}  # an indirect transfer/access can hide a definition or read
+    successors = lane_mask_cfg(ins, edges)
+    accesses, writes, possible_writes, candidates = lane_mask_accesses(ins)
+    if not successors or not candidates or not lane_mask_flow_supported(successors):
+        return {}
+    words = set().union(*(lane_mask_words(pair) for pair in candidates.values()))
+    incoming = reaching_mask_words(successors, writes, possible_writes, words)
+    bad, uses, links = set(), {}, {}
+    for i, (ops, dests, sources, implicit) in enumerate(accesses):
+        if incoming[i] is None:
+            continue
+        for word in implicit & words:
+            bad.update(incoming[i][word] & candidates.keys())
+        graph_defs = links.setdefault(i, set()) if i in candidates else set()
+        for j, token in enumerate(ops):
+            if j in dests:
+                continue
+            touched = lane_mask_words(token) & words
+            if not touched:
+                continue
+            reached = set().union(*(incoming[i][word] for word in touched))
+            defs = reached & candidates.keys()
+            if (j not in sources or not lane_mask_pair(token) or
+                    not all(candidates.get(d) == token for d in reached) or
+                    any(incoming[i][word] != reached for word in touched)):
+                bad.update(defs)
+                if j in sources and i in candidates:
+                    bad.add(i)
+                continue
+            uses.setdefault(i, {})[token] = reached
+            graph_defs.update(reached)
+            for d in reached:
+                links.setdefault(d, set()).update(reached - {d})
+                if i in candidates:
+                    links[d].add(i)
+    pending = list(bad)
+    while pending:
+        d = pending.pop()
+        fresh = links.get(d, set()) - bad
+        bad.update(fresh)
+        pending.extend(fresh)
+    result = {i: {pair} for i, pair in candidates.items() if i not in bad and incoming[i] is not None}
+    for i, operands in uses.items():
+        for pair, defs in operands.items():
+            if defs & bad:
+                continue
+            result.setdefault(i, set()).add(pair)
+            if readers is not None:
+                for d in defs:
+                    readers.setdefault(d, set()).add(i)
+    return result
 
 
 def lane_mask_instruction(name, ops, masks):
     """Prove that an instruction with a mask destination works one bit at a time."""
     ops = lane_mask_operands(name, ops)
     writes, reads = lane_mask_positions(name, ops)
-    return (writes == (0,) and lane_mask_pair(ops[0]) in masks
-            and all(ops[i] in masks | {'0', '-1'} for i in reads))
-
-
-def defined_lane_masks(ins, first, last, edges, mask_ops):
-    """Require a full-mask definition on every forward path before each mask read."""
-    incoming = {first: [{'exec'}]}
-    written = set()
-    for i in range(first, last):
-        if i not in incoming:
-            continue
-        have = set.intersection(*incoming[i])
-        name, asm = ins[i][2:]
-        _, ops, _ = parse(asm)
-        if i in mask_ops:
-            ops = lane_mask_operands(name, ops)
-            writes, reads = lane_mask_positions(name, ops)
-            if any(ops[j] not in have | {'0', '-1'} for j in reads):
-                raise Unsupported('a lane mask is undefined on an incoming path')
-            have.update(ops[j] for j in writes)
-            written.update(ops[j] for j in writes if ops[j] != 'exec')
-        elif any(scalar_tokens(pair) & scalar_effects(name, asm)[0] for pair in written):
-            raise Unsupported('an unproven use of a lane mask')
-        if i in edges:
-            incoming.setdefault(edges[i], []).append(have)
-        if name != 's_branch':
-            incoming.setdefault(i + 1, []).append(have)
-    return written
+    return (writes == (0,) and lane_mask_pair(ops[0]) in masks | {'exec'}
+            and all(ops[i] in masks | {'0', '-1', 'exec'} for i in reads))
 
 
 def skipped_mask_write(name, ops, zero, lane, width=64):
@@ -2607,17 +2686,36 @@ def skipped_mask_write(name, ops, zero, lane, width=64):
 def mask_join_read(ins, join, pair):
     """Reject whole-word observations of either half after a per-lane join."""
     words = lane_mask_words(pair)
-    for _, _, name, asm in ins[join:]:
+    successors = lane_mask_cfg(ins)
+    if not successors:
+        return False
+    pending, seen = [join], set()
+    while pending:
+        i = pending.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        _, _, name, asm = ins[i]
         _, args, _ = parse(asm)
         args = lane_mask_operands(name, args)
         writes, reads = lane_mask_positions(name, args)
+        read, must, _ = scalar_effects(name, asm)
+        read_words = lane_mask_words(' '.join(read))
+        overwritten = lane_mask_words(' '.join(must))
         for j, arg in enumerate(args):
-            if not lane_mask_words(arg) & words or j in writes and arg == pair:
+            touched = lane_mask_words(arg) & words
+            if not touched or (j in writes and arg == pair):
+                continue
+            if j == 0 and not writes and touched <= overwritten and not touched & read_words:
                 continue
             local = (name.startswith('v_cndmask_b32') or LANE_MASK_CARRY.fullmatch(name)
                      or name == 's_and_saveexec_b64' or (name == 's_and_b64' and 'exec' in args[1:]))
             if not local or j not in reads or arg != pair:
                 return False
+        for j in writes:
+            overwritten |= lane_mask_words(args[j])
+        if not words <= overwritten:
+            pending.extend(successors[i])
     return True
 
 
@@ -2633,7 +2731,7 @@ def lane_mask_entry(ins, branch, edges, masks):
         writes, _ = lane_mask_positions(name, args)
         for j in writes:
             pair = args[j]
-            if pair == 'exec' or pair not in masks or pair in last:
+            if pair == 'exec' or pair not in masks.get(i, ()) or pair in last:
                 continue
             last[pair] = i
             if (name.startswith('v_cmp_') or LANE_MASK_CARRY.fullmatch(name)
@@ -2658,7 +2756,7 @@ def skipped_lane_mask_writes(ins, branch, join, edges, live_at_join, masks):
     for i in range(branch + 1, join):
         name, asm = ins[i][2:]
         args = lane_mask_operands(name, parse(asm)[1])
-        if name == 's_cselect_b64' or not lane_mask_instruction(name, args, masks) or args[0] == 'exec':
+        if name == 's_cselect_b64' or not lane_mask_instruction(name, args, masks.get(i, set())) or args[0] == 'exec':
             continue
         if 'scc' in scalar_effects(name, asm)[1] and live_at_join('scc', i + 1):
             return {}, set()
@@ -2893,6 +2991,91 @@ def mesh_mask_scalar(name, asm):
     return name != 'v_readfirstlane_b32' and mesh_wave_block_scalar(name, asm, explicit_scc=True)
 
 
+def mesh_local_mask_ops(ins, webs, live_at_join):
+    """Admit pure, lane-local producers whose flag cannot be observed."""
+    supported = {'s_cselect_b64', 's_and_b64', 's_or_b64', 's_not_b64'}
+    result = set()
+    for i, masks in webs.items():
+        name, asm = ins[i][2:]
+        _, args, _ = parse(asm)
+        normalized = lane_mask_operands(name, args)
+        writes, reads = lane_mask_positions(name, normalized)
+        carry = (LANE_MASK_CARRY.fullmatch(name) and writes == (1,) and normalized[1] in masks
+                 and all(normalized[j] in masks | {'exec', '0', '-1'} for j in reads))
+        if carry or ((name in supported or name.startswith('v_cmp_')) and lane_mask_instruction(name, args, masks)):
+            if not writes_exec(name, args) and (
+                    'scc' not in scalar_effects(name, asm)[1] or not live_at_join('scc', i + 1)):
+                result.add(i)
+    return result
+
+
+def mesh_mask_region(ins, branch, target, edges):
+    """Recognize the save, else boundary and exact restoration of incoming EXEC."""
+    save, other = branch - 1, edges[branch]
+    name, asm = ins[save][2:]
+    if name != 's_and_saveexec_b64' or not branch < other < target:
+        return None
+    pair = lane_mask_pair(parse(asm)[1][0])
+    if not pair or pair in ('exec', 'vcc') or ins[other][3] != 's_andn2_b64 exec, %s, exec' % pair:
+        return None
+    restores = ('s_or_b64 exec, exec, %s' % pair, 's_mov_b64 exec, %s' % pair)
+    close = next((i for i in range(other + 1, target) if ins[i][3] in restores or (
+        ins[i][2] == 's_and_b64' and parse(ins[i][3])[1][:2] == ['exec', pair])), target)
+    return save, branch, other, close, pair
+
+
+def mesh_multiple_mask_regions(ins, source, target, branches, edges, live_at_join):
+    """Require disjoint regions or nested regions wholly inside a parent's then arm."""
+    fail = 'the voted branch is reached through unproven EXEC control flow'
+    regions = [mesh_mask_region(ins, b, target, edges) for b in branches]
+    if any(region is None for region in regions):
+        raise mesh_wave_block_error(fail)
+    for position, (save, branch, other, close, pair) in enumerate(regions):
+        if any(save < child <= close and not branch < child < end < other
+               for child, _, _, end, _ in regions[position + 1:]):
+            raise mesh_wave_block_error(fail)
+        if any(live_at_join(word, close + 1) for word in scalar_tokens(pair)):
+            raise mesh_wave_block_error('a saved EXEC mask is live after the if/else')
+        if any(scalar_tokens(pair) & scalar_tokens(ins[i][3])
+               for i in range(branch + 1, close) if i != other):
+            raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+        if any(ins[i][2].startswith('s_') and not ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+               for i in range(other + 1, close)):
+            raise mesh_wave_block_error('the else arm has scalar work without a voted EXEC branch')
+    def arm_path(i):
+        return tuple((save, i >= other) for save, _, other, close, _ in regions if save < i <= close)
+
+    boundaries = {i for _, branch, other, close, _ in regions for i in (branch, other, close)}
+    for a, b in edges.items():
+        if a in branches or not (source < a < target or source < b < target):
+            continue
+        if (not source < a < b <= target or b in boundaries or arm_path(a) != arm_path(b)
+                or ins[a][2] not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1')):
+            raise mesh_wave_block_error(fail)
+    return {i for save, _, other, close, _ in regions for i in (save, other, close) if i < target}
+
+
+def prove_mesh_mask_regions(ins, source, target, branches, structural, edges, live_at_join):
+    """Prove mask operands and EXEC writes in a series of wave-coherent regions."""
+    webs = lane_mask_webs(ins)
+    mask_ops = set()
+    for i in range(source + 1, target):
+        name, asm = ins[i][2:]
+        args = parse(asm)[1]
+        masks = webs.get(i, set())
+        if i in structural or (not writes_exec(name, args) and lane_mask_instruction(name, args, masks)):
+            if not lane_mask_instruction(name, args, masks):
+                raise mesh_wave_block_error('a lane mask is also read as a number')
+            if 'scc' in scalar_effects(name, asm)[1] and live_at_join('scc', i + 1):
+                raise mesh_wave_block_error('SCC of a mask operation is read')
+            mask_ops.add(i)
+        elif writes_exec(name, args):
+            raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+        elif name.startswith('v_cndmask_b32') and masks:
+            mask_ops.add(i)
+    return set(branches), mask_ops
+
+
 def mesh_mask_arm(ins, source, target, edges, live_at_join):
     """Prove one forward if/else, whose else arm ends at the enclosing EXEC reset."""
     branches = [i for i in range(source + 1, target) if ins[i][2] == 's_cbranch_execz']
@@ -2909,14 +3092,17 @@ def mesh_mask_arm(ins, source, target, edges, live_at_join):
     else:
         return None
     if len(branches) != 1:
-        raise mesh_wave_block_error('the voted branch is reached through unproven EXEC control flow')
+        structural = mesh_multiple_mask_regions(ins, source, target, branches, edges, live_at_join)
+        return prove_mesh_mask_regions(ins, source, target, branches, structural, edges, live_at_join)
     if any(live_at_join(reg, target + 1) for reg in scalar_tokens(dest)):
         raise mesh_wave_block_error('a saved EXEC mask is live after the if/else')
-    masks = pure_lane_mask_pairs(ins)
+    readers = {}
+    webs = lane_mask_webs(ins, readers=readers)
     mask_ops = {save, join}
     for i in range(source + 1, target):
         name, asm = ins[i][2:]
         _, args, _ = parse(asm)
+        masks = webs.get(i, set())
         mask_setup = i < save and lane_mask_instruction(name, args, masks)
         cmpx_setup = i < save and name.startswith('v_cmpx_') and len(args) == 2
         vcc_test = i < save and name in MESH_VCC_BRANCHES
@@ -2943,17 +3129,13 @@ def mesh_mask_arm(ins, source, target, edges, live_at_join):
         raise mesh_wave_block_error('the voted branch is reached through unproven EXEC control flow')
     if any(source < a < target and not (a < b <= target) for a, b in edges.items()):
         return None
-    try:
-        written = defined_lane_masks(ins, source + 1, target, edges, mask_ops)
-    except Unsupported as reason:
-        raise mesh_wave_block_error(str(reason)) from reason
-    if any(live_at_join(reg, target + 1) for pair in written for reg in scalar_tokens(pair)):
+    if any(reader > target for i in mask_ops for reader in readers.get(i, ())):
         raise mesh_wave_block_error('a lane mask is live after the wave-load block')
-    return branch, mask_ops
+    return {branch}, mask_ops
 
 
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
-                  mask_arm_sites=None):
+                  mask_arm_sites=None, standalone_selects=None):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -3119,6 +3301,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     pending.append(i + 1)
         return False
 
+    local_mask_ops = (mesh_local_mask_ops(ins, lane_mask_webs(ins), live_at_join)
+                      if standalone_selects is not None else set())
+
     def dead_block_scalar(i, join):
         """Scalar ALU in a skipped block whose results no path reads past the join. Lanes that skip the block per lane
         never read them, and lanes that run it compute the wave-uniform values the guest computes once per wave."""
@@ -3252,11 +3437,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     if causes and target != count_at and (prefix or vector_limit) and compare > a_end and not entries:
                         arm = mesh_mask_arm(ins, source, target, edges, live_at_join)
                         if arm:
-                            branch, mask_ops = arm
+                            voted, mask_ops = arm
                             mask_vcc = {i for i in mask_ops if ins[i][2] in MESH_VCC_BRANCHES}
-                            proved_inner = inner + [branch] + sorted(mask_vcc - vcc_edges)
+                            proved_inner = inner + sorted(voted | (mask_vcc - vcc_edges))
                             vector_loads = {i for i in scalar if lane_predicated_load(*ins[i][2:])}
-                            remaining = [i for i in scalar if i not in mask_ops | vector_loads and i != branch]
+                            remaining = [i for i in scalar if i not in mask_ops | vector_loads | voted]
                             if (not any(source < d < target and not source < a < target for a, d in edges.items())
                                     and all(i in proved_inner for i in edges if source < i < target)
                                     and all(mesh_mask_scalar(*ins[i][2:]) for i in remaining)
@@ -3265,8 +3450,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                                 vcc_edges |= mask_vcc
                                 causes.clear()
                                 mask_instructions.update(mask_ops)
-                                scalar_arms.add(branch)
-                                extra.add(branch)
+                                scalar_arms.update(voted)
+                                extra.update(voted)
                                 if mask_arm_sites is not None:
                                     mask_arm_sites.update(ins[i][0] for i in range(source, target))
                                 live = sorted({reg for i in scalar for reg in scalar_effects(*ins[i][2:])[2]
@@ -3274,6 +3459,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                                 wave_scalars.update(ins[i][0] for i in mask_ops
                                                     if ins[i][2] == 's_cselect_b64')
                                 wave_scalars.update(ins[i][0] for i in inner if reads_scc(*ins[i][2:]))
+                    if causes and local_mask_ops and not any(source < i < target for i in edges):
+                        remaining = [i for i in scalar if i not in local_mask_ops]
+                        if (set(causes) <= {'a scalar instruction the wave block cannot run once per wave',
+                                            'VCC or SCC live at the join'}
+                                and len(remaining) != len(scalar)
+                                and all(mesh_wave_block_scalar(*ins[i][2:]) for i in remaining)
+                                and not any(reg in VCC_KEYS | {'scc'} and live_at_join(reg, target)
+                                            for i in remaining for reg in scalar_effects(*ins[i][2:])[1])):
+                            scalar = remaining
+                            live = sorted({reg for i in scalar for reg in scalar_effects(*ins[i][2:])[2]
+                                           if re.fullmatch(r's\d+', reg) and live_at_join(reg, target)})
+                            causes.clear()
                     if causes and not any(i in edges and i not in inner for i in range(source + 1, target)):
                         memory = {i for i in scalar if lane_predicated_load(*ins[i][2:])}
                         if memory and causes == ['a scalar instruction the wave block cannot run once per wave'] and all(
@@ -3321,15 +3518,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     missing.add(i)
             if missing:
                 allowed, initializers = skipped_lane_mask_writes(
-                    ins, source, target, edges.items(), live_at_join, pure_lane_mask_pairs(ins))
+                    ins, source, target, edges.items(), live_at_join, lane_mask_webs(ins))
                 if not missing <= allowed.keys():
                     raise Unsupported(execz_effects)
                 mask_instructions.update(allowed.keys() | initializers)
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
 
-    saved_masks = set().union(*(scalar_registers(parse(asm)[1][0]) for _, _, name, asm in ins
-                              if name == 's_and_saveexec_b64'))
+    saved_masks = set().union(*(scalar_registers(parse(asm)[1][0]) for i, (_, _, name, asm) in enumerate(ins)
+                              if name == 's_and_saveexec_b64' and i not in mask_instructions))
+    mask_instructions.update(local_mask_ops)
+    if standalone_selects is not None:
+        standalone_selects.update(ins[i][0] for i in local_mask_ops if ins[i][2] == 's_cselect_b64')
     out = list(ins[:first])
     span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
     # State of the walk over the code outside the two exchanges.
@@ -3481,6 +3681,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         if after and re.search(r'\bm0\b', asm):
             raise Unsupported('slot 57 mesh: m0 is used after the allocation request')
         if scc_stale and reads_scc(name, asm):
+            if standalone_selects is not None and off in standalone_selects:
+                raise Unsupported('slot 57 mesh: s_cselect_b64 on a wave mask is not covered')
             raise Unsupported('slot 57 mesh: SCC of the count exchange is read')
         if name.startswith(('s_cmp', 's_bitcmp')):
             scc_stale = False
@@ -3760,9 +3962,22 @@ class Stage:
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
-                                     self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
-                                     self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites)
+            self.mesh_standalone_selects = set()
+            try:
+                self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
+                                         self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
+                                         self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites)
+            except Unsupported as reason:
+                if not str(reason).startswith(('slot 57 mesh:', MESH_WAVE_BLOCK)):
+                    raise
+                for proof in (self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads,
+                              self.mesh_wave_votes, self.mesh_wave_scalars, self.mesh_wave_scalar_joins,
+                              self.mesh_mask_arm_sites):
+                    proof.clear()
+                self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
+                                         self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
+                                         self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites,
+                                         self.mesh_standalone_selects)
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):
@@ -4772,7 +4987,7 @@ class Stage:
         self.execz_counted_loops = {}
         refused, into = {}, {}
         self.execz_scalar_votes = {}
-        pair_masks = pure_lane_mask_pairs(self.ins) if getattr(self, 'retry_mask_joins', False) else ()
+        pair_masks = lane_mask_webs(self.ins) if getattr(self, 'retry_mask_joins', False) else ()
         edges = [(k, index[target]) for k, target in jumps if target in index]
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -6198,6 +6413,9 @@ class Stage:
                             raise Unsupported(execz_effects)
                         # Capture the bound at the compare, before any intervening SGPR write.
                         self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if off in getattr(self, 'mesh_standalone_selects', ()) and not (
+                            self.scc_verified and self.scc_uniform):
+                        raise Unsupported('slot 57 mesh: s_cselect_b64 on a wave mask is not covered')
                     if off in wave_scalars:
                         reads, _, _ = scalar_effects(name, asm)
                         if off in mask_arm_sites and name == 's_cselect_b64':
@@ -6670,7 +6888,7 @@ class Stage:
             return set()
         edges = [(index[src], index[dst]) for src, dst in branches if src in index and dst in index]
         allowed, _ = skipped_lane_mask_writes(
-            self.ins, b, t, edges, lambda _word, _at: True, pure_lane_mask_pairs(self.ins))
+            self.ins, b, t, edges, lambda _word, _at: True, lane_mask_webs(self.ins))
         # Graphics' check only exempts mask writers with no SCC effect. The
         # existing scalar flow rules still apply to every other instruction.
         return {self.ins[i][0] for i in allowed}

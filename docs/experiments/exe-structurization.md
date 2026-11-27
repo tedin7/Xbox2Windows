@@ -158,8 +158,7 @@ and a complement. An EXEC vote gates its scalar then arm. VALU and read-only
 vector loads obey the lane predicate. The outer full reset closes the region.
 Numeric reads of masks, SCC produced by mask operations, non-uniform scalar
 inputs, undefined skip values, and scalar else arms without a vote are refused.
-Additional nested if/else regions and uses of the saved mask beyond the region
-remain refused.
+Uses of the saved mask beyond its closure remain refused.
 
 #### Shared EXEC-zero join proof
 
@@ -172,6 +171,27 @@ Either half used as numeric data, a whole-wave observation, an SCC read of
 a mask operation, or unexpected control flow keeps the prior refusal.
 The new proof covers straight forward blocks with stable EXEC. Existing
 compute and graphics programs get their original lowering first.
+
+#### Reaching mask values and multiple regions
+
+Purity follows reaching definitions of the two scalar words, including the
+VCC aliases. A numeric overwrite starts another lifetime. A numeric path into
+a mask read, or a numeric read reached by the mask definition, makes that
+web impure. The mesh walk can lower pure mask selects on verified uniform
+SCC even outside a saved-EXEC region.
+
+Sequential regions can restore the saved EXEC, re-narrow from it, or end at
+the enclosing reset. A nested region must stay within its parent's then arm
+and restore a known EXEC predicate before the parent complement. Each branch
+votes only when its guest wave reaches the site together. Scalar work in an
+else arm without its own vote remains refused.
+
+Habermaier and Knapp's SIMT simulation theorem (2012, Theorem 1) motivates the
+per-thread interpretation of vector state. The whole-wave scalar state still
+requires a vote. [SIMT execution model](https://opus.bibliothek.uni-augsburg.de/opus4/frontdoor/deliver/index/docId/1600/file/TR_2012_01.pdf)
+
+Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
+uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
 
 ### Phase 3: `v_readfirstlane` and waterfalls
 

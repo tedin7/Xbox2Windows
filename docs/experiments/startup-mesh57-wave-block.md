@@ -156,3 +156,18 @@ checks passed in all three suites. The before/after comparison against
 `871025f1c` matched all 484 emitted HLSL and manifest outputs from the seven
 existing fixture scripts exercised in the comparison. Windows readback
 remains pending.
+
+
+Round 2 checks numeric reuse before and after a mask lifetime, a mixed
+numeric/mask join, and high-word data reads. The same lane-mask draw mode
+now covers a standalone uniform SCC select, sequential regions and a region
+nested in the then arm. Reversing SCC in the standalone draw changes the
+CPU reference. The offline wave64 high-VCC numeric-read control still
+reports the same refusal.
+
+
+On Linux with Python 3.14.8 and LLVM 19, the mesh offline and assembly
+checks passed. Round 2 adds seven accepting fixtures and four refusal controls.
+A before/after comparison against `fd5f476b7` covered seven existing scripts
+and matched 496 emitted HLSL and manifest outputs byte for byte. Windows
+readback remains pending.
