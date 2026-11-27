@@ -1897,6 +1897,10 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_indexed_alias_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_alias_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
+add_test(NAME startup_indirect_exit_totals_warp
+    COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_exit_totals_check.py"
+            "$<TARGET_FILE:startup_indirect_draw_indexed>")
+set_tests_properties(startup_indirect_exit_totals_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware
     startup_indirect_rectlist_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)

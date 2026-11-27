@@ -3236,6 +3236,26 @@ int main(int argc, char** argv) try
             std::fprintf(stderr, "indirect line mismatch:\n  got      '%s'\n  expected '%s'\n", line.c_str(), expected.c_str());
             return 1;
         }
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
+        const char* reasons[] = {
+            "placeholder-signature: missing or placeholder signature",
+            "graphics-pipeline: indirect graphics requires a direct list wit",
+            "compute-pipeline: requires a desktop compute pipeline and root",
+        };
+        if (report.find(line + "\n") == std::string::npos ||
+            report.find("x2w-d3d12 indirect-pipeline refusals: total 3; distinct keys 1, distinct pairs 3 (overflow calls 0)\n") == std::string::npos) {
+            std::fprintf(stderr, "indirect fixture totals or pipeline census mismatch\n");
+            return 1;
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+            const std::string entry = std::string("x2w-d3d12 indirect-pipeline refusal ") + std::to_string(i + 1) +
+                ": key=0000000000000000 reason=" + reasons[i] + " calls=1\n";
+            if (report.find(entry) == std::string::npos) {
+                std::fprintf(stderr, "missing pipeline census entry: %s", entry.c_str());
+                return 1;
+            }
+        }
         std::printf("%s\n", line.c_str());
     }
     if (kind == DrawKind::rect &&

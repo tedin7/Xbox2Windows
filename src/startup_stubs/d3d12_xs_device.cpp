@@ -156,6 +156,7 @@ x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
 x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};
+x2w_startup::PerReasonRefusalCensus indirect_pipeline_refusal_census{"indirect-pipeline"};
 
 enum Kind : int {
     device_kind, queue_kind, fence_kind, allocator_kind, list_kind, descriptor_heap_kind, root_signature_kind,
@@ -4111,6 +4112,30 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
+// Read each counter once so the formatted line and optional snapshot agree.
+bool indirect_totals_line(char* line, std::size_t size, LONG64 (*snapshot)[5] = nullptr)
+{
+    static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
+                                           "placeholder-signature", "other"};
+    static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
+    bool any = false;
+    int n = std::snprintf(line, size, "x2w-render indirect:");
+    for (int o = 0; o < indirect_outcomes; ++o) {
+        n += std::snprintf(line + n, size - n, "%s %s:", o ? ";" : "", outcomes[o]);
+        const int start = n;
+        for (int k = 0; k < 5; ++k) {
+            const LONG64 calls = InterlockedCompareExchange64(&indirect_calls[o][k], 0, 0);
+            if (snapshot) snapshot[o][k] = calls;
+            if (calls) {
+                any = true;
+                n += std::snprintf(line + n, size - n, " %s %lld", kinds[k], static_cast<long long>(calls));
+            }
+        }
+        if (n == start) n += std::snprintf(line + n, size - n, " 0");
+    }
+    return any;
+}
+
 struct IndirectAddressAlias {
     ID3D12Resource* resource = nullptr;
     u64 offset = 0;
@@ -4278,7 +4303,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 log("x2w-render ExecuteIndirect refused, key %016llx [%s]: %s", key, reason_code, reason);
             return;
         }
-        if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
+        const char* label = outcome == indirect_graphics_pipeline ? "graphics-pipeline" :
+                            outcome == indirect_compute_pipeline ? "compute-pipeline" : "placeholder-signature";
+        char census_reason[64];
+        std::snprintf(census_reason, sizeof(census_reason), "%s: %s", label, reason);
+        const bool first_pair = indirect_pipeline_refusal_census.note(known_pipeline_key(refusal_pipeline), census_reason);
+        if (first_pair || first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
@@ -9089,20 +9119,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     if (render_mode() && frame % 300 == 0) {
-        // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
-        static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
-                                               "placeholder-signature", "other"};
-        static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
-        char line[1024];  // fits every outcome with five 19-digit counts
-        int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
-        for (int o = 0; o < indirect_outcomes; ++o) {
-            n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);
-            const int start = n;
-            for (int k = 0; k < 5; ++k)
-                if (const LONG64 calls = indirect_calls[o][k])
-                    n += std::snprintf(line + n, sizeof(line) - n, " %s %lld", kinds[k], static_cast<long long>(calls));
-            if (n == start) n += std::snprintf(line + n, sizeof(line) - n, " 0");
-        }
+        char line[1024];
+        indirect_totals_line(line, sizeof(line));
         log("%s", line);
     }
     if (render_mode() && frame % 300 == 0) {
@@ -9117,6 +9135,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
+        if (render_mode()) {
+            static LONG64 previous[indirect_outcomes][5]{};
+            LONG64 current[indirect_outcomes][5]{};
+            char line[1024];
+            indirect_totals_line(line, sizeof(line), current);
+            if (std::memcmp(previous, current, sizeof(current)) != 0) {
+                std::memcpy(previous, current, sizeof(current));
+                log("%s", line);
+            }
+        }
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
@@ -9179,6 +9207,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        indirect_pipeline_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -9202,6 +9231,9 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
         for (std::size_t i = 0; i <= bytes; ++i, ++length)
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
+    char indirect_line[1024];
+    indirect_totals_line(indirect_line, sizeof(indirect_line));
+    emit(indirect_line);
     memory_srv_census.report(emit, false);
     if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.report(emit, false, true);
     memory_srv_switch_census.report(emit, false);
@@ -9219,6 +9251,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     report_placeholder_draws(emit);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
+    if (indirect_pipeline_refusal_census.total()) indirect_pipeline_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;
 }
@@ -9436,6 +9469,13 @@ extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type
     if (InterlockedExchange(&logged[type], 1) == 0)
         log("x2w-d3d12 replay: heap type %u title increment %u (this device %u)", type, increment,
             removal_device ? removal_device->GetDescriptorHandleIncrementSize(static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type)) : 0);
+}
+
+extern "C" void x2w_d3d12_exit_report()
+{
+    char line[1024];
+    if (indirect_totals_line(line, sizeof(line)))
+        log("x2w-render indirect at exit:%s", line + sizeof("x2w-render indirect:") - 1);
 }
 
 // The offline player owns these heap references and keys them by recorded creation ID.
