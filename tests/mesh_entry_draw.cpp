@@ -297,12 +297,16 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     upload->Unmap(0, nullptr);
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    // A root signature with HEAP_DIRECTLY_INDEXED needs a descriptor heap bound before it is set.
-    ComPtr<ID3D12DescriptorHeap> indexed_root_heap;
+    // A root signature with HEAP_DIRECTLY_INDEXED needs its descriptor heap bound before it is set, and the heap
+    // cannot change afterwards: create the two-entry heap now, fill it below.
+    ComPtr<ID3D12DescriptorHeap> indexed_heap_descriptors;
     if (indexed_heap) {
-        D3D12_DESCRIPTOR_HEAP_DESC bind_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-        check(device->CreateDescriptorHeap(&bind_desc, IID_PPV_ARGS(&indexed_root_heap)), "Create mesh root bind heap");
-        ID3D12DescriptorHeap* bind[]{indexed_root_heap.Get()};
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 2;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&indexed_heap_descriptors)), "Create indexed mesh heap");
+        ID3D12DescriptorHeap* bind[]{indexed_heap_descriptors.Get()};
         list->SetDescriptorHeaps(1, bind);
     }
     list->SetGraphicsRootSignature(root.Get());
@@ -345,14 +349,9 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     }
     if (vertices && !fallback) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
-    ComPtr<ID3D12DescriptorHeap> indexed_heap_descriptors;
     ComPtr<ID3D12Resource> alternate_buffer;
     if (indexed_heap) {
-        D3D12_DESCRIPTOR_HEAP_DESC desc{};
-        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        desc.NumDescriptors = 2;
-        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&indexed_heap_descriptors)), "Create indexed mesh heap");
+        const auto desc = indexed_heap_descriptors->GetDesc();
         alternate_buffer = make_buffer(device, 512, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         check(alternate_buffer->Map(0, &empty, &mapped), "Map alternate mesh buffer");
         std::memcpy(mapped, input.data() + 2 * cb_bytes, 512);
@@ -372,8 +371,6 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         auto second = first;
         second.ptr += device->GetDescriptorHandleIncrementSize(desc.Type);
         device->CreateShaderResourceView(upload.Get(), &view, second);
-        ID3D12DescriptorHeap* heaps[]{indexed_heap_descriptors.Get()};
-        list->SetDescriptorHeaps(1, heaps);
     }
     ComPtr<ID3D12Resource> sampled, texture_upload;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
