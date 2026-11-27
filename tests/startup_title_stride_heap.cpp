@@ -1,4 +1,17 @@
-// Replay descriptor increments map CPU and GPU handles by index.
+// A replay declares the descriptor increment the recorded title was given (x2w_d3d12_replay_title_increment). When it
+// differs from this device's, title CPU and GPU handles must map to desktop descriptors by index, and a CPU handle that
+// is in title memory no desktop heap backs must never reach D3D12 (the debug layer reports #646
+// INVALID_DESCRIPTOR_HANDLE and raises 0x87D; without the layer the descriptor is written into that title memory).
+//
+//   startup_title_stride_heap <warp|hardware>   (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_RENDER=1 X2W_D3D12_DEBUG=1)
+//
+// Title stride T = 32, or 64 where the device's own increment is 32. Two heaps of 8: a shader-visible one over title
+// memory of 8 * T bytes, and a CPU-side one. UAVs of A at index 1 and B at index 2 (odd index on purpose), an SRV at
+// index 3, then two SRVs that must be refused: one into title memory of stride 2 * T that a third heap offered and the
+// layer could not back (that memory must stay zero), and one in the middle of a title descriptor.
+// ClearUnorderedAccessViewUint through index 1 and 2, read back: A a1a1a1a1, B b2b2b2b2. The device must not be
+// removed and the debug layer must report no error.
+// Exit codes: 0 pass, 77 no physical adapter, other values name the failing step.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
@@ -132,7 +145,8 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 4;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
 
-    if (!probe.watch()) { std::printf("debug message callback unavailable\n"); return 9; }
+    // Without the debug layer the error count stays 0; the readback and untouched-memory checks still run.
+    if (!probe.watch()) std::printf("no debug layer message callback: validation not counted\n");
     const UINT desktop_stride = probe.desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT stride = desktop_stride == 32 ? 64 : 32;
     x2w_d3d12_replay_title_increment(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, stride);
@@ -154,17 +168,21 @@ int main(int argc, char** argv)
     if (FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                                       nullptr, IID_PPV_ARGS(&probe.readback)))) return 5;
 
+    // `backing` is title memory of the declared stride. `offered` is title memory of another stride (2 * T per
+    // descriptor): the layer cannot back it, as for a recording whose increments were not declared.
+    const UINT offered_stride = 2 * stride;
     void* backing = VirtualAlloc(nullptr, 8 * stride, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    void* unknown = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!backing || !unknown) { std::printf("allocation failed\n"); return 6; }
-    const auto make_heap = [&](D3D12_DESCRIPTOR_HEAP_FLAGS flags, void* memory, void** out) {
+    void* offered = VirtualAlloc(nullptr, 8 * offered_stride, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!backing || !offered) { std::printf("allocation failed\n"); return 6; }
+    const auto make_heap = [&](D3D12_DESCRIPTOR_HEAP_FLAGS flags, void* memory, Word bytes, void** out) {
         const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
-            desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, flags}, arg(memory), memory ? 8ull * stride : 0};
+            desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, flags}, arg(memory), bytes};
         return ok(invoke(device, 14, arg(&desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(out)));
     };
-    void *visible_heap = nullptr, *plain_heap = nullptr;
-    if (!make_heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, backing, &visible_heap) ||
-        !make_heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE, nullptr, &plain_heap)) {
+    void *visible_heap = nullptr, *plain_heap = nullptr, *offered_heap = nullptr;
+    if (!make_heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, backing, 8ull * stride, &visible_heap) ||
+        !make_heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE, nullptr, 0, &plain_heap) ||
+        !make_heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE, offered, 8ull * offered_stride, &offered_heap)) {
         std::printf("heap creation failed\n"); return 7;
     }
     const Word visible_cpu = invoke(visible_heap, 9), plain_cpu = invoke(plain_heap, 9), gpu_start = invoke(visible_heap, 10);
@@ -181,9 +199,12 @@ int main(int argc, char** argv)
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     invoke(device, 18, arg(a.Get()), arg(&srv), visible_cpu + 3 * stride);
-    invoke(device, 18, arg(a.Get()), arg(&srv), arg(unknown));
+    invoke(device, 18, arg(a.Get()), arg(&srv), arg(offered) + offered_stride);
     invoke(device, 18, arg(a.Get()), arg(&srv), visible_cpu + stride / 2);
     if (debug_error_count.load()) { std::printf("invalid SRV reached D3D12\n"); return 10; }
+    const auto* page = static_cast<const unsigned char*>(offered);
+    for (unsigned i = 0; i < 8 * offered_stride; ++i)
+        if (page[i]) { std::printf("a descriptor was written into title memory no heap backs (byte %u)\n", i); return 17; }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
