@@ -440,7 +440,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (!bind_dropmips(desktop.Get(), guest, binding)) return 36;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
-    if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
+    if (two_targets) frame.count = 2;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        GetEnvironmentVariableW(L"X2W_TEST_GBUFFER_TARGETS", nullptr, 0)) {
+        frame.count = 2;
+        frame.second_format = DXGI_FORMAT_R32_UINT;
+    }
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;

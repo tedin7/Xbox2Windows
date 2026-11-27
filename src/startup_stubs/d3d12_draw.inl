@@ -373,6 +373,7 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+LONG rtv_variants_requested, rtv_variants_ready, rtv_base_draws;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
 // Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
@@ -920,6 +921,9 @@ bool integral_depth_bias(float bias, INT& out)
     return true;
 }
 
+bool needs_rtv_variant(DXGI_FORMAT format);
+Translation* request_rtv_variant(Translation& base, const DXGI_FORMAT* formats, UINT count);
+
 // Resolve the shader pointers and wrapped root while the caller still owns the stream.
 Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend,
                                 D3D12_DEPTH_STENCIL_DESC& depth_stencil, bool& has_depth_stencil, DXGI_FORMAT& dsv_format,
@@ -927,6 +931,8 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
 {
     // RASTERIZER1 (type 27) is the same width as RASTERIZER. The width comes from the table.
     static_assert(stream_sizes[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER] == sizeof(unsigned) + sizeof(D3D12_RASTERIZER_DESC));
+    static_assert(stream_sizes[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS] ==
+                  sizeof(unsigned) + sizeof(D3D12_RT_FORMAT_ARRAY));
     const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
     if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
         !x2w_local::readable(stream, desc.SizeInBytes)) return nullptr;
@@ -935,6 +941,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     D3D12_SHADER_BYTECODE stages[2]{};
     std::string layout;
     unsigned seen = 0;
+    D3D12_RT_FORMAT_ARRAY targets{};
     for (std::size_t at = 0; at < desc.SizeInBytes;) {
         unsigned type;
         std::memcpy(&type, stream + at, sizeof(type));
@@ -973,6 +980,8 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
                 layout.clear();
                 log("x2w-draw stream input layout unreadable; requesting the translation without it");
             }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+            std::memcpy(&targets, stream + at + sizeof(type), sizeof(targets));
         } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
@@ -1006,6 +1015,13 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     draw_lock_acquire_exclusive();
     auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
                                       stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob, layout);
+    if (result && targets.NumRenderTargets && targets.NumRenderTargets <= std::size(targets.RTFormats)) {
+        auto* end = targets.RTFormats + targets.NumRenderTargets;
+        std::transform(targets.RTFormats, end, targets.RTFormats, desktop_format);
+        if (std::none_of(targets.RTFormats, end, [](DXGI_FORMAT fmt) { return fmt == DXGI_FORMAT_UNKNOWN; }) &&
+            std::any_of(targets.RTFormats, end, needs_rtv_variant))
+            request_rtv_variant(*result, targets.RTFormats, targets.NumRenderTargets);
+    }
     draw_lock_release_exclusive();
     return result;
 }
@@ -1163,11 +1179,16 @@ u64 known_pipeline_key(Wrapper* pipeline)
     return key;
 }
 
+bool float32_rtv(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32G32_FLOAT ||
+           format == DXGI_FORMAT_R32G32B32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+}
+
 bool needs_rtv_variant(DXGI_FORMAT format)
 {
+    if (float32_rtv(format)) return true;
     switch (format) {
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
-    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32_FLOAT:
     case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
     case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
     case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
@@ -1185,17 +1206,11 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
-Translation* translation_for_targets(Translation* base, const Pass& pass)
+Translation* request_rtv_variant(Translation& base, const DXGI_FORMAT* formats, UINT count)
 {
-    if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
-            load_translation(*base);
-        return base;
-    }
-    std::string request = "rtv1 " + std::to_string(base->key);
-    for (UINT i = 0; i < pass.target_count; ++i)
-        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
+    std::string request = "rtv1 " + std::to_string(base.key);
+    for (UINT i = 0; i < count; ++i)
+        request += " " + std::to_string(static_cast<unsigned>(formats[i]));
     const u64 key = fnv_bytes(request.data(), request.size());
     auto& entry = translation_by_key()[key];
     if (!entry) {
@@ -1203,13 +1218,35 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         entry->key = key;
         load_translation(*entry, request);
         if (entry->state != 1) {
-            publish_shader_request(key, L".rtv", request.data(), request.size());
+            if (publish_shader_request(key, L".rtv", request.data(), request.size()))
+                InterlockedIncrement(&rtv_variants_requested);
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
+        } else {
+            InterlockedIncrement(&rtv_variants_ready);
         }
     } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
         load_translation(*entry, request);
+        if (entry->state == 1) InterlockedIncrement(&rtv_variants_ready);
     }
     return entry;
+}
+
+Translation* translation_for_targets(Translation* base, const Pass& pass, bool& using_base)
+{
+    if (!base) return nullptr;
+    const auto* end = pass.target_formats + pass.target_count;
+    if (std::any_of(pass.target_formats, end, needs_rtv_variant)) {
+        auto* variant = request_rtv_variant(*base, pass.target_formats, pass.target_count);
+        if (variant->state == 1 || !x2w_local::env_on("X2W_RTV_BASE_FALLBACK") ||
+            std::any_of(pass.target_formats, end, [](DXGI_FORMAT fmt) {
+                return needs_rtv_variant(fmt) && !float32_rtv(fmt);
+            }))
+            return variant;
+        using_base = true;
+    }
+    if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+        load_translation(*base);
+    return base;
 }
 
 // The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
@@ -1229,6 +1266,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    key = fnv_bytes(&tr.key, sizeof(tr.key), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -2898,7 +2936,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
     if (bound && bound->translation) bound->translation->use.note(process_ms());
-    Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    bool using_rtv_base = false;
+    Translation* tr = bound ? translation_for_targets(bound->translation, pass, using_rtv_base) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     std::uint32_t d16_unorm16[32] = {};
@@ -3631,6 +3670,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
+    if (drawn && using_rtv_base) InterlockedIncrement(&rtv_base_draws);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
     if (indirect) return drawn;

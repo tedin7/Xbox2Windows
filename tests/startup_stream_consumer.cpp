@@ -856,7 +856,7 @@ int main(int argc, char** argv)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (argc == 5 && std::strncmp(argv[4], "present-", 8) == 0) return present_gray(device, argv[4]);
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
-    if (argc == 4) return 0;
+    if (argc == 4 || (argc == 6 && std::strcmp(argv[5], "create-only") == 0)) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
     bool two_targets = false;

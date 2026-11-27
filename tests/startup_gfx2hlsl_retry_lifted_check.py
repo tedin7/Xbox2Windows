@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 import time
 from pathlib import Path
 
@@ -71,7 +72,7 @@ def fixture(d, built):
     if retried.exists():
         retried.unlink()
     for key, reason in reasons.items():
-        touch(d / ('req_%016x.%s' % (key, 'c67' if key == 5 else 'rtv')), b'not a request', built - 200)
+        touch(d / ('req_%016x.%s' % (key, 'c67' if key == 5 else 'a')), b'not a request', built - 200)
         touch(d / ('%016x.fail' % key), (reason + '\n').encode(), built + 50 if key == 4 else built - 100)
     return reasons
 
@@ -134,7 +135,7 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         G.translate_one = real
 
-# The command line form, with real requests that refuse (an invalid RTV request) and every core.
+# The command line form, with malformed base requests and every core.
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     reasons = fixture(d, built)
@@ -322,8 +323,77 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             os.environ['X2W_PRE_RUN_FAMILY_RETRY'] = saved_retry
 
+def variant_fixture(cache):
+    from startup_mrt_check import gbuffer_pixel
+    from startup_stream_draw_check import vertex
+
+    a, b, root = vertex(), gbuffer_pixel(0x01000005), P.root_blob()
+    base = G.pipeline_key(a, b, root)
+    for ext, blob in (('b', b), ('root', root), ('a', a)):
+        (cache / f'req_{base:016x}.{ext}').write_bytes(blob)
+    variants = []
+    for formats in ('10 42', '26 42', '2 42'):
+        line = f'rtv1 {base} {formats}'
+        key = G.fnv(line.encode('ascii'))
+        (cache / f'req_{key:016x}.rtv').write_text(line, encoding='ascii')
+        variants.append(key)
+    return base, variants
+
+
+with patch.dict(os.environ, {'X2W_PRE_RUN_FAMILY_RETRY': '1', 'X2W_FXC': ''}):
+    for mutant in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            base, variants = variant_fixture(cache)
+            base_fail = cache / f'{base:016x}.fail'
+            G.write_failure(base_fail, LIFTED['mrtz'], version='0' * 64)
+            for key in range(1, 51):
+                (cache / f'req_{key:016x}.a').touch()
+                G.write_failure(cache / f'{key:016x}.fail', OTHER[0], version='0' * 64)
+            G.watch_pass(cache, True, jobs=1)
+            expect('blocked variants get only a dependency diagnostic',
+                   [(cache / f'{key:016x}.fail').read_text() for key in variants], ['base refused\n'] * 3)
+            manifest = cache / f'{base:016x}.txt'
+            # This clock admits one base job only. The mutant drops its followers as if they were capped.
+            translate = G.translate_with_variants
+            def run_key(directory, key, followers):
+                return translate(directory, key, () if mutant else followers)
+            with patch.object(G, 'translate_with_variants', run_key):
+                report = G.retry_lifted(cache, seconds=1, jobs=1, clock=lambda: float(manifest.exists()),
+                                        weights={base: 1})
+            expect('family counts include only base requests', (report.keys, report.ok, report.left), (51, 1, 50))
+            ready = sum((cache / f'{key:016x}.txt').exists() for key in variants)
+            expect('one-key cap publishes all followers; cap mutant publishes none', ready, 0 if mutant else 3)
+
+    for watch in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            base, variants = variant_fixture(cache)
+            G.write_failure(cache / f'{base:016x}.fail', LIFTED['mrtz'], version='0' * 64)
+            if watch:
+                G.watch_pass(cache, True, jobs=1)
+                # A rewritten request lets the watcher see the base again.
+                marker = cache / f'req_{base:016x}.a'
+                newer = (cache / f'{base:016x}.fail').stat().st_mtime + 1
+                os.utime(marker, (newer, newer))
+                G.watch_pass(cache, True, jobs=1)
+            else:
+                G.translate_pending(cache, since_translator=G.translator_version(), jobs=1)
+            expect('watch and post-run publish all followers',
+                   [(cache / f'{key:016x}.txt').exists() for key in variants], [True] * 3)
+            # A ready base's variants take priority over an older base request.
+            for key in variants:
+                (cache / f'{key:016x}.txt').unlink(missing_ok=True)
+                os.utime(cache / f'req_{key:016x}.rtv', (100, 100))
+            unrelated = cache / 'req_0000000000000001.a'
+            touch(unrelated, b'', 50)
+            with patch.object(G, 'translate_one', wraps=G.translate_one) as translation:
+                G.watch_pass(cache, True, jobs=1)
+            expect('watch queue places variants ahead of the older request',
+                   [call.args[1] for call in translation.call_args_list], [*sorted(variants), 1])
+
 if failures:
     print('\n'.join('FAIL ' + f for f in failures))
     sys.exit(1)
 print('startup_gfx2hlsl_retry_lifted_check passed: legacy ordering and CLI, versioned family probes, '
-      'cross-run cursor, and scene weights')
+      'cross-run cursor, scene weights, and RTV dependency scheduling')
