@@ -366,7 +366,7 @@ def controls():
     plan_reason(['s_branch label_0x4', 's_endpgm'], 'no convergence proof for 2 instructions')
     plan_reason(['s_barrier 1', 's_endpgm'], 's_barrier at +0x0 has operands')
     plan_reason(['s_branch label_0x4', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4', sites={8: 8})
-    plan_reason(['ds_write_b32 v1, v2', 'ds_read_b32 v3, v1', 's_endpgm'],
+    plan_reason(['ds_write_b32 v6, v7', 'ds_read_b32 v8, v6', 's_endpgm'],
                 'ordering point inside per-lane control flow at +0x4', sites={0: 0, 8: 8})
     plan_reason(['s_branch label_0x4', 's_endpgm'], 'lacks proven group convergence and entry EXEC at +0x4', sites={})
     invalid, rsrc, group = program('same_wave')
