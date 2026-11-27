@@ -13127,8 +13127,8 @@ class Stage:
             elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
                 word = (int(tok, 16) >> (16 if is_hi else 0)) & 0xffff
                 text = 'f16tof32(0x%04xu)' % word
-            elif tok == '0.5' and not is_hi:
-                text = '0.5'
+            elif tok in PK_INLINE_F16 and not is_hi:  # RDNA 2 ISA inline constants and §6.5 (VOP3P).
+                text = tok
             elif r and r[1] == r[2]:
                 # Only a high-half read needs the upper 16 bits defined.
                 text = 'f16tof32(%s%s)' % (self.u(tok, low16_only=not is_hi), ' >> 16' if is_hi else '')

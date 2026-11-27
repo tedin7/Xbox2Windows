@@ -1,6 +1,7 @@
 """Mixed-precision VOP3P FMA (`v_fma_mix_f32`, `v_fma_mix{lo,hi}_f16`) in tools/startup/gfx2hlsl.py.
 
-usage: startup_gfx2hlsl_fma_mix_check.py [fxc <path to fxc.exe> | dispatch <dxc> <offscreen_check> warp|hardware]
+usage: startup_gfx2hlsl_fma_mix_check.py [fxc <fxc> | dispatch <dxc> <offscreen_check> warp|hardware |
+                                        warp-heap <offscreen_check> <dxc>]
 
 With `fxc`, every translated line is also compiled for ps_5_1 (the profile the startup tools use),
 so emitted text that is not valid HLSL fails here and not only in a later draw. With `dispatch`, every
@@ -201,14 +202,21 @@ expect_refused('op_sel on a binary32 negated inline 0',
 expect_refused('op_sel without op_sel_hi (high half of a binary32 source)',
                encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0)),
                'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0]')
-# The binary16 encoding of an inline float on a half source is unverified. The old mixlo/mixhi path
-# read the binary32 bits of 1.0 through f16tof32, i.e. 0.0; it is now refused rather than wrong.
-expect_refused('inline float on a binary16 source',
-               encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
-               'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]')
-expect_refused('inline float on a binary16 source of mixlo',
-               encode(MIXLO_F16, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
-               'v_fma_mixlo_f16 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]')
+for src, value in enumerate((0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0), 240):
+    expect(f'low-half binary16 inline {value}',
+           encode(MIX_F32, 1, (v2, src, v4), op_sel_hi=(0, 1, 0)),
+           f'v_fma_mix_f32 v1, v2, {value}, v4 op_sel_hi:[0,1,0]',
+           f'v1 = U(mix32(F(v2), {value}, F(v4)));')
+expect('low-half binary16 inline 1.0 in mixlo',
+       encode(MIXLO_F16, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
+       'v_fma_mixlo_f16 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]',
+       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(F(v2), 1.0, F(v4)));')
+expect_refused('high half of inline 1.0',
+               encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0)),
+               'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel:[0,1,0] op_sel_hi:[0,1,0]')
+expect_refused('binary16 inline reciprocal two pi',
+               encode(MIX_F32, 1, (v2, 248, v4), op_sel_hi=(0, 1, 0)),
+               'v_fma_mix_f32 v1, v2, 0.15915494, v4 op_sel_hi:[0,1,0]')
 expect('literal on a binary16 source',
                encode(MIX_F32, 1, (LITERAL, v3, v4), op_sel_hi=(1, 0, 0), literal=0x3c00),
                'v_fma_mix_f32 v1, 0x3c00, v3, v4 op_sel_hi:[1,0,0]',
@@ -453,11 +461,40 @@ def check_dispatch(dxc, runner, adapter):
               len(caught) > 0)
 
 
+def heap_shaders():
+    from startup_gfx2hlsl_dynamic_heap_check import IMAGE_HEAD, IMAGE_LOAD, IMAGE_TAIL, VS_WORDS, root_blob
+
+    mix = encode(MIX_F32, 4, (V + 4, ONE_F, V + 5), op_sel_hi=(0, 1, 0))
+    pipe = G.Pipeline(VS_WORDS, bytes.fromhex(IMAGE_HEAD + IMAGE_LOAD) + mix + bytes.fromhex(IMAGE_TAIL), root_blob())
+    ps = pipe.hlsl_ps()
+    check('heap pixel uses a binary16 inline 1.0', 'mix32(F(v4), 1.0, F(v5))' in ps)
+    return pipe, pipe.hlsl_vs(), ps
+
+
+def warp_heap(offscreen, dxc, pipe, vs_source, ps_source):
+    from pathlib import Path
+    from startup_gfx2hlsl_dynamic_heap_check import compile_shader, draw, mutate
+
+    expected = [f32_word(value) for value in (1.25 * 1.0 + 2.5, 2.5, 4, 8)]
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        draw(offscreen, vs, ps, 96, expected, len(pipe.uds), heap_count=5)
+        wrong = mutate(ps_source, 'mix32(F(v4), 1.0, F(v5))', 'mix32(F(v4), 0.0, F(v5))')
+        ps = compile_shader(dxc, directory, 'ps_6_6', wrong)
+        draw(offscreen, vs, ps, 96, expected, len(pipe.uds), negative=True, heap_count=5)
+
+
 if len(sys.argv) == 3 and sys.argv[1] == 'fxc':
     status, output = compile_translated(sys.argv[2])
     check(f'fxc ps_5_1 compiles all {len(translated)} translated lines', status == 0, output)
 elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
     check_dispatch(*sys.argv[2:])
+elif len(sys.argv) == 4 and sys.argv[1] == 'warp-heap':
+    warp_heap(*sys.argv[2:], *heap_shaders())
+elif len(sys.argv) == 1:
+    heap_shaders()
 elif len(sys.argv) != 1:
     print(__doc__)
     sys.exit(2)
