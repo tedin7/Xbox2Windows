@@ -96,7 +96,8 @@ def main(consumer, dxc, adapter):
         # 0x07ffffff reaches the heap-record check, so the dispatch really read the word it was given.
         got, result = dispatch(directory, consumer, env, 'dispatch-heap-word-title')
         refused = lines(result, 'refused: ')
-        assert got == untouched and len(refused) == 1 and "a heap index word is not in the list's upload memory" in refused[0], \
+        # Without the switch the table buffer is refused as an input before its word is looked at.
+        assert got == untouched and len(refused) == 1 and 'an input is in title memory outside any placed buffer' in refused[0], \
             'title memory without the switch:\n' + result.stderr[-3000:]
         env_title = dict(env, X2W_COMPUTE_TITLE_INPUTS='1')
         got, result = dispatch(directory, consumer, env_title, 'dispatch-heap-word-title')
