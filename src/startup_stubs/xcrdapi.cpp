@@ -421,6 +421,13 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
 {
     char id[48];
     guid_text(riid, id, sizeof(id));
+    {
+        // The first OpenFile ends the title's file-call diagnostics in xmem.dll (src/xmem_file_diag.cpp).
+        static volatile LONG announced = 0;
+        if (!InterlockedExchange(&announced, 1))
+            if (const HMODULE xmem = GetModuleHandleW(L"xmem.dll"))
+                if (const auto opened = reinterpret_cast<void(WINAPI*)()>(GetProcAddress(xmem, "x2w_file_diag_opened"))) opened();
+    }
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!path) {

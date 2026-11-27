@@ -183,7 +183,7 @@ set_tests_properties(placed_build_causes PROPERTIES TIMEOUT 30)
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp src/xmem_file_diag.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -334,6 +334,13 @@ target_compile_features(xmem_lazy_imports_check PRIVATE cxx_std_17)
 add_dependencies(xmem_lazy_imports_check xmem_shim xmem_shim_test_controls)
 add_test(NAME xmem_lazy_imports COMMAND xmem_lazy_imports_check "$<TARGET_FILE:xmem_shim>")
 set_tests_properties(xmem_lazy_imports PROPERTIES TIMEOUT 60)
+# Title file-call diagnostics (src/xmem_file_diag.cpp): failing calls from a temp folder, WARP-free. The _off run is the control.
+add_executable(xmem_file_diag_check tests/xmem_file_diag_check.cpp)
+target_compile_features(xmem_file_diag_check PRIVATE cxx_std_17)
+add_dependencies(xmem_file_diag_check xmem_shim)
+add_test(NAME xmem_file_diag COMMAND xmem_file_diag_check "$<TARGET_FILE:xmem_shim>" on)
+add_test(NAME xmem_file_diag_off COMMAND xmem_file_diag_check "$<TARGET_FILE:xmem_shim>" off)
+set_tests_properties(xmem_file_diag xmem_file_diag_off PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 # A refused fault handler (test-controls build) leaves the switches off: pages and blocks are committed up front.
 add_test(NAME xmem_lazy_handler_failure COMMAND xmem_lazy_imports_check
     "$<TARGET_FILE:xmem_shim_test_controls>" handler-failure)
