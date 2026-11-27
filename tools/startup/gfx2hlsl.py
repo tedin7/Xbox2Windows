@@ -9772,8 +9772,11 @@ class Stage:
             key = self.descriptor(ops[2])
             buf = None if key is None or ((dynamic or heap_format) and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
         soffset = None
+        immediate_offset = offset
+        literal_soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            offset += int(ops[3], 0)
+            literal_soffset = int(ops[3], 0)
+            offset += literal_soffset
         else:
             sreg = reg_range(ops[3])
             if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
@@ -9781,6 +9784,7 @@ class Stage:
             soffset = self.S(sreg[1])
         idxen, offen = 'idxen' in mods, 'offen' in mods
         terms = []
+        index_term = None
         if idxen and buf is None and key is not None and not (heap_format and key[0][0] == 'dynamic_heap'):
             raise Unsupported('indexed load through a dynamic resource heap descriptor')
         if idxen and offen:
@@ -9790,7 +9794,8 @@ class Stage:
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
             stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
-            terms.append('%s * %s' % (self.u('v%d' % r[1]), stride))
+            index_term = self.u('v%d' % r[1])
+            terms.append('%s * %s' % (index_term, stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
             if key in self.pipe.modified:
@@ -9799,7 +9804,8 @@ class Stage:
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
             stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
-            terms.append('%s * %s' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
+            index_term = getattr(self, 'uniform_vaddr', None) or self.u(ops[1])
+            terms.append('%s * %s' % (index_term, stride))
         elif offen:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
@@ -9814,7 +9820,14 @@ class Stage:
             # a large byte offset back into the table.
             return buf, '%s, %s, %du' % (terms[0] if offen else '0u', soffset or '0u', offset)
         terms.append('%d' % offset)
-        return buf if buf is not None else key, ' + '.join(terms)
+        result = (buf if buf is not None else key, ' + '.join(terms))
+        if heap_format:
+            addends = terms[1:-1] if idxen else terms[:-1]
+            if literal_soffset is not None:
+                addends.append('%du' % literal_soffset)
+            addends.append('%du' % immediate_offset)
+            return (*result, index_term, addends)
+        return result
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         # ops[0] is read before buffer_address() can refuse a short operand list, so an instruction with no
@@ -10419,7 +10432,7 @@ class Stage:
         Compute also accepts proven heap records. A view token needs a decoded format before dispatch, while
         an unknown format in a native heap record returns zero in every destination.
         """
-        buf, address = self.buffer_address(ops, mods, heap_format=True)
+        buf, address, address_index, address_addends = self.buffer_address(ops, mods, heap_format=True)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
@@ -10452,10 +10465,21 @@ class Stage:
             index = first[1][1]
             self.emit('{ uint2 info = x2w_heap_info(%s);' % index)
             self.emit('ByteAddressBuffer hb = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];' % (index, index))
-            buf, word3 = 'hb', 'info.y'
+            buf, word3 = 'hb', 'format_word'
+            self.emit('uint format_word = info.y;')
+            if address_index is not None:
+                self.emit('bool address_overflow = info.x != 0u && %s > 0xffffffffu / info.x;' % address_index)
+                self.emit('a = %s * info.x;' % address_index)
+            else:
+                self.emit('bool address_overflow = false;')
+                self.emit('a = 0u;')
+            for term in address_addends:
+                self.emit('{ uint previous = a; a += %s; address_overflow = address_overflow || a < previous; }' % term)
+            self.emit('if (address_overflow) format_word = 0u;')
         else:
             word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
-        self.emit('a = %s;' % address)
+        if not dynamic:
+            self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
         extended = (dynamic or self.kind != 'cs') and extended_buffer_formats()

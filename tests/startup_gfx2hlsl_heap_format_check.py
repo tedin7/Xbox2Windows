@@ -90,7 +90,22 @@ def warp(offscreen, dxc):
         assert vs_source.count('index * 8u') == 1
         mutant = compile_shader(dxc, directory, 'vs_6_6', vs_source.replace('index * 8u', 'index * 8u + 8u'))
         run(mutant, ps, record, info, expected, mutant=True)
-    print('formatted dynamic heap: WARP cases and mutant matched')
+
+        # 0x40000001 * 4 wraps to byte 4 without the overflow guard.
+        literal = bytes.fromhex('ff02167e01000040')
+        assert fixture.count(bytes.fromhex('8102167e')) == 1
+        overflow_fixture = fixture.replace(bytes.fromhex('8102167e'), literal)
+        _, overflow_source, _ = translate(overflow_fixture)
+        record = words(bytes(4) + pack_element([0x12345678], [32]) + bytes(16))
+        word3 = (20 << 12) | sum(s << (3 * i) for i, s in enumerate((4, 5, 6, 7)))
+        info = [4, word3, 4, 0]
+        overflow_vs = compile_shader(dxc, directory, 'vs_6_6', overflow_source)
+        run(overflow_vs, ps, record, info, [0] * 4)
+        guard = 'if (address_overflow) format_word = 0u;'
+        assert overflow_source.count(guard) == 1
+        overflow_mutant = compile_shader(dxc, directory, 'vs_6_6', overflow_source.replace(guard, ''))
+        run(overflow_mutant, ps, record, info, [0] * 4, mutant=True)
+    print('formatted dynamic heap: WARP cases and mutants matched')
 
 
 if __name__ == '__main__':
