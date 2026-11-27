@@ -48,6 +48,8 @@ RESTORE = '0404febe'         # s_mov_b64 exec, s[4:5]
 READ_V2 = 'fa040806' '02b100ff'  # v_add_f32_dpp v4, v2, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 READ_V3 = 'fa040806' '03b100ff'  # v_add_f32_dpp v4, v3, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 EXPORT = '0f1800f8' '04040404' '000081bf'  # exp mrt0 v4, v4, v4, v4 done vm ; s_endpgm
+MIN_SWAP_V2 = 'fa040826' '02b100ff'   # v_min_u32_dpp v4, v2, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+MOV_BROADCAST_V2 = 'fa02087e' '02aa00ff'  # v_mov_b32_dpp v4, v2 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf
 COPY_V3_TO_V2 = '0303047e'   # v_mov_b32_e32 v2, v3
 COPY_V2_TO_V3 = '0203067e'   # v_mov_b32_e32 v3, v2
 VCC_FROM_V3 = '8806887d' '02030402'  # v_cmp_gt_u32_e32 vcc_lo, 8, v3 ; v_cndmask_b32_e32 v2, v2, v1, vcc_lo
@@ -59,6 +61,35 @@ SELECT_BY_WHOLE = '020001d5' '01051200'  # v_cndmask_b32_e64 v2, v1, v2, s[4:5]
 # A uniform scalar branch over the window (never taken: s0 is 0). The read then follows a join of a path that kept the
 # whole-quad mask and a path through the window, so EXEC there is not symbolically known and the CFG proof decides.
 UNIFORM_TEST = '800380be' '008106bf'  # s_mov_b32 s0, 0 ; s_cmp_eq_u32 s0, 1
+
+
+# Narrowing instead of a window: a v_cmpx (a kill test) on a clean compare keeps EXEC lane-exact, so a register written
+# while narrowed is still the guest's on every lane after the restore. Narrowing with the exact entry mask is a window.
+COPY_V2_TO_V3_WHOLE = '0203067e'              # v_mov_b32_e32 v3, v2 (whole quad)
+KILL_TEST = '8802a87d'                        # v_cmpx_gt_u32_e32 8, v1
+AND_EXACT = '7e06fe87'                        # s_and_b64 exec, exec, s[6:7]
+NARROWED_WRITE = '0103067e'                   # v_mov_b32_e32 v3, v1 (narrowed)
+
+
+def narrowed(narrow=KILL_TEST):
+    body = COPY_V2_TO_V3_WHOLE + narrow + NARROWED_WRITE + RESTORE
+    return program(SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(body), body, READ_V3, EXPORT)
+
+
+# A v_cndmask_b32 quad broadcast: v4 = VCC ? v1 : (v2 of quad lane 1), with VCC set on even x. Only src0 is exchanged.
+EVEN_X = '81000a36' '810a887d'               # v_and_b32_e32 v5, 1, v0 ; v_cmp_gt_u32_e32 vcc_lo, 1, v5
+SELECT_BROADCAST = 'fa020802' '025500ff'     # v_cndmask_b32_dpp v4, v2, v1, vcc_lo quad_perm:[1,1,1,1]
+SELECT_PROGRAM = (SAVE_EXACT + WQM + SAVE_WHOLE + POSITION + EVEN_X + SELECT_BROADCAST
+                  + '0f1800f8' '04040404' '000081bf')
+
+
+def select_reference():
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            value = float(16 * y + x) if x % 2 == 0 else 16 * (y & ~1) + (x | 1) + 0.5
+            out.extend(struct.unpack('<I', struct.pack('<f', value)) * 4)
+    return out
 
 
 def skip(words):
@@ -164,6 +195,60 @@ def check_draw(dxc, renderer, adapter):
         run = draw(renderer, adapter, full, bad, full_ref)
         check('%s: without helper lanes the mutant is not detected (power control)' % adapter,
               run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+        # The other forms the proof now admits after a window, over the cut quads: an integer quad swap and a broadcast.
+        def bits(value):
+            return struct.unpack('<I', struct.pack('<f', value))[0]
+
+        def v2(x, y):
+            return bits(16 * y + x + 0.5)
+
+        def v3_narrowed(x, y):
+            # v3 = v2 on the whole quad, then v1 where the kill test 8 > bits(v1) holds (only x + 16 y == 0).
+            return bits(16 * y + x) if bits(16 * y + x) < 8 else v2(x, y)
+
+        for form, code, value, own_text, quad_text in (
+                ('v_min_u32 swap', base(read=MIN_SWAP_V2), lambda x, y: min(v2(x ^ 1, y), v2(x, y)),
+                 'QuadReadAcrossX(v2)', 'QuadReadAcrossX(v2)'),
+                ('v_mov_b32 broadcast', base(read=MOV_BROADCAST_V2), lambda x, y: v2(x & ~1, y | 1),
+                 'QuadReadLaneAt(v2, 2u)', 'QuadReadLaneAt(v2, 2u)'),
+                ('narrowed write', narrowed(), lambda x, y: bits(struct.unpack('<f', struct.pack('<I', v3_narrowed(x ^ 1, y)))[0]
+                                                                 + 16 * y + x + 0.5),
+                 'QuadReadAcrossX(v3)', 'QuadReadAcrossX(v3)')):
+            text, reason = translate(code)
+            if text is None:
+                check('%s after the window translates for the draw' % form, False, str(reason))
+                continue
+            ref = words_file(directory, form.replace(' ', '_'),
+                             [w for y in range(HEIGHT) for x in range(WIDTH)
+                              for w in ([value(x, y)] * 4 if covered(x, y) else [CLEAR] * 4)])
+            ps = compile_hlsl(dxc, 'dxc', text, 'ps_' + form.replace(' ', '_'), 'ps_6_0', directory)
+            run = draw(renderer, adapter, partial, ps, ref)
+            check('%s: %s after the window matches the guest on all pixels of the cut quads' % (adapter, form),
+                  run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+            check('%s own-lane mutant changes the HLSL' % form, quad_text in text)
+            own = compile_hlsl(dxc, 'dxc', text.replace(own_text, own_text[own_text.index('(') + 1:own_text.index(',') if ',' in own_text else -1], 1), 'ps_own_' + form.replace(' ', '_'),
+                               'ps_6_0', directory)
+            run = draw(renderer, adapter, partial, own, ref)
+            check('%s: %s reading its own lane fails' % (adapter, form),
+                  run.returncode != 0 and any(ln.startswith('pixel mismatch') for ln in run.stderr.splitlines()),
+                  run.stdout + run.stderr)
+        # The v_cndmask_b32 broadcast, full screen: every pixel against the CPU reference; reading src0 from the own
+        # lane instead of quad lane 1 must fail.
+        text, reason = translate(bytes.fromhex(SELECT_PROGRAM))
+        if text is None:
+            check('the v_cndmask_b32 broadcast translates for the draw', False, str(reason))
+            return
+        select_ref = words_file(directory, 'select', select_reference())
+        ps = compile_hlsl(dxc, 'dxc', text, 'ps_select', 'ps_6_0', directory)
+        run = draw(renderer, adapter, full, ps, select_ref)
+        check('%s: v_cndmask_b32 broadcast matches on all %d pixels' % (adapter, WIDTH * HEIGHT),
+              run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+        own = compile_hlsl(dxc, 'dxc', text.replace('QuadReadLaneAt(v2, 1u)', 'v2'), 'ps_select_own', 'ps_6_0',
+                           directory)
+        run = draw(renderer, adapter, full, own, select_ref)
+        check('%s: v_cndmask_b32 broadcast reading its own lane fails' % adapter,
+              run.returncode != 0 and any(ln.startswith('pixel mismatch') for ln in run.stderr.splitlines()),
+              run.stdout + run.stderr)
 
 
 def words_file(directory, name, values):
@@ -196,7 +281,16 @@ def controls():
     check('straight-line window and restore (EXEC known, s_wqm flag lost) translates', text is not None, str(reason))
     if text is not None:
         check('straight-line: the read is a quad swap of v2', 'v256 = QuadReadAcrossX(v2);' in text, text)
+    text, reason = translate(bytes.fromhex(SELECT_PROGRAM))
+    check('a v_cndmask_b32 quad broadcast translates', text is not None, str(reason))
+    if text is not None:
+        check('the broadcast reads quad lane 1 of v2 and the own lane of v1 and VCC',
+              'QuadReadLaneAt(v2, 1u)' in text and text.replace('QuadReadLaneAt(v2, 1u)', 'v2') != text, text)
+    text, reason = translate(narrowed())
+    check('a register written under a v_cmpx narrowing (lane-exact) is read after the restore', text is not None,
+          str(reason))
     refused = (
+        ('a register written under a narrowing by the exact entry mask', narrowed(narrow=AND_EXACT)),
         ('the read takes a register written in the window', base(read=READ_V3)),
         ('a window register copied after the restore', base(after_restore=COPY_V3_TO_V2)),
         ('a VCC compare of a window register selects the source', base(after_restore=VCC_FROM_V3)),

@@ -5523,11 +5523,19 @@ class Stage:
             reg = reg_range(token)
             return bool(reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] == mask_width)
 
-        # Facts: 'entry' / 'exec' as before; 'window' once a whole-quad EXEC was narrowed or replaced by a mask that is
-        # not proven whole-quad; frozenset(sN) for a register holding the whole-quad mask. Separately, the registers
-        # whose value may differ between guest and host lanes of a quad ("dirty"): every lane-varying result written
-        # inside a window (the host may run helper lanes the guest left off), and every result computed from a dirty
-        # register. Facts intersect at joins, dirty registers unite; both only move toward refusal, so the loop ends.
+        # EXEC is tracked as three nested levels, each fact set holding the weaker ones too, so an intersection at a
+        # join keeps the weakest incoming level:
+        #   'exec'   whole-quad and lane-exact (the entry s_wqm, or a restore of a saved whole-quad mask);
+        #   'lexact' lane-exact but narrowed: derived from a lane-exact EXEC by a scalar mask operation or a v_cmpx whose
+        #            operands are clean (an if/else, a kill test), so every host thread holds the guest lane's EXEC bit;
+        #   'window' EXEC derived from something else, such as the exact entry mask, which the host cannot tell apart on
+        #            helper lanes (it starts every thread with EXEC 1).
+        # 'entry' marks the program before s_wqm; frozenset(sN) a register holding the whole-quad mask. Separately, the
+        # registers whose value may differ between guest and host lanes of a quad ("dirty"): every vector result
+        # written in a window or before s_wqm, every scalar result written in a window, every result computed from a
+        # dirty register, and a narrowed write keeps a dirty old value in its inactive lanes. Facts intersect at joins,
+        # dirty registers unite; both only move toward refusal, so the loop ends.
+        whole, exact, window = {'exec', 'lexact', 'window'}, {'lexact', 'window'}, {'window'}
         before = {0: {'entry'}}
         dirty_before = {0: frozenset()}
         pending = {0}
@@ -5547,17 +5555,20 @@ class Stage:
                     # An EXEC-guarded export can discard host lanes before a later restore.
                     facts.clear()
                     continue
+                # Operands read before this instruction's own writes: an EXEC write reads them as they were.
+                sources_clean = dirty.isdisjoint(lane_reads)
                 if lane_writes:
-                    # Outside proven whole-quad EXEC a vector result may differ between guest and host lanes (the guest
-                    # skips its off lanes). Inside a window a scalar result is kept dirty too: a block that an execz
-                    # branch skips can leave it different per quad. Cross-lane reads (readlane, permlane, swizzle) take
-                    # another lane and are never proven. EXEC read as data outside whole-quad EXEC (the exact entry mask,
-                    # a count of it) differs on helper lanes, which the host cannot tell apart at entry.
-                    if ((vector and 'exec' not in facts) or not facts & {'entry', 'exec'}
-                            or not dirty.isdisjoint(lane_reads) or cross
-                            or ('exec' not in facts and not reads.isdisjoint(EXEC_KEYS))):
+                    # A vector result written before s_wqm or in a window may differ on helper lanes (the guest skips
+                    # its off lanes, the host thread runs). A scalar result written in a window too: a block that an
+                    # execz branch skips can leave it different per quad. Cross-lane reads (readlane, permlane,
+                    # swizzle) take another lane and are never proven. EXEC read as data where it is not lane-exact
+                    # (the exact entry mask, a count of it) differs on helper lanes.
+                    if ((vector and 'lexact' not in facts) or not facts & {'entry', 'lexact'}
+                            or not sources_clean or cross
+                            or ('lexact' not in facts and not reads.isdisjoint(EXEC_KEYS))):
                         dirty |= lane_writes
-                    else:
+                    elif not (vector and 'exec' not in facts):
+                        # A narrowed vector write keeps the old value in its inactive lanes: a dirty one stays.
                         dirty -= lane_writes
                 previous = facts
                 facts = {fact for fact in previous if not isinstance(fact, frozenset) or writes.isdisjoint(fact)}
@@ -5567,34 +5578,34 @@ class Stage:
                     facts.add(frozenset(scalar_tokens(ops[0])))
                 if not exec_write:
                     continue
-                facts.discard('entry')
-                facts.discard('exec')
+                facts -= {'entry'} | whole
                 if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1]:
                     if previous & {'entry', 'exec'}:
-                        facts.add('exec')
+                        facts |= whole
                         continue
                 if not mods and 'exec' in previous:
                     if name == narrow and ops[0] in full_exec and (
                             set(ops[1:]) <= full_exec | constants and set(ops[1:]) & full_exec):
-                        facts.add('exec')
+                        facts |= whole
                         continue
                     if name == save and ops[1] in full_exec | constants:
                         if mask_register(ops[0]):
-                            facts.update(('exec', frozenset(scalar_tokens(ops[0]))))
+                            facts |= whole | {frozenset(scalar_tokens(ops[0]))}
                             continue
-                if (not mods and previous & {'exec', 'window'} and name == move and ops[0] in full_exec and
+                if (not mods and 'window' in previous and name == move and ops[0] in full_exec and
                         (ops[1] in full_exec and 'exec' in previous or frozenset(scalar_tokens(ops[1])) in previous)):
-                    # A restore of a saved whole-quad mask ends a window.
-                    facts.discard('window')
-                    facts.add('exec')
+                    # A restore of a saved whole-quad mask ends a narrowing or a window.
+                    facts |= whole
                     continue
-                if previous & {'exec', 'window'} and not mods and name.startswith('s_') and (
-                        not name.startswith(('s_movrel', 's_setpc', 's_swappc', 's_call', 's_rfe'))):
-                    # A scalar EXEC write after whole-quad EXEC was established opens (or continues) a window. A
-                    # saveexec taken from whole-quad EXEC also records its destination as the whole-quad mask.
+                # A v_cmpx writes EXEC from its compare whatever its operand modifiers (SDWA selects, neg/abs).
+                if 'window' in previous and (name.startswith('v_cmpx') or not mods and name.startswith('s_') and (
+                        not name.startswith(('s_movrel', 's_setpc', 's_swappc', 's_call', 's_rfe')))):
+                    # A scalar mask operation or a v_cmpx narrows EXEC. From a lane-exact EXEC with clean operands
+                    # it stays lane-exact; otherwise it opens (or continues) a window. A saveexec taken from
+                    # whole-quad EXEC records its destination as the whole-quad mask.
                     if 'saveexec' in name and 'exec' in previous and mask_register(ops[0]):
                         facts.add(frozenset(scalar_tokens(ops[0])))
-                    facts.add('window')
+                    facts |= exact if 'lexact' in previous and sources_clean else window
                     continue
                 # A later restore cannot repair values produced by an inexact EXEC write.
                 facts.clear()
@@ -5731,7 +5742,7 @@ class Stage:
                 else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
         self.whole_quad_sites = set()
         if (getattr(self, 'kind', None) == 'ps' and not getattr(self, 'fetched', False) and
-                any(name in WHOLE_QUAD_DPP_OPS for _, _, name, _ in self.ins)):
+                any(name.endswith('_dpp') for _, _, name, _ in self.ins)):
             self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
         self.entry_wqm_sites = (self.entry_wqm_exec_sites()
                                 if branches and getattr(self, 'kind', None) == 'ps' and
@@ -7165,14 +7176,23 @@ class Stage:
         longer the entry mask, but every quad is whole, so the four reads are as safe as after the entry s_wqm."""
         # The symbolic EXEC can also be known here (a restore of the saved mask on every path) while the entry s_wqm
         # flag is gone; the CFG proof covers that case too.
-        return (base in ('v_add_f32', 'v_subrev_f32')
-                and not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
+        # Any quad swap form: the proof is about EXEC and the source registers, not about the operation.
+        return (not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
                 and getattr(self, 'pc', None) in getattr(self, 'whole_quad_sites', ()))
 
     def quad_subrev_block_proof(self, base):
-        return (base == 'v_subrev_f32' and self.quad_flow_allowed()
-                and not getattr(self, 'fetched', False)
-                and self.pc in getattr(self, 'entry_wqm_sites', ()))
+        """A quad broadcast or subtraction where EXEC is proven whole-quad: the entry s_wqm mask on every path
+        (entry_wqm_sites, subtraction only), or a lane-exact whole-quad EXEC whose source registers no helper-divergent
+        write reached (whole_quad_sites, any form)."""
+        if not self.quad_flow_allowed() or getattr(self, 'fetched', False):
+            return False
+        if base == 'v_subrev_f32' and self.pc in getattr(self, 'entry_wqm_sites', ()):
+            return True
+        if self.pc in getattr(self, 'whole_quad_sites', ()):
+            # Proven here rather than by the entry s_wqm: quad_flow_refusals then checks only the branches.
+            self.whole_quad_reads.add(self.pc)
+            return True
+        return False
 
     def quad_flow_refusals(self, branches, targets):
         """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
@@ -8048,8 +8068,13 @@ class Stage:
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
             raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
-        if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
+        # v_cndmask_b32 takes the broadcast word as src0 and selects per lane by its own VCC bit (RDNA 2 ISA VOP2 DPP:
+        # only src0 is the exchanged operand), so the ordinary select lowering applies to the rewritten operand.
+        if (base not in ('v_mov_b32', 'v_cndmask_b32') and base not in VEC_F and base not in VEC_U
+                and base not in VEC_U_TO_F):
             raise Unsupported('DPP form of %s' % base)
+        if base == 'v_cndmask_b32' and (len(ops) != 4 or ops[3] not in ('vcc', 'vcc_lo') or rest):
+            raise Unsupported('v_cndmask_b32_dpp needs dst, src0, src1 and VCC without an output modifier')
         if len(ops) < 2:
             raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
         token = ops[1]
