@@ -561,7 +561,7 @@ def flow_controls():
     mixed = M0 + branch(8, ROUND_ZERO) + ROUND_ZERO + mix_words(16, 17, opcode=0x21) + END
     refused('mixed modes at a binary16 producer', mixed, 'mixed binary16/binary64 rounding modes')
     reset = translate(M0 + ROUND_ZERO + words(0xbfa40000) + mix_words(16, 17, opcode=0x21) + END).hlsl_ps()
-    assert 'f32tof16(mix32(' in reset and 'f16rz' not in reset, reset
+    assert 'f16rn(mix32(' in reset and 'f16rz' not in reset, reset
 
 
 def save_exec(dst, source=128):
