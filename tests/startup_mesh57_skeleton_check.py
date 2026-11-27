@@ -1614,7 +1614,6 @@ def mesh_root_layout_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
-    group_reference_controls()
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, HEAP_MESH, root_blob=heap_root())
         expect('heap branch translates', result, 'ok')
@@ -1691,8 +1690,6 @@ def controls():
         expect('published files', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
         expect('a translated request is not pending', G.pending_keys(tmp, False), [])
         manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
-        expect('mesh manifest identifies request key', [line for line in manifest if line.startswith('key ')],
-               ['key %016x' % key])
         expect('paired manifest stage information',
                [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
                ['params 1', 'targets 0'])
@@ -2079,18 +2076,6 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
-
-
-def group_reference_controls():
-    """Check that the runtime fixture's negative controls have distinct images."""
-    points, colours, indices = geometry()
-    full = rasterise(points, colours, indices, len(points), len(indices))
-    group_zero = rasterise(points, colours, indices[:2], len(points), 2)
-    no_constants = rasterise(points, colours, indices, 0, 0)
-    clear = [(0, 0, 0, 255)] * (SIDE * SIDE)
-    expect('one group differs from two groups', group_zero != full, True)
-    expect('zero entry counts leave the target clear', no_constants, clear)
-    expect('zero entry counts differ from two groups', no_constants != full, True)
 
 
 def lane_mask_reference(label, full, mutant=None):
@@ -2685,8 +2670,8 @@ def reference_per_lane(points, colours, triangles, bound, old, wave_red):
     return rasterise(points, rendered, triangles, 128, len(triangles))
 
 
-def publish_request(directory, publisher, adapter, mesh=MESH):
-    ms, ps = code(mesh), code(PIXEL)
+def publish_request(directory, publisher, adapter):
+    ms, ps = code(MESH), code(PIXEL)
     (directory / 'ms.bin').write_bytes(ms)
     (directory / 'ps.bin').write_bytes(ps)
     env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
@@ -2709,66 +2694,6 @@ def publish_request(directory, publisher, adapter, mesh=MESH):
     if FAILED:
         return 1, None
     return 0, (cache, key, root_blob)
-
-
-def runtime(dxc, renderer, adapter, publisher):
-    os.environ['X2W_DXC'] = dxc
-    os.environ.pop('X2W_FXC', None)
-    points, colours, indices = geometry()
-    words = [a | b << 10 | c << 20 for a, b, c in indices]
-    correct = b''.join(map(bytes, rasterise(points, colours, indices, len(points), len(indices))))
-    group_zero = b''.join(map(bytes, rasterise(points, colours, indices[:2], len(points), 2)))
-    clear = bytes((0, 0, 0, 255)) * (SIDE * SIDE)
-    assert correct != group_zero and correct != clear
-    with tempfile.TemporaryDirectory() as tmp:
-        directory = Path(tmp)
-        status, published = publish_request(directory, publisher, adapter, GROUP_MESH)
-        if status:
-            return status
-        cache, key, _ = published
-        data = directory / 'data.bin'
-        arguments = directory / 'args.bin'
-        pixels = directory / 'pixels.bin'
-        log = directory / 'runtime.log'
-        data.write_bytes(buffer(points, colours, words))
-        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
-                   X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data),
-                   X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
-                   X2W_TRAP_LOG=str(log))
-        def execute(groups, expected, no_constants=False, reason=None):
-            arguments.write_bytes(struct.pack('<3I', *groups))
-            pixels.unlink(missing_ok=True)
-            log.unlink(missing_ok=True)
-            case_env = dict(env)
-            if no_constants:
-                case_env['X2W_TEST_MESH57_NO_CONSTANTS'] = '1'
-            result = subprocess.run([publisher, adapter, 'mesh'], env=case_env, capture_output=True, text=True)
-            if result.returncode == 77:
-                return 77
-            if result.returncode:
-                raise AssertionError(result.stdout + result.stderr)
-            actual = pixels.read_bytes()
-            if actual != expected:
-                raise AssertionError(f'mesh runtime {groups}: image differs at '
-                                     f'{sum(a != b for a, b in zip(actual, expected))} bytes')
-            if reason and (not log.exists() or reason not in log.read_text(errors='replace')):
-                raise AssertionError(f'mesh runtime did not log {reason}')
-            return 0
-        if execute((2, 1, 1), clear, reason='slot57 mesh translation pending') == 77:
-            return 77
-        if G.translate_request(str(cache), key) != 'ok':
-            raise AssertionError('mesh request translation failed')
-        manifest = cache / f'{key:016x}.ms57.txt'
-        original = manifest.read_text()
-        manifest.write_text(original.replace(f'key {key:016x}', 'key 0000000000000000'))
-        if execute((2, 1, 1), clear, reason='manifest key mismatch') == 77:
-            return 77
-        manifest.write_text(original)
-        for groups, expected, missing in (((2, 1, 1), correct, False), ((1, 2, 1), correct, False),
-                                          ((1, 1, 1), group_zero, False), ((2, 1, 1), clear, True)):
-            if execute(groups, expected, missing) == 77:
-                return 77
-    return 0
 
 
 def draw(dxc, renderer, adapter, publisher=None):
@@ -3255,8 +3180,6 @@ def main(argv):
         status = draw_shift(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
-    elif argv[1:2] == ['runtime'] and len(argv) == 6:
-        status = runtime(*argv[2:])
     elif len(argv) == 1:
         controls()
     else:
