@@ -47,8 +47,9 @@ inline constexpr int onset_rgb_tolerance = 4;
 
 class Sampler {
 public:
-    explicit Sampler(int every, bool always = true, bool capture_center = false, bool check_flat = false)
-        : capture_center_(capture_center || check_flat), check_flat_(check_flat), every_(every), always_(always) {}
+    explicit Sampler(int every, bool always = true, bool capture_center = false, bool check_flat = false, bool flat_from_first = false)
+        : capture_center_(capture_center || check_flat), check_flat_(check_flat), flat_from_first_(flat_from_first),
+          every_(every), always_(always) {}
 
     // Called once per present with the presented surface. Returns true when this call published a sample.
     bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
@@ -66,8 +67,11 @@ public:
             const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
             if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
                 const auto* base = static_cast<const unsigned char*>(mapped);
-                if (capture_center_)
-                    std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
+                if (capture_center_) {
+                    const auto* texel = flat_from_first_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ?
+                        base : base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4;
+                    std::memcpy(last_rgba_, texel, 4);
+                }
                 if (check_flat_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
                     last_flat_ = true;
                     for (int band = 0; band < cells_y && last_flat_; ++band) {
@@ -228,7 +232,7 @@ private:
         list_->ResourceBarrier(1, &b);
     }
 
-    const bool capture_center_, check_flat_;
+    const bool capture_center_, check_flat_, flat_from_first_;
     bool last_flat_ = false;
     DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN, last_format_ = DXGI_FORMAT_UNKNOWN;
     LONG64 last_present_ = 0;

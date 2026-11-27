@@ -559,6 +559,7 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
 
 
 PHASES_NAME = "phases.txt"
+PRODUCER_NAME = "present_producer.txt"
 PHASE_WINDOW_S = 30
 HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
@@ -694,6 +695,36 @@ def _read_json(path):
         return None
 
 
+def producer_report(text):
+    """Summarize automatic back-buffer producer captures from runtime stderr."""
+    floor = re.search(r"x2w-red auto configured floor=(\d+s?)\b", text)
+    legacy = False
+    if not floor:
+        floor = re.search(r"x2w-red producer waits for RGB [\d,]+ at or after present (\d+)\b", text)
+        legacy = True
+    captures = re.findall(
+        r"x2w-red auto armed sampled_present=(\d+) published_at=\d+ target=\S+ "
+        r"capture=(\d+)\.\.(\d+) rgb=(\d+,\d+,\d+)(?: ordinal=(\d+))?", text)
+    if not floor and not captures:
+        return ""
+    lines = ["Back-buffer producer captures"]
+    if captures:
+        for index, (sampled, first, last, rgb, ordinal) in enumerate(captures, 1):
+            lines.append(f"capture {ordinal or index}: RGB {rgb}, onset present {sampled}, frames {first}..{last}")
+    else:
+        threshold = floor.group(1)
+        last = max((int(present) for present in re.findall(
+            r"x2w-red auto (?:waiting|floor reached) present=(\d+)", text)), default=0)
+        if legacy:
+            last = max((int(match[1]) for match in RE_HEARTBEAT_FRAMES.finditer(text)), default=0)
+        reached = bool(re.search(r"x2w-red auto floor reached present=\d+", text))
+        if not reached and (threshold.endswith("s") or last < int(threshold)):
+            lines.append(f"floor not reached: last present {last}, floor {threshold}")
+        else:
+            lines.append("no flat onset seen")
+    return "\n".join(lines) + "\n"
+
+
 def last_milestone(logdir):
     """The last frame count the title reported ("last present #N at S s") from its heartbeat lines, or "no present reported"."""
     best = None
@@ -823,6 +854,9 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 texts[name] = handle.read()
+    producer = producer_report(texts.get("stderr.txt", ""))
+    if producer:
+        add(PRODUCER_NAME, producer.encode("utf-8"))
     if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
         add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
     files = log_files(logdir)

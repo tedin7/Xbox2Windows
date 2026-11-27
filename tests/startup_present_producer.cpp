@@ -1,5 +1,6 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -22,6 +24,64 @@ Word call(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Word
     return slot<Slot>(object, index)(object, a, b, c, d, e);
 }
 bool ok(Word result) { return SUCCEEDED(static_cast<HRESULT>(result)); }
+
+template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Kind, class T>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Kind;
+    T value{};
+};
+
+bool onset_pipeline(void* device, void** root, void** pipeline)
+{
+    static constexpr char source[] = R"(
+struct Pixel {
+    float4 position : SV_Position;
+    nointerpolation uint picture : PICTURE;
+};
+Pixel vertex(uint id : SV_VertexID) {
+    uint corner = id % 3;
+    Pixel output;
+    output.position = float4((corner & 1) * 4.0 - 1.0, (corner >> 1) * 4.0 - 1.0, 0, 1);
+    output.picture = id / 3;
+    return output;
+}
+float4 pixel(Pixel input) : SV_Target {
+    if (input.picture == 0 && input.position.x < 8.0) return float4(0, 0, 1, 1);
+    float shade = input.picture == 3 ? 0.0 : (input.picture == 2 ? 187.0 / 255.0 : 1.0);
+    return float4(shade, shade, shade, 1);
+}
+)";
+    ComPtr<ID3DBlob> vs, ps, blob;
+    if (FAILED(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "vertex", "vs_5_0", 0, 0, &vs, nullptr)) ||
+        FAILED(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "pixel", "ps_5_0", 0, 0, &ps, nullptr)))
+        return false;
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)) ||
+        !ok(call(device, 16, 0, arg(blob->GetBufferPointer()), blob->GetBufferSize(), arg(&__uuidof(ID3D12RootSignature)), arg(root))))
+        return false;
+    struct {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, void*> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+    } stream;
+    stream.root.value = *root;
+    stream.vs.value = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    stream.ps.value = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+    stream.raster.value.DepthClipEnable = TRUE;
+    stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    stream.targets.value = {{DXGI_FORMAT_R8G8B8A8_UNORM}, 1};
+    stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    stream.samples.value.Count = 1;
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    return ok(call(device, 86, arg(&desc), arg(&__uuidof(ID3D12PipelineState)), arg(pipeline))) && *pipeline;
+}
 }
 
 int main(int argc, char** argv)
@@ -31,6 +91,7 @@ int main(int argc, char** argv)
     const bool default_cadence = argc >= 2 && std::strcmp(argv[1], "auto-default") == 0;
     const bool flat_onset = argc >= 2 && std::strcmp(argv[1], "auto-onset") == 0;
     const bool automatic = use_magenta || default_cadence || flat_onset || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
+    const bool levels = argc >= 2 && std::strcmp(argv[1], "auto-levels") == 0;
     const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
@@ -131,6 +192,58 @@ int main(int argc, char** argv)
         void* lists[]{list};
         call(queue, 10, 1, arg(lists));
         if (!finish()) return 17;
+    } else if (levels) {
+        void *root = nullptr, *pipeline = nullptr, *signature = nullptr;
+        if (!onset_pipeline(device, &root, &pipeline)) return 19;
+        static constexpr D3D12_DRAW_ARGUMENTS commands[]{{3, 1, 0, 0}, {3, 1, 3, 0}, {3, 1, 6, 0}, {3, 1, 9, 0}};
+        const D3D12_INDIRECT_ARGUMENT_DESC draw{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+        const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(commands[0]), 1, &draw, 0};
+        if (!ok(call(device, 41, arg(&signature_desc), 0, arg(&__uuidof(ID3D12CommandSignature)), arg(&signature))) ||
+            !signature) return 20;
+        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(commands), 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        // An unaligned title address selects a desktop copy. Seed its GPU bytes with a real copy.
+        const auto free_backing = [](void* address) { VirtualFree(address, 0, MEM_RELEASE); };
+        const std::unique_ptr<void, decltype(free_backing)> backing(
+            VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), free_backing);
+        if (!backing) return 21;
+        ComPtr<IUnknown> arguments;
+        using Place = HRESULT (WINAPI*)(void*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+        if (FAILED(slot<Place>(device, 133)(device, static_cast<char*>(backing.get()) + 4, &buffer,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                           reinterpret_cast<void**>(arguments.GetAddressOf())))) return 21;
+        const D3D12_HEAP_PROPERTIES upload_props{D3D12_HEAP_TYPE_UPLOAD};
+        ComPtr<ID3D12Resource> upload;
+        if (FAILED(desktop->CreateCommittedResource(&upload_props, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) return 22;
+        void* mapped = nullptr;
+        const D3D12_RANGE unread{};
+        if (FAILED(upload->Map(0, &unread, &mapped))) return 22;
+        std::memcpy(mapped, commands, sizeof(commands));
+        upload->Unmap(0, nullptr);
+        const D3D12_VIEWPORT viewport{0, 0, 16, 16, 0, 1};
+        const D3D12_RECT scissor{0, 0, 16, 16};
+        const D3D12_CPU_DESCRIPTOR_HANDLE handle{rtv};
+        for (unsigned frame = 0; frame < 25; ++frame) {
+            const unsigned picture = frame < 5 || (frame >= 10 && frame < 15) ? 0 :
+                                     frame < 10 ? 1 : frame < 20 ? 2 : 3;
+            if (!ok(call(list, 139, arg(allocator)))) return 23;
+            if (!frame) call(list, 15, arg(arguments.Get()), 0, arg(upload.Get()), 0, sizeof(commands));
+            call(list, 25, arg(pipeline));
+            call(list, 34, arg(root));
+            call(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            call(list, 21, 1, arg(&viewport));
+            call(list, 22, 1, arg(&scissor));
+            call(list, 50, 1, arg(&handle));
+            // A fresh sentinel makes a missing draw visible in the paired readback.
+            call(list, 52, rtv, arg(green));
+            using Execute = void (WINAPI*)(void*, void*, UINT, void*, UINT64, void*, UINT64);
+            slot<Execute>(list, 61)(list, signature, 1, arguments.Get(), picture * sizeof(commands[0]), nullptr, 0);
+            if (!ok(call(list, 9))) return 24;
+            void* lists[]{list};
+            call(queue, 10, 1, arg(lists));
+            if (!finish() || !present()) return 25;
+        }
     } else if (!emit(automatic && !default_cadence && !flat_onset ? chosen : blue) || !present()) {
         return 8; // discover the title's present surface
     } else if (flat_onset) {
