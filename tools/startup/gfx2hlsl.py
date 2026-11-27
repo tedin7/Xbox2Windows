@@ -6750,7 +6750,8 @@ class Stage:
         _, ops, mods = parse(asm)
         masks = getattr(self, 'firstlane_masks', None)
         cfg = getattr(self, 'spill_cfg', None)
-        if masks and cfg and any(self.ins[lo][0] == self.pc for lo, _ in cfg[0]):
+        ins = getattr(self, 'ins', ())
+        if masks and cfg and any(lo < len(ins) and ins[lo][0] == getattr(self, 'pc', None) for lo, _ in cfg[0]):
             masks.clear()
         if writes_exec(name, ops):
             self.exec_generation += 1
@@ -6856,8 +6857,9 @@ class Stage:
         # AMD RDNA 2 ISA guide, 3.9 VCC, p.19: compares produce a lane mask. Equal inputs give equal active bits.
         # Keep these facts within one basic block, and invalidate them on any overlapping scalar write.
         masks = getattr(self, 'firstlane_masks', None)
-        mask_enabled = (masks is not None and self.kind == 'ps' and self.firstlane_cfg
-                        and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in self.ins))
+        mask_enabled = (masks is not None and getattr(self, 'kind', None) == 'ps'
+                        and getattr(self, 'firstlane_cfg', False)
+                        and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ())))
         def mask_key(token):
             if token in ('vcc', 'vcc_lo'):
                 return 'vcc'
@@ -6951,7 +6953,8 @@ class Stage:
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
-            if entry_proof and loaded_regs and self.kind == 'ps' and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in self.ins):
+            if (entry_proof and loaded_regs and getattr(self, 'kind', None) == 'ps'
+                    and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ()))):
                 self.firstlane_v.update(loaded_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
@@ -10631,13 +10634,17 @@ class Stage:
     def pixel_store_constant_index(self, position):
         """Prove the last index write within this store's basic block."""
         name = 'buffer_store_format_xyzw'
-        args = parse(self.ins[position][3])[1]
+        ins = getattr(self, 'ins', ())
+        cfg = getattr(self, 'spill_cfg', None)
+        if not cfg or not 0 <= position < len(ins) or position not in cfg[1]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        args = parse(ins[position][3])[1]
         index = reg_range(args[1]) if len(args) > 1 else None
         if not index or index[0] != 'v' or index[1] != index[2]:
             raise Unsupported(name + ' index not proven constant in the same basic block')
-        bounds, block_of, _, _ = self.spill_cfg
+        bounds, block_of, _, _ = cfg
         lo, _ = bounds[block_of[position]]
-        for _, _, op, asm in reversed(self.ins[lo:position]):
+        for _, _, op, asm in reversed(ins[lo:position]):
             _, operands, mods = parse(asm)
             if writes_exec(op, operands) or op.startswith(('v_movrel', 'v_accvgpr_write')):
                 break
@@ -10670,7 +10677,8 @@ class Stage:
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
         name = 'buffer_store_format_xyzw'
-        if self.kind != 'cs' and not (self.kind == 'ps' and self.pipe.pixel_formatted_stores):
+        if getattr(self, 'kind', None) != 'cs' and not (
+                getattr(self, 'kind', None) == 'ps' and getattr(getattr(self, 'pipe', None), 'pixel_formatted_stores', False)):
             raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
@@ -10713,22 +10721,22 @@ class Stage:
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
-        if self.kind == 'ps':
+        if getattr(self, 'kind', None) == 'ps':
             if int(ops[3], 0) or (imm_offset or 0):
                 raise Unsupported(name + ' pixel store requires zero offsets')
-            stores = [i for i, item in enumerate(self.ins) if item[2] == name]
+            stores = [i for i, item in enumerate(getattr(self, 'ins', ())) if item[2] == name]
             indices = [self.pixel_store_constant_index(pos) for pos in stores]
             if len(indices) != len(set(indices)):
                 raise Unsupported(name + ' pixel stores have overlapping indices')
-            if (not self.firstlane_cfg or not self.uniform_cf or not self.uniform_entry_exec()
-                    or not all(n in self.firstlane_v for n in range(src[1], src[2] + 1))):
+            if (not getattr(self, 'firstlane_cfg', False) or not getattr(self, 'uniform_cf', False) or not self.uniform_entry_exec()
+                    or not all(n in getattr(self, 'firstlane_v', ()) for n in range(src[1], src[2] + 1))):
                 raise Unsupported(name + ' data not proven wave-uniform')
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
-        if self.kind == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
+        if getattr(self, 'kind', None) == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
             raise Unsupported('%s shares a vertex UAV' % name)
         uav = self.pipe.uav(key, 'raw')
-        if self.kind == 'ps':
+        if getattr(self, 'kind', None) == 'ps':
             self.pipe.uavs[key]['pixel_format'] = True
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
@@ -10738,7 +10746,7 @@ class Stage:
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
             uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
         # D3D pixel helper invocations have no UAV side effects. Also honor the guest's per-lane EXEC bit.
-        self.emit(call if self.kind == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
+        self.emit(call if getattr(self, 'kind', None) == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
