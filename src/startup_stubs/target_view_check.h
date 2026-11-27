@@ -72,7 +72,8 @@ Refusal check(Desc* v, const D3D12_RESOURCE_DESC* r, Repair repair, bool typed_c
     if (r && !x2w_view_dimension::fits(uav ? 19 : dsv ? 21 : 20, static_cast<unsigned>(v->ViewDimension), static_cast<unsigned>(r->Dimension))) return Refusal::dimension;
     if (r && ((uav && r->SampleDesc.Count > 1) || (!uav && p.ms != (r->SampleDesc.Count > 1)))) return Refusal::dimension;
     auto allowed = [&](DXGI_FORMAT f) { return dsv ? view_desc::depth_format(f) : f != DXGI_FORMAT_UNKNOWN && !is_typeless(f) && !view_desc::depth_format(f); };
-    if constexpr (dsv) if (!view_desc::depth_format(v->Format)) return Refusal::format;
+    // A DSV format that is not a depth format (UNKNOWN included) takes the resource's typed depth format below, else
+    // the view is refused; a typeless depth family member (R32_TYPELESS) is cast by format_cast_fits.
     bool special_buffer = false;
     if constexpr (uav) special_buffer = p.buffer && (v->Buffer.StructureByteStride || v->Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW);
     if ((!allowed(v->Format) && !special_buffer) || (r && !p.buffer && !view_desc::format_cast_fits(r->Format, v->Format, typed_cast))) {

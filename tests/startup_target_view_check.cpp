@@ -25,9 +25,13 @@ int main() {
     u.Buffer.CounterOffsetInBytes=4096; auto saved=u; expect(check_uav(&u,&b,&b,repair)==Refusal::none && !std::memcmp(&u,&saved,sizeof(u)), "counter valid");
     D3D12_DEPTH_STENCIL_VIEW_DESC d{}; d.Format=DXGI_FORMAT_D32_FLOAT; d.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D; d.Flags=D3D12_DSV_FLAG_READ_ONLY_STENCIL; r.Format=d.Format;
     expect(check(&d,&r,repair)==Refusal::none && d.Flags==D3D12_DSV_FLAG_NONE, "stencil flag");
+    d.Format=DXGI_FORMAT_R32_FLOAT; expect(check(&d,&r,repair)==Refusal::none && d.Format==DXGI_FORMAT_D32_FLOAT, "depth format repair");
+    d.Format=DXGI_FORMAT_UNKNOWN; expect(check(&d,&r,repair)==Refusal::none && d.Format==DXGI_FORMAT_D32_FLOAT, "unknown depth format");
+    r.Format=DXGI_FORMAT_R32_TYPELESS; d.Format=DXGI_FORMAT_D32_FLOAT; auto saved_d=d;
+    expect(check(&d,&r,repair)==Refusal::none && !std::memcmp(&d,&saved_d,sizeof(d)), "typeless depth family unchanged");
     d.Format=DXGI_FORMAT_R32_FLOAT; expect(check(&d,&r,repair)==Refusal::format, "depth format");
     d={}; d.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; d.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D; d.Flags=D3D12_DSV_FLAG_READ_ONLY_STENCIL; r.Format=d.Format;
-    auto saved_d=d; expect(check(&d,&r,repair)==Refusal::none && !std::memcmp(&d,&saved_d,sizeof(d)), "stencil valid unchanged");
+    saved_d=d; expect(check(&d,&r,repair)==Refusal::none && !std::memcmp(&d,&saved_d,sizeof(d)), "stencil valid unchanged");
     d.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS; r.SampleDesc.Count=4; saved_d=d;
     expect(check(&d,&r,repair)==Refusal::none && !std::memcmp(&d,&saved_d,sizeof(d)), "MS depth unchanged");
     r.SampleDesc.Count=1; expect(check(&d,&r,repair)==Refusal::dimension, "MS on single sample");
