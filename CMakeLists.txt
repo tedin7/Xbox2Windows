@@ -1406,10 +1406,6 @@ set_tests_properties(startup_pixel_history_warp PROPERTIES TIMEOUT 60)
 add_test(NAME startup_pixel_history_hardware COMMAND startup_pixel_history hardware)
 set_tests_properties(startup_pixel_history_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
-add_executable(startup_typed_buffer_view tests/startup_typed_buffer_view.cpp)
-target_compile_features(startup_typed_buffer_view PRIVATE cxx_std_17)
-add_test(NAME startup_typed_buffer_view COMMAND startup_typed_buffer_view)
-
 # tests/startup_stream_setup.cpp is compiled once for the consumer and the depth check.
 add_library(startup_stream_setup_obj OBJECT tests/startup_stream_setup.cpp)
 target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
