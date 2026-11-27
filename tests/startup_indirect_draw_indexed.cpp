@@ -2050,8 +2050,12 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
 #include "startup_indirect_mesh_lease.inl"
 }  // namespace
 
+int run_startup_draw_depth_target(int argc, char** argv, bool indirect);
+
 int main(int argc, char** argv) try
 {
+    if (argc > 1 && std::strcmp(argv[1], "readonly-depth") == 0)
+        return run_startup_draw_depth_target(argc - 1, argv + 1, true);
     DrawKind kind = DrawKind::indexed;
     const bool null_census = argc == 3 && std::strcmp(argv[2], "null-census") == 0;
     const bool lease_writer = argc == 3 && std::strcmp(argv[2], "mesh-lease-writer") == 0;

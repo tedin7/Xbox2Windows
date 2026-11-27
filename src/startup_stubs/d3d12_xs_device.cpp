@@ -1485,6 +1485,15 @@ bool render_mode()
     return on;
 }
 
+bool readonly_depth_draws()
+{
+    static const bool on = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_READONLY_DEPTH_DRAWS", value, sizeof(value)) && value[0] == '1';
+    }();
+    return on;
+}
+
 // Render-target view handle (desktop) -> the resource it views, recorded when the view is created.
 SRWLOCK target_lock = SRWLOCK_INIT;
 struct ViewTarget {
@@ -3005,6 +3014,7 @@ struct Pass {
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool targets_single_sample = false;
     bool depth_view_writable = false;
+    bool stencil_view_readonly = false;
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     UINT64 target0_width = 0;
@@ -3126,14 +3136,16 @@ bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
     return written;
 }
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
-void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
+void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                   bool preserve_mixed_depth = true)
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
         if (it->resource != resource) continue;
         // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
-        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
+        if (preserve_mixed_depth && (state & D3D12_RESOURCE_STATE_DEPTH_READ) &&
+            (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
             x2w_dsv::move_plane(list, *it, 0, state);
             return;
         }
@@ -4203,6 +4215,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.targets_bound = false;
     pass.targets_single_sample = false;
     pass.depth_view_writable = false;
+    pass.stencil_view_readonly = false;
     pass.target_count = 0;
     pass.target0 = nullptr;
     std::fill_n(pass.bound_targets, 8, nullptr);
@@ -4281,6 +4294,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
             // A format without a stencil plane has no second plane to disagree with.
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
+            pass.stencil_view_readonly = read_stencil;
             if (read_depth != read_stencil) {
                 // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
                 mixed_planes = true;
@@ -4319,7 +4333,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
         x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
     } else if (dsv_target) {
-        require_state(self, dsv_target, dsv_state);
+        // A whole-view rebind sets both planes, including a previously writable stencil plane.
+        require_state(self, dsv_target, dsv_state, !readonly_depth_draws());
     }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
@@ -7944,6 +7959,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     }
     null_report.emit([](const char* line) { log("%s", line); });
+    if (render_mode() && frame % 300 == 0 && readonly_depth_draws())
+        log("x2w-render totals: read-only depth/stencil masked draws %ld",
+            InterlockedCompareExchange(&readonly_depth_masked_draws, 0, 0));
     if (render_mode() && frame % 300 == 0) {
         log("x2w-render RTV variant totals: requested %ld, ready %ld, draws with base %ld",
             InterlockedCompareExchange(&rtv_variants_requested, 0, 0),
