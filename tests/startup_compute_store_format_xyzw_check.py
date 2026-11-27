@@ -385,8 +385,10 @@ def check_controls():
     for inserted, fragment in (('800392be', 'modified descriptor'),              # s_mov_b32 s18, 0
                                ('11ff1187ffff00c0', 'modified descriptor'),      # s_and_b32 s17, s17, 0xc000ffff
                                ('10841080', 'modified descriptor'),              # s_add_u32 s16, s16, 4
-                               ('000082bf', 'local table load')):                # s_branch +0, no local reload
+                               ('800392be000082bf', 'modified descriptor')):     # s_mov_b32 s18, 0; s_branch +0
         refused(fragment, lambda i=inserted: translate('X', code=patch(WORDS_X, STORE_X, i + STORE_X)).hlsl_cs())
+    # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
+    translate('X', code=patch(WORDS_X, STORE_X, '000082bf' + STORE_X)).hlsl_cs()
     for kind in ('ps', 'vs'):  # outside compute: the unknown-op refusal, the bare mnemonic
         stage = G.Stage.__new__(G.Stage)
         stage.kind = kind

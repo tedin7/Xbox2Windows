@@ -536,9 +536,11 @@ def check_controls():
         ('800393be', 'modified descriptor'),                 # s_mov_b32 s19, 0
         ('11ff1187ffff00c0', 'modified descriptor'),         # s_and_b32 s17, s17, 0xc000ffff (stride clear)
         ('10841080', 'modified descriptor'),                 # s_add_u32 s16, s16, 4
-        ('000082bf', 'local table load'),                    # s_branch +0 without local reload
+        ('800392be000082bf', 'modified descriptor'),         # s_mov_b32 s18, 0; s_branch +0
     ):
         refused(frag, lambda ins=inserted: translate('F', code=patch(WORDS_F, store_f, ins + store_f)).hlsl_cs())
+    # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
+    translate('F', code=patch(WORDS_F, store_f, '000082bf' + store_f)).hlsl_cs()
 
     store_on_read = encode_mubuf(MUBUF_STORE_FORMAT_D16_X, 5, 0, 12, 0x80, idxen=True, offset=4).hex()
     refused('used for a load and a store',
