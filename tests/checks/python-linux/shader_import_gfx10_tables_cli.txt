@@ -1,0 +1,1 @@
+tests/startup_import_gfx10_tables_cli_check.py

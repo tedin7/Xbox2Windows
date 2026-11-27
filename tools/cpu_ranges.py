@@ -3,9 +3,20 @@
 import struct
 
 
+def _require_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"expected integer {name}, got {type(value).__name__}")
+    return value
+
+
 def image_bytes(pe, rva, size, executable=False):
+    rva = _require_int(rva, "rva")
+    size = _require_int(size, "size")
+    if rva < 0 or size <= 0:
+        raise ValueError(f"invalid file-backed range at RVA {rva:#x}")
     section = pe.get_section_by_rva(rva)
-    if (not section or size <= 0 or (executable and not section.Characteristics & 0x20000000)
+    if (not section or rva < section.VirtualAddress
+            or (executable and not section.Characteristics & 0x20000000)
             or rva + size - section.VirtualAddress > min(section.Misc_VirtualSize, section.SizeOfRawData)):
         raise ValueError(f"invalid file-backed range at RVA {rva:#x}")
     data = pe.get_data(rva, size)
@@ -15,10 +26,15 @@ def image_bytes(pe, rva, size, executable=False):
 
 
 def function_ranges(pe, entry):
+    entry = _require_int(entry, "entry")
+    if entry < 0:
+        raise ValueError(f"invalid entry RVA {entry:#x}")
     directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     if len(directories) < 4:
         raise ValueError("image has no runtime-function directory")
     table = directories[3]
+    if table.VirtualAddress == 0 or table.Size <= 0:
+        raise ValueError("image has no runtime-function directory")
     if table.Size % 12:
         raise ValueError("incomplete runtime-function record")
     records = list(struct.iter_unpack("<III", image_bytes(pe, table.VirtualAddress, table.Size)))

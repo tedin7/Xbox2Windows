@@ -54,6 +54,21 @@ constexpr const char* memory_srv_reasons[] = {
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
 
+// The largest layout the transient upload ring accepts for one copy (publish_tiled_texture).
+constexpr std::uint64_t max_published_texture_bytes = 64ull << 20;
+
+// Why no texture came back for a memory SRV (d3d12_memory_srv.inl, texture_unavailable_reason). `published` is true when a
+// publication was attempted (BC, console layout, single element), false when only a live resource could have served the
+// view. `readable` runs only for a layout within the limit, so a huge layout never pays a page-touch pass.
+template <class Readable>
+inline const char* texture_unavailable_cause(bool published, std::uint64_t bytes, Readable&& readable)
+{
+    if (!published) return "texture_no_resource";
+    if (bytes > max_published_texture_bytes) return "texture_over_64mib";
+    if (!readable()) return "texture_unreadable";
+    return "texture_unavailable";  // publication failed for another reason (no wrapper)
+}
+
 inline int memory_srv_reason_index(const char* reason)
 {
     for (int i = 0; reason && i < memory_srv_reason_count; ++i)

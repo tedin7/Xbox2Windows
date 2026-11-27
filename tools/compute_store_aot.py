@@ -322,9 +322,14 @@ def shared_lds_step(line, step, vector, words):
     if op in LDS_SHARED_ATOMICS:
         place(single)
         (value,) = words_of(data, 1)
-        if op == "sub_u32":
-            value = f"(0u - {value})"
         method = LDS_SHARED_ATOMICS[op]
+        if op == "sub_u32":
+            # mem - v == mem + ~v + 1 (mod 2^32), as two additions. One InterlockedAdd of (0u - v) on groupshared
+            # memory fails compute PSO creation with E_OUTOFMEMORY on NVIDIA GeForce RTX 5080 (driver
+            # 32.0.16.2124); DXC folds every spelling of the negation to `sub i32 0, v`. The update has no
+            # return value and the step ends with a barrier, so the intermediate word is never read.
+            statements.append(f"    if ({base} < {words}u) InterlockedAdd(lds[{base}], ~({value}));")
+            value = "1u"
         statements.append(f"    if ({base} < {words}u) Interlocked{method}(lds[{base}], {value});")
         return "\n".join(statements)
     count = int(m["bits"]) // 32

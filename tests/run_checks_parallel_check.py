@@ -73,6 +73,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert both.returncode == 1, both.stdout
     assert "FAILED: " + bad + "\n" in both.stdout, both.stdout
     assert "SKIPPED: " + skip + "\n" in both.stdout, both.stdout
+    # Equivalent script path spellings on the command line (e.g. a.py vs ./a.py) count as duplicates.
+    dot_good = os.path.join(tmp, ".", "good.py")
+    spelled_twice = run(good, dot_good)
+    assert spelled_twice.returncode == 1, spelled_twice.stdout
+    assert spelled_twice.stdout.strip() == "duplicate command-line script: " + dot_good, spelled_twice.stdout
+    assert "good ran" not in spelled_twice.stdout and "::group::" not in spelled_twice.stdout, spelled_twice.stdout
     # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
     serial = run(good, jobs="0")
     assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout

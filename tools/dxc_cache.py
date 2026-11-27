@@ -5,6 +5,7 @@ Unset, run_dxc is a plain subprocess.run. Anything the cache cannot reason
 about (includes, -I, response files, unknown -F outputs, extra run options)
 bypasses it, so a cached result is never reused for a different compile.
 """
+import errno
 import hashlib
 import json
 import os
@@ -83,8 +84,47 @@ def _store(path, payload):
 
 
 def _write_file(path, data):
-    with open(path, "wb") as out:
-        out.write(data)
+    """Write data to path atomically, refusing symlink or directory targets."""
+    target = os.fspath(path)
+    stripped = os.path.normpath(target)
+    if os.path.islink(target) or os.path.islink(stripped):
+        raise OSError(errno.ELOOP, "refusing symlink target", target)
+    if target.endswith(("/", "\\")) or os.path.isdir(target):
+        raise IsADirectoryError(errno.EISDIR, "refusing directory target", target)
+    parent = os.path.dirname(os.path.abspath(target))
+    handle, temp = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".tmp")
+    closed = False
+    try:
+        with os.fdopen(handle, "wb") as out:
+            closed = True
+            out.write(data)
+        os.replace(temp, target)
+    except BaseException:
+        if not closed:
+            os.close(handle)
+        if os.path.exists(temp):
+            os.unlink(temp)
+        raise
+
+
+def _valid_cache_dir(cache_dir):
+    """Return True when cache_dir is usable and neither symlink- nor file-backed."""
+    if not cache_dir:
+        return False
+    target = os.path.normpath(os.fspath(cache_dir))
+    if os.path.islink(target):
+        return False
+    if os.path.lexists(target):
+        return os.path.isdir(target)
+    probe = os.path.dirname(os.path.abspath(target))
+    while probe:
+        if os.path.lexists(probe):
+            return os.path.isdir(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return True
 
 
 def _emit(result_bytes, text, stream):
@@ -143,7 +183,7 @@ def run_dxc(compiler, args, **options):
     cache_dir = os.environ.get(ENV_VAR)
     plan = None
     resolved = None
-    if cache_dir and not extra:
+    if _valid_cache_dir(cache_dir) and not extra:
         resolved = _resolve(compiler)
         if resolved is not None and not _is_wrapper(resolved):
             plan = _plan(compiler, args)

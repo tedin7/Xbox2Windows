@@ -80,6 +80,32 @@ def prototype(lib, name, args, result):
     return function
 
 
+SEM_FAILCRITICALERRORS = 0x0001
+
+
+def quiet_loader(kernel, load):
+    """LoadLibraryExW with SEM_FAILCRITICALERRORS set on the calling thread for the call only.
+
+    A provider that is not a loadable image (empty, truncated or not a PE) raises a critical error
+    inside the loader. Without the flag Windows shows a modal "Bad Image" dialog and the load blocks
+    until someone closes it; with it the load just fails, and the provider's symbols are reported
+    missing. The thread's previous mode is restored, so the guest runs under the host's setting.
+    """
+    get_mode = prototype(kernel, "GetThreadErrorMode", [], W.DWORD)
+    set_mode = prototype(kernel, "SetThreadErrorMode", [W.DWORD, C.POINTER(W.DWORD)], W.BOOL)
+
+    def call(path, flags):
+        previous = W.DWORD()
+        changed = set_mode(get_mode() | SEM_FAILCRITICALERRORS, C.byref(previous))
+        try:
+            return load(path, None, flags)
+        finally:
+            if changed:
+                set_mode(previous.value, None)
+
+    return call
+
+
 def trap_key(name):
     """Parse a --trap-callable DLL!SYMBOL (or DLL!#ORDINAL) into an import key."""
     dll, sep, symbol = name.partition("!")
@@ -138,7 +164,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
     order, routes = plan(report)
     callback = C.WINFUNCTYPE(C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32)
     kernel = C.WinDLL("kernel32", use_last_error=True)
-    load = prototype(kernel, "LoadLibraryExW", [W.LPCWSTR, W.HANDLE, W.DWORD], W.HMODULE)
+    load = quiet_loader(kernel, prototype(kernel, "LoadLibraryExW", [W.LPCWSTR, W.HANDLE, W.DWORD], W.HMODULE))
     release_host = prototype(kernel, "FreeLibrary", [W.HMODULE], W.BOOL)
     find = prototype(kernel, "GetProcAddress", [W.HMODULE, C.c_void_p], C.c_void_p)
     pin_module = prototype(kernel, "GetModuleHandleExW", [W.DWORD, C.c_void_p, C.POINTER(W.HMODULE)], W.BOOL)
@@ -163,8 +189,8 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                         missing_keys[key].add(image)
                     continue
                 if dll not in modules:
-                    module = (load(str(shims[dll]), None, 0x900) if dll in shims else
-                              load(dll, None, 0x800) if dll in system else None)
+                    module = (load(str(shims[dll]), 0x900) if dll in shims else
+                              load(dll, 0x800) if dll in system else None)
                     modules[dll] = module
                     if module:
                         stack.callback(release_host, module)

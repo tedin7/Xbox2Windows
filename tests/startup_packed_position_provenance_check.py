@@ -236,7 +236,7 @@ def controls():
         cache = Path(tmp)
         bare = G.pipeline_key(VS_WORDS, ps_words(4), root_blob())
         check('without a description the key is unchanged',
-              bare == G.fnv(root_blob(), G.fnv(ps_words(4), G.fnv(VS_WORDS, G.shader_cache_seed(b'x2w-startup-shader-28')))))
+              bare == G.fnv(root_blob(), G.fnv(ps_words(4), G.fnv(VS_WORDS, G.shader_cache_seed(b'x2w-startup-shader-29')))))
         keys = [put_request(cache, ps_words(4), masks) for masks in (TARGET, SAME_V4, DECOY)]
         check('same stages, root and layout with three mask pairs: three request identities',
               len(set(keys)) == 3 and bare not in keys

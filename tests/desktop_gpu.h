@@ -29,16 +29,19 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             float* colors, const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false,
                             UINT first_mip = 0, UINT view_levels = 0, bool cube = false, UINT width = 1,
-                            UINT height = 1);
+                            UINT height = 1, UINT mip_base = 4);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64], bool array, bool sampled,
                                   bool half_float = false, bool red_only = false,
                                   const std::uint32_t* descriptor_entry = nullptr, UINT descriptor_count = 0,
                                   bool descriptor_bound = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4]);
+                              const std::uint32_t expected[4], unsigned coverage = 1);
 int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const char* fixture_path, bool signed_view);
+// Queries colour formats and returns "typed_uav_load_refused" when one has no typed UAV load, before any draw.
+// Returns nullptr only when the refusal helper itself accepts a cleared UAV_TYPED_LOAD bit.
+const char* check_startup_image_store_typed_load(ID3D12Device* device);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,

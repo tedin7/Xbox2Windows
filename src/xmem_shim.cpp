@@ -104,9 +104,28 @@ extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
     era_heap::release_with_attributes(allocation, attributes);
 }
 
+extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context);
+
+// The answer for a page of a shared-view run is taken outside a run break (x2w_xmem_stable_call): inside one the
+// page would read as reserved. era_query writes a local buffer, and on success its tail_offset + 1 bytes (the MBI and
+// the tail byte, all that era_query writes) go to the caller's after the call: on stable_call's mutex path the
+// lazy-commit handler passes faults on, so an uncommitted mapped slot is not written there. The caller's buffer is
+// not read, and nothing is written to it on failure.
 extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)
 {
-    return era_query::query(process, address, buffer, query_buffer_bytes) != 0;
+    struct Query {
+        HANDLE process;
+        LPCVOID address;
+        unsigned char* buffer;
+        unsigned char copy[query_buffer_bytes];
+        std::size_t result;
+    } query{process, address, static_cast<unsigned char*>(buffer), {}, 0};
+    x2w_xmem_stable_call([](void* context) {
+        auto& q = *static_cast<Query*>(context);
+        q.result = era_query::query(q.process, q.address, q.buffer ? q.copy : nullptr, query_buffer_bytes);
+    }, &query);
+    if (query.buffer && query.result) std::memcpy(query.buffer, query.copy, era_query::tail_offset + 1);
+    return query.result != 0;
 }
 
 // Desktop policy (docs/experiments.md): writes only +8, with this process's GPU memory in bytes;

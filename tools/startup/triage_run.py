@@ -107,6 +107,21 @@ RE_SLOT = re.compile(r"(?:[A-Za-z0-9_]+!)?(?:([A-Za-z0-9_]+)::)?slot(\d{1,4})\b"
 RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
 SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported instruction " + MNEMONIC_FAMILY + r"\b"),
+     r"\1_* instruction"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported opcode\b"), "unsupported opcode"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported pixel entry VGPR\b"), "unsupported pixel entry VGPR"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unproven resource descriptor\b"), "unproven resource descriptor"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unbound numeric SGPR\b"), "unbound numeric SGPR"),
+    (re.compile(r"(?:unknown gfx1013 instruction format|truncated or misaligned gfx1013 instruction|"
+                r"reserved FLAT segment) at byte \d+\Z"), "undecodable word"),
+    (re.compile(r"graphics request key mismatch\b"), "graphics request key mismatch"),
+    (re.compile(r"compute request key mismatch\b"), "compute request key mismatch"),
+    (re.compile(r"stale pixel input description\b"), "stale pixel input description"),
+    (re.compile(r"pixel input description names another pipeline\Z"), "pixel input description names another pipeline"),
+    (re.compile(r"contradictory pixel input enable/address masks\Z"), "contradictory pixel input enable/address masks"),
+    (re.compile(r"pixel input (?:enable|address) mask missing\b"), "invalid pixel input description"),
+    (re.compile(r"invalid pixel input description\Z"), "invalid pixel input description"),
     (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
     (re.compile(r"buffer_load_format_(?:x|xy|xyz|xyzw) requires descriptor FORMAT and DST_SEL\Z"),
      "buffer_* instruction"),

@@ -903,6 +903,9 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
 
 int main(int argc, char** argv)
 {
+    // The growth checks describe the default ring (doubling chunks up to 256 MiB). The stand-in reads
+    // X2W_D3D12_RING_RELEASE_AT_SUBMIT on first use in this process, so clear it before any call.
+    SetEnvironmentVariableW(L"X2W_D3D12_RING_RELEASE_AT_SUBMIT", nullptr);
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
         (argc == 3 && std::strcmp(argv[2], "cap") && std::strcmp(argv[2], "video") && std::strcmp(argv[2], "stagefail"))) {
         std::puts("usage: startup_slot133_heap_cap_check <warp|hardware> [cap|video|stagefail]");

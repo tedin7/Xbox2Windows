@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_v_mad_i32_i16_check.py

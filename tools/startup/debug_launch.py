@@ -28,6 +28,8 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
+from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
 
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
@@ -428,6 +430,9 @@ def main():
     redirects = {}
     # Offline by default (--offline 0 turns it off): no sockets, NetBIOS name devices or DNS resolver.
     offline = opts.get("--offline", "1") == "1"
+    # Keep the same offline entry checks. An allowed file operation only
+    # needs a return breakpoint when collecting its completion status.
+    offline_entry_only = offline and os.environ.get("X2W_OFFLINE_ENTRY_ONLY") == "1"
     OFFLINE_DENY = ("\\device\\afd", "\\device\\netbt", "dnsresolver", "\\device\\tcp", "\\device\\udp",
                     "\\device\\rawip", "\\device\\ws2ifsl")
     denied = {}
@@ -644,6 +649,8 @@ def main():
                     return True
                 if not log_files:
                     desc = None   # a plain open: nothing to log, and no return breakpoint to arm
+                if offline_entry_only:
+                    desc = None
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -667,8 +674,9 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
-        # Step over the original instruction, then re-arm.
+        # Hold other threads while stepping over the original instruction.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])

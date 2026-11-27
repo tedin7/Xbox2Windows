@@ -340,7 +340,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
                                     UINT descriptor_stride = 0, std::uint64_t* key_out = nullptr, bool publish = true)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-28";
+    constexpr char revision[] = "x2w-startup-shader-29";
     constexpr char feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207};

@@ -1792,6 +1792,10 @@ def check_formatted_loads():
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end).hlsl_cs()
     # A word rewritten after that load, with the target between, is not the loaded descriptor any more.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe000082bf') + LOAD_L + end))
+    # An instruction writes a derived descriptor word to a separate SGPR (s21), leaving operand s[12:15] intact.
+    # The indexed formatted load is refused because the descriptor is modified.
+    refused('indexed load through a modified descriptor',
+            lambda: translate('L-uint', code=prefix + bytes.fromhex('0dff1587ffff00c0') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
     check_formatted_pointer_copy()

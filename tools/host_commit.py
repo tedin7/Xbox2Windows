@@ -4,10 +4,17 @@ The system commit limit includes RAM and paging-file backing; it is NOT the
 amount of free physical RAM. This is a snapshot, not a reservation.
 """
 
+from collections.abc import Mapping
 import ctypes as C
 import sys
 
 MIB = 1 << 20
+_SNAPSHOT_KEYS = ("available_bytes", "limit_mib", "used_mib", "available_mib")
+
+
+def _is_int(value):
+    """Return True only for exact integers, excluding bool."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 class PerformanceInformation(C.Structure):
@@ -33,10 +40,12 @@ class PerformanceInformation(C.Structure):
 
 def snapshot_from_pages(limit_pages, used_pages, page_size):
     """Pure conversion of GetPerformanceInfo page counts; never wrap under pressure."""
-    if not page_size or not limit_pages:
+    if not _is_int(page_size) or page_size <= 0 or not _is_int(limit_pages) or limit_pages <= 0:
         raise ValueError("Windows reported an invalid commit page size or limit")
-    limit_bytes = int(limit_pages) * int(page_size)
-    used_bytes = int(used_pages) * int(page_size)
+    if not _is_int(used_pages) or used_pages < 0:
+        raise ValueError("Windows reported an invalid commit used page count")
+    limit_bytes = limit_pages * page_size
+    used_bytes = used_pages * page_size
     free_bytes = max(limit_bytes - used_bytes, 0)
     return {"limit_mib": limit_bytes // MIB, "used_mib": used_bytes // MIB,
             "available_mib": free_bytes // MIB, "available_bytes": free_bytes}
@@ -60,8 +69,16 @@ def read_host_commit():
 
 def require_commit_budget(minimum_mib, snapshot):
     """Reject a requested budget before any guest module is mapped or started."""
-    if not isinstance(minimum_mib, int) or minimum_mib < 0 or minimum_mib > 1 << 20:
+    if not _is_int(minimum_mib) or minimum_mib < 0 or minimum_mib > 1 << 20:
         raise ValueError("--min-commit-mib must be between 0 and 1048576")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("commit snapshot must be a Mapping")
+    for key in _SNAPSHOT_KEYS:
+        if key not in snapshot:
+            raise ValueError(f"commit snapshot is missing required field: {key}")
+        value = snapshot[key]
+        if not _is_int(value) or value < 0:
+            raise ValueError(f"commit snapshot field {key} must be a non-negative integer")
     if snapshot["available_bytes"] < minimum_mib * MIB:
         raise ValueError(
             f"Windows system commit headroom {snapshot['available_mib']} MiB is below the "

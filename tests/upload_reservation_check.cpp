@@ -64,6 +64,51 @@ void check_ring_reuse()
     check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "untracked submit prevents reuse");
 }
 
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 bookkeeping: a closed list stops holding its chunks once its submit is fenced,
+// the fence alone then guards the chunks, and a later submit of the same list before its Reset fences the intact
+// chunks again and reports the reused ones.
+void check_release_at_submit()
+{
+    constexpr std::uint64_t bytes = 4 * kAlign;
+    unsigned char storage[2][bytes];
+    std::array<UploadRingChunk, 2> chunks{};
+    UploadChunkMask recording = 0;
+    for (unsigned i = 0; i < chunks.size(); ++i) {
+        chunks[i] = {nullptr, storage[i], bytes};
+        check(reserve_upload_chunk(chunks[i], bytes).mapped != nullptr, "release: fill chunk");
+        chunks[i].hold(recording, i);
+    }
+
+    TestFence fence;
+    std::map<unsigned, UploadQueue<TestFence>> queues{{0, {&fence, 1}}};
+    queues[0].submitted(recording, true);
+    check(!reuse_upload_chunk(chunks[0], 0, bytes, queues).mapped, "release: a closed list holds until released");
+
+    ReleasedUploadChunks released;
+    release_upload_chunks_at_submit(recording, chunks.data(), released);
+    check(recording == 0 && chunks[0].recordings == 0 && chunks[1].recordings == 0, "release: holds dropped");
+    check(released.chunks == 3 && released.generation[0] == 0 && released.generation[1] == 0,
+          "release: chunks and generations recorded");
+    check(!reuse_upload_chunk(chunks[0], 0, bytes, queues).mapped, "release: the fence still guards the chunk");
+
+    fence.value = 1;
+    const auto reused = reuse_upload_chunk(chunks[0], 0, bytes, queues);
+    check(reused.mapped == storage[0] && reused.generation == 1, "release: chunk reused after the fence");
+
+    UploadChunkMask recycled = UINT32_MAX;
+    const auto intact = resubmitted_upload_chunks(released, chunks.data(), recycled);
+    check(intact == 2 && recycled == 1, "release: a resubmit finds chunk 1 intact and chunk 0 reused");
+
+    ++queues[0].value;
+    queues[0].submitted(intact, true);
+    check(!reuse_upload_chunk(chunks[1], 1, bytes, queues).mapped, "release: the resubmit fences the intact chunk");
+    fence.value = 2;
+    check(reuse_upload_chunk(chunks[1], 1, bytes, queues).mapped != nullptr,
+          "release: the intact chunk is reused after the resubmit's fence");
+    check(resubmitted_upload_chunks(released, chunks.data(), recycled) == 0 && recycled == 3,
+          "release: both chunks reported once reused");
+}
+
 }  // namespace
 
 int main()
@@ -111,6 +156,7 @@ int main()
           "existing reservations survive exhaustion");
 
     check_ring_reuse();
+    check_release_at_submit();
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

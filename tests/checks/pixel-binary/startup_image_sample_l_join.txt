@@ -1,0 +1,1 @@
+tests/startup_image_sample_l_join_check.py binary llvm-mc-15

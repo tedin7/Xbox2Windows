@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_v_add_sub_nc_i32_check.py

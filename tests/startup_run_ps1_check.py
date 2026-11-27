@@ -32,7 +32,8 @@ import sys
 import time
 from pathlib import Path
 
-record = [sys.argv[1:], os.environ.get("X2W_TRACE_API")]
+record = [sys.argv[1:], os.environ.get("X2W_TRACE_API"), os.environ.get("X2W_NATIVE_SHADERS"),
+          os.environ.get("X2W_TITLE_ID"), os.environ.get("X2W_STORAGE_MB")]
 Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
 watch = Path(__file__).with_name("watch.json")
@@ -167,12 +168,13 @@ REVISION_PHRASES = ("was written by stand-ins of revision graphics x2w-startup-s
 
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
              early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, cache_files=None,
-             emit_stderr=False, missing_python=False, real_log_error=False):
+             emit_stderr=False, missing_python=False, real_log_error=False, native=False, manifest="absent"):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
     With `early_exit` the watcher has no child and exits before the debugger finishes.
+    `native` passes -Render -NativeShaders <dir>: the stand-in gets the directory and no watcher starts.
     This checks the log head and debugger exit code. The live watcher case checks worker cleanup.
     """
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
@@ -195,16 +197,25 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
         (build / f"{dll}.dll").write_bytes(b"")
-    exe, data, log = root / "run" / "t.exe", root / "data", root / "log"
+    exe, data, log = root / "run" / "t.exe", root / ("data [test]" if manifest.startswith("bracket") else "data"), root / "log"
     exe.parent.mkdir()
     exe.write_bytes(b"")
     data.mkdir()
     if real_log_error:
         (log / "events.txt").mkdir(parents=True)
+    if manifest in ("normal", "bracket"):
+        (data / "MicrosoftGame.config").write_text("<TitleId>1234</TitleId><SizeMB>42</SizeMB>", encoding="utf-8")
+    if manifest.startswith("bracket"):
+        decoy = root / "data t"
+        decoy.mkdir()
+        (decoy / "MicrosoftGame.config").write_text("<TitleId>9999</TitleId><SizeMB>99</SizeMB>", encoding="utf-8")
     env = dict(os.environ)
+    env.pop("X2W_TITLE_ID", None)
+    env.pop("X2W_STORAGE_MB", None)
     # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
     env["NO_COLOR"] = "1"
     env.pop("X2W_FAKE_USER", None)
+    env.pop("X2W_NATIVE_SHADERS", None)
     if trace_api_env is None:
         env.pop("X2W_TRACE_API", None)
     else:
@@ -223,6 +234,10 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
                "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log),
                "-BuildDir", build_arg,
                "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
+    sdk = root / "dxc"
+    if native:
+        sdk.mkdir()
+        command += ["-Render", "-NativeShaders", str(sdk), "-ShaderCache", "cache"]
     if translate:
         command += ["-Render", "-Translate", "-ShaderCache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
@@ -309,9 +324,12 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             "--trace-files", "1", "--continue-asserts", "4", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
-    expected = [want, "1" if "-TraceApi" in switches else trace_api_env]
+    expected = [want, "1" if "-TraceApi" in switches else trace_api_env,
+                str(sdk) if native else None,
+                "1234" if manifest in ("normal", "bracket") else None,
+                "42" if manifest in ("normal", "bracket") else None]
     if got != expected:
-        found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API] was {got}, expected {expected}")
+        found.append(f"stub exit {code}: debugger [argv, trace, native shaders, title ID, storage MB] was {got}, expected {expected}")
     watch = startup / "watch.json"
     if translate:
         started = json.loads(watch.read_text(encoding="utf-8")) if watch.is_file() else None
@@ -341,6 +359,8 @@ def run_problems(shell, script, work, first_only):
         if found and first_only:
             return found
     found += run_case(shell, script, 7, work, absolute_build=True)
+    for manifest in ("normal", "bracket", "bracket_missing"):
+        found += run_case(shell, script, 0, work, manifest=manifest)
     if found and first_only:
         return found
     for code in (0, 7):
@@ -360,6 +380,7 @@ def run_problems(shell, script, work, first_only):
     found += run_case(shell, script, 0, work, switches=["-CommitHeadroomMiB", "256", "-CommitWarnMiB", "2048"], passed=["--commit-headroom-mib", "256", "--commit-warn-mib", "2048"])
     found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
     found += run_case(shell, script, 0, work, trace_api_env="1")
+    found += run_case(shell, script, 0, work, native=True)
     if found and first_only:
         return found
     found += run_case(shell, script, 7, work, translate=True)
@@ -402,6 +423,8 @@ def text_problems(script):
     if not re.search(r"""^if\s*\(\s*\$TraceApi\s*\)\s*\{\s*\$env:X2W_TRACE_API\s*=\s*["']1["']\s*\}""",
                      before, re.I | re.M):
         found.append("missing -TraceApi environment opt-in before launch")
+    if not re.search(r"\$env:X2W_NATIVE_SHADERS\s*=", before):
+        found.append("missing -NativeShaders directory hand-over before launch")
     if not WATCH_CLEANUP.search("\n".join(after)):
         found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found
@@ -423,6 +446,7 @@ def mutants_of(script):
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
         "no FakeUser warning": no_fake_warn,
+        "no X2W_NATIVE_SHADERS": [line for line in lines if "$env:X2W_NATIVE_SHADERS" not in line],
         # The same text without the warning prefix: the run must still see Write-Warning's prefix.
         "FakeUser warning printed with Write-Host": [
             line.replace(FAKE_USER_WARN_LINE, f'Write-Host "{FAKE_USER_WARNING}"') for line in lines],

@@ -1,0 +1,1 @@
+tests/cpu_call_aot_cli_check.py

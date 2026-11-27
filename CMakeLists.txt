@@ -3,6 +3,38 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+if(WIN32)
+    include(CheckIncludeFiles)
+    check_include_files("windows.h;dxcapi.h" X2W_HAVE_DXCAPI LANGUAGE CXX)
+    if(X2W_HAVE_DXCAPI)
+        add_library(x2w_shader_compiler STATIC src/gfx1013_pixel.cpp src/gfx1013_compute_clear.cpp
+            src/shader_compute_request.cpp src/guest_shader_container.cpp src/gfx1013_isa.cpp src/direct_compute_cache.cpp src/gfx1013_compute_native.cpp src/native_compute_pipeline.cpp
+            src/gfx1013_compute_ir.cpp src/gfx1013_sampled_pixel.cpp src/gfx1013_vertex_id.cpp src/gfx1013_rect_geometry.cpp src/shader_dxil_compiler.cpp)
+        set(native_shader_revision "")
+        foreach(source gfx1013_compute_native.cpp gfx1013_compute_native.h gfx1013_compute_opcodes.inl gfx1013_graphics_wqm.inl
+                gfx1013_isa_tables.inl gfx1013_isa.cpp gfx1013_isa.h gfx1013_compute_alu.inl gfx1013_direct_compute.inl gfx1013_compute_ir.cpp gfx1013_compute_ir.h
+                gfx1013_compute_mtbuf.inl gfx1013_direct_graphics.inl gfx1013_rect_geometry.cpp guest_shader_container.cpp guest_shader_container.h
+                dxil_module.h direct_compute_cache.cpp direct_compute_cache.h
+                shader_compute_request.cpp shader_compute_request.h startup_stubs/inflate.h)
+            set(native_shader_file "${CMAKE_CURRENT_SOURCE_DIR}/src/${source}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${native_shader_file}")
+            file(SHA256 "${native_shader_file}" native_shader_part)
+            string(APPEND native_shader_revision "${native_shader_part}")
+        endforeach()
+        string(SHA256 native_shader_revision "${native_shader_revision}")
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/native_shader_revision.h"
+             CONTENT "#define X2W_NATIVE_SHADER_REVISION \"${native_shader_revision}\"\n")
+        target_include_directories(x2w_shader_compiler PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        target_include_directories(x2w_shader_compiler PUBLIC src)
+        target_compile_features(x2w_shader_compiler PUBLIC cxx_std_17)
+        target_link_libraries(x2w_shader_compiler PRIVATE bcrypt d3d12)
+        add_executable(compile_dxil tools/startup/compile_dxil.cpp)
+        target_link_libraries(compile_dxil PRIVATE x2w_shader_compiler)
+        set_target_properties(compile_dxil x2w_shader_compiler PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+endif()
+
 # Python never caches the bytecode of the script it is started with, so every start of a big
 # tests/<name>.py recompiled it. tests/pyc_main.py <name> runs that file through the import system,
 # which reuses a valid .pyc. The add_test calls below keep naming the script; this wrapper swaps in
@@ -420,6 +452,12 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
+# X2W_NATIVE_SHADERS: the stand-in translates slot 67 compute requests in-process
+# (src/startup_stubs/d3d12_compute_dispatch.inl). Both use the static CRT.
+if(TARGET x2w_shader_compiler)
+    target_link_libraries(d3d12_xs_shim PRIVATE x2w_shader_compiler)
+    target_compile_definitions(d3d12_xs_shim PRIVATE X2W_NATIVE_SHADERS)
+endif()
 # The creation-IID gate and refusal text of D3D12XboxCreateDevice (src/d3d12x_device_slots.h),
 # without a device. The mutated run is the negative control.
 add_executable(d3d12x_device_slots_check tests/d3d12x_device_slots_check.cpp src/d3d12x_device_slots.cpp)
@@ -854,6 +892,15 @@ target_link_libraries(startup_list_copy_texture_warp PRIVATE d3d12_xs_shim d3d12
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_copy_texture_${backend} COMMAND startup_list_copy_texture_warp ${backend})
     set_tests_properties(startup_list_copy_texture_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+# Stage-by-stage trace and regression for horizontal alternating row bands on textured indexed UI draws (#3132).
+add_executable(startup_ui_texture_bands_check tests/startup_ui_texture_bands_check.cpp)
+target_compile_features(startup_ui_texture_bands_check PRIVATE cxx_std_17)
+target_link_libraries(startup_ui_texture_bands_check PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_ui_texture_bands_${backend} COMMAND startup_ui_texture_bands_check ${backend})
+    set_tests_properties(startup_ui_texture_bands_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
@@ -2057,6 +2104,110 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
 endforeach()
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
+
+if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${DXC_BIN_DIR}/dxil.dll")
+    add_executable(native_store_replay tests/native_store_replay.cpp tests/desktop_gpu.cpp)
+    target_include_directories(native_store_replay PRIVATE src tests)
+    target_link_libraries(native_store_replay PRIVATE x2w_shader_compiler d3d12 dxgi d3dcompiler)
+    set_property(TARGET native_store_replay PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_scalar_lds_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_scalar_lds_check.py" "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_scalar_lds_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME native_adjacent_srv_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_adjacent_srv_check.py" "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_adjacent_srv_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME native_mtbuf_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_mtbuf_check.py" "$<TARGET_FILE:compile_dxil>" "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_mtbuf_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME native_indexed_atomic_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_indexed_atomic_check.py" "$<TARGET_FILE:compile_dxil>" "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_indexed_atomic_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(native_wave_request_gpu tests/native_wave_request_gpu.cpp tests/native_compute_grid.cpp tests/native_half_grid.cpp tests/desktop_gpu.cpp)
+    target_link_libraries(native_wave_request_gpu PRIVATE x2w_shader_compiler d3d12 dxgi)
+    set_target_properties(native_wave_request_gpu PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_wave_request_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_wave_request_check.py" "$<TARGET_FILE:compile_dxil>"
+        "$<TARGET_FILE:native_wave_request_gpu>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_wave_request_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(native_lds_gpu tests/native_lds_gpu.cpp tests/desktop_gpu.cpp)
+    target_link_libraries(native_lds_gpu PRIVATE x2w_shader_compiler d3d12 dxgi)
+    set_target_properties(native_lds_gpu PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_executable(native_sampled_pixel_gpu tests/native_sampled_pixel_gpu.cpp tests/desktop_gpu.cpp)
+    add_executable(native_buffered_vertex_gpu tests/native_buffered_vertex_gpu.cpp tests/desktop_gpu.cpp)
+    target_link_libraries(native_buffered_vertex_gpu PRIVATE x2w_shader_compiler d3d12 dxgi)
+    set_target_properties(native_buffered_vertex_gpu PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_link_libraries(native_sampled_pixel_gpu PRIVATE x2w_shader_compiler d3d12 dxgi)
+    set_target_properties(native_sampled_pixel_gpu PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_sampled_replay COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_sampled_replay_check.py"
+        "$<TARGET_FILE:native_sampled_pixel_gpu>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(backend IN ITEMS warp hardware)
+        add_test(NAME native_buffered_vertex_${backend} COMMAND native_buffered_vertex_gpu ${backend} "${DXC_BIN_DIR}"
+            "${CMAKE_CURRENT_BINARY_DIR}/native-buffered-${backend}")
+        set_tests_properties(native_buffered_vertex_${backend} PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME native_sampled_pixel_${backend} COMMAND native_sampled_pixel_gpu ${backend} "${DXC_BIN_DIR}"
+            "${CMAKE_CURRENT_BINARY_DIR}/native-sampled-${backend}")
+        set_tests_properties(native_sampled_pixel_${backend} PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME native_lds_${backend} COMMAND native_lds_gpu ${backend} "${DXC_BIN_DIR}"
+            "${CMAKE_SOURCE_DIR}/tests/native_lds_gpu.hlsl" "${CMAKE_CURRENT_BINARY_DIR}/native-lds-${backend}")
+        set_tests_properties(native_lds_${backend} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+    add_test(NAME native_lds_control_flow COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_lds_control_flow_check.py")
+    add_test(NAME native_compute_clear COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_test(NAME native_direct_container
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_test(NAME native_dpp_mirror_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_dpp_mirror_check.py" "$<TARGET_FILE:compile_dxil>"
+        "$<TARGET_FILE:native_store_replay>" "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_dpp_mirror_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME native_graphics_wqm_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_graphics_wqm_check.py" "$<TARGET_FILE:compile_dxil>"
+        "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_graphics_wqm_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME native_graphics_interface_library
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_graphics_interface_library_check.py"
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_executable(native_recording_check tests/native_recording_check.cpp)
+    target_include_directories(native_recording_check PRIVATE src)
+    target_compile_features(native_recording_check PRIVATE cxx_std_17)
+    target_link_libraries(native_recording_check PRIVATE x2w_shader_compiler dxgi d3d12)
+    set_property(TARGET native_recording_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_comparison_pso_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --sampler-pso
+        "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
+    set_tests_properties(native_comparison_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME native_graphics_comparison_pso_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --graphics-sampler-pso
+        "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
+    set_tests_properties(native_graphics_comparison_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    # Cycle 1 of the global SRV work: ResourceDescriptorHeap[index] from a native DXIL module against a DXC reference.
+    add_executable(native_heap_handle_probe tests/native_heap_handle_probe.cpp)
+    target_include_directories(native_heap_handle_probe PRIVATE src)
+    target_compile_features(native_heap_handle_probe PRIVATE cxx_std_17)
+    target_link_libraries(native_heap_handle_probe PRIVATE x2w_shader_compiler dxgi d3d12)
+    set_property(TARGET native_heap_handle_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME native_heap_handle_probe_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_heap_handle_probe_check.py" "$<TARGET_FILE:native_heap_handle_probe>"
+            "${DXC_BIN_DIR}" ${adapter})
+        set_tests_properties(native_heap_handle_probe_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endforeach()
+    add_test(NAME native_recording_pages_warp COMMAND native_recording_check)
+    add_test(NAME native_dispatch_states_warp COMMAND native_recording_check --subresources)
+    set_tests_properties(native_dispatch_states_warp PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(native_recording_pages_warp PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME native_rectangle_pso_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --rect-pso
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
+    set_tests_properties(native_rectangle_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME native_pixel_dxil
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_pixel_dxil_check.py"
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+endif()
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
@@ -3702,6 +3853,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py")
     add_test(NAME startup_compute_dynamic_heap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dynamic_heap_check.py")
+    add_test(NAME startup_gfx2hlsl_image_store_3d1d COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_image_store_3d1d_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
@@ -4113,7 +4266,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: a plain image_sample past a uniform join keeps its implicit LOD (Sample, not level 0).
     add_test(NAME startup_image_sample_implicit_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_implicit_lod_check.py")
-    # Startup shader translator: image_get_lod on a 2D texture (CalculateLevelOfDetail / Unclamped).
+    # Startup shader translator: image_get_lod on 2D and 2D-array textures.
     add_test(NAME startup_gfx2hlsl_image_get_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_get_lod_check.py")
     foreach(adapter IN ITEMS warp hardware)
@@ -5244,11 +5397,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_entry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_entry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_compute_dispatch_two_mips_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter} two-mips)
         set_tests_properties(startup_compute_dispatch_texture_${adapter} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         set_tests_properties(startup_compute_dispatch_${adapter}
             startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
             startup_compute_live_retry_${adapter} startup_compute_dispatch_entry_${adapter}
-            startup_compute_dispatch_input_${adapter}
+            startup_compute_dispatch_input_${adapter} startup_compute_dispatch_two_mips_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     foreach(adapter IN ITEMS warp hardware)
@@ -5446,6 +5602,10 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "$<TARGET_FILE:startup_stream_consumer>" --draw)
             set_tests_properties(startup_list_copy15_draw_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
         endif()
+        add_test(NAME startup_table_alias_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_table_alias_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_table_alias_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_direct_index_late_write_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -5511,8 +5671,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             set_tests_properties(startup_slot70_texture_alias_warp PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         endif()
         # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
-        # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
-        foreach(gate IN ITEMS gate gate-ring gate-ring-reuse)
+        # queue has run them. The ring control fills them from the shared upload ring, which must refuse the uploads
+        # past its 256 MiB cap while the queue is held. gate-ring-reuse: once those submits have completed, the ring
+        # must accept a new upload again.
+        # gate-ring-keep(-release): a closed list that is never Reset, without and with X2W_D3D12_RING_RELEASE_AT_SUBMIT.
+        foreach(gate IN ITEMS gate gate-ring gate-ring-reuse gate-ring-keep gate-ring-keep-release)
             string(REPLACE "-" "_" gate_name "${gate}")
             add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
@@ -11388,6 +11551,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_exact_extra_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_exact_extra_${adapter}.txt")
+        add_test(NAME pixel_aot_f16_cvt_norm_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-cvt-norm "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_cvt_norm_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_cvt_norm_${adapter}.txt")
         add_test(NAME pixel_aot_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sdwa-cvt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

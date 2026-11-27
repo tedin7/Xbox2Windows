@@ -103,6 +103,9 @@ export X2W_AUDIO_PERMISSIVE=1 X2W_D3D12_DEVICE_NOOP=1 X2W_D3D12_LIST_NOOP=1
 export X2W_D3D12_PERMISSIVE=1 X2W_XMEM_PERMISSIVE=1 X2W_RUNTIME_PROXY=1
 # Under Wine, one section and view per page did not get past start-up (docs/wine.md).
 export X2W_XMEM_SHARED_VIEWS=${X2W_XMEM_SHARED_VIEWS:-1}
+# Mapping calls join the shared view that ends at their address: fewer views, and under Wine each map costs more
+# the more views there are (docs/wine.md).
+export X2W_XMEM_JOIN_CALLS=${X2W_XMEM_JOIN_CALLS:-1}
 export WINEDEBUG=${WINEDEBUG:--all} WINEFSYNC=${WINEFSYNC:-1}
 # Wine's built-in D3D12 is not enough (docs/wine.md); the prefix holds vkd3d-proton and DXVK.
 export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-d3d12,d3d12core,dxgi,d3d11=n}

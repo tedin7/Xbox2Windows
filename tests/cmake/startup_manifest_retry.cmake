@@ -1,0 +1,5 @@
+# The retry schedule for an absent shader cache manifest (startup_stubs/manifest_retry.h).
+add_executable(startup_manifest_retry_check tests/startup_manifest_retry_check.cpp)
+target_include_directories(startup_manifest_retry_check PRIVATE src)
+target_compile_features(startup_manifest_retry_check PRIVATE cxx_std_17)
+add_test(NAME startup_manifest_retry COMMAND startup_manifest_retry_check)

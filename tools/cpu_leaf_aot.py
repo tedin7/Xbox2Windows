@@ -1,8 +1,11 @@
 """Lift a bounded AMD64 leaf function with the fixture's (uint32, uint32*) ABI to C++."""
 
 import argparse
+import os
 from pathlib import Path
 import struct
+import sys
+import tempfile
 
 import pefile
 
@@ -52,6 +55,15 @@ CONDITIONS = {
 
 
 def translate(start, code):
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError(f"expected integer start RVA, got {type(start).__name__}")
+    if start < 0:
+        raise ValueError(f"expected non-negative start RVA, got {start}")
+    if not isinstance(code, bytes):
+        try:
+            code = memoryview(code).tobytes()
+        except TypeError as exc:
+            raise ValueError(f"expected bytes-like code, got {type(code).__name__}") from exc
     # This profile initializes EAX from ECX before either branch. A compare and
     # its immediate consumer form one operation, so flags never cross a join.
     if not code.startswith((b"\x8b\xc1", b"\x89\xc8")):
@@ -125,14 +137,65 @@ def translate(start, code):
     return "\n".join([*lines, "}", ""])
 
 
-if __name__ == "__main__":
+def _validate_paths(image: Path, export: str, output: Path) -> None:
+    if image.is_dir():
+        raise IsADirectoryError(f"image path is a directory: {image}")
+    if not image.is_file():
+        raise FileNotFoundError(f"image file not found: {image}")
+    if not isinstance(export, str) or not export.strip():
+        raise ValueError("export name must not be empty")
+    if output.suffix.lower() != ".cpp":
+        raise ValueError(f"output path must have .cpp suffix: {output}")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {output}")
+    if output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    if output.resolve() == image.resolve() or (output.exists() and image.samefile(output)):
+        raise ValueError(f"output path must not match input image: {output}")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write UTF-8 text to a sibling temp file and atomically replace path, unlinking temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("export")
     parser.add_argument("output", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        _validate_paths(args.image, args.export, args.output)
         rva, code = function_bytes(args.image, args.export)
-        args.output.write_text(translate(rva, code), encoding="utf-8")
+        _write_atomic(args.output, translate(rva, code))
     except (ValueError, OSError, pefile.PEFormatError) as error:
-        parser.exit(1, f"{error}\n")
+        sys.stderr.write(f"{error}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

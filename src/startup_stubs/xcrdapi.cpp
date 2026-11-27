@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/resident_pages.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
@@ -179,55 +180,53 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
-// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
-// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
-// destination's size, not the region's. Reads attributes only; no page is touched.
-static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
-{
-    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
-    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
-    while (page < end) {
-        DWORD count = 0;
-        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
-        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
-        for (DWORD i = 0; i < count; ++i) {
-            const auto& page_info = pages[i].VirtualAttributes;
-            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
-            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
-                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
-                return false;
-        }
-    }
-    return true;
-}
-
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
 // no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
 // their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
-// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
-// large regions: each query scans to the end of the region (#2684).
+// destination to the region walk (x2w_local::committed_writable), which judges it region by region. That walk
+// is slow on the title's large regions: each query scans to the end of the region (#2684). Lazily mapped
+// physical pages (X2W_XMEM_LAZY_COMMIT) are committed first.
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
-    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    const std::uintptr_t end = cursor + bytes;
-    if (resident_read_write(cursor, end)) return true;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return false;
-        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= cursor) return false;
-        cursor = region_end;
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - start) return false;
+    x2w_local::commit_lazy(destination, bytes);
+    if (x2w_local::resident_read_write(start, start + bytes)) return true;
+    return x2w_local::committed_writable(destination, bytes);
+}
+
+// Copies bytes of data into a plain-memory destination whose whole declared capacity must be writable. With
+// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy, under XMem's mapping mutex when
+// either range overlaps one of its runs, so an XMem run break (the pages of a shared view unmapped and mapped again)
+// can neither make a mapped destination look reserved nor take it away during the copy. Without xmem.dll the check
+// and the copy run here.
+// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); ERROR_INVALID_ADDRESS when
+// the copy faulted (part of the destination may be written); ERROR_INVALID_PARAMETER for an invalid request.
+static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)
+{
+    using CopyToDestination = BOOL(WINAPI*)(void*, SIZE_T, const void*, SIZE_T);
+    static const CopyToDestination copy = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<CopyToDestination>(GetProcAddress(xmem, "x2w_xmem_copy_to_destination")) : nullptr;
+    }();
+    if (copy) return copy(destination, capacity, data, bytes) ? ERROR_SUCCESS : GetLastError();
+    if (!destination_writable(destination, capacity)) return ERROR_NOACCESS;
+    std::memcpy(destination, data, bytes);
+    return ERROR_SUCCESS;
+}
+
+// The outcome logged for a copy that copy_to_destination did not complete, by its error. text holds the last case.
+static const char* copy_outcome(DWORD error, char (&text)[40])
+{
+    switch (error) {
+    case ERROR_NOACCESS: return "destination not writable";
+    case ERROR_INVALID_ADDRESS: return "copy faulted (part of the destination may be written)";
+    case ERROR_INVALID_PARAMETER: return "invalid copy request";
+    default:
+        std::snprintf(text, sizeof(text), "copy failed (error %lu)", static_cast<unsigned long>(error));
+        return text;
     }
-    return true;
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
@@ -999,6 +998,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    char copy_failure[40];  // copy_outcome's text for an error it does not name
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
@@ -1198,11 +1198,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // The title's destination can be smaller in memory than its declared capacity (#870:
                 // a write fault inside this copy). Judge the whole declared capacity before the first
                 // byte is written, so a refusal leaves every page untouched.
-                if (destination_writable(destination, destination_capacity)) {
-                    std::memcpy(destination, data, decode_length);
-                } else {
-                    outcome = "destination not writable";
-                    failure = StorageFailure::destination_not_writable;
+                const DWORD copied = copy_to_destination(destination, destination_capacity, data, decode_length);
+                if (copied != ERROR_SUCCESS) {
+                    outcome = copy_outcome(copied, copy_failure);
+                    failure = copied == ERROR_NOACCESS ? StorageFailure::destination_not_writable : StorageFailure::other;
                     data = nullptr;
                     written = false;
                 }

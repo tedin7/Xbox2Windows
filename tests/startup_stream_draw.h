@@ -20,6 +20,7 @@ struct StartupBc7Input {
     // A 256x256 R8G8B8A8 texture with 9 mips, every mip one solid colour, in the title's row layout: placed through slot 133
     // and sampled at level 0 by a translated draw (tests/startup_texture_drop_mips_draw_check.py).
     bool dropmips = false;
+    bool display64k = false;
 };
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,

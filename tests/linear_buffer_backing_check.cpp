@@ -345,7 +345,7 @@ struct Pool {
         write(previous.cpu, 0, D, alloc_pages * page / 4);
         return release(previous);
     }
-    bool map(Memory& out, unsigned pages)
+    bool map(Memory& out, unsigned pages, bool split_last_page = false)
     {
         out.cpu = base + cursor;
         if (cursor + pages * page > bytes) return false;
@@ -353,8 +353,14 @@ struct Pool {
         if (!xmem) return true;
         out.tokens.assign(pages, 0);
         ULONG_PTR got = pages;
-        return XMemAllocatePhysicalPages(0x20400000, &got, out.tokens.data()) && got == pages &&
-               XMemMapPhysicalPages(out.cpu, pages, out.tokens.data()) == out.cpu;
+        if (!XMemAllocatePhysicalPages(0x20400000, &got, out.tokens.data()) || got != pages) return false;
+        if (!split_last_page) return XMemMapPhysicalPages(out.cpu, pages, out.tokens.data()) == out.cpu;
+
+        // Map the upper page first so that, with X2W_XMEM_JOIN_CALLS=1, neither call can join across the boundary
+        // inside the buffer.
+        auto* const last_page = out.cpu + (pages - 1) * page;
+        return XMemMapPhysicalPages(last_page, 1, &out.tokens.back()) == last_page &&
+               XMemMapPhysicalPages(out.cpu, pages - 1, out.tokens.data()) == out.cpu;
     }
     // One allocation in the case layout: neighbour pages, then the buffer filled with `fill`.
     bool allocate(Memory& out, Tag fill, bool* zero = nullptr)
@@ -370,11 +376,7 @@ struct Pool {
     // Two pages of the buffer in two mapping calls (two views): the buffer crosses a view boundary.
     bool allocate_split(Memory& out, Tag fill)
     {
-        Memory first, second;
-        if (!xmem || !map(first, alloc_pages - 1) || !map(second, 1)) return false;
-        out.cpu = first.cpu;
-        out.tokens = first.tokens;
-        out.tokens.insert(out.tokens.end(), second.tokens.begin(), second.tokens.end());
+        if (!xmem || !map(out, alloc_pages, true)) return false;
         write(out.cpu, 0, neighbour, buffer_offset / 4);
         write(out.buffer(), 0, fill, buffer_bytes / 4);
         return true;
@@ -1766,6 +1768,7 @@ int main(int argc, char** argv)
     SetEnvironmentVariableW(L"X2W_D3D12_LIST_NOOP", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
+    SetEnvironmentVariableW(L"X2W_XMEM_JOIN_CALLS", nullptr);  // no joins across mapping calls (the default)
     SetEnvironmentVariableW(L"X2W_D3D12_LINEAR_BUFFERS", path == Path::default_backing ? nullptr
                                                          : path == Path::copy || path == Path::untracked || path == Path::stale || path == Path::contention ||
                                                                  path == Path::lease ? L"copy" : L"1");

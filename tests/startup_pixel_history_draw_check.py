@@ -40,6 +40,8 @@ def check(directory, consumer, backend):
 
     base_env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                     X2W_SHADER_CACHE=str(cache), X2W_TEST_PIXEL_HISTORY="1")
+    for name in ("X2W_DRAW_DUMP_PIXEL", "X2W_DRAW_DUMP_FRAME", "X2W_DRAW_DUMP_DIR"):
+        base_env.pop(name, None)
     base_env.setdefault("X2W_D3D12_DEBUG", "0")
 
     # Publish and translate the green triangle pipeline once, before any draw runs.

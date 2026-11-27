@@ -1,0 +1,2 @@
+# Pure-Python witness set for the console BVH node formats (no GPU, no LLVM).
+tests/gfx1030_bvh_box/check.py --model-only

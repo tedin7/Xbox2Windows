@@ -1,11 +1,13 @@
 // Desktop readback for tools/startup/gfx2hlsl.py's pixel-stage image_store (#1996 item F).
 //
 // The translated pixel shader stores to w0 : register(u0), a RWTexture2D<float4>, and reads its entry
-// constants from cbuffer entry : register(b0). This draws one pixel with that shader and a source-built
-// full-screen vertex shader into a 4x4 R32G32B32A32_FLOAT texture whose texels all start as -1.0, then
-// reads every texel back. The caller names the one texel it expects the store to change and its value;
-// every other texel must still hold -1.0.
+// constants from cbuffer entry : register(b0). This draws one or two pixels (coverage) with that shader
+// and a source-built full-screen vertex shader into a 4x4 R32G32B32A32_FLOAT texture whose texels all
+// start as -1.0, then reads every texel back. The caller names the one texel it expects the store to
+// change and its value; every other texel must still hold -1.0. Coverage 2 uses a 2x1 viewport so two
+// invocations run in one draw.
 #include "desktop_gpu.h"
+#include "startup_stubs/typed_uav_load.h"
 
 #include <array>
 #include <cstdint>
@@ -61,7 +63,7 @@ struct Image {
 };
 
 int draw_and_check(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                   Image* images, UINT count, UINT draw_side)
+                   Image* images, UINT count, UINT draw_width, UINT draw_height)
 {
     const auto vs = read_shader(vertex_path);
     const auto ps = read_shader(pixel_path);
@@ -109,7 +111,8 @@ int draw_and_check(ID3D12Device* device, const char* vertex_path, const char* pi
     }
 
     D3D12_RESOURCE_DESC rd = td;
-    rd.Width = rd.Height = draw_side;
+    rd.Width = draw_width;
+    rd.Height = draw_height;
     rd.Format = pd.RTVFormats[0];
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const D3D12_CLEAR_VALUE clear{rd.Format, {0.0f, 0.0f, 0.0f, 0.0f}};
@@ -145,8 +148,8 @@ int draw_and_check(ID3D12Device* device, const char* vertex_path, const char* pi
     const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};  // ud0 = 0: plain triangles
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, float(draw_side), float(draw_side), 0, 1};
-    const D3D12_RECT scissor{0, 0, LONG(draw_side), LONG(draw_side)};
+    const D3D12_VIEWPORT viewport{0, 0, float(draw_width), float(draw_height), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(draw_width), LONG(draw_height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -192,15 +195,16 @@ int draw_and_check(ID3D12Device* device, const char* vertex_path, const char* pi
 }  // namespace
 
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4])
+                              const std::uint32_t expected[4], unsigned coverage)
 {
+    if (coverage != 1 && coverage != 2) throw std::runtime_error("Image store coverage is not 1 or 2");
     if (x >= side || y >= side) throw std::runtime_error("Expected a texel inside the 4x4 image");
     std::array<std::uint32_t, side * side * 4> initial, want;
     initial.fill(untouched);
     want = initial;
     std::memcpy(want.data() + (y * side + x) * 4, expected, 4 * sizeof(std::uint32_t));
     Image image{DXGI_FORMAT_R32G32B32A32_FLOAT, 4, initial.data(), want.data()};
-    const int result = draw_and_check(device, vertex_path, pixel_path, &image, 1, 1);
+    const int result = draw_and_check(device, vertex_path, pixel_path, &image, 1, coverage, 1);
     if (!result) std::printf("image store: texel (%u, %u) written, %u others untouched\n", x, y, side * side - 1);
     return result;
 }
@@ -217,5 +221,36 @@ int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, co
         {signed_view ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT, 1, fixture[0], fixture[2]},
         {DXGI_FORMAT_R32_UINT, 1, fixture[1], fixture[3]},
     };
-    return draw_and_check(device, vertex_path, pixel_path, images, 2, side);
+    return draw_and_check(device, vertex_path, pixel_path, images, 2, side, side);
+}
+
+// Colour formats a pixel UAV may store. None of these is an R32 typed-load format, so a missing
+// UAV_TYPED_LOAD bit, or a device without TypedUAVLoadAdditionalFormats, is a real refusal.
+// The function does not create a command list and does not draw.
+const char* check_startup_image_store_typed_load(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    const bool options_ok = SUCCEEDED(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
+    const bool additional = options_ok && options.TypedUAVLoadAdditionalFormats;
+    const DXGI_FORMAT candidates[] = {
+        DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_UNORM,
+        DXGI_FORMAT_R16G16B16A16_SNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    };
+    for (DXGI_FORMAT format : candidates) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        if (FAILED(check_feature(device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) continue;
+        if (typed_uav_load_refusal(format, support.Support2, additional)) {
+            std::fprintf(stderr, "typed_uav_load_refused format=%d\n", static_cast<int>(format));
+            return "typed_uav_load_refused";
+        }
+    }
+    // Every queried format can load on this device. The same helper must still refuse a cleared
+    // UAV_TYPED_LOAD bit, and this path still returns before any draw.
+    if (typed_uav_load_refusal(DXGI_FORMAT_R11G11B10_FLOAT, 0, additional)) {
+        std::fprintf(stderr, "typed_uav_load_refused format=%d support2=0\n",
+                     static_cast<int>(DXGI_FORMAT_R11G11B10_FLOAT));
+        return "typed_uav_load_refused";
+    }
+    return nullptr;
 }

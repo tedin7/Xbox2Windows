@@ -22,6 +22,8 @@
 #include <windows.h>
 #include <cstdint>
 
+#include "startup_stubs/local_log.h"
+
 namespace x2w_startup {
 
 struct PlacedBufferRange {
@@ -91,11 +93,9 @@ inline bool region_stamp(const void* address, std::uint64_t& base, std::uint64_t
     return true;
 }
 
-// False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
-// exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
-// full walk measures.
-inline bool measure_placed_buffer(const void* address, std::uint64_t width, PlacedBufferRange& out,
-                                  PlacedProof proof = PlacedProof::exact)
+namespace placed_detail {
+// One pass of measure_placed_buffer; out is reset first, so a second pass replaces the first.
+inline bool measure_once(const void* address, std::uint64_t width, PlacedBufferRange& out, PlacedProof proof)
 {
     out = PlacedBufferRange{};
     if (!address) return false;
@@ -143,6 +143,24 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
     }
     out.covered = true;
     return true;
+}
+} // namespace placed_detail
+
+// False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
+// exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
+// full walk measures. The queries run outside xmem's run breaks (x2w_local::outside_run_breaks): inside
+// one, pages of a shared-view run read as reserved, and the buffer would be refused although it is mapped.
+inline bool measure_placed_buffer(const void* address, std::uint64_t width, PlacedBufferRange& out,
+                                  PlacedProof proof = PlacedProof::exact)
+{
+    bool committed = false;
+    unsigned queries = 0;  // over every pass: a pass run again after a break replaces out
+    x2w_local::outside_run_breaks([&] {
+        committed = placed_detail::measure_once(address, width, out, proof);
+        queries += out.queries;
+    });
+    out.queries = queries;
+    return committed;
 }
 
 // True when an uncovered buffer at [address, address + width) lies inside a MEM_PRIVATE

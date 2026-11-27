@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_lerp_u8_check.py

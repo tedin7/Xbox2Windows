@@ -289,7 +289,29 @@ def check_wrapped_heap(dll_path, backend):
     for slot, address_u in ((1, 1), (2, 3)):
         desc = c.create_string_buffer(struct.pack('<4If2I6f', 0, address_u, 3, 3, 0.0, 1, 1, *([0.0] * 6)))
         create_sampler(device, desc, src + 16 * slot, 0, 0)
-    assert source[0] == 0xABCDEF00 and source[4] == source[8] == 0x56573258, list(source)
+    # The console method and the desktop method must publish identical tokens
+    # for equivalent samplers, including when the U address mode changes.
+    console_sampler = method(device, 61, None, ptr, word)
+    console = (uint * 27)()
+    console[7] = console[8] = 3
+    for slot, address_u in ((1, 1), (2, 3)):
+        console[6] = address_u
+        console_sampler(device, console, src)
+        assert source[:4] == source[4 * slot:4 * slot + 4], list(source)
+    # Independently encode linear min/mip + point mag, three address modes,
+    # explicit bias, border and LOD range in each ABI.
+    mixed = c.create_string_buffer(struct.pack('<4If2I6f', 0x11, 2, 3, 4, -.5, 1, 1,
+                                               .25, .5, .75, 1., 1., 3.))
+    create_sampler(device, mixed, src, 0, 0)
+    expected = list(source[:4])
+    assert expected != list(source[4:8]) and expected != list(source[8:12])
+    console[2], console[3] = 1, 2
+    console[6:9] = 2, 3, 4
+    console[9:12] = struct.unpack('<3I', struct.pack('<3f', 1., 3., -.5))
+    console[17:21] = struct.unpack('<4I', struct.pack('<4f', .25, .5, .75, 1.))
+    console_sampler(device, console, src)
+    assert list(source[:4]) == expected, list(source)
+    assert source[4] == source[8] == 0x56573258, list(source)
     assert source[5] != source[9], 'distinct samplers produced the same token'
     method(device, 24, None, uint, word, word, uint)(device, 1, dst + 32, src + 16, 1)
     assert target[8:12] == source[4:8] and target[:8] == [0xABCDEF00] * 8, list(target)

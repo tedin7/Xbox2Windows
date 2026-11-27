@@ -1,4 +1,4 @@
-"""Draw gfx1013 image_get_lod through the translated static sampler and four views of a 4x4 texture."""
+"""Draw gfx1013 image_get_lod through translated static samplers and 2D/array mip views."""
 import re
 import struct
 import subprocess
@@ -28,6 +28,31 @@ float4 main(float4 position : SV_Position) : SV_Target0 {
     return float4(clamped, raw, clamped, raw);
 }
 """
+SLICE_LIT = bytes.fromhex('ff02047e')  # v_mov_b32 v2, <imm32> (VOP1 literal): the slice dword of the array address
+DIRECT_ARRAY_PS = DIRECT_PS.replace('Texture2D<', 'Texture2DArray<', 1)
+
+
+def patch_sampler(code, low, high):
+    # s_mov_b32 s25, literal: sampler word 1 carries the two unsigned 4.8 LOD limits.
+    at = fixture.W2_AT - 4
+    assert code[at:at + 4] == bytes.fromhex('800399be')
+    limits = int(low * 256) | (int(high * 256) << 12)
+    return code[:at] + struct.pack('<II', 0xbe9903ff, limits) + code[at + 4:]
+
+
+def array_pipeline(step, slice_index, low, high, mip_filter):
+    """The dim 0x5 (SQ_RSRC_IMG_2D_ARRAY) stage: v[0:2] is u, v and the slice; the u/v moves are the same
+    pixel-position unpacking and scaling as the 2D lane, and the slice dword becomes a literal move (the
+    fixture's VOP1 v2 = 1.0 cannot hold 0.0 as an inline constant)."""
+    code = fixture.stage(dmask=3, dim=5, word2=mip_filter << 26)
+    coords = bytes.fromhex('f002007eff02027e0000803ef202047ef402067e')
+    assert code.count(coords) == 1
+    scale = {1: b'', 0.125: SCALE_EIGHTH}[step]
+    lit = struct.pack('<I', 0 if slice_index == 0 else 0x3f800000)
+    # v2 (the slice) and v3 (unused) keep moving constants; only their encodings shift with the insertion.
+    code = code.replace(coords, UNPACK_XY + scale + SLICE_LIT + lit + bytes.fromhex('f402067e'))
+    code = patch_sampler(code, low, high)
+    return fixture.G.Pipeline(fixture.VS_WORDS, code, fixture.root_blob(flags=0), ps_hw_inputs=(0x8000, 0x8000))
 
 
 def pipeline(step, low, high, mip_filter):
@@ -37,17 +62,18 @@ def pipeline(step, low, high, mip_filter):
     assert code.count(coords) == 1
     scale = {1: b'', 0.125: SCALE_EIGHTH}[step]
     code = code.replace(coords, UNPACK_XY + scale)
-    # s_mov_b32 s25, literal: sampler word 1 carries the two unsigned 4.8 LOD limits.
-    at = fixture.W2_AT - 4
-    assert code[at:at + 4] == bytes.fromhex('800399be')
-    limits = int(low * 256) | (int(high * 256) << 12)
-    code = code[:at] + struct.pack('<II', 0xbe9903ff, limits) + code[at + 4:]
+    code = patch_sampler(code, low, high)
     return fixture.G.Pipeline(fixture.VS_WORDS, code, fixture.root_blob(flags=0), ps_hw_inputs=(0x8000, 0x8000))
 
 
-def read_pixel(renderer, adapter, vs, ps, sampler, view):
-    run = subprocess.run([renderer, adapter, '--startup-image-2d-view', vs, ps, sampler, view],
-                         capture_output=True, text=True, timeout=30)
+def read_pixel(renderer, adapter, vs, ps, sampler, view, *, selector=None, array=False, mip_base=None):
+    mode = '--startup-image-2d-array-view' if array else '--startup-image-2d-view'
+    args = [renderer, adapter, mode, vs, ps, sampler, view]
+    if selector is not None or mip_base is not None:
+        args.append(str(0 if selector is None else selector))
+    if mip_base is not None:
+        args.append(str(mip_base))
+    run = subprocess.run(args, capture_output=True, text=True, timeout=30)
     print(run.stdout, end='')
     if run.returncode == 77:
         print(run.stderr, file=sys.stderr)
@@ -98,5 +124,37 @@ def draw(dxc, renderer, adapter):
                 print(f'ordinary sampler control rgba={unlimited.hex()}')
 
 
+def draw_array(dxc, renderer, adapter):
+    """The array lane: the dim 0x5 get_lod stage against the same 4x4 two-slice three-mip texture through
+    --startup-image-2d-array-view. The whole resource is bound (srv tex2da table 0 0: no SRV mip window), so
+    the raw LOD is log2(step * 4) and the clamped LOD is that value clamped by the sampler's MIN_LOD/MAX_LOD
+    word. Two different valid slices (0 and 1; a slice coordinate is not normalized) must return the same LOD
+    pair: the slice is consumed but not part of the query. The translated and direct HLSL readbacks must
+    match exactly, and check_color keeps both near the CPU reference (mip filter 1 = point, 2 = linear)."""
+    # UV step, slice, sampler min/max, mip filter (1 point, 2 linear), expected (clamped, raw).
+    cases = (
+        (1, 0, 0, 2, 1, (2, 2)),
+        (1, 1, 0, 2, 1, (2, 2)),
+        (0.125, 0, 0.5, 2, 2, (0.5, -1)),
+        (0.125, 1, 0.5, 2, 2, (0.5, -1)),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'fullscreen_array', 'vs_6_0', work)
+        for step, slice_index, low, high, mip_filter, expected in cases:
+            pipe = array_pipeline(step, slice_index, low, high, mip_filter)
+            sampler, = (line for line in pipe.manifest().splitlines() if line.startswith('smpl '))
+            guest = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), 'translated_array_%d' % slice_index, 'ps_6_0', work)
+            direct = compile_hlsl(dxc, 'dxc', DIRECT_ARRAY_PS.replace('STEP', str(float(step))),
+                                  'direct_array_%d' % slice_index, 'ps_6_0', work)
+            pixel = read_pixel(renderer, adapter, vs, guest, sampler, '0/3', array=True)
+            reference = read_pixel(renderer, adapter, vs, direct, sampler, '0/3', array=True)
+            assert pixel == reference, (slice_index, pixel.hex(), reference.hex())
+            check_color(pixel, expected)
+            print(f'array slice={slice_index} step={step} min={low} max={high} mip_filter={mip_filter} '
+                  f'rgba={pixel.hex()}')
+
+
 if __name__ == '__main__':
     draw(*sys.argv[1:])
+    draw_array(*sys.argv[1:])

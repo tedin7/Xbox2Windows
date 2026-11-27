@@ -114,18 +114,11 @@ Target make_target(IDXGIAdapter* adapter)
     return target;
 }
 
-// A fresh target keeps the control independent of the first history: the clear value is the resource's
-// initial content, so no extra clear command is needed.
-void renew_texture(Target& target)
+void clear_target(Target& target, ComputeCommands& commands)
 {
-    target.texture.Reset();
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format, {1, 0},
-                             D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-    const D3D12_CLEAR_VALUE clear{format, {0, 0, 0, 0}};
-    check(target.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                 &clear, IID_PPV_ARGS(&target.texture)), "renew target");
-    target.device->CreateRenderTargetView(target.texture.Get(), nullptr, target.rtv);
+    check(commands.list->Reset(commands.allocator.Get(), nullptr), "reset clear list");
+    commands.list->ClearRenderTargetView(target.rtv, black, 0, nullptr);
+    commands.submit_and_wait(target.device.Get());
 }
 
 struct Recorded {
@@ -228,6 +221,7 @@ int main(int argc, char** argv)
     const auto pipeline = make_pipeline(target.device.Get(), root.Get());
     ComputeCommands commands(target.device.Get(), pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     check(commands.list->Close(), "close initial list");
+    clear_target(target, commands);
 
     // Three source-built draws: the first and the third only cover the top-left texel, so the second
     // is the only one that changes the watched texel (1, 1).
@@ -257,7 +251,7 @@ int main(int argc, char** argv)
     bool ok = first_black && second_green && third_green && second_key;
 
     // Negative control: without the second draw the watched texel stays black at draw 3.
-    renew_texture(target);
+    clear_target(target, commands);
     std::vector<Recorded> control(2);
     record_draw(target, commands, root.Get(), pipeline.Get(), red, corner, 1, 0x1111111111111111ull, control[0]);
     record_draw(target, commands, root.Get(), pipeline.Get(), blue, corner, 3, 0x3333333333333333ull, control[1]);

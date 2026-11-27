@@ -254,6 +254,8 @@ def main(probe, calls_dll, group='all'):
                               {"X2W_LOG_AT": ",".join((*malformed, entry, *(f"{rva:x}:rax" for rva in unusable), entry))},
                               options=("--continue-asserts", "10", "--offline", "0"))
             assert "process exited with 0x00000000" in out and f"LOG_AT hit counts: +{log_rva:x} x2\n" in out, out
+            assert re.search(r"^  hook windows: entries=\d+ windows=\d+ unprotected=0 "
+                             r"deferred=\d+ timeouts=0 protection=on$", out, re.M), out
             assert log_probe_state(logdir) == (log_rva, opcode), text(logdir / "stdout.txt")
             assert log_at_records(logdir, log_rva, 2) == [
                 f"rdx={LOG_TOKEN + i:#x} [rcx+8]=0x89abcdef01234567 "

@@ -170,8 +170,8 @@ check('both files spell a x2w-startup-shader revision', seed is not None and lit
       repr((seed and seed.group(1), literal and literal.group(1))))
 check('the two literals are identical', seed and literal and seed.group(1) == literal.group(1),
       repr((seed and seed.group(1), literal and literal.group(1))))
-check('the revision is x2w-startup-shader-28, after the precise v_fma_mix lowering',
-      bool(seed and seed.group(1) == 'x2w-startup-shader-28'), repr(seed and seed.group(1)))
+check('the revision is x2w-startup-shader-29, after the vcc_hi may-write of the mad64 carry-out',
+      bool(seed and seed.group(1) == 'x2w-startup-shader-29'), repr(seed and seed.group(1)))
 
 
 def key_from_seed(word):

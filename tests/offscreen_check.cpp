@@ -1400,16 +1400,32 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] [8] prints one RGBA32F pixel.
+// The optional selector is forwarded as the second root constant. The final 8 requests an 8x8 mip base.
+// --startup-image-2d-array-view uses the two-slice renderer with the default 4x4 base.
 OperationResult run_startup_image_2d_view(const OperationContext& ctx)
 {
     const std::string_view window = ctx.argv[6];
     if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
         window[2] < '1' || window[2] > '3')
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array-view") == 0;
+    float selector = 0.0f;
+    if (ctx.argc >= 8) {
+        if (std::strcmp(ctx.argv[7], "1") == 0)
+            selector = 1.0f;
+        else if (std::strcmp(ctx.argv[7], "0") != 0)
+            return {OutcomeKind::fail, "view selector must be 0 or 1"};
+    }
+    UINT mip_base = 4;
+    if (ctx.argc == 9) {
+        if (std::strcmp(ctx.argv[8], "8") != 0)
+            return {OutcomeKind::fail, "2D mip base must be 8"};
+        mip_base = 8;
+    }
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
-                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], selector, color, ctx.argv[5], array, 3, false, !array,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'), false, 1, 1, mip_base);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
@@ -1456,16 +1472,19 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
-// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits> [coverage]: the translated pixel
+// stage stores to u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and
+// every other texel -1.0. Coverage is 1 (one pixel) or 2 (two pixels in one draw).
 OperationResult run_startup_image_store(const OperationContext& ctx)
 {
-    unsigned x = 0, y = 0;
+    unsigned x = 0, y = 0, coverage = 1;
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
-    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+    if (ctx.argc == 8 && (std::sscanf(ctx.argv[7], "%u", &coverage) != 1 || (coverage != 1 && coverage != 2)))
+        return {OutcomeKind::fail, "coverage is not 1 or 2"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected, coverage))
         return {OutcomeKind::fail, "image store readback differs"};
     return {OutcomeKind::pass, nullptr};
 }
@@ -1479,6 +1498,14 @@ OperationResult run_startup_image_atomic(const OperationContext& ctx)
     if (check_startup_image_atomic(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], signed_view))
         return {OutcomeKind::fail, "image atomic readback differs"};
     return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-store-reject-load: a colour format without typed UAV load is refused before any draw.
+OperationResult run_startup_image_store_reject_load(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_image_store_typed_load(ctx.device))
+        return {OutcomeKind::fail, reason};
+    return {OutcomeKind::fail, "typed UAV load negative control found no refusal"};
 }
 
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
@@ -1851,11 +1878,13 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-view", 7, 9, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-array-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store", 7, 8, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-atomic", 7, 7, nullptr, kNoGate, run_startup_image_atomic},
+    {"--startup-image-store-reject-load", 3, 3, nullptr, kNoGate, run_startup_image_store_reject_load},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},
