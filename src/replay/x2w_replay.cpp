@@ -3,8 +3,11 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]
+//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--prefix-fast draws]
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
+// --prefix-fast draws: the draws recorded before the window's first present are not played (a long loading prefix
+// replays faster); everything else in the prefix still runs. A picture the window shows from a target drawn only in the
+// prefix is then missing.
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // recording could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
@@ -63,6 +66,7 @@ enum Kind : std::uint16_t { device_kind = 0, queue_kind = 1, fence_kind = 2, des
 constexpr std::uint16_t device_create_descriptor_heap = 14, device_increment_size = 15;
 constexpr std::uint16_t heap_cpu_start = 9, heap_gpu_start = 10, fence_completed = 8, queue_present = 32;
 constexpr std::uint16_t resource_map = 8, resource_get_desc = 10, resource_gpu_address = 11;
+constexpr std::uint16_t queue_execute = 10, list_draw = 12, list_draw_indexed = 13;
 constexpr std::uint32_t rcx_arg = 15;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
 constexpr int top_slots = 16;
 
@@ -71,6 +75,7 @@ struct Options {
     bool hardware = false;
     double max_seconds = 0;
     u64 dump_address = 0, dump_bytes = 0;
+    bool prefix_fast = false;  // --prefix-fast draws
 };
 
 struct HeapInfo {
@@ -102,6 +107,11 @@ struct Player {
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
     u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
+    // The prefix (the calls before the window's first present): lists submitted in it, and with --prefix-fast draws, the
+    // draws not played (nothing else is left out: creations, copies, dispatches, clears, Map, fences and descriptors run).
+    bool prefix_fast = false;
+    u64 window_seq = ~0ull, prefix_lists = 0, prefix_draws_skipped = 0;
+    double prefix_seconds = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
 
@@ -458,6 +468,13 @@ bool play(Player& p, const Recording& r, const Step& step)
 {
     current_step = &step;
     const CallRecord& c = step.call;
+    if (c.seq < p.window_seq) {
+        if (c.kind == queue_kind && c.slot == queue_execute) p.prefix_lists += static_cast<std::uint32_t>(c.args[0]);
+        if (p.prefix_fast && c.kind == x2w_replay_slots::list && (c.slot == list_draw || c.slot == list_draw_indexed)) {
+            ++p.prefix_draws_skipped;
+            return false;
+        }
+    }
     Played call{&step};
     if (const auto object = p.objects.find(c.object); object != p.objects.end()) {
         call.self = object->second;
@@ -716,6 +733,7 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--prefix-fast" && value == L"draws") o.prefix_fast = true;
         else if (name == L"--dump") {
             if (!parse_dump(value, o)) return false;
         }
@@ -813,6 +831,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
                             "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
+        std::fprintf(f, ", \"prefix\": {\"fast\": %s, \"lists\": %llu, \"draws_left_out\": %llu, \"wall_s\": %.3f}",
+                     p.prefix_fast ? "true" : "false", p.prefix_lists, p.prefix_draws_skipped, p.prefix_seconds);
         if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
@@ -975,6 +995,17 @@ int run(const Options& o)
     if (time_slots) timing.emplace().next_report = started + std::chrono::seconds(1);
     const auto elapsed = [&] { return std::chrono::duration<double>(ReplayClock::now() - started).count(); };
     bool stopped = false;
+    p.prefix_fast = o.prefix_fast;
+    p.window_seq = r.window_seq;
+    bool in_prefix = true;
+    const auto end_prefix = [&] {
+        in_prefix = false;
+        p.prefix_seconds = elapsed();
+        say("x2w-replay: prefix %s: %llu lists executed%s, %llu draws left out, wall %.3f s",
+            p.prefix_fast ? "fast (draws left out)" : "played in full", static_cast<unsigned long long>(p.prefix_lists),
+            p.prefix_fast ? " without their draws" : "", static_cast<unsigned long long>(p.prefix_draws_skipped),
+            p.prefix_seconds);
+    };
     Step s;  // the call being played, loaded from the mapping
     for (const StepRef& ref : r.steps) {
         r.load(ref, s);
@@ -982,6 +1013,7 @@ int run(const Options& o)
             stopped = true;
             break;
         }
+        if (in_prefix && s.call.seq >= p.window_seq) end_prefix();
         if (timing) {
             const auto before = ReplayClock::now();
             play(p, r, s);
@@ -993,6 +1025,7 @@ int run(const Options& o)
         }
     }
     current_step = nullptr;
+    if (in_prefix && !stopped) end_prefix();  // a file whose window has no call after its first present
     bool dump_ok = true;
     if (!stopped && o.dump_bytes) {
         phase = "dumping title memory";
@@ -1029,7 +1062,7 @@ int wmain(int argc, wchar_t** argv)
     x2w_replay::Options options;
     if (!x2w_replay::parse(argc, argv, options)) {
         std::fprintf(stderr, "usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] "
-                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]\n");
+                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--prefix-fast draws]\n");
         return 2;
     }
     return x2w_replay::run(options);

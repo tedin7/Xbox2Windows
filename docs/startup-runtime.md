@@ -2003,6 +2003,12 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 recording, 3 a title range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
+The prefix is every call before the recording's first `PRES` chunk (the recorder writes `PRES` only inside the window).
+The log line `x2w-replay: prefix ...` gives the lists submitted in it and its wall time, and `replay_summary.json` has
+the same under `prefix`. `--prefix-fast draws` leaves out the prefix's draws (list slots 12 and 13) to reach the window
+sooner; creations, copies, dispatches, clears, `Map`, fences and descriptor writes still run. A target the title drew
+only in the prefix and shows in the window is then missing from the window's pictures.
+
 Set `X2W_REPLAY_TIMING=1` in the player environment to benchmark replay steps. At each elapsed wall-second boundary,
 the player prints `x2w-replay timing` with calls played, presents, and up to five `kind:slot=us` entries ranked by
 time since the previous report. Reports are emitted between calls, and a blocking call can delay a report across

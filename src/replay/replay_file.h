@@ -216,6 +216,9 @@ struct Recording {
     std::unordered_map<PageKey, const unsigned char*, PageKeyHash> pages;  // PAGE: key -> its 4 KiB
     std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
+    // The first PRES chunk's sequence number. The recorder writes PRES only inside the window (and at the present that
+    // opens it), so a call before it belongs to the prefix; a recording from the start has a one-frame prefix.
+    u64 window_seq = ~0ull;
     bool ended = false;
 
     // The CALL of a step.
@@ -327,6 +330,10 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             out.live_objects.emplace_back(kind, object);
         } else if (name == "PRES") {
             ++out.presents_marked;
+            if (u64 seq; header_bytes >= sizeof(seq)) {
+                std::memcpy(&seq, h, sizeof(seq));
+                if (seq < out.window_seq) out.window_seq = seq;
+            }
         } else if (name == "XEND" && header_bytes >= 8) {
             std::memcpy(&out.end_calls, h, 8);
             out.ended = true;
