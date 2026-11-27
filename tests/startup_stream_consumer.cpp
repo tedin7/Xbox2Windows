@@ -993,7 +993,6 @@ int main(int argc, char** argv)
     const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_IDENTIFIER_SRV", nullptr, 0) != 0 || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0 ||
-                          GetEnvironmentVariableW(L"X2W_TEST_DESCRIPTOR_COUNT", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0) != 0;

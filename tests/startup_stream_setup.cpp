@@ -132,9 +132,7 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
-    const bool descriptor_count = GetEnvironmentVariableW(L"X2W_TEST_DESCRIPTOR_COUNT", nullptr, 0) != 0;
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        joined_table || vertex_srv_pair || descriptor_count ? 2u : 1u, 0, 0, 0};
+    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
     D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
