@@ -846,7 +846,8 @@ def sample_fixture(form='plain', flow='narrowed'):
     for reg, value in enumerate(sampler, 24):
         scalar += words(0xbe8003ff | reg << 16, value)
     scalar += words(0xbf8cc07f)
-    prefix = M0 + scalar + (copy_exec(32) if flow != 'narrowed' else b'') + wqm() + p1 + p2
+    saved_entry = copy_exec(32) if flow in ('entry', 'placeholder') else b''
+    prefix = M0 + scalar + saved_entry + wqm() + p1 + p2
     # 1.25 < interpolated 1.5 on the covered pixel. Keep the scalar branch and
     # mask in the translated shader even though this one-pixel draw takes the body.
     prefix += words(0x7e001700 | 21 << 17 | 20, 0x7c020000 | 21 << 9 | 255, 0x3fa00000)
@@ -858,6 +859,8 @@ def sample_fixture(form='plain', flow='narrowed'):
     body += words(0xbf8c3f70)
     if flow == 'narrowed':
         active = save_exec(32, 106) + branch(8, body) + body + restore_exec(32)
+    elif flow == 'whole':
+        active = body
     else:
         # Returning to the entry mask is a no-op in the main walk. In the
         # guest it removes the helper lanes before the coordinate overwrite.
@@ -906,20 +909,21 @@ def subset_fixture(control=None, *, shrink_op=0x15):
 def sample_and_subset_controls():
     for form, call in (
             ('plain', 'SampleLevel(q0, float2(F(v12), F(v13)), 0)'),
-            ('offset', 'SampleLevel(q0, float2(F(v12), F(v13)), 0, int2(1, 0))'),
             ('cmp', 'SampleCmpLevelZero(q0, float2(F(v12), F(v13)), F(v11))')):
         ps = sample_stage(form).hlsl_ps()
         assert call in ps, (form, ps)
     stale = ('v12 is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
              'a v_interp_p2_f16 that wrote another register')
-    for label, form, flow, opcode in (
-            ('exec_known', 'plain', 'entry', 'image_sample'),
-            ('plain placeholder', 'plain', 'placeholder', 'image_sample'),
-            ('bias', 'bias', 'narrowed', 'image_sample_b')):
+    for label, form, flow, reason in (
+            ('exec_known', 'plain', 'entry', stale % 'image_sample'),
+            ('plain placeholder', 'plain', 'placeholder', stale % 'image_sample'),
+            ('bias', 'bias', 'narrowed', stale % 'image_sample_b'),
+            ('offset under narrowed EXEC', 'offset', 'narrowed', stale % 'image_sample_o'),
+            ('offset under whole EXEC', 'offset', 'whole', 'image_sample_o')):
         try:
             sample_stage(form, flow).hlsl_ps()
         except G.Unsupported as error:
-            assert str(error) == stale % opcode, (label, error)
+            assert str(error) == reason, (label, error)
         else:
             raise AssertionError('%s was translated' % label)
     for label in ('rewritten', 'different pair', 'helpers', 'shrink reverse'):
@@ -1274,16 +1278,15 @@ def check_subset_draw(dxc, renderer, adapter, directory, vertex, width, height):
 
 
 def check_covered_sample_draw(dxc, renderer, adapter, directory):
-    def texel(mip, offset=0):
+    def texel(mip):
         # Point sampling of (3/8, 5/8) in the 4x4 mip fixture, slice zero.
         side = 4 >> mip
-        x, y = (3 * side) // 8 + offset, (5 * side) // 8
+        x, y = (3 * side) // 8, (5 * side) // 8
         return (1 + x + 4 * y + 32 * mip) / 128
 
     vs = compile_hlsl(dxc, 'dxc', sample_stage().hlsl_vs(), 'covered_sample_vs', 'vs_6_0', directory)
     for form, reference, old, new, wrong in (
             ('plain', texel(0), 'F(v13)), 0)', 'F(v13)), 1)', texel(1)),
-            ('offset', texel(0, 1), 'int2(1, 0)', 'int2(0, 0)', texel(0)),
             ('cmp', float(0.125 < texel(0)), 'F(v13)), F(v11))', 'F(v13)), 0.0)', float(0.0 < texel(0)))):
         pipe = sample_stage(form)
         source = pipe.hlsl_ps()

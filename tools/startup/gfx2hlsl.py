@@ -10497,12 +10497,6 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        offset_arg = ''
-        if how == 'o':
-            if dim != 'SQ_RSRC_IMG_2D' or 'a16' in mods or len(cs) != 3:
-                raise Unsupported('image_sample_o requires a 2D offset and two 32-bit coordinates')
-            offset_arg = self.image_sample_offset(cs.pop(0))
-            how = 'sample'
         integer_srvs = getattr(getattr(self, 'pipe', None), 'integer_texture_srvs', False)
         # The legacy 1D path models only sampling. Typed SRVs also use the generic load
         # path below, whose Texture1D address has one coordinate and a mip index.
@@ -10747,21 +10741,20 @@ class Stage:
                 if implicit_bias:
                     self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
-                call = '%s.SampleLevel(%s, %s, 0%s)' % (tex, smp, uv, offset_arg)
+                call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             elif len(self.blocks) > 0:
                 # Past a join the guest still takes the LOD from the quad's derivatives. Where the rule of image_sample_b
                 # holds (entry EXEC, wave-uniform control flow, no divergent back edge over the call) the call is the
                 # implicit-LOD Sample; otherwise it stays level 0 (resolve_plain_samples).
-                call = '%s.SampleLevel(%s, %s, 0%s)' % (tex, smp, uv, offset_arg)
+                call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
                 if getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
-                    self.plain_samples[self.pc] = (None if implicit_bias else call,
-                                                   '%s.Sample(%s, %s%s)' % (tex, smp, uv, offset_arg))
+                    self.plain_samples[self.pc] = (None if implicit_bias else call, '%s.Sample(%s, %s)' % (tex, smp, uv))
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
                 elif implicit_bias:
                     self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             else:
-                call = '%s.Sample(%s, %s%s)' % (tex, smp, uv, offset_arg)
+                call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.check_interp_sample_call(call)
         if tex is None:
             self.null_image_read(dst, dmask, packed='d16' in mods)
@@ -10888,32 +10881,6 @@ class Stage:
 
     def op_image_sample(self, ops, mods):
         self.image(ops, mods, 'sample')
-
-    def image_sample_offset(self, token):
-        # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
-        # HLSL needs immediate offsets in [-8, 7]. Look for a literal move in
-        # this basic block under the same EXEC as the sample.
-        reg = int(token[1:])
-        for i in range(self.descriptor_instruction_index - 1, self.descriptor_block_first - 1, -1):
-            _, _, name, asm = self.ins[i]
-            _, ops, _ = parse(asm)
-            name = re.sub(r'_e(32|64)$', '', name)
-            if writes_exec(name, ops):
-                break
-            if reg in lds_vgpr_writes(name, ops):
-                if name != 'v_mov_b32':
-                    break
-                packed = self.const_u32(ops[1]) if reg_range(ops[1]) is None else None
-                if packed is not None and not (packed & ~0x3f3f):
-                    x = ((packed & 63) ^ 32) - 32
-                    y = (((packed >> 8) & 63) ^ 32) - 32
-                    if -8 <= x <= 7 and -8 <= y <= 7:
-                        return ', int2(%d, %d)' % (x, y)
-                break
-        raise Unsupported('image_sample_o requires an immediate 2D offset in [-8, 7]')
-
-    def op_image_sample_o(self, ops, mods):
-        self.image(ops, mods, 'o')
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
@@ -13028,7 +12995,7 @@ class Stage:
                 else:
                     reason = ('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
                               'a v_interp_p2_f16 that wrote another register' % (reg, name))
-                if identity[-1] and name in ('image_sample', 'image_sample_o', 'image_sample_c'):
+                if identity[-1] and name in ('image_sample', 'image_sample_c'):
                     sample_obligations.setdefault(self.ins[i][0], reason)
                 else:
                     raise Unsupported(reason)
