@@ -367,6 +367,7 @@ jobs:
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
             tests/startup_gfx2hlsl_cmp16_check.py \
+            tests/startup_gfx2hlsl_cmp64_check.py \
             tests/startup_gfx2hlsl_draw_skip_check.py \
             tests/startup_gfx2hlsl_sdwa_cvt_check.py \
             tests/startup_gfx2hlsl_sdwa_cndmask_check.py \
