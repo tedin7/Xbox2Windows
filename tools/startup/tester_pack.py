@@ -565,9 +565,29 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
 
 
 PHASES_NAME = "phases.txt"
+MOVIE_AFTER_S = 250      # Run O's credits movie showed at 384 and 446 s; before this the loading art and intros are on screen
+MOVIE_MIN_MEAN = 20.0    # a picture with at least this mean level is content, not black
 PHASE_WINDOW_S = 30
 HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
+
+
+def movie_note(timeline_text, after=MOVIE_AFTER_S):
+    """One line for the end of phases.txt: did OUR window captures show content (mean >= 20) after 250 s, when the credits movie
+    plays in the tester's own captures? Says how many pictures, when, and that a movie shorter than the capture interval can be
+    missed, so 'not seen' means 'not in our pictures', not 'did not play'."""
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    late = [(t, m) for t, m in pictures if t > after]
+    if not late:
+        return "# credits movie: no window pictures after %d s, cannot tell" % after
+    gaps = [b[0] - a[0] for a, b in zip(late, late[1:])]
+    step = "%.0f s" % (sum(gaps) / len(gaps)) if gaps else "one picture"
+    seen = [(t, m) for t, m in late if m >= MOVIE_MIN_MEAN]
+    if seen:
+        return "# credits movie: content in %d of %d of OUR pictures after %d s (%s); capture interval %s" % (
+            len(seen), len(late), after, ", ".join("%.0f s mean %.0f" % tm for tm in seen[:8]), step)
+    return ("# credits movie: NOT seen in our %d pictures after %d s (all mean < %d); capture interval %s, a movie shorter than that can be "
+            "missed: compare with the tester's own captures" % (len(late), after, MOVIE_MIN_MEAN, step))
 
 
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
@@ -592,6 +612,7 @@ def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
             presents, fps = "-", "-"
         lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
         start = stop
+    lines.append(movie_note(timeline_text))
     return "\n".join(lines) + "\n"
 
 
@@ -943,6 +964,62 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     return parts
 
 
+RECORD_DEFAULT_SPEC = "slow"         # `-Record auto` = the runtime trigger (c25): a 10 s window opening at the first present after 120 s with a >= 500 ms gap, fallback at 180 s.
+                                     # The tester's clock runs ~200 s later than ours, so a trigger on the slowdown beats a fixed time
+RECORD_DEFAULT_MAX_MIB = 400         # ... capped at 400 MiB so the upload stays small (c25 may change both here, one place)
+RECORD_EXPLICIT_MAX_MIB = 2048       # an explicit -Record spec keeps the old cap unless -RecordMaxMiB says otherwise
+RECORD_RE = re.compile(r"^(f)?(\d+),(\d+)$")
+RECORD_MAX_SECONDS = 120
+RECORD_MAX_FRAMES = 2000
+
+
+def parse_record_spec(spec):
+    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60) or `f<first frame>,<frames>`.
+    Returns {"spec": normalized text, "by": "time"|"frame", "start", "length"}. Raises ValueError for anything else, a window longer
+    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder) or an empty window."""
+    if spec.strip().lower() in ("auto", "default", "slow"):
+        return {"spec": "slow", "by": "slow", "start": 120, "length": 10}   # the runtime decides the window; these are its documented defaults
+    match = RECORD_RE.match(spec.strip().lower())
+    if not match:
+        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60) or f<first frame>,<frames> (e.g. f4000,24), got %r" % spec)
+    by = "frame" if match.group(1) else "time"
+    start, length = int(match.group(2)), int(match.group(3))
+    if length < 1 or length > (RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS):
+        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds",
+                                                                      RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS))
+    return {"spec": ("f" if by == "frame" else "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
+
+
+PREFIX_ONLY_LINE = "the cap stopped the recording BEFORE the window opened"
+
+
+def recording_unusable(log_dir):
+    """"prefix only" when the run's stderr.txt says the cap stopped the recording before its window opened (the file holds only the
+    state-making prefix: nothing to replay), else None."""
+    try:
+        with open(os.path.join(log_dir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            return "prefix only" if any(PREFIX_ONLY_LINE in line for line in handle) else None
+    except OSError:
+        return None
+
+
+def folder_report(folder, log_dir=None):
+    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console);
+    with log_dir, "unusable": "prefix only" when the run's log says the recording never reached its window."""
+    sizes = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                sizes.append((os.path.relpath(path, folder).replace(os.sep, "/"), os.path.getsize(path)))
+    sizes.sort(key=lambda item: -item[1])
+    report = {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+    unusable = recording_unusable(log_dir) if log_dir and sizes else None
+    if unusable:
+        report["unusable"] = unusable
+    return report
+
+
 def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
     """One report from several runs of a matrix (tester_run -Matrix gray). `runs` is [(label, [part zip paths in order])]; every
     member of run <label> goes in as run_<label>/<name>, its manifest.json too. Part 1 also holds matrix_manifest.json (per run:
@@ -1026,6 +1103,12 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    rs = sub.add_parser("record-spec")
+    rs.add_argument("spec")
+    sub.add_parser("record-defaults")
+    rr = sub.add_parser("record-report")
+    rr.add_argument("folder")
+    rr.add_argument("--logs", default=None)
     cb = sub.add_parser("combine")
     cb.add_argument("zip")
     cb.add_argument("--matrix", default="matrix")
@@ -1034,6 +1117,19 @@ def main(argv):
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
+    if args.cmd == "record-spec":
+        try:
+            print(parse_record_spec(args.spec)["spec"])
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
+        return 0
+    if args.cmd == "record-defaults":
+        print("%s %d %d" % (RECORD_DEFAULT_SPEC, RECORD_DEFAULT_MAX_MIB, RECORD_EXPLICIT_MAX_MIB))
+        return 0
+    if args.cmd == "record-report":
+        print(json.dumps(folder_report(args.folder, args.logs)))
+        return 0
     if args.cmd == "combine":
         runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]
         for path, size in combine(args.zip, runs, int(args.limit_mb * 1024 * 1024), args.matrix):

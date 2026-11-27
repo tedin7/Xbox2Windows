@@ -1964,6 +1964,208 @@ allow unordered access are never in the retire class.
 ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
 ```
 
+## D3D12 replay record
+
+`X2W_REPLAY_RECORD=all`, `<start s>,<seconds>` or `f<first present>,<presents>` records every call the title
+makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `<X2W_REPLAY_DIR>\replay.x2wr` when that folder is
+set, else `replay.x2wr`; it stops with its end chunk once the file reaches `X2W_REPLAY_MAX_MIB`, default 2048), so a replayer can feed the
+same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
+Unset, no slot is wrapped and nothing changes.
+
+Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
+the real slot first except for the optional submit scan below, then appends
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
+present count), argument memory from declared layouts, and the wrapper a declared output receives. The recorder keeps
+the raw call words for replay. For memory capture it follows only declared pointers and byte counts, including shader
+bytecode in a pipeline stream. A call shares a 1 MiB copy budget across all its argument memory, including descriptor
+arrays. Memory contents are stored once per content. The recorder checks commitment and readable protection with
+`VirtualQuery`, caching results within 64 KiB granules for up to 16 presents. Copies use `ReadProcessMemory` so a
+mapping change can fail the copy safely. Calls with opaque layouts can have insufficient memory for replay.
+
+Full buffers are written under one file lock. The window opens and closes at presents. Closing the recording disables
+capture for both the window and the prefix and finishes the file, whether the trigger is the window end, the file cap,
+`x2w_d3d12_replay_record_stop`, or process exit.
+
+File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
+`CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
+`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` and settings whose value is a drive or share path left out: recordings travel, and such paths
+carry the user's name).
+Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
+and anything past 512 MiB in total are left out and counted in the log; `X2W_REPLAY_SHADERS=0` writes none).
+Size of a window that opens late: the part before the window (the prefix) has its own cap, `X2W_REPLAY_PREFIX_MAX_MIB`
+(`tester_run.ps1 -RecordPrefixMaxMiB`, default 512), and `X2W_REPLAY_MAX_MIB` counts from where the window opens.
+A prefix that reaches its cap ends the recording with "prefix only". Before the window, a call without a declared layout
+copies at most `X2W_REPLAY_PREFIX_GENERIC_KIB` (default 16, 0 = no limit) behind each pointer argument, and the stop line
+`prefix blob KiB by kind:slot` names the five slots that took the most unique blob bytes in the prefix.
+Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
+parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
+passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven
+argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
+Float argument values and device creation are not recorded.
+When a present ends the recording, a finisher thread writes the `SHDR` files and `XEND`, so the title's presents go
+on meanwhile; a later stop waits for it, and if the process exits first the file ends at its last whole chunk followed by
+`XEND`.
+
+`X2W_REPLAY_PAGES_AT_SUBMIT=1` scans registered title-memory pages before `ExecuteCommandLists` inside the recording
+window. Use `X2W_REPLAY_RECORD=all` for a workload without Present. The first submit can initialize the page store.
+Submissions and Presents share the change-only page store and its `X2W_REPLAY_PAGES_MAX_MIB` budget. Submit scans
+use the same round-robin `X2W_REPLAY_SCAN_MS` limit as Present rescans (default 250 ms). A submit MAP carries the
+submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
+
+`X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
+(up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of
+descriptor heaps, including supplied memory and stand-in allocations whose CPU start the title has queried.
+The recorder scans before root setters, draws, dispatch, indirect execution, resource and descriptor copies, and queue
+submission. Each snapshot uses the preceding sequence number, so the player applies it before the call that
+can read the bytes. In this mode call-time scans also collect placed ranges within the window. Prefix descriptor
+copies can capture named ranges before the window opens. The regular page and scan budgets still apply, and
+`X2W_REPLAY_PAGES=0` disables page recording. The switch reuses format 3 `PAGE` and `MAP` chunks.
+
+`startup_replay_title_ranges_warp` uses an 8 KiB constant buffer in a plain allocation and alternates the colour
+at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
+must match the original pictures with the switch enabled and differ when the switch is off.
+
+The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
+creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
+destination starts, destination sizes, source starts and source sizes of a `CopyDescriptors` call. Its header is the call
+sequence (u64). The payload omits null arrays and uses the counts from the call. The player relocates the descriptor
+handles in the arrays and runs the call from them. If the arrays are unreadable or exceed the per-call budget, the
+recorder logs the omission and replay skips the copy when its arguments are unavailable. Direct CPU writes to descriptor backing memory are outside
+this recipe: the pages of the heap's title memory carry them.
+A successful heap creation with caller-supplied backing
+has a `DHPM` chunk with three u64 fields (call sequence, address, byte count) and an empty payload. The player reserves and
+commits that range through the same allocator as `MAP` before playing any calls. It passes the original backing address
+to heap creation and uses that address for descriptor writes. `DHPM` carries no memory contents and is recorded even
+with `X2W_REPLAY_PAGES=0`. Older recordings without `DHPM` still use generic argument relocation.
+
+For slot 133 buffers placed on the default path's existing heaps, an optional `HPLC` header holds five u64 words:
+call sequence, creation-order heap ID, allocation base, heap size and byte offset. Replay reserves the recorded
+allocation and opens one heap per ID. Each placement uses that heap and its recorded offset. Recordings without
+`HPLC` still use the address-based call.
+
+`X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
+present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
+GPU round trip per present. A recorded run and its replay write the same names.
+
+### Submission dumps without Present
+
+Set `X2W_REPLAY_DUMP=1` with render mode and `X2W_REPLAY_RECORD=all` to compare scenes that never call
+Present. The player inherits the switch from `XENV`. Set it explicitly to `1` to enable it on an older
+recording, or to `0` to disable it on the player. The recorder uses the existing `PAGE` and `MAP` chunks
+to capture eligible title memory before each recorded submission, subject to the page budgets and
+`X2W_REPLAY_PAGES`.
+
+The shim queues a copy after the submitted batch and logs its rows when the next guest Signal on
+that queue completes. Each row has the form
+`x2w-replay dump submit <n> resource <id> <w>x<h> fmt <f> hash <16 hex digits>`.
+Submission and resource creation numbers start at one. There is one row per written resource per
+submission. Compare the row sets from the recorder log and the player's `stderr.txt`.
+
+The 64-bit FNV-1a hash covers buffer bytes or the texture's subresources in copy order, excluding
+readback row padding. A supported multisample target is resolved before hashing. A failed or
+unsupported copy produces a diagnostic. Initialize the contents that will be compared, including
+regions a shader leaves untouched. Submissions without a following recorded Signal have no dump row.
+Dump mode adds GPU work and can delay the Signal call while the CPU collects the hashes.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_dump_(warp|hardware)$'
+```
+
+### Replayer
+
+`x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a
+device through the stand-in (loaded late, after it has set every recorded `XENV` setting this process does not set
+itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache), writes the recording's
+`SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
+(the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
+`replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
+recording, 3 a title range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+accepted and ignored in this version.
+
+Set `X2W_REPLAY_TIMING=1` in the player environment to benchmark replay steps. At each elapsed wall-second boundary,
+the player prints `x2w-replay timing` with calls played, presents, and up to five `kind:slot=us` entries ranked by
+time since the previous report. Reports are emitted between calls, and a blocking call can delay a report across
+several boundaries. The summary adds `slot_times` entries with `kind`, `slot`, `calls`, and `total_us`, plus more precision
+in `wall_s`. Step time includes argument relocation, page writes before the call, dispatch, fence waits,
+and output processing. Time spent checking a skipped call is charged to its recorded slot. The wall clock also
+includes reporting overhead and any page writes after the last call.
+
+Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack
+word past the slot's own arguments may point at the same variable), argument memory is copied into the replayer's
+memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
+heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
+completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
+map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
+with a buffer of the replayer's. Title memory recorded as pages (`PAGE`/`MAP`, src/startup_stubs/replay_pages.h) is
+reserved and committed at its recorded addresses before the stand-in loads (merged into 64 KiB spans; a span that cannot
+be had stops the replay with exit 3 and its address), and every `MAP` is written before the first call with a larger
+sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
+span's final image hash. Set `X2W_REPLAY_DUMP_MAP_RANGES=1` in the player environment to write
+`map_<sequence>.bin` for an explicit, nonempty buffer Map read range, when the call succeeds and writes its
+output. For an output buffer that aliases title memory, record with
+`X2W_REPLAY_TITLE_RANGES=1` and `X2W_REPLAY_PAGES_AT_SUBMIT=1` to capture raw heap descriptors and placed buffers.
+Play with `--dump HEX_ADDRESS:BYTES` to write up to 64 MiB of a reserved title range to `dump.bin` after the recorded calls
+and before trailing page updates. Wait for GPU completion in the recorded workload before either readback.
+Not replayed yet: float arguments passed by value, one thread per recorded thread.
+
+The recorder uses the layouts in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h)
+for device slots 70, 73, 80 and 86. It keeps format 3. The player reads formats 2 and 3.
+With `X2W_REPLAY_SLOT_LAYOUTS=1` stored in `XENV`, the player also maps the CPU
+pointer returned by list slot 148 over the requested range. As with other memory-backed views, replay of slot
+
+The player checks each CALL header against its format (104 bytes in v2,
+136 in v3). Format 2 supplies zero for argument words 7 through 10. The
+Windows x64 bridge forwards all eleven integer or pointer words.
+
+Run the synthetic CALL compatibility and bridge checks together with the replay
+scenes on Windows after building Release:
+
+```powershell
+ctest --preset release --no-tests=error -R '^(startup_replay_(call_formats|invoke|warp|hardware))$'
+```
+
+Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
+in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
+recorder keeps format 3 and stores the switch in `XENV`. The player reads
+formats 2 and 3. The switch bounds argument copies for device slots 70, 73,
+80 and 86, and the player maps the CPU pointer returned by list slot 148
+over the requested range. As with other memory-backed views, replay of slot
+70 needs the backing address to be available through replayed pages or a
+translated range. Tracking the slot 148 pointer alone does not record writes
+made through it.
+
+List slot 146 currently returns zero through the list no-op. The capture
+probe suggests a barrier array, but the stand-in does not consume one.
+Opaque no-ops with unknown argument layouts record their raw call words. List slots 28–30 use query objects and scalar arguments when
+`X2W_D3D12_QUERY_SLOTS=1` selects the experimental bindings. For switched
+recordings, replay checks the slot 146 result and the slot 80 HRESULT and
+written frame token. A mismatch returns exit 6.
+
+`startup_replay_slot_layouts_warp` and `startup_replay_slot_layouts_hardware`
+record a two-present window with three frame waits, including one in the
+prefix, and two list no-ops. They check exact argument captures for slots 70,
+73, 80 and 86, check two translated slot 148 upload allocations, compare the
+two replayed pictures pixel for pixel, and mutate the stored frame token and
+no-op return to check that replay detects both mismatches.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_slot_layouts_(warp|hardware)$' --output-on-failure
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
+```
+
+The no-Present fixture sends two copies on a compute queue, writes different bytes to a placed buffer before each
+submit, and fences each readback. It compares both pages with the live readback and checks that removing the second
+submit MAP leaves the first page's bytes in the second readback. The fixture requires an adapter with support for
+heaps backed by existing CPU memory.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_submit_pages_(warp|hardware)$' --output-on-failure
+```
+
 ## D3D12 view census
 
 The stand-in keeps one record per distinct view: slot, resource, counter,
