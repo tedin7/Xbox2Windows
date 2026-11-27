@@ -163,6 +163,49 @@ def _check_decoded_exits(code, stage, decoder, *, vertex_fetch, mesh_layout, ear
         fail(f"unreachable instruction at +0x{min(pcs - visited - nops):x}")
 
 
+def _vertex_getpc_tail(code, decoder, *, vertex_fetch, mesh_layout):
+    """Prove a closed vertex instruction graph followed by GETPC-addressed data."""
+    # AMD RDNA 2 ISA, SOP1 S_GETPC_B64 and SOP2 S_ADD_U32/S_ADDC_U32:
+    # the PC is the address after GETPC, and the carry completes the address.
+    end_word = b"\x00\x00\x81\xbf"
+    candidates = 0
+    for end in range(4, len(code), 4):
+        if code[end - 4:end] != end_word:
+            continue
+        candidates += 1
+        if candidates > 8:
+            break
+        try:
+            rows = list(decoder(code[:end]))
+            _check_decoded_exits(code[:end], 1, decoder, vertex_fetch=vertex_fetch, mesh_layout=mesh_layout)
+        except (ValueError, IndexError):
+            continue
+        gets = [(i, pc, line) for i, (pc, line) in enumerate(rows) if line.startswith("s_getpc_b64 ")]
+        if len(gets) != 1:
+            continue
+        i, pc, line = gets[0]
+        pair = re.fullmatch(r"s_getpc_b64 s\[(\d+):(\d+)\]", line)
+        if not pair or i + 2 >= len(rows):
+            continue
+        lo, hi = map(int, pair.groups())
+        if hi != lo + 1 or lo % 2 or rows[i + 1][0] != pc + 4:
+            continue
+        add = re.fullmatch(rf"s_add_u32 s{lo}, s{lo}, (0x[0-9a-f]+|[0-9]+)", rows[i + 1][1])
+        if (not add or code[rows[i + 1][0] + 1] != 0xff
+                or rows[i + 2][1] != f"s_addc_u32 s{hi}, s{hi}, 0"
+                or rows[i + 2][0] != rows[i + 1][0] + 8):
+            continue
+        offset = pc + 4 + int(add.group(1), 0)
+        if offset < end or offset >= len(code) or offset % 4:
+            continue
+        # A second GETPC in the intervening tail makes its role ambiguous.
+        if any(word & 0xff80ffff == 0xbe801f00
+               for word, in struct.iter_unpack("<I", code[end:offset])):
+            continue
+        return end, offset
+    return False
+
+
 def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None,
                    cpu=b"gfx1013", features=b"") -> tuple[bytes, bytes]:
     name = record.encode("ascii")
@@ -227,8 +270,13 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", d
                 return disassemble(span, llvm, offsets=True, cpu=cpu, features=features)
         if decoder is not None:
             mesh_layout = llvm is None or (cpu == b"gfx1013" and features == MESH_WAVE64)
-            _check_decoded_exits(code, stage, decoder, vertex_fetch=vertex_fetch, mesh_layout=mesh_layout,
-                                early_out=stage == 0 and cpu == b"gfx1013" and not features)
+            try:
+                _check_decoded_exits(code, stage, decoder, vertex_fetch=vertex_fetch, mesh_layout=mesh_layout,
+                                     early_out=stage == 0 and cpu == b"gfx1013" and not features)
+            except ValueError:
+                if stage != 1 or not _vertex_getpc_tail(code, decoder, vertex_fetch=vertex_fetch,
+                                                        mesh_layout=mesh_layout):
+                    raise
             return code
         if not code.endswith(b"\x00\x00\x81\xbf"):
             raise ValueError("Expected termination followed by code padding")

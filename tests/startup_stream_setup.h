@@ -52,6 +52,8 @@ inline bool stream_mrt_format(DXGI_FORMAT format, StreamMrtFormat& out)
         out = {true, true, 2, DXGI_FORMAT_R8G8_TYPELESS}; return true;
     case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
         out = {true, true, 2, DXGI_FORMAT_R16_TYPELESS}; return true;
+    case DXGI_FORMAT_R16_SNORM:
+        out = {false, true, 2, format}; return true;
     case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
         out = {true, true, 4, DXGI_FORMAT_R16G16_TYPELESS}; return true;
     case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:

@@ -42,16 +42,19 @@ int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, co
 // Queries colour formats and returns "typed_uav_load_refused" when one has no typed UAV load, before any draw.
 // Returns nullptr only when the refusal helper itself accepts a cleared UAV_TYPED_LOAD bit.
 const char* check_startup_image_store_typed_load(ID3D12Device* device);
+int check_startup_pixel_formatted_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                        const char* sampler_line, const char* fixture_path);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
                               UINT vertices = 3, const std::uint32_t* constants = nullptr,
                               UINT constant_count = 4, const std::vector<std::uint32_t>& raw_srv = {}, UINT instances = 1,
                               DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_FLOAT, bool rgba8 = false,
-                              std::uint32_t* uint_words = nullptr);
+                              std::uint32_t* uint_words = nullptr, bool vertex_srv = false);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width = 1, UINT height = 1, bool dynamic_heap = false);
+                               UINT width = 1, UINT height = 1, bool dynamic_heap = false,
+                               const std::vector<std::vector<std::uint32_t>>& records = {});
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);

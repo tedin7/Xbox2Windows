@@ -679,6 +679,11 @@ def main(consumer, dxc, adapter, mode=None):
             filtered(directory / 'filtered', consumer, dxc, env)
             compared(directory / 'compared', consumer, dxc, env)
             uniform_image_load_mip(directory / 'uniform_image_load_mip', consumer, dxc, env)
+            for dim in DIMENSIONS:
+                identifier_load(directory / f'identifier-{dim}', consumer, dxc, env, dim)
+            identifier_load(directory / 'identifier-1d-mip', consumer, dxc, env, '1d', explicit_mip=True)
+            for dim in ('3d', '2da'):
+                default_typed_load(directory / f'default-{dim}', consumer, dxc, env, dim)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 

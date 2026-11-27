@@ -34,7 +34,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
                               const std::uint32_t* constants, UINT constant_count,
                               const std::vector<std::uint32_t>& raw_srv, UINT instances, DXGI_FORMAT format,
-                              bool rgba8, std::uint32_t* uint_words)
+                              bool rgba8, std::uint32_t* uint_words, bool vertex_srv)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = pixel_path ? read_blob(pixel_path) : std::vector<char>{};
@@ -45,7 +45,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[1].Descriptor = {0, 0};
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ShaderVisibility = vertex_srv ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = raw_srv.empty() ? 1 : 2;
     rs.pParameters = params;

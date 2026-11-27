@@ -44,6 +44,7 @@ struct ComputeTranslation {
     x2w_startup::ManifestRetry manifest_retry;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
     bool dynamic_heap = false;
+    bool dynamic_heap_formats = false;
     x2w_startup::IntegerTextureSrvs integer_srvs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
@@ -279,6 +280,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             return ComputeTranslation::root_constant;
         };
         if (line == "dynamic_heap") { tr.dynamic_heap = true; continue; }
+        if (line == "dynamic_heap_formats") { tr.dynamic_heap_formats = true; continue; }
         const auto input_dimension = [&] {
             return !std::strcmp(name, "tex2d") ? D3D12_SRV_DIMENSION_TEXTURE2D :
                 !std::strcmp(name, "texcube") ? D3D12_SRV_DIMENSION_TEXTURECUBE :
@@ -362,7 +364,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             return why;
         }
     }
-    if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
+    if ((tr.dynamic_heap_formats && !tr.dynamic_heap) || tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
@@ -666,10 +668,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
         if (!output && slot.root) {
-            // A root constant buffer view (dynamic-heap programs): its address was recorded by the list's slot 43/44 calls
+            // A root constant buffer view (dynamic-heap programs only; other programs refuse it below): its address was recorded by the list's slot 43/44 calls
             // and must lie in this list's upload memory. A root SRV goes through the checks below.
             const auto* root_params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
-            if (root_params && slot.a >= 0 && static_cast<std::size_t>(slot.a) < root_params->size() &&
+            if (tr->dynamic_heap && root_params && slot.a >= 0 && static_cast<std::size_t>(slot.a) < root_params->size() &&
                 static_cast<std::size_t>(slot.a) < pass.compute_root_addresses.size() &&
                 (*root_params)[slot.a].type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
                 const auto range = list_upload_range(self, pass.compute_root_addresses[slot.a], 1, true);
@@ -969,7 +971,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
     }
     ID3D12DescriptorHeap* view_heap = draw_heap;
-    UINT first = 0;
+    UINT first = 0, heap_count = 0;
     if (!reason && tr->dynamic_heap) {
         if (dispatch.signature) reason = "translated indirect Dispatch requires fixed-table raw buffers";
         else {
@@ -978,7 +980,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     for (std::size_t i = inputs; i < count; ++i)
                         if (views[i].resource == resource) return true;
                     return false;
-                }, first);
+                }, tr->dynamic_heap_formats, heap_count, false);
+            first = heap_count + 1;
             if (!view_heap) reason = "the dynamic resource heap could not be bound";
         }
     }
@@ -1065,7 +1068,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     list->SetComputeRootSignature(tr->root.Get());
     const UINT entries_now = static_cast<UINT>(tr->uds.size()) + twins;
     if (entries_now) list->SetComputeRoot32BitConstants(0, entries_now, values, 0);
-    if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()) + twins);
+    if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, heap_count, static_cast<UINT>(tr->uds.size()) + twins);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);

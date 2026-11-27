@@ -60,10 +60,12 @@ HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& 
     std::vector<D3D12_ROOT_PARAMETER1> parameters(desc.NumParameters);
     for (UINT i = 0; i < desc.NumParameters; ++i) {
         const D3D12_ROOT_PARAMETER& p = desc.pParameters[i];
-        if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_CBV && p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) return E_INVALIDARG;
         parameters[i].ParameterType = p.ParameterType;
-        parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
         parameters[i].ShaderVisibility = p.ShaderVisibility;
+        if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) parameters[i].Constants = p.Constants;
+        else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV)
+            parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+        else return E_INVALIDARG;
     }
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{D3D_ROOT_SIGNATURE_VERSION_1_1};
     versioned.Desc_1_1 = {desc.NumParameters, parameters.data(), 0, nullptr, desc.Flags};
@@ -176,12 +178,14 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(std::strtoul(flags, nullptr, 0));
     }
     D3D12_ROOT_PARAMETER entry_constant{};
-    if (GetEnvironmentVariableW(L"X2W_TEST_ENTRY_WORD", nullptr, 0)) {
+    const bool heap_texture = GetEnvironmentVariableW(L"X2W_TEST_HEAP_TEXTURE_DRAW", nullptr, 0) != 0;
+    if (heap_texture || GetEnvironmentVariableW(L"X2W_TEST_ENTRY_WORD", nullptr, 0)) {
         entry_constant.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        entry_constant.Constants = {0, 0, 1};
+        entry_constant.Constants = {0, 0, heap_texture ? 2u : 1u};
         entry_constant.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = &entry_constant;
+        if (heap_texture) root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     }
     // A runtime or device that rejects the requested root signature flags is a capability skip.
     const int rejected = root_desc.Flags ? 77 : 0;

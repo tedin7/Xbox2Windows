@@ -205,15 +205,18 @@ def main():
             check('%s on one descriptor is refused' % label,
                   result.startswith('unsupported') and 'both read and stored to' in fail_reason(name), '%s %s' % (result, fail_reason(name)))
 
-        # 7. A pixel-stage store is refused.
+        # 7. A plain pixel-stage dword store is still refused.
         ps = LOAD_DESCRIPTOR + DEFINE_V + encode_mubuf(STORE_OPS['dwordx3']) + PS
         result, name = request(folder, LOAD_DESCRIPTOR + EXPORT_POSITION, ps)
-        check('pixel-stage store is refused', result.startswith('unsupported') and not name.with_suffix('.txt').exists(),
+        check('plain pixel-stage store is refused', result.startswith('unsupported') and not name.with_suffix('.txt').exists(),
               '%s %s' % (result, fail_reason(name)))
 
         # 8. The cache revision moved, so a translation from before the store lowering is never loaded.
         check('cache key uses revision 29', G.pipeline_key(b'a', b'b', ROOT) ==
               G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.shader_cache_seed(b'x2w-startup-shader-29')))))
+
+    from startup_pixel_store_format_xyzw_check import controls
+    controls()
 
     if failures:
         print('FAILED: ' + ', '.join(failures))
