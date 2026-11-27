@@ -4307,6 +4307,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_load_d16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_image_load_d16_odd_tail_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_load_d16_check.py" odd-draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_image_load_d16_odd_tail_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # Build revision generator in temporary repositories: clean commit, no rewrite of an unchanged file,
     # untracked-only, tracked edit, new commit, not a repository, a directory inside another repository,
     # an inherited GIT_DIR and no git executable.

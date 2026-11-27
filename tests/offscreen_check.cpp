@@ -1386,24 +1386,27 @@ OperationResult run_startup_image_2d_view(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array|rgba32f_sampled> <vs.cso> <ps.cso> <expected.bin>:
+// --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array|rgba32f_sampled|rgba16f|rgba16f_r32f> <vs.cso> <ps.cso> <expected.bin>:
 // draws an 8x2 full-screen pair to an R32G32B32A32_UINT target against a two-mip (8x2 + 4x1) 2D or two-slice
-// 2D-array R16_UNORM / R32G32B32A32_FLOAT source texture and compares all 64 little-endian words with expected.bin.
+// 2D-array source texture. The RGBA16F cases use either a UINT target or a single-channel FLOAT target.
+// Compares 64 little-endian words with expected.bin, with absent FLOAT channels represented as zeros.
 OperationResult run_startup_image_load_d16(const OperationContext& ctx)
 {
     const bool depth16 = std::strcmp(ctx.argv[3], "r16_unorm") == 0 || std::strcmp(ctx.argv[3], "r16_unorm_array") == 0;
     const bool rgba32f = std::strcmp(ctx.argv[3], "rgba32f") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
     const bool array = std::strcmp(ctx.argv[3], "r16_unorm_array") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
     const bool sampled = std::strcmp(ctx.argv[3], "rgba32f_sampled") == 0;
-    if (!depth16 && !rgba32f && !sampled)
-        return {OutcomeKind::fail, "image_load d16 source mode must be r16_unorm[_array] or rgba32f[_array|_sampled]"};
+    const bool red_only = std::strcmp(ctx.argv[3], "rgba16f_r32f") == 0;
+    const bool half_float = red_only || std::strcmp(ctx.argv[3], "rgba16f") == 0;
+    if (!depth16 && !rgba32f && !sampled && !half_float)
+        return {OutcomeKind::fail, "unknown image_load d16 source mode"};
     std::uint32_t expected[64]{};
     std::ifstream file(ctx.argv[6], std::ios::binary);
     file.read(reinterpret_cast<char*>(expected), sizeof(expected));
     if (!file || file.peek() != std::char_traits<char>::eof())
         return {OutcomeKind::fail, "expected file does not hold 64 words"};
     std::uint32_t actual[64]{};
-    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual, array, sampled);
+    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual, array, sampled, half_float, red_only);
     unsigned differing = 0;
     for (unsigned i = 0; i < 16; ++i) {
         const std::uint32_t* want = &expected[i * 4];
