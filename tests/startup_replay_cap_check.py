@@ -177,14 +177,15 @@ def main(scene, backend):
         assert took > 1e-5 and abs(ends - was - took) < 2e-6, base.group(0)
         end_totals(slow)
 
-        # "d<draws>,<seconds>": the window opens at the first present whose frame made that many translated draws (a
-        # title's play, not its loading screens). One draw a frame, then three from frame 10 on: present 11 opens it.
+        # "d<draws>,<seconds>": the window opens at the first present after that many translated draws in total (the
+        # rule of X2W_DEBUG_PRESENT_FROM_DRAWS), however few each frame makes. One draw a frame, then three from frame 10
+        # on: 10 draws by present 10, 13 by present 11, so d12 opens at present 11 although no frame made 12.
         drawn = directory / "drawn.x2wr"
-        code, text, _ = timed(args + [30], dict(env, X2W_REPLAY_RECORD="d3,0.15", X2W_REPLAY_RECORD_FILE=str(drawn),
+        code, text, _ = timed(args + [30], dict(env, X2W_REPLAY_RECORD="d12,0.15", X2W_REPLAY_RECORD_FILE=str(drawn),
                                                X2W_TEST_REPLAY_DRAWS="10,3"))
         assert code == 0, text[-3000:]
         opened = [line for line in text.splitlines() if "x2w-replay record: window opens at" in line]
-        assert len(opened) == 1 and "present 11 (3 translated draws in its frame, at least 3)" in opened[0], opened or text[-3000:]
+        assert len(opened) == 1 and "present 11 (13 translated draws so far, at least 12)" in opened[0], opened or text[-3000:]
         _, _, _, window_presents = end_totals(drawn)
         assert window_presents > 0, "the draw-count window recorded no present"
 

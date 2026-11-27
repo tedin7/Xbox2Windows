@@ -990,7 +990,7 @@ RECORD_BY = {"f": "frame", "d": "draws", None: "time"}
 
 def parse_record_spec(spec):
     """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60), `f<first frame>,<frames>`
-    or `d<draws>,<seconds>` (the window opens at the first frame with that many translated draws: play, not a loading screen).
+    or `d<draws>,<seconds>` (the window opens after that many translated draws in total, as X2W_DEBUG_PRESENT_FROM_DRAWS: play, not a loading screen).
     Returns {"spec": normalized text, "by": "time"|"frame"|"draws", "start", "length"}. Raises ValueError for anything else, a window longer
     than 120 s / 2000 frames (the file would not fit a disk or a Drive folder), an empty window or a draw count of 0."""
     if spec.strip().lower() in ("auto", "default", "slow"):
@@ -998,7 +998,7 @@ def parse_record_spec(spec):
     match = RECORD_RE.match(spec.strip().lower())
     if not match:
         raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60), f<first frame>,<frames> (e.g. f4000,24) or "
-                         "d<draws in a frame>,<seconds> (e.g. d200,10), got %r" % spec)
+                         "d<translated draws in total>,<seconds> (e.g. d200,10), got %r" % spec)
     by = RECORD_BY[match.group(1)]
     start, length = int(match.group(2)), int(match.group(3))
     limit = RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS

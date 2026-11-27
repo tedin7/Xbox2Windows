@@ -71,10 +71,11 @@ constexpr LONG memory_cache_presents = 16;
 // slow_gap_s, or at slow_fallback_s; it lasts slow_seconds.
 bool slow_mode;
 double slow_after_s = 120, slow_gap_s = 0.5, slow_seconds = 10, slow_fallback_s = 180, last_present_s = -1;
-// "d<draws>,<seconds>": the window opens at the first present whose frame made at least draw_trigger translated draws
-// (a title's play, not its loading screens: a few draws a frame against hundreds); it lasts draw_seconds. The draws of a
-// frame are the translated draws counted since the previous present, so they need X2W_D3D12_RENDER. While it waits, the
-// largest frame of every 600 presents is logged, so a too-high count can be seen and lowered.
+// "d<draws>,<seconds>": the window opens at the first present after draw_trigger translated draws in total since the
+// start, the rule of X2W_DEBUG_PRESENT_FROM_DRAWS (a title's play comes after its loading screens' draws; a count per
+// frame does not tell them apart: a tester's title drew at most 24 a frame on its loading screen and about 22 in play).
+// It lasts draw_seconds. Translated draws need X2W_D3D12_RENDER. While it waits, every 600 presents the total so far and
+// the largest frame are logged, so the count can be checked.
 bool draw_mode;
 LONG draw_trigger;
 double draw_seconds;
@@ -920,15 +921,15 @@ void present()
         const LONG draws = translated_draws, in_frame = draws - draws_at_present;
         draws_at_present = draws;
         draws_most = (std::max)(draws_most, in_frame);
-        if (present > 1 && in_frame >= draw_trigger) {  // the first present's count holds everything before it
+        if (draws >= draw_trigger) {
             const double t = seconds_now();
             start_s = t;
             end_s = t + draw_seconds;
-            log("x2w-replay record: window opens at %.1f s, present %ld (%ld translated draws in its frame, at least %ld) for %.1f s",
-                t, present, in_frame, draw_trigger, draw_seconds);
+            log("x2w-replay record: window opens at %.1f s, present %ld (%ld translated draws so far, at least %ld) for %.1f s",
+                t, present, draws, draw_trigger, draw_seconds);
         } else if (present % draw_log_presents == 0) {
-            log("x2w-replay record: waiting for a frame of %ld translated draws: the most in one frame of presents %ld-%ld was %ld",
-                draw_trigger, present - draw_log_presents + 1, present, draws_most);
+            log("x2w-replay record: waiting for %ld translated draws: %ld so far at present %ld (the most in one frame of "
+                "presents %ld-%ld was %ld)", draw_trigger, draws, present, present - draw_log_presents + 1, present, draws_most);
             draws_most = 0;
         }
     }

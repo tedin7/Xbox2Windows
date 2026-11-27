@@ -1972,10 +1972,11 @@ makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `<X2W_REP
 set, else `replay.x2wr`; it stops with its end chunk once the file reaches `X2W_REPLAY_MAX_MIB`, default 2048), so a replayer can feed the
 same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
 Unset, no slot is wrapped and nothing changes.
-`d<draws>,<seconds>` (`tester_run.ps1 -Record d200,10`) opens the window at the first present whose frame made at least
-that many translated draws (play draws hundreds a frame, a loading screen a few; render mode only) and keeps it for
-the seconds; while it waits, `x2w-replay record: waiting for a frame of N translated draws: the most in one frame of
-presents A-B was M` every 600 presents shows whether N is too high.
+`d<draws>,<seconds>` (`tester_run.ps1 -Record d200,10`) opens the window at the first present after that many
+translated draws in total, the rule of `X2W_DEBUG_PRESENT_FROM_DRAWS` (render mode only), and keeps it for the
+seconds. A count per frame would not do: a tester's title drew at most 24 a frame on its loading screen and about 22
+in play. While it waits, `x2w-replay record: waiting for N translated draws: T so far at present P (the most in one
+frame of presents A-B was M)` comes every 600 presents.
 
 Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
 the real slot first except for the optional submit scan below, then appends
