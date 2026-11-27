@@ -258,7 +258,9 @@ def controls():
     check('quad broadcast also translates', refused(accepted.replace('[1,1,3,3]', '[0,0,0,0]')) is None)
     for label, asm, kwargs in (
             ('the identity permutation stays with the lane-local forms', accepted.replace('[1,1,3,3]', '[0,1,2,3]'), {}),
-            ('another pair pattern', accepted.replace('[1,1,3,3]', '[3,3,1,1]'), {}),
+            ('another pair pattern', accepted.replace('[1,1,3,3]', '[3,3,0,0]'), {}),
+            ('projected exchange with integer ALU',
+             'v_add_nc_u32_dpp v2, v1, v1 quad_perm:[3,3,1,1] row_mask:0xf bank_mask:0xf', {}),
             ('a row control', 'v_mov_b32_dpp v2, v1 row_shr:1 row_mask:0xf bank_mask:0xf', {}),
             ('a wave control', 'v_mov_b32_dpp v2, v1 wave_shl:1 row_mask:0xf bank_mask:0xf', {}),
             ('a mirror control', 'v_mov_b32_dpp v2, v1 row_mirror row_mask:0xf bank_mask:0xf', {}),
