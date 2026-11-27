@@ -682,7 +682,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // word verbatim, including unknown formats handled by the generated switch.
             if (slot.heap && formatted_inputs[i] && words[0] == view_token_magic) {
                 std::uint32_t format = 0;
-                if (const char* refusal = formatted_buffer_word3(words, format)) {
+                if (const char* refusal = formatted_buffer_word3(words, format, extended_buffer_formats())) {
                     reason = refusal == x2w_startup::undecoded_view_format
                         ? "a formatted input view has no buffer format code"
                         : "a formatted input has no word 3 the program decodes";
@@ -773,7 +773,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 break;
             }
             std::memcpy(word, view.words, sizeof(word));
-            if (formatted_buffer_word3(word, format)) {
+            if (formatted_buffer_word3(word, format, extended_buffer_formats())) {
                 reason = "a formatted input has no word 3 the program decodes";
                 std::memcpy(words, view.words, sizeof(view.words));
             }

@@ -401,9 +401,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             format = DXGI_FORMAT_R8G8B8A8_UINT;
             element = 4;
             mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
+        } else if (mode == "dispatch-heap-format-r32-uint" || mode == "dispatch-heap-format-snorm" ||
+                   mode == "dispatch-heap-format-ufloat") {
+            format = mode == "dispatch-heap-format-r32-uint" ? DXGI_FORMAT_R32_UINT :
+                     mode == "dispatch-heap-format-snorm" ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R11G11B10_FLOAT;
+            element = 4;
+            mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
         } else if (mode == "dispatch-heap-format-unsupported") {
-            format = DXGI_FORMAT_R16G16B16A16_UINT;
-            element = 8;
+            format = DXGI_FORMAT_R32G32B32_UINT;
+            element = 12;
         } else {
             return 2;
         }
