@@ -758,6 +758,27 @@ def carry_bound_mesh(case="uniform"):
     return mesh
 
 
+
+SDWA_BOUND_SETUP = "4a7c7881 347c7c88"  # v62 = (v60 + 1) << 8
+SDWA_BOUND_PAD = "02787cf9 0101003e"
+SDWA_BOUND_PRESERVE = "02787cf9 0101103e"
+SDWA_BOUND_MIXED = "02787cf9 0001003e"
+
+
+def sdwa_bound_mesh(case="pad"):
+    mesh = vector_count_guard_mesh()
+    at = mesh.index("7e2c053c")
+    extra = {
+        "pad": "",
+        "preserve": "34780088",     # v_lshlrev_b32 v60, 8, v0 (old high bits)
+        "lane source": "347c0088",  # v_lshlrev_b32 v62, 8, v0 (selected byte)
+        "lane mask": "7d880086",    # v_cmp_gt_u32_e32 vcc, 6, v0
+    }[case]
+    words = {"preserve": SDWA_BOUND_PRESERVE, "lane mask": SDWA_BOUND_MIXED}.get(case, SDWA_BOUND_PAD)
+    mesh[at:at] = (SDWA_BOUND_SETUP + " " + extra + " " + words).split()
+    return mesh
+
+
 def rewritten_guarded_position():
     """Overwriting v50 under the primitive mask invalidates its older position definition."""
     mesh = GUARDED_POSITIONS['select']
@@ -1316,9 +1337,31 @@ def carry_bound_controls(tmp):
         expect("mutant accepts a lane-dependent add operand",
                request(tmp, carry_bound_mesh("lane operand"))[1], "ok")
     for bit in (0, 1):
-        _, guest, _ = count_guard_reference(bit, vector_bound=True, carry_bound=True)
+        _, guest, _ = count_guard_reference(bit, vector_bound=True, bound_alu="carry")
         _, no_carry, _ = count_guard_reference(bit, vector_bound=True)
         expect(f"carry-in changes CPU raster pixels for root bit {bit}", guest != no_carry, bit == 0)
+
+
+
+def sdwa_bound_controls(tmp):
+    for label in ("pad", "preserve", "lane source", "lane mask"):
+        expect("SDWA bound: " + label, request(tmp, sdwa_bound_mesh(label))[1],
+               "ok" if label == "pad" else GUARDED_REFUSAL)
+
+    prove = G.mesh_uniform_vector_sources
+
+    def ignore_preserve(name, ops, mods, *state):
+        mods = ["dst_unused:UNUSED_PAD" if mod == "dst_unused:UNUSED_PRESERVE" else mod for mod in mods]
+        return prove(name, ops, mods, *state)
+
+    with patch.object(G, "mesh_uniform_vector_sources", ignore_preserve):
+        expect("mutant accepts SDWA which preserves part of a lane-dependent word",
+               request(tmp, sdwa_bound_mesh("preserve"))[1], "ok")
+    for bit in (0, 1):
+        _, guest, wrong = count_guard_reference(bit, vector_bound=True, bound_alu="sdwa")
+        _, before_sdwa, _ = count_guard_reference(bit, vector_bound=True)
+        expect(f"SDWA extraction changes CPU raster pixels for root bit {bit}", guest != before_sdwa, True)
+        expect(f"SDWA bound clamp mutant changes CPU raster pixels for root bit {bit}", guest != wrong, True)
 
 
 def count_entry_guard_controls(tmp):
@@ -1394,6 +1437,7 @@ def lane_mask_controls(tmp):
     count_guard_controls(tmp)
     vector_count_guard_controls(tmp)
     carry_bound_controls(tmp)
+    sdwa_bound_controls(tmp)
     count_entry_guard_controls(tmp)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
@@ -1887,6 +1931,16 @@ buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
     }
     for label, assembly in encodings.items():
         expect("carry bound words: " + label, assemble(mc, assembly), CARRY_PREFIXES[label].split())
+    expect("SDWA packed bound setup words",
+           assemble(mc, "v_add_nc_u32_e32 v62, 1, v60\nv_lshlrev_b32_e32 v62, 8, v62"), SDWA_BOUND_SETUP.split())
+    sdwa = ("v_cndmask_b32_sdwa v60, v62, v62, vcc dst_sel:BYTE_0 dst_unused:UNUSED_%s "
+            "src0_sel:BYTE_1 src1_sel:BYTE_1")
+    for label, words in (("PAD", SDWA_BOUND_PAD), ("PRESERVE", SDWA_BOUND_PRESERVE)):
+        expect("SDWA bound words: " + label, assemble(mc, sdwa % label), words.split())
+    expect("SDWA mixed lane mask words", assemble(mc, (sdwa % "PAD").replace("src1_sel:BYTE_1", "src1_sel:BYTE_0")),
+           SDWA_BOUND_MIXED.split())
+    expect("SDWA lane-dependent bytes words",
+           assemble(mc, "v_lshlrev_b32_e32 v60, 8, v0\nv_lshlrev_b32_e32 v62, 8, v0"), ["34780088", "347c0088"])
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
     expect('group words match llvm-mc', assemble(mc, mesh.replace(
@@ -2168,8 +2222,12 @@ def draw_lane_masks(dxc, renderer, adapter):
             status = draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=vector_bound)
             if status:
                 return status
-    with tempfile.TemporaryDirectory() as tmp:
-        return draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=True, carry_bound=True)
+    for bound_alu in ("carry", "sdwa"):
+        with tempfile.TemporaryDirectory() as tmp:
+            status = draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=True, bound_alu=bound_alu)
+            if status:
+                return status
+    return 0
 
 
 def guarded_position_reference():
@@ -2224,7 +2282,7 @@ def draw_guarded_positions(tmp, dxc, renderer, adapter):
     return 0
 
 
-def count_guard_reference(bit, *, vector_bound=False, carry_bound=False):
+def count_guard_reference(bit, *, vector_bound=False, bound_alu=None):
     """Build the two synthetic prefix inputs and model the guest index clamp."""
     points, colours, _ = geometry()
     triangles = [(7, 2, 15)]
@@ -2246,9 +2304,12 @@ def count_guard_reference(bit, *, vector_bound=False, carry_bound=False):
         struct.pack_into('<2I', data, 480, 8, 0)
         packed = struct.unpack_from('<I', data, 464 if bit else 480)[0]
         verts, prims = (packed & 63) + 1, ((packed >> 8) & 255) + 1
-    if carry_bound:
+    if bound_alu == "carry":
         # The clear-bit arm puts one in every lane of the input carry mask.
         verts += int(not bit)
+    elif bound_alu == "sdwa":
+        # Byte 1 supplies the count and destination padding clears the high bytes.
+        verts = struct.pack("<I", (verts + 1) << 8)[1]
     guest = [tuple(min(i, verts - 1) for i in tri) for tri in triangles]
     wrong = [tuple(min(i, verts - 2) for i in tri) for tri in guest]
     return data, rasterise(points, colours, guest, verts, prims), rasterise(points, colours, wrong, verts, prims)
@@ -2261,9 +2322,13 @@ def clamp_with_rewritten_count(source):
     return source.replace(old, new)
 
 
-def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False, carry_bound=False):
-    mesh = carry_bound_mesh() if carry_bound else vector_count_guard_mesh() if vector_bound else count_guard_mesh()
-    bound = "carry VGPR" if carry_bound else "VGPR" if vector_bound else "SGPR"
+def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False, bound_alu=None):
+    if bound_alu:
+        mesh = {"carry": carry_bound_mesh, "sdwa": sdwa_bound_mesh}[bound_alu]()
+        bound = f"{bound_alu} VGPR"
+    else:
+        mesh = vector_count_guard_mesh() if vector_bound else count_guard_mesh()
+        bound = "VGPR" if vector_bound else "SGPR"
     key, result = request(tmp, mesh)
     expect(f'two wave-load guards with a {bound} position bound compile', result, 'ok')
     if result != 'ok':
@@ -2282,7 +2347,7 @@ def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False, carry_b
     path = tmp / 'count-guard.bin'
     for bit in (0, 1):
         struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), bit)
-        data, guest, wrong = count_guard_reference(bit, vector_bound=vector_bound, carry_bound=carry_bound)
+        data, guest, wrong = count_guard_reference(bit, vector_bound=vector_bound, bound_alu=bound_alu)
         differences = sum(a != b for a, b in zip(guest, wrong))
         expect('the index clamp affects the image', differences > 0, True)
         cases = (('guest', base.with_suffix('.ms57.cso'), guest, 0),

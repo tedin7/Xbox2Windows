@@ -3426,12 +3426,23 @@ def mesh_uniform_lane_mask(token, scalars, uniform):
     return low == high and mesh_replicated_mask_word(low, uniform)
 
 
-def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read_only):
+def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read_only, uniform_rules=()):
     """Prove whole-word VALU and buffer loads have the same inputs in every lane."""
     base = re.sub(r'_e(32|64)$', '', name)
-    if base == 'v_cndmask_b32':
+    if base == 'v_cndmask_b32' or (name == 'v_cndmask_b32_sdwa' and 'sdwa' in uniform_rules):
         args = lane_mask_operands(name, ops)
-        return (not mods and len(args) == 4 and mesh_uniform_lane_mask(args[3], scalars, uniform)
+        if name == 'v_cndmask_b32_sdwa':
+            # RDNA 2 ISA §6.8. Select fields of the current lane's sources
+            # and fully define the result word with padding or sign extension.
+            fields = dict(mod.split(':', 1) for mod in mods if ':' in mod)
+            if (len(fields) != len(mods) or set(fields) != {'dst_sel', 'dst_unused', 'src0_sel', 'src1_sel'}
+                    or fields['dst_unused'] not in ('UNUSED_PAD', 'UNUSED_SEXT')
+                    or not all(fields[key] in SDWA_SEL for key in ('dst_sel', 'src0_sel', 'src1_sel'))):
+                return False
+            args[1:3] = [token.removeprefix('sext(').removesuffix(')') for token in args[1:3]]
+        elif mods:
+            return False
+        return (len(args) == 4 and mesh_uniform_lane_mask(args[3], scalars, uniform)
                 and mesh_uniform_operands(args[1:3], scalars, vectors, uniform))
     if base.startswith(('buffer_load_', 'tbuffer_load_')):
         if not read_only or '_d16' in name or any(
@@ -3446,7 +3457,7 @@ def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read
     return mesh_uniform_operands(sources, scalars, vectors, uniform)
 
 
-def mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry=False):
+def mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_rules=()):
     """Number full-width masks and report a uniform carry-producing VALU result."""
     # RDNA 2 ISA p. 20: V_CMP writes EXEC[n] & result.
     ss, vs, full = state
@@ -3472,7 +3483,7 @@ def mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry=Fa
             uniform.add(number)
             next_s.update(dict.fromkeys(words, number))
 
-    if uniform_carry and LANE_MASK_CARRY.fullmatch(name) and len(ops) in (4, 5):
+    if 'carry' in uniform_rules and LANE_MASK_CARRY.fullmatch(name) and len(ops) in (4, 5):
         args = lane_mask_operands(name, ops)
         words = mask_words(args[1], 2)
         if words and args[1] != 'exec':
@@ -3490,7 +3501,7 @@ def mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry=Fa
     return False
 
 
-def mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_carry=False):
+def mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_rules=()):
     """Number scalar and vector writes using the RDNA 2 ISA (SMEM p. 51, first-lane read p. 137)."""
     ss, vs, full = state
     _, ops, mods = parse(asm)
@@ -3521,11 +3532,11 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_ca
             uniform.add(('group-index',))
         elif mesh_uniform_value(source, uniform):
             next_s[ops[0]] = source
-    carry_uniform = mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry)
+    carry_uniform = mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_rules)
     vector_writes = mesh_vector_writes(name, asm)
     if vector_writes:
         vector_uniform = carry_uniform or (
-            full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only))
+            full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only, uniform_rules))
         for word in vector_writes:
             token = f'v{word}'
             number = ('def', i, token)
@@ -3535,7 +3546,7 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_ca
     return next_s, next_v, asm == 's_mov_b64 exec, -1' or (full and not writes_exec(name, ops))
 
 
-def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only, uniform_carry=False):
+def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only, uniform_rules=()):
     """Number forward paths. GS user data starts at s8; the root starts at s16."""
     if any(first <= i < exchange for i in constant_trips) or any(
             first <= i < exchange and not i < dest <= exchange for i, dest in edges.items()):
@@ -3559,7 +3570,7 @@ def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only, u
         if i == exchange:
             break
         name, asm = ins[i][2:]
-        state = mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_carry)
+        state = mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_rules)
         if i in edges:
             incoming.setdefault(edges[i], []).append(state)
             if name == 's_branch':
@@ -3761,7 +3772,7 @@ def mesh_full_exec_reset(ins, floor, compare, edges):
 
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
                   mask_arm_sites=None, standalone_selects=None, pixel_writes=False, count_rewrites=None,
-                  uniform_bounds=None, coherent_sites=None, uniform_carry=False):
+                  uniform_bounds=None, coherent_sites=None, uniform_rules=()):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -4219,7 +4230,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     if load_branches or count_entry is not None:
         read_only = not (pixel_writes or mesh_memory_writes(ins[:start] + ins[a_end:count_at] + ins[b_end:]))
         value_at, uniform_values, count_selects = mesh_value_numbers(
-            ins, a_end, count_at, edges, constant_trips, read_only, uniform_carry)
+            ins, a_end, count_at, edges, constant_trips, read_only, uniform_rules)
     count_words = value_at[count_at][0] if count_at in value_at else {}
     published = {key: count_words.get(env[key]) for key in ('verts', 'prims')}
     count_regs = {env[key]: key for key in published}
@@ -4708,17 +4719,18 @@ class Stage:
                       self.mesh_wave_votes, self.mesh_wave_scalars, self.mesh_wave_scalar_joins,
                       self.mesh_mask_arm_sites)
             # Preserve the legacy lowering whenever one of its three passes succeeds.
-            passes = ((None, None, False), (self.mesh_standalone_selects, None, False),
-                      (self.mesh_standalone_selects, self.mesh_coherent_sites, False),
-                      (self.mesh_standalone_selects, self.mesh_coherent_sites, True))
-            for selects, coherent, uniform_carry in passes:
+            passes = ((None, None, ()), (self.mesh_standalone_selects, None, ()),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, ()),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, ('carry',)),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, ('carry', 'sdwa')))
+            for selects, coherent, uniform_rules in passes:
                 try:
                     self.ins = mesh_skeleton(
                         self.ins, *proofs, selects, pixel_writes, self.mesh_count_rewrites,
-                        self.mesh_uniform_bounds, coherent, uniform_carry)
+                        self.mesh_uniform_bounds, coherent, uniform_rules)
                     break
                 except Unsupported as reason:
-                    if uniform_carry or not str(reason).startswith('slot 57 mesh:'):
+                    if 'sdwa' in uniform_rules or not str(reason).startswith('slot 57 mesh:'):
                         raise
                     for proof in proofs + (self.mesh_standalone_selects, self.mesh_count_rewrites,
                                            self.mesh_uniform_bounds, self.mesh_coherent_sites):
