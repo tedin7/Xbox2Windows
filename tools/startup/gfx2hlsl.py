@@ -7758,11 +7758,6 @@ class Stage:
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
-                    if getattr(self, 'pipe', None) is not None:
-                        plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words)
-                        if plan is not None:
-                            self.lds_error = None
-                            self.lds_plan = plan
             if self.lds_error is not None:
                 raise Unsupported(self.lds_error)
             if base == 's_barrier':
