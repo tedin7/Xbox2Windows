@@ -53,6 +53,7 @@ sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 from startup_flat_param_check import assemble  # noqa: E402
 from startup_image_3d_check import VS_WORDS, compile_hlsl, root_blob  # noqa: E402
+from startup_gfx2hlsl_scalar_null_check import sop2  # noqa: E402
 
 MASK = 0xffffffff
 SIZE = 32                  # the draw is SIZE x SIZE pixels
@@ -220,6 +221,8 @@ def start(op):
 
 
 def word(op, x, y):
+    if op == WAVE64:
+        return x
     return (1 << (x & 31)) if op == 'v_or_b32' else ((x | (y << 16)) * MULTIPLIER) & MASK
 
 
@@ -306,6 +309,33 @@ def branch_into_later_readlane():
     words_before = sum(len(w) for _t, w in upto) // 4
     label = [('s_cbranch_execz label_%04X' % (4 * (1 + words_before)), sopp(0x08, words_before))]
     return program(label, body, export('v4', 'v6', 'v8'))
+
+
+WAVE64 = 'wave64 sum'
+
+
+def wave64_sum(high_lane=63, tail=()):
+    op = 'v_add_nc_u32'
+    # The DPP/permlane operations reduce each half. The SALU add joins those two halves.
+    prefix = chain(op, vt=8, vp=9, ss=12, wave='b64', tail_order=(),
+                   steps=(STEPS[2], STEPS[1], STEPS[3], STEPS[0]))
+    input_x = [('v_and_b32_e32 v1, 31, v0', vop2(VOP2_OPS['v_and_b32'], 1, 159, 0))]
+    return program(input_x, prefix, [
+        ('s_mov_b64 exec, s[12:13]', sop1(4, EXEC_LO, 12)),
+        readlane(20, 8), readlane(21, 8, high_lane),
+        ('s_add_u32 s22, s20, s21', sop2(0, 22, 20, 21)),
+    ], tail, [move(4, 22)], export('v4', 'v1', 'v4'))[1]
+
+
+def synthetic_refusal_report(directory):
+    for words in (wave64_sum(),):
+        root = root_blob()
+        key = G.pipeline_key(VS_WORDS, words, root, b'', PACKED)
+        stem = 'req_%016x' % key
+        for suffix, blob in (('.a', VS_WORDS), ('.b', words), ('.root', root),
+                             ('.psin', ('psin1 %016x ena=0x8000 addr=0x8000\n' % key).encode())):
+            (directory / (stem + suffix)).write_bytes(blob)
+    return G.refusals_report(directory)
 
 
 def translate(words):
@@ -538,7 +568,46 @@ def model_run(label, source, model, default):
     check('%s: the 32-lane model %s' % (label, 'still reduces' if want else 'is not the reduction'), got == want)
 
 
+def new_controls():
+    with tempfile.TemporaryDirectory() as work:
+        report = synthetic_refusal_report(Path(work))['per_request']
+    check('the new synthetic request has no diagnostic refusal',
+          report['examined'] == report['no_refusal'] == 1, str(report))
+    for label, words, expected in (
+        ('duplicate half', wave64_sum(high_lane=31), 'distinct readlanes'),
+        ('live half', wave64_sum(tail=[move(7, 21)]), 'half-wave temporary'),
+        ('live vector temporary', wave64_sum(tail=[('v_mov_b32_e32 v7, v8', vop1_mov(7, 264))]),
+         'half-wave temporary'),
+        ('live half-add carry', wave64_sum(tail=[('v_mov_b32_e32 v7, src_scc', vop1_mov(7, 253))]),
+         'carry of the half-wave add'),
+    ):
+        _, reason = translate(words)
+        check(label + ' refuses', bool(reason and expected in reason), str(reason))
+    text, reason = translate(wave64_sum())
+    check('wave64 lowers only the final sum', bool(text and text.count('WaveActiveSum(v1)') == 1
+          and 's22 = WaveActiveSum(v1);' in text and 's20 =' not in text and 's21 =' not in text), str(reason))
+
+    # Run the decoded DPP prefix in each half, with separately selected input lanes.
+    # The ISA pairs rows 0/1 and 2/3, so the existing 32-lane model applies within each half.
+    decoded = [text for _, _, _, text in G.decode(wave64_sum())]
+    half = '\n'.join(['s_or_saveexec_b32 s12, -1', *decoded[2:9],
+                      's_mov_b32 exec_lo, s%d' % 12, decoded[10]])
+    rng = random.Random(64)
+    differs = False
+    valid = True
+    for mask in (1, 1 << 63, (1 << 64) - 1, *(rng.getrandbits(64) for _ in range(40))):
+        inputs = [rng.getrandbits(32) for _ in range(64)]
+        lo = run_model(half, inputs[:32], mask & MASK, rng)[20]
+        hi = run_model(half, inputs[32:], mask >> 32, rng)[20]
+        want = sum(value for lane, value in enumerate(inputs) if mask >> lane & 1) & MASK
+        valid &= ((lo + hi) & MASK) == want
+        differs |= (lo * 2 & MASK) != want
+    check('64-lane source model matches the CPU sum', valid)
+    check('64-lane source model detects reading the low half twice', differs)
+
+
 def controls():
+    new_controls()
     fills = G.Stage.WAVE_REDUCE_FILLS
     census = G.Stage.__dict__['wave_reduce_cndmask_fill']
     check('the identity fill table holds the census form only', fills == (census,), str(fills))
@@ -665,9 +734,14 @@ OBSERVE = ('    o.mrt0.w = asfloat(WaveGetLaneIndex() | (WaveGetLaneCount() << 8
            ' (WaveReadLaneFirst(uint(i.pos.x) | (uint(i.pos.y) << 5)) << 16));\n    return o;')
 
 
-def observed(text):
+def observed(text, tagged=False):
+    observation = OBSERVE
+    if tagged:
+        # Carry small integer payloads in normal floats on the FLOAT render target.
+        observation = observation.replace('asfloat(WaveGetLaneIndex()', 'asfloat(0x40000000u | WaveGetLaneIndex()')
+        observation = ('    o.mrt0.xyz = asfloat(asuint(o.mrt0.xyz) | 0x3f000000u);\n' + observation)
     assert text.count('    return o;') == 1
-    return text.replace('    return o;', OBSERVE)
+    return text.replace('    return o;', observation)
 
 
 def late_readlane(text):
@@ -743,9 +817,16 @@ BRANCH_PAIR_LABEL = 'branched min then max, interleaved'
 DRAWS.append((BRANCH_PAIR_LABEL, BRANCH_PAIR[1], 'v_min_u32',
               (('branch', 'v_min_u32'), ('branch_lane', pair_sdwa), ('branch', 'v_max_u32'))))
 
+DRAWS += [
+    (WAVE64, wave64_sum(), WAVE64,
+     (('reduce', 'v_add_nc_u32'), ('input', None), ('reduce', 'v_add_nc_u32'))),
+]
 
-def verify(input_op, channels, words):
+
+def verify(input_op, channels, words, tagged=False):
     """Group the readback by desktop wave and compare with the CPU reference. Returns (errors, facts)."""
+    if len(words) != SIZE * SIZE * 16:
+        return ['readback size is %d bytes' % len(words)], ''
     pixels = struct.unpack('<%dI' % (len(words) // 4), words)
     groups, errors = collections.defaultdict(list), []
     for y in range(SIZE):
@@ -753,6 +834,11 @@ def verify(input_op, channels, words):
             p = pixels[(y * SIZE + x) * 4:(y * SIZE + x) * 4 + 4]
             if p == (CLEAR,) * 4:
                 continue
+            if tagged:
+                if any(value & 0xff800000 != 0x3f000000 for value in p[:3]) or p[3] >> 26 != 16:
+                    errors.append('readback tag mismatch at (%d,%d)' % (x, y))
+                    continue
+                p = (*(value & 0x007fffff for value in p[:3]), p[3] & 0x03ffffff)
             groups[p[3] >> 16].append((x, y, p))
     counts, arms = set(), set()
     branched = any(kind == 'branch' for kind, _ in channels)
@@ -820,7 +906,10 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
             branched = label in BRANCHED or label == BRANCH_PAIR_LABEL
-            if label == BRANCH_PAIR_LABEL:
+            tagged = label == WAVE64
+            if label == WAVE64:
+                hows = [('lane-local input', lambda t: t.replace('WaveActiveSum(v1)', 'v1'))]
+            elif label == BRANCH_PAIR_LABEL:
                 hows = [('min/max swapped', PAIR_MUTATIONS['min and max swapped'])]
             elif label in BRANCHED:
                 op, _ = BRANCHED[label]
@@ -833,8 +922,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             else:
                 hows = list(PAIR_MUTATIONS.items())
             for how, mutate in [(None, None)] + hows:
-                source = observed(text if how is None else mutate(text))
-                if how is not None and source == observed(text):
+                source = observed(text if how is None else mutate(text), tagged)
+                if how is not None and source == observed(text, tagged):
                     if label not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32') and how == 'signed for unsigned':
                         continue   # only min and max have a signedness
                     check('%s %s %s: the planted error applies' % (adapter, label, how), False)
@@ -846,7 +935,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 if run.returncode != 0 or not out.exists():
                     check('%s %s %s: draw' % (adapter, label, how or 'lowering'), False, run.stdout + run.stderr)
                     continue
-                errors, facts = verify(input_op, channels, out.read_bytes())
+                errors, facts = verify(input_op, channels, out.read_bytes(), tagged)
                 clean = 'debug_layer=enabled' not in run.stdout or 'debug_errors=0 debug_warnings=0' in run.stdout
                 if how is None:
                     print('  ' + ' '.join(ln for ln in run.stdout.splitlines() if ln.startswith(
@@ -855,7 +944,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     check('%s %s: every covered pixel matches its desktop wave' % (adapter, label),
                           not errors and clean, '; '.join(errors[:3]) + ' ' + run.stdout)
                 else:
-                    mismatches = [err for err in errors if err.startswith('pixel (')] if branched else errors
+                    mismatches = ([err for err in errors if err.startswith('pixel (')]
+                                  if branched or tagged else errors)
                     check('%s %s %s mutation fails against the reference: %s (%d mismatches)' % (
                         adapter, label, how, mismatches[0] if mismatches else '', len(mismatches)), bool(mismatches))
 
