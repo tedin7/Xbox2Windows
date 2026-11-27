@@ -69,6 +69,22 @@ static bool derive(void* device, void*& pipeline, bool child)
     return true;
 }
 
+static bool derive_target_blend(void* device, void*& pipeline, bool logic, bool coverage)
+{
+    using Create = HRESULT (WINAPI*)(void*, void*, UINT, const Patch*, REFIID, void**);
+    auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[55]);
+    Patch patch{2};
+    patch.blend.AlphaToCoverageEnable = coverage;
+    patch.blend.RenderTarget[0] = {
+        !logic && !coverage, logic, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+        logic ? D3D12_LOGIC_OP_XOR : D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+    void* next = nullptr;
+    if (FAILED(create(device, pipeline, 1, &patch, __uuidof(ID3D12PipelineState), &next)) || !next) return false;
+    pipeline = next;
+    return true;
+}
+
 // A slot-57 description as the stand-in reads it: 64-bit words 0 (root signature), 1-2 (state block
 // A and its size), 5-6 and 9-10 (the two shaders). spec lists "offset:word" pairs in hex, written
 // into a zeroed state block A; the colour-blend words of the eight targets start at +0xD0.
@@ -889,6 +905,14 @@ int main(int argc, char** argv)
         StreamMrtFormat mrt{};
         if (!stream_mrt_format(format, mrt)) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
+    }
+    char target_blend[16]{};
+    if (GetEnvironmentVariableA("X2W_TEST_TARGET_BLEND", target_blend, sizeof(target_blend))) {
+        const bool logic = std::strcmp(target_blend, "logic") == 0;
+        const bool coverage = std::strcmp(target_blend, "coverage") == 0;
+        if (!logic && !coverage && std::strcmp(target_blend, "alpha") != 0) return 2;
+        if (!derive_target_blend(device, pso, logic, coverage)) return 10;
+        format = coverage ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     }
     wchar_t manifest[MAX_PATH];
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_PUBLISH_MANIFEST", manifest, MAX_PATH);

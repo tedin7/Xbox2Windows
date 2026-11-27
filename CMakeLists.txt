@@ -5125,6 +5125,14 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")
             set_tests_properties(startup_mrt_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            if(backend STREQUAL "warp")
+                foreach(blend_case IN ITEMS alpha logic coverage)
+                    add_test(NAME startup_mrt_target_blend_${blend_case}_${compiler}_warp COMMAND "${INTAKE_PYTHON}" -B
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
+                        "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}" "${blend_case}")
+                    set_tests_properties(startup_mrt_target_blend_${blend_case}_${compiler}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endif()
         endforeach()
         add_test(NAME startup_logical_view_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_logical_view_check.py"

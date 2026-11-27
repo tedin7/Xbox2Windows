@@ -440,6 +440,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (!bind_dropmips(desktop.Get(), guest, binding)) return 36;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
+    const bool target_blend = GetEnvironmentVariableW(L"X2W_TEST_TARGET_BLEND", nullptr, 0) != 0;
+    if (target_blend) {
+        frame.count = 2;
+        frame.second_format = format == DXGI_FORMAT_R32_UINT ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32_UINT;
+    }
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
@@ -591,6 +596,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
+    } else if (target_blend) {
+        // Vertex IDs 0 through 3 form a strip covering the same pixel in both draws.
+        static constexpr UINT first[] = {0x01000001, 0x3f800000};
+        static constexpr UINT last[] = {0x02000003, 0};
+        invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        invoke(list, 40, 0, 2, arg(first), 0);
+        invoke(list, 12, 4, 1);
+        invoke(list, 40, 0, 2, arg(last), 0);
+        invoke(list, 12, 4, 1);
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);

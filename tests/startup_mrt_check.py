@@ -39,6 +39,26 @@ def pixel(values, unorm=False):
     return container(0, words + [0xbf810000])
 
 
+def target_blend_pixel(integer_first=False):
+    # Root words s8/s9 hold the exact ID and the red component for this draw.
+    colour, identifier = (1, 0) if integer_first else (0, 1)
+    words = [vop1(1, 0, 9), vop1(1, 1, 240), vop1(1, 2, 128), vop1(1, 3, 8),
+             0xf800000f | colour << 4, 0x01020100, 0xf8001801 | identifier << 4, 3, 0xbf810000]
+    return container(0, words)
+
+
+def target_blend_reference(alpha_blend, integer_first=False):
+    colour = (0.0, 0.0, 1.0, 1.0)
+    for red in (1.0, 0.0):
+        source = (red, 0.5, 0.0, 0.5)
+        rgb = tuple(src * source[3] + dst * (1 - source[3])
+                    for src, dst in zip(source[:3], colour[:3]))
+        colour = (*rgb, source[3]) if alpha_blend else source
+    rgba = struct.pack('<4e', *colour)
+    identifier = struct.pack('<I', 0x02000003)
+    return identifier + rgba if integer_first else rgba + identifier
+
+
 def compile_shader(compiler, kind, stage, source, blob, listing, unoptimized=False):
     profile = stage + ('_5_1' if kind == 'fxc' else '_6_0')
     if kind == 'fxc':
@@ -56,7 +76,9 @@ def signature(listing):
     return {slot: 'int' if kind == 'sint' else kind for slot, kind in targets}
 
 
-def check(work, consumer, backend, kind, dxc, fxc):
+def check(work, consumer, backend, kind, dxc, fxc, scenario=None):
+    if scenario is not None and (backend != 'warp' or scenario not in ('alpha', 'logic', 'coverage')):
+        raise ValueError(f'Unknown WARP target-blend scenario {scenario!r}')
     compiler = fxc if kind == 'fxc' else dxc
     if not Path(compiler).is_file():
         print(f'{kind} compiler unavailable')
@@ -73,7 +95,7 @@ def check(work, consumer, backend, kind, dxc, fxc):
                    X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc if kind == 'fxc' else '')
         args = [consumer, vs, ps, root, backend, output]
 
-        def draw(fmt, word=0, wanted_draw=True):
+        def draw(fmt, word=0, wanted_draw=True, blend_reference=None):
             result = subprocess.run(args + [str(fmt), str(word)], env=env, capture_output=True, text=True)
             if result.returncode == 77:
                 raise SystemExit(77)
@@ -81,6 +103,16 @@ def check(work, consumer, backend, kind, dxc, fxc):
             debug = next((line for line in result.stderr.splitlines() if 'debug layer:' in line), '')
             assert debug, result.stderr
             print(debug)
+            if blend_reference is not None and result.returncode == 0:
+                observed = output.read_bytes()
+                if observed == struct.pack('<4eI', 0, 0, 1, 1, 0):
+                    failures = re.findall(r'PSO failure pipeline .*rt0=10 blend=1 logic=0 rt1=42 blend=1 logic=0',
+                                          result.stderr)
+                    if len(failures) == 1:
+                        print('Skipped-adjustment mutant: one cached PSO failure and both clear values preserved')
+                    elif result.stderr.count('export write masks incompatible with shared logic op') == 1:
+                        print('Skipped-adjustment mutant: shared logic rejected and both clear values preserved')
+                assert observed == blend_reference, (observed.hex(), blend_reference.hex(), result.stderr)
             assert not re.search(r'x2w-d3d12-debug.*sev=[012]\b', result.stderr), result.stderr
             actual_draw = '-> drawn;' in result.stderr
             assert result.returncode == 0 and actual_draw == wanted_draw, result.stderr
@@ -109,6 +141,28 @@ def check(work, consumer, backend, kind, dxc, fxc):
 
         return SimpleNamespace(cache=cache, root=root, output=output, env=env, draw=draw,
                                queue_request=queue_request, request=request, compile_pair=compile_pair)
+
+    if scenario is not None:
+        integer_first = scenario == 'coverage'
+        ps.write_bytes(target_blend_pixel(integer_first))
+        formats = (42, 10) if integer_first else (10, 42)
+        colour_slot, id_slot = ('1', '0') if integer_first else ('0', '1')
+        s = session(f'target-blend-{scenario}')
+        s.env['X2W_TEST_TARGET_BLEND'] = scenario
+        key, cleared = s.request(formats[0], formats)
+        clear_colour = struct.pack('<4e', 0, 0, 1, 1)
+        clear_id = bytes(4)
+        assert cleared == (clear_id + clear_colour if integer_first else clear_colour + clear_id), cleared.hex()
+        assert s.compile_pair(key) == {colour_slot: 'float', id_slot: 'uint'}
+        assert f'wmask {id_slot} 0x1' in (s.cache / f'{key}.txt').read_text().splitlines()
+        expected = target_blend_reference(scenario == 'alpha', integer_first)
+        pixels, log = s.draw(formats[0], blend_reference=expected)
+        assert log.count('-> drawn;') == 2, log
+        assert log.count(f'2 targets (format {formats[0]}) -> 0x00000000') == 1, log
+        assert re.findall(r'adjusted target blend .*\(adjusted pipelines (\d+)\)', log) == ['1'], log
+        assert 'export write masks incompatible' not in log, log
+        print(f'{kind} {backend} {scenario} target blend: CPU reference matched {pixels.hex()}')
+        return 0
 
     main = session('cache')
     cache, root, output, env = main.cache, main.root, main.output, main.env
@@ -254,6 +308,42 @@ def check(work, consumer, backend, kind, dxc, fxc):
     return 0
 
 
+def check_target_blend_offline():
+    # Serialized root signature with two pixel-visible 32-bit constants at b0.
+    payload = struct.pack('<12I', 2, 1, 24, 0, 0, 0, 1, 5, 36, 0, 0, 2)
+    part = b'RTS0' + struct.pack('<I', len(payload)) + payload
+    root = b'DXBC' + bytes(16) + struct.pack('<4I', 1, 36 + len(part), 1, 36) + part
+    Path('out').mkdir(exist_ok=True)
+    vs = vertex()
+    with tempfile.TemporaryDirectory(dir='out') as directory:
+        path = Path(directory)
+        for integer_first in (False, True):
+            ps = target_blend_pixel(integer_first)
+            base = gfx2hlsl.pipeline_key(vs, ps, root)
+            record = f'rtv1 {base} ' + ('42 10' if integer_first else '10 42')
+            key = gfx2hlsl.fnv(record.encode('ascii'))
+            for ext, data in (('a', vs), ('b', ps), ('root', root)):
+                (path / f'req_{base:016x}.{ext}').write_bytes(data)
+            (path / f'req_{key:016x}.rtv').write_text(record)
+            kinds, signature_blob, formats, _, fetch, _, attrs = gfx2hlsl.load_request(path, key)
+            pipe = gfx2hlsl.Pipeline(kinds['vs'], kinds['ps'], signature_blob, rtv_formats=formats,
+                                     vs_fetch=fetch, ps_attr_map=attrs)
+            source, manifest = pipe.hlsl_ps(), pipe.manifest()
+            colour, identifier = (1, 0) if integer_first else (0, 1)
+            assert f'float4 mrt{colour} : SV_Target{colour}' in source
+            assert f'uint4 mrt{identifier} : SV_Target{identifier}' in source
+            assert f'o.mrt{identifier} = uint4(v3, 0u, 0u, 0u);' in source
+            for entry in (f'wmask {identifier} 0x1', 'udsrc 1 rootconst 0 0', 'udsrc 2 rootconst 0 1'):
+                assert entry in manifest, manifest
+    assert struct.unpack('<4eI', target_blend_reference(True)) == (0.25, 0.375, 0.25, 0.5, 0x02000003)
+    assert struct.unpack('<4eI', target_blend_reference(False)) == (0.0, 0.5, 0.0, 0.5, 0x02000003)
+    assert struct.unpack('<I4e', target_blend_reference(False, True)) == (0x02000003, 0.0, 0.5, 0.0, 0.5)
+    print('Target blend offline: typed shader exports, root constants, write mask and CPU references passed')
+
+
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--target-blend-offline']:
+        check_target_blend_offline()
+        sys.exit(0)
     with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
         sys.exit(check(Path(directory), *sys.argv[1:]))

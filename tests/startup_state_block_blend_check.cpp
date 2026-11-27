@@ -1,6 +1,8 @@
 // Checks src/startup_stubs/state_block_blend.h without a device: synthetic slot 57 state blocks
 // carrying the four CB_BLENDn_CONTROL words measured on #1216, and the refusals.
 #include "startup_stubs/state_block_blend.h"
+#include "startup_stubs/export_write_mask.h"
+#include "startup_stubs/target_blend.h"
 
 #include <cstdio>
 #include <vector>
@@ -42,6 +44,60 @@ void expect_target0(const char* name, std::uint32_t word, D3D12_BLEND src, D3D12
         if (blend.RenderTarget[target].BlendEnable || blend.RenderTarget[target].RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_ALL)
             return fail(name, "a disabled target is blended or masked");
     if (refused) fail(name, "a target was reported refused");
+}
+void check_target_formats()
+{
+    D3D12_BLEND_DESC original{};
+    original.RenderTarget[0] = {
+        TRUE, FALSE, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
+        D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_ALPHA};
+    original.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_GREEN;
+    const DXGI_FORMAT floats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
+    const DXGI_FORMAT mixed[] = {floats[0], DXGI_FORMAT_R32_UINT};
+    const DXGI_FORMAT integers[] = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT};
+    D3D12_BLEND_DESC blend;
+    std::memcpy(&blend, &original, sizeof(blend));
+    if (x2w_startup::adjust_target_blend(blend, floats, 2) || std::memcmp(&blend, &original, sizeof(blend)))
+        fail("float-only control", "the blend description bytes changed");
+
+    if (!x2w_startup::adjust_target_blend(blend, mixed, 2) || !blend.IndependentBlendEnable ||
+        std::memcmp(&blend.RenderTarget[0], &original.RenderTarget[0], sizeof(blend.RenderTarget[0])) ||
+        blend.RenderTarget[1].BlendEnable || blend.RenderTarget[1].LogicOpEnable ||
+        blend.RenderTarget[1].SrcBlend != original.RenderTarget[0].SrcBlend ||
+        blend.RenderTarget[1].DestBlend != original.RenderTarget[0].DestBlend ||
+        blend.RenderTarget[1].RenderTargetWriteMask != original.RenderTarget[0].RenderTargetWriteMask ||
+        x2w_startup::adjust_target_blend(blend, mixed, 2))
+        fail("shared blend with an integer target", "the effective state or idempotence differs");
+
+    original.IndependentBlendEnable = TRUE;
+    original.AlphaToCoverageEnable = TRUE;
+    original.RenderTarget[1].BlendEnable = TRUE;
+    blend = original;
+    if (!x2w_startup::adjust_target_blend(blend, integers, 2) || blend.AlphaToCoverageEnable ||
+        !blend.IndependentBlendEnable || blend.RenderTarget[0].BlendEnable || blend.RenderTarget[1].BlendEnable ||
+        blend.RenderTarget[1].RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_GREEN)
+        fail("independent blend on UINT and SINT", "integer blend, coverage or mask differs");
+
+    original = {};
+    original.RenderTarget[0].LogicOpEnable = TRUE;
+    original.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+    original.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend = original;
+    const DXGI_FORMAT uints[] = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UINT};
+    if (x2w_startup::adjust_target_blend(blend, uints, 2) || !blend.RenderTarget[0].LogicOpEnable)
+        fail("UINT-only logic", "the shared logic operation was changed");
+    x2w_startup::ExportWriteMasks masks;
+    if (!masks.read_manifest_line("wmask 1 0x1") ||
+        x2w_startup::apply_export_write_masks(blend, masks, 2))
+        fail("shared logic mask control", "the unadjusted state accepted different export masks");
+    if (!x2w_startup::adjust_target_blend(blend, mixed, 2) || blend.RenderTarget[0].LogicOpEnable ||
+        !x2w_startup::apply_export_write_masks(blend, masks, 2) || !blend.IndependentBlendEnable ||
+        blend.RenderTarget[1].LogicOpEnable || blend.RenderTarget[1].RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_RED)
+        fail("mixed shared logic", "the adjustment did not make different export masks usable");
+    blend = original;
+    if (!x2w_startup::adjust_target_blend(blend, integers, 2) || blend.RenderTarget[0].LogicOpEnable)
+        fail("mixed UINT/SINT logic", "the shared logic operation survived");
 }
 }  // namespace
 
@@ -142,10 +198,11 @@ int main()
             fail("dual source on target 0 with all other targets blending", "not refused, a refused target is unreported, or the output was written");
     }
 
+    check_target_formats();
     if (failures) {
         std::printf("startup_state_block_blend: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_state_block_blend: PASS (4 measured words, constant alpha, enable clear, 5 controls, dual source)\n");
+    std::printf("startup_state_block_blend: PASS (4 measured words, constant alpha, enable clear, 5 decode controls, dual source, RTV blend compatibility)\n");
     return 0;
 }

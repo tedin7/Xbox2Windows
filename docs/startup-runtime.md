@@ -2832,6 +2832,25 @@ These are measured on one executable; treat them as hypotheses for others.
   a whole pair, an export of no channel, two exports of one target with different masks, a packed
   integer compressed export and a partial compressed export to a vertex output stay refused
   (`ctest --preset release --no-tests=error -R "^startup_(gfx2hlsl_)?export_(write_)?mask"`).
+- Translated graphics PSOs use the bound render-target formats to adjust the blend description
+  before export write masks. A UINT or SINT target keeps its effective write mask and writes
+  without blending. Integer target 0 disables alpha-to-coverage. A shared logic operation
+  requires every target to be UINT. If any bound target is incompatible, the PSO disables the
+  shared operation, and export write masks can then vary across targets. The render totals count
+  adjusted PSO creation attempts. The first creation failure for each cached variant logs the
+  translated shader and cache keys, all RTV formats, and their effective blend and logic flags.
+
+  On Windows, build `startup_stream_consumer` and `startup_state_block_blend_check`, then run
+  `ctest --preset dev --no-tests=error -V -R '^startup_(state_block_blend|mrt_target_blend_(alpha|logic|coverage)_(fxc|dxc)_warp)$'`.
+  The WARP fixtures compare two overlapping draws to CPU references for RGBA16F colour and an
+  exact R32_UINT identifier. The coverage case swaps the targets and enables alpha-to-coverage
+  with the UINT target in slot 0. The state check includes a byte-for-byte float-only control.
+  To run the source mutant in a disposable checkout, replace the initializer of
+  `const bool adjusted` in `pipeline_for` with `false`, rebuild the stand-in, and rerun
+  `ctest --preset dev --no-tests=error -V -R '^startup_mrt_target_blend_(alpha|logic)_(fxc|dxc)_warp$'`.
+  The alpha cases must report one cached PSO failure per process. The logic cases must report
+  incompatible export masks. Both must read back the original clears and fail their pixel
+  comparisons. Restore the source and rebuild before rerunning the positive cases.
 - Colour-blend registers reach the draw path for pipelines created through device slot 57 only
   (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend

@@ -67,22 +67,6 @@ bool float_uav_format(DXGI_FORMAT format)
     }
 }
 
-bool integer_uav_format(DXGI_FORMAT format)
-{
-    switch (format) {
-    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
-    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UINT:
-    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT:
-    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT:
-    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT:
-    case DXGI_FORMAT_R8_SINT:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool srgb_uav_format(DXGI_FORMAT format)
 {
     return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
@@ -117,7 +101,7 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
         if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
     }
-    if (integer_uav_format(format)) return "integer format for a float view";
+    if (x2w_startup::integer_color_format(format)) return "integer format for a float view";
     if (srgb_uav_format(format)) return "sRGB format";
     if (!float_uav_format(format)) return "format is not a float colour format";
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
@@ -373,6 +357,7 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+LONG adjusted_blend_pipelines;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
 // Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
@@ -1254,6 +1239,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
+    const bool adjusted = x2w_startup::adjust_target_blend(desc.BlendState, pass.target_formats, pass.target_count);
     // Channels the translated exports leave unwritten stay out of the write mask (#1674).
     if (!x2w_startup::apply_export_write_masks(desc.BlendState, tr.write_masks, pass.target_count)) {
         log("x2w-draw export write masks incompatible with shared logic op for %016llx", tr.key);
@@ -1280,6 +1266,21 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
         pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
         static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
+    if (adjusted) {
+        const LONG total = InterlockedIncrement(&adjusted_blend_pipelines);
+        log("x2w-draw adjusted target blend for %016llx (adjusted pipelines %ld)", tr.key, total);
+    }
+    if (FAILED(hr)) {
+        std::string targets;
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            const auto& target = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            targets += " rt" + std::to_string(i) + "=" + std::to_string(desc.RTVFormats[i]) +
+                       " blend=" + std::to_string(target.BlendEnable) + " logic=" + std::to_string(target.LogicOpEnable);
+        }
+        log("x2w-draw PSO failure pipeline %016llx cache key %016llx hr 0x%08lx independent %d alpha-to-coverage %d%s",
+            tr.key, key, static_cast<unsigned long>(hr), desc.BlendState.IndependentBlendEnable,
+            desc.BlendState.AlphaToCoverageEnable, targets.c_str());
+    }
     check_device("translated CreateGraphicsPipelineState", 0);
     bound.pipelines[key] = pipeline;
     return pipeline;

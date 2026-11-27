@@ -149,6 +149,14 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             root_desc.NumParameters = 2;
         }
     }
+    D3D12_ROOT_PARAMETER blend_constants{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_TARGET_BLEND", nullptr, 0)) {
+        blend_constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        blend_constants.Constants = {0, 0, 2};
+        blend_constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_desc.NumParameters = 1;
+        root_desc.pParameters = &blend_constants;
+    }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
     D3D12_ROOT_PARAMETER root_cbv{};
@@ -279,7 +287,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const bool typed = stream_mrt_format(format, mrt);
     const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
-    // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
+    // A caller that wants a second target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
@@ -297,8 +305,10 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const float clear[] = {0, 0, 1, narrow ? 0.0f : 1.0f};
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
-        const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? mrt.typeless : view_format;
+        const auto view_format = i ? state.second_format : format;
+        StreamMrtFormat attachment{};
+        const bool typed_view = stream_mrt_format(view_format, attachment);
+        const auto resource_format = typed_view ? attachment.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -307,7 +317,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (typed_view ? attachment.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 

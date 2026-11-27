@@ -26,6 +26,7 @@ struct StreamAttachment {
 struct StreamTarget {
     std::array<StreamAttachment, 2> attachments;
     UINT count{};
+    DXGI_FORMAT second_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     void* rtv_heap{};
     void* list{};
     void* queue{};
@@ -64,6 +65,7 @@ inline bool stream_mrt_format(DXGI_FORMAT format, StreamMrtFormat& out)
     case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: out = {true, true, 8, DXGI_FORMAT_R32G32_TYPELESS}; return true;
     case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
         out = {true, true, 16, DXGI_FORMAT_R32G32B32A32_TYPELESS}; return true;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: out = {false, true, 8, format}; return true;
     case DXGI_FORMAT_R32_FLOAT: out = {false, true, 4, format}; return true;
     case DXGI_FORMAT_R32G32_FLOAT: out = {false, true, 8, format}; return true;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: out = {false, true, 16, format}; return true;
