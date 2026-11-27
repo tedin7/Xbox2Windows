@@ -11090,6 +11090,89 @@ class Stage:
             text = 'abs(%s)' % text
         return '(-%s)' % text if neg else text
 
+    def half_source(self, tok, base, *, high=False, packed=False):
+        """Return a binary16 source word and its negation and absolute modifiers."""
+        original = tok
+        neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+        tok = tok[1:] if neg else tok
+        absolute = tok.startswith('|') and tok.endswith('|')
+        tok = tok[1:-1] if absolute else tok
+        r = reg_range(tok)
+        if r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255)):
+            raise Unsupported('%s source register %s' % (base, original))
+        if high:
+            word = '0u' if tok in FLOATS or re.fullmatch(r'-?\d+', tok) else '(%s >> 16)' % self.u(tok)
+        elif tok in FLOATS:
+            word = '%du' % struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+        elif packed and re.fullmatch(r'-?\d+', tok):
+            word = '%du' % (int(tok) & 0xffff)
+        else:
+            word = self.u(tok, low16_only=not packed)
+        return word, neg, absolute
+
+    def half_source_float(self, tok, base, *, high=False):
+        word, neg, absolute = self.half_source(tok, base, high=high)
+        value = 'f16tof32(%s & 0xffffu)' % word
+        if absolute:
+            value = 'abs(%s)' % value
+        return '(-%s)' % value if neg else value
+
+    def half_form(self, base, ops, mods, arity, allow_sel=False):
+        if len(ops) != arity + 1:
+            raise Unsupported('%s operand count' % base)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        sel = [0, 0, 0, 0]
+        seen = set()
+        for m in mods:
+            if m == 'clamp' and m not in seen:
+                seen.add(m)
+                continue
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])(?:,([01]))?\]', m)
+            if allow_sel and match and 'op_sel' not in seen:
+                sel = [int(x or 0) for x in match.groups()]
+                seen.add('op_sel')
+                continue
+            raise Unsupported('%s modifier %s' % (base, m))
+        return dst[1], sel
+
+    def op_v_fma_f16(self, ops, mods):
+        # AMD RDNA 2 ISA guide, VOP3 V_FMA_F16.
+        base = 'v_fma_f16'
+        d, sel = self.half_form(base, ops, mods, 3, allow_sel=True)
+        args = [self.half_source_float(tok, base, high=high) for tok, high in zip(ops[1:], sel)]
+        expr = 'fma16o(%s)' % ', '.join(args)
+        if 'clamp' in mods:
+            expr = 'saturate(%s)' % expr
+        result = 'f16rn(%s)' % expr
+        keep_low16 = not sel[3] and d in self.low16_only_v
+        result = ('(v%d & 0xffffu) | ((%s) << 16)' if sel[3]
+                  else '(v%d & 0xffff0000u) | (%s)') % (d, result)
+        self.set_v(d, result, low16_only=keep_low16)
+
+    def op_v_ldexp_f16(self, ops, mods):
+        # AMD RDNA 2 ISA guide, VOP2 V_LDEXP_F16.
+        base = 'v_ldexp_f16'
+        d, _ = self.half_form(base, ops, mods, 2)
+        if (ops[2].startswith(('-', '|')) and ops[2] not in FLOATS
+                and not re.fullmatch(r'-\d+', ops[2])):
+            raise Unsupported('%s exponent source modifier' % base)
+        r = reg_range(ops[2])
+        if r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255)):
+            raise Unsupported('%s exponent register %s' % (base, ops[2]))
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None:
+            pipe.uses_ldexp = True
+        exponent = ('%du' % struct.unpack('<H', struct.pack('<e', FLOATS[ops[2]]))[0]
+                    if ops[2] in FLOATS else self.u(ops[2], low16_only=True))
+        exponent = 'clamp(asint((%s & 0xffffu) << 16u) >> 16, -64, 64)' % exponent
+        source = self.half_source_float(ops[1], base)
+        expr = 'asfloat(x2w_ldexp(asuint(%s), %s))' % (source, exponent)
+        if 'clamp' in mods:
+            expr = 'saturate(%s)' % expr
+        self.set_v(d, 'f16rn(%s)' % expr)
+
     def half_alu(self, base, ops, mods):
         """16-bit VALU: operands are the low 16 bits, the result fills the low 16 bits and zeroes the rest (RDNA 2)."""
         arity, kind, text, result = VEC_H[base]
@@ -16659,6 +16742,29 @@ class Stage:
 
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
+    def op_v_pk_fmac_f16(self, ops, mods):
+        # AMD RDNA 2 ISA guide, VOP2 V_PK_FMAC_F16; RDNA 3 ISA guide, 7.5.1 packed inline constants.
+        if mods or len(ops) != 3:
+            raise Unsupported('v_pk_fmac_f16 modifiers or operand count %s' % mods)
+        d, s0, s1 = ops
+        dst, src1 = reg_range(d), reg_range(s1)
+        if (not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255 or not src1
+                or src1[0] != 'v' or src1[1] != src1[2] or src1[1] > 255):
+            raise Unsupported('v_pk_fmac_f16 destination or source1')
+        src0 = reg_range(s0)
+        if not ((src0 and src0[0] in ('s', 'v') and src0[1] == src0[2]
+                 and (src0[0] != 'v' or src0[1] <= 255)) or s0 in FLOATS
+                or re.fullmatch(r'-?\d+', s0) or re.fullmatch(r'0x[0-9a-fA-F]{1,8}', s0)):
+            raise Unsupported('v_pk_fmac_f16 source0 %s' % s0)
+        word, _, _ = self.half_source(s0, 'v_pk_fmac_f16', packed=True)
+        b = self.u(s1)
+        old = self.u(d)
+        lanes = []
+        for shift in (0, 16):
+            args = ['f16tof32((%s >> %du) & 0xffffu)' % (v, shift) for v in (word, b, old)]
+            lanes.append('f16rn(fma16o(%s))' % ', '.join(args))
+        self.set_v(dst[1], '%s | ((%s) << 16)' % tuple(lanes))
 
     # v_pk_{min,max}_f16: the lane values are exact binary32 images of binary16, so the binary32 helper that orders -0 below +0 and passes a
     # NaN to D3D min/max (the one v_min_f32 and v_max_f32 use) is exact, and f16rn gives the result back its binary16 word.
