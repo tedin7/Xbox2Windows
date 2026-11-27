@@ -54,11 +54,15 @@ LONG64 volatile prefix_slot_bytes[kind_count][wide_slots];
 // The thunk checks active before doing any recorder work. Window and prefix
 // selection is published by present(); the prefix ends when the window opens.
 std::atomic<bool> window_open{false}, prefix_open{false};
+// The window's base image of title memory is written before the window opens, a slice per present (see
+// base_image_holds_window): its bytes are the window's share of the caps, as when it was written at the window's start.
+bool base_warming;     // the window's time has come and its base image is being written
+u64 base_prefix_bytes; // the base image's bytes written so far before the window
 inline bool cap_exceeded(u64 extra = 0)
 {
     const u64 total = bytes_written + extra;
     if (!prefix_max_bytes) return total >= max_bytes;
-    if (!window_base_set) return prefix_open.load() ? total >= prefix_max_bytes : total >= max_bytes;
+    if (!window_base_set) return prefix_open.load() ? total - base_prefix_bytes >= prefix_max_bytes : total >= max_bytes;
     return total - window_base_bytes >= max_bytes;
 }
 std::atomic<unsigned> memory_epoch{0};
@@ -135,7 +139,7 @@ void update_window()
     window_open = in_window();
     if (window_open) {
         if (!window_base_set) {
-            window_base_bytes = prefix_open ? bytes_written : 0;
+            window_base_bytes = prefix_open ? bytes_written - base_prefix_bytes : 0;
             window_base_set = true;
         }
         prefix_open = false;
@@ -903,8 +907,8 @@ void present()
                 gap >= slow_gap_s ? "first slowdown" : "fallback time", gap * 1000, slow_seconds);
         }
     }
-    update_window();
-    if (window_open || present == first_present) {
+    if (!base_image_holds_window(b, present)) update_window();
+    if (window_open || (present == first_present && !base_warming)) {
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
@@ -913,7 +917,8 @@ void present()
             else if (window_open) pages_at_present(b, seq, present);
         }
     }
-    if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
+    if (!base_warming && (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)))
+        InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&b.lock);
 }
 

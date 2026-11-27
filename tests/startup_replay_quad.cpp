@@ -31,6 +31,7 @@ enum class TitleRange { none, root, generated, supplied };
 
 struct Scene {
     void* target = nullptr;
+    void* title_buffer = nullptr;
     void* rtv_heap = nullptr;
     void* queue = nullptr;
     void* allocator = nullptr;
@@ -141,6 +142,21 @@ int create_scene(void* device, Scene& s)
     } else if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
                                                   arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
+    }
+    // X2W_TEST_REPLAY_TITLE_BUFFER=1: a 3 MiB buffer placed at a title address by device slot 133, its pages written
+    // once here (each page its own byte), so a recording's base image of title memory takes three 1 MiB slabs.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_TITLE_BUFFER", nullptr, 0)) {
+        constexpr SIZE_T bytes = 3u << 20;
+        auto* memory = static_cast<unsigned char*>(
+            VirtualAlloc(reinterpret_cast<void*>(0x21100000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!memory) return 45;
+        for (SIZE_T at = 0; at < bytes; at += 4096) std::memset(memory + at, static_cast<int>(1 + at / 4096 % 251), 4096);
+        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(memory), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                               arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
+            !s.title_buffer)
+            return 45;
     }
     // X2W_TEST_REPLAY_ALLOC108=1: device slot 108 (GetResourceAllocationInfo1) in the title's form: the return buffer
     // first, the device second, two descriptions and the per-resource array the slot writes, all on this stack.

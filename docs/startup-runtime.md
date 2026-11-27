@@ -2017,11 +2017,19 @@ submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
 The page budget (`X2W_REPLAY_PAGES_MAX_MIB`, default half of `X2W_REPLAY_MAX_MIB`; `tester_run.ps1 -RecordPagesMaxMiB`)
 is part of the window's cap. Resources larger than `X2W_REPLAY_PAGES_MAX_RANGE_MIB` (default 8;
 `tester_run.ps1 -RecordPageRangeMiB`) are left out. A texture placed at a title address (device slot 133) is sized with
-the footprint the XG stand-in reported for it (the stand-in itself notes no size for it), so its bytes are recorded. The base image written when the window opens may use 3/4 of the
+the footprint the XG stand-in reported for it (the stand-in itself notes no size for it), so its bytes are recorded. The base image may use 3/4 of the
 budget; if it stops there (`x2w-replay pages: the base image stopped at ...`), the range it stopped in and the larger
 ones stay out of the later scans, and the last quarter keeps the window's changed pages (per-frame descriptors,
 constants). `pages: budget of N MiB reached` means the later changes were lost too: the window then replays from stale
 memory, and the pictures are wrong.
+
+The base image is written before the window opens: when the window's time comes, each present writes at most
+`X2W_REPLAY_BASE_SCAN_MS` (default 500) milliseconds of it while the title keeps presenting and the calls go on into the
+prefix (`x2w-replay record: the window waits for the base image of title memory ...`). A title stopped for the whole base
+image inside one present can fault (one did after 30 s). When it is complete the window opens at that present and counts
+its seconds or presents from there (`the base image took X s and N presents before the window: ...`); its first present
+rescans the ranges from the smallest (descriptor rings, constants) within `X2W_REPLAY_SCAN_MS`, and later presents catch
+the rest. The base image counts toward the window's cap, not the prefix's.
 
 `X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
 (up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of

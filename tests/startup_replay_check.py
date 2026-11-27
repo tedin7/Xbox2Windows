@@ -396,6 +396,47 @@ def check_prefix_live(scene, player, backend, env, directory, vs, ps, root):
     print("replay: --prefix-live left out %d of %d prefix calls, window f6,6 presents 7-12 equal" % (cut["left_out"], calls))
 
 
+def check_base_slices(scene, player, backend, env, directory, vs, ps, root):
+    """The base image of title memory is written before the window, a slice per present (X2W_REPLAY_BASE_SCAN_MS),
+    so the title never stops for all of it in one present. A 3 MiB title buffer and slices of one 1 MiB slab: the window
+    f6,6 waits two presents or more, then opens and still records its six presents, the buffer's pages all come before
+    them, and the window replays equal to the recorded presents it holds."""
+    recorded_dir, recording = directory / "slices_recorded", directory / "slices.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS + 8],
+                     dict(env, X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir), X2W_TEST_REPLAY_TITLE_BUFFER="1",
+                          X2W_REPLAY_BASE_SCAN_MS="0.001"))
+    assert code == 0, text[-3000:]
+    waited = re.search(r"the base image took ([0-9.]+) s and (\d+) presents before the window: the window opens at present (\d+)",
+                       text)
+    assert waited and int(waited.group(2)) >= 2, text[-3000:]
+    shift = int(waited.group(2))
+    assert shift <= 8, waited.group(0)
+    data = recording.read_bytes()
+    presents, maps = [], []
+    for tag, header, _hb, _payload, _size in chunks(data):
+        if tag == b"PRES":
+            presents.append(struct.unpack_from("<Q", data, header)[0])
+        if tag == b"MAP ":
+            maps.append(struct.unpack_from("<QQQ", data, header))
+    assert len(presents) == 6, (len(presents), waited.group(0))
+    base, size = 0x21100000000, 3 << 20
+    covered = sorted((max(a, base), min(a + n, base + size)) for a, n, stamp in maps
+                     if stamp < presents[0] and a < base + size and a + n > base)
+    reach = base
+    for start, end in covered:
+        if start <= reach:
+            reach = max(reach, end)
+    assert reach == base + size, "the title buffer's base image reaches %#x of %#x before the window" % (reach, base + size)
+    whole = pictures(recorded_dir)
+    _score, played = replay(player, recording, directory / "slices_replayed", backend, env, presents=6)
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6 + shift)) for k in range(1, 7)]
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "base-slices window replay differs at %s" % differ
+    print("replay: base image before window f6,6 in slices over %d presents, 6 presents recorded and equal" % shift)
+
+
 def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -511,6 +552,7 @@ def main(scene, player, backend, mode=None):
             if differ else "")
         check_placed_window(scene, player, backend, env, directory, vs, ps, root)
         check_prefix_live(scene, player, backend, env, directory, vs, ps, root)
+        check_base_slices(scene, player, backend, env, directory, vs, ps, root)
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
               (PRESENTS, score))

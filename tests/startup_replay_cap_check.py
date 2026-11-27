@@ -168,8 +168,10 @@ def main(scene, backend):
         opened = [line for line in text.splitlines() if "x2w-replay record: window opens at" in line]
         trigger = re.search(r"present (\d+) \(first slowdown, gap (\d+) ms\)", opened[0]) if len(opened) == 1 else None
         assert trigger and int(trigger.group(1)) <= 16 and int(trigger.group(2)) >= 300, opened or text[-3000:]
-        # The window's 0.15 s count from the end of its base image of title memory, however long that took.
-        base = re.search(r"the base image took ([0-9.]+) s: the window now ends at ([0-9.]+) s \(was ([0-9.]+) s\)", text)
+        # The window's 0.15 s count from the end of its base image of title memory, written before it however long that
+        # took.
+        base = re.search(r"the base image took ([0-9.]+) s and \d+ presents before the window: the window now ends at ([0-9.]+) s "
+                         r"\(was ([0-9.]+) s\)", text)
         assert base, text[-3000:]
         took, ends, was = map(float, base.groups())
         assert took > 1e-5 and abs(ends - was - took) < 2e-6, base.group(0)
