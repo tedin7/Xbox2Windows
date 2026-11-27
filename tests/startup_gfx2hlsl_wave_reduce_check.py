@@ -463,6 +463,16 @@ def masked_controls():
               bool(text and '(exec & 1u) != 0u) ?' in text), str(reason))
     mutant, mutant_reason = masked_unfolded_mutant(paired_program(missing=True)[1])
     check('unfolded mutant removes masked fold', bool(mutant and 'WaveActiveMax(v1)' in mutant), str(mutant_reason))
+    # A host-wave vote must also see an exact EXEC inside the entry mask: prove only the chains, not the vote.
+    sites = G.Stage.masked_reduction_exec_sites
+
+    def chains_only(stage, cfg):
+        names = {off: name for off, _n, name, _a in stage.ins}
+        return {off for off in sites(stage, cfg) if names[off] == 's_or_saveexec_b32'}
+    with patch.object(G.Stage, 'masked_reduction_exec_sites', chains_only):
+        _, vote_reason = translate(paired_program(missing=True)[1])
+    check('masked stage refuses a wave vote outside the proven EXEC',
+          bool(vote_reason and 'a wave vote' in str(vote_reason)), str(vote_reason))
     text, reason = translate(paired_program(missing=True, cmpx_nand=True)[1])
     check('cmpx and nand draw fixture translates', bool(text), str(reason))
     source, words = cmpx_program()

@@ -7088,8 +7088,16 @@ class Stage:
                     del refusals[first_refusal:]
                 continue
             if retry_wave and raised_unsupported is None and self.wave_unsound is None:
+                # The masked stage drops the program-wide participation refusal, so each host-wave vote must see
+                # what the guest wave sees too: EXEC exact and inside the entry mask there (helpers never vote).
+                masked_votes = sorted(
+                    pc for pc in self.wave_voted_branches | set(self.scc_voted_branches)
+                    if pc not in self.masked_reduction_sites) if self.retry_masked_reduction else ()
                 if self.lane_exec_breaks and not self.retry_masked_reduction:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_PARTICIPATION + self.lane_exec_breaks[0][1])
+                elif masked_votes:
+                    self.wave_unsound = Unsupported('%s (a wave vote at +0x%x)' % (WAVE_REDUCTION_MASKED,
+                                                                                  masked_votes[0]))
                 elif self.reduction_widens - self.recognized_reductions:
                     self.wave_unsound = Unsupported(WAVE_REDUCTION_ENTRY)
                 else:
