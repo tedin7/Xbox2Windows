@@ -1470,6 +1470,17 @@ OperationResult run_startup_image_store(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-atomic <vs.cso> <ps.cso> <fixture.bin> <uint|sint>
+OperationResult run_startup_image_atomic(const OperationContext& ctx)
+{
+    const bool signed_view = std::strcmp(ctx.argv[6], "sint") == 0;
+    if (!signed_view && std::strcmp(ctx.argv[6], "uint") != 0)
+        return {OutcomeKind::fail, "atomic view must be uint or sint"};
+    if (check_startup_image_atomic(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], signed_view))
+        return {OutcomeKind::fail, "image atomic readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
 
 OperationResult run_startup_sharedexp_target(const OperationContext& ctx)
@@ -1838,6 +1849,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-atomic", 7, 7, nullptr, kNoGate, run_startup_image_atomic},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},

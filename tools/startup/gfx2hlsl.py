@@ -992,8 +992,14 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
-def effect_destinations(base, ops):
+def image_atomic_no_return(name, mods):
+    return name.startswith('image_atomic_') and 'glc' not in mods
+
+
+def effect_destinations(base, ops, mods=()):
     """Split the decoded operands into destination and source fields."""
+    if image_atomic_no_return(base, mods):
+        return [], ops
     count = 2 if base.startswith(TWO_DESTINATIONS) or base == 'v_swap_b32' else 1
     return ops[:count], ops[count:]
 
@@ -1001,7 +1007,7 @@ def effect_destinations(base, ops):
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
-    _, ops, _ = parse(asm)
+    _, ops, mods = parse(asm)
     if base.startswith(NO_SCALAR_EFFECT) or base == 's_endpgm':
         reads = {'scc'} if base.startswith('s_cbranch_scc') else {'vcc'} if base.startswith('s_cbranch_vcc') else \
             {'exec'} if base.startswith('s_cbranch_exec') else set()
@@ -1012,7 +1018,7 @@ def scalar_effects(name, asm):
         return scalar_tokens(' '.join(ops)) | ({'m0'} if 'movrel' in base else set()), set(), set()
     if base.startswith(('s_cmp', 's_bitcmp')):
         return scalar_tokens(' '.join(ops)), {'scc'}, {'scc'}
-    dests, srcs = effect_destinations(base, ops)
+    dests, srcs = effect_destinations(base, ops, mods)
     writes = scalar_tokens(' '.join(dests))
     reads = scalar_tokens(' '.join(srcs))
     if base.startswith(READ_MODIFY_WRITE) or base == 'v_swap_b32':
@@ -1224,16 +1230,16 @@ INTERP_STORE_PREFIXES = ('buffer_store', 'tbuffer_store', 'global_store', 'flat_
 VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v_mad_[iu]64_[iu]32')
 
 
-def destinations(name, ops):
+def destinations(name, ops, mods=()):
     """The operands an instruction writes: the first, and the SGPR destination of the VOP3b forms. Compares write none."""
-    if not ops or name.startswith(('s_cmp', 's_bitcmp')):
+    if not ops or name.startswith(('s_cmp', 's_bitcmp')) or image_atomic_no_return(name, mods):
         return []
     return [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
 
 
-def writes_exec(name, ops):
+def writes_exec(name, ops, mods=()):
     """Conservatively: whether the instruction can write EXEC, explicitly or implicitly."""
-    for tok in destinations(name, ops):
+    for tok in destinations(name, ops, mods):
         r = reg_range(tok)
         if tok in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126:
             return True
@@ -2161,13 +2167,13 @@ LDS_EXCHANGE_OPS = {
 }
 
 
-def lds_vgpr_writes(base, ops):
+def lds_vgpr_writes(base, ops, mods=()):
     """VGPR may-writes, including register spans and both destinations of a swap."""
     if base.startswith(INTERP_STORE_PREFIXES + ('s_', 'v_cmp', 'v_readlane', 'v_readfirstlane')):
         return set()
     if base.startswith('v_movrel'):
         return set(range(256))
-    dests, _ = effect_destinations(base, ops)
+    dests, _ = effect_destinations(base, ops, mods)
     return {reg for tok in dests if (r := reg_range(tok)) and r[0] == 'v'
             for reg in range(r[1], r[2] + 1)}
 
@@ -2345,7 +2351,7 @@ def check_lds_exchange(ins, group, words):
                     base.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane', 'v_permlane', 'v_movrel',
                                      's_sendmsg', 's_sethalt')) or base.endswith(('_dpp', '_dpp8'))):
                 raise Unsupported('LDS fill needs the unchanged entry local X ID: ' + name)
-            written = lds_vgpr_writes(base, ops)
+            written = lds_vgpr_writes(base, ops, mods)
             dest = _lds_single(ops[0]) if ops else None
             value = lds_affine(base, ops[1:], addresses, group[0]) if dest in written and not mods else None
             if 0 in written and first_x_write is None:
@@ -6386,6 +6392,8 @@ class Stage:
                                 any(name == 'v_subrev_f32_dpp' for _, _, name, _ in self.ins)
                                 else set())
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
+        if getattr(self, 'kind', None) == 'ps' and any(name in PIXEL_IMAGE_ATOMICS for name in names.values()):
+            self.nonhelper_atomic_sites = self.pixel_nonhelper_atomic_sites(self.spill_cfg)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
         all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
@@ -6577,13 +6585,13 @@ class Stage:
                     self.descriptor_block_first = instruction_index
                 # The relaxed pixel proof tracks a load only within its straight run.
                 if self.firstlane_ps_load_v:
-                    _, operands, _ = parse(asm)
+                    _, operands, modifiers = parse(asm)
                     if (instruction_index == self.descriptor_block_first or writes_exec(name, operands)
                             or scalar_effects(name, asm)[2] & EXEC_KEYS):
                         self.firstlane_ps_load_v.clear()
                     else:
                         base = re.sub(r'_e(32|64)$', '', name)
-                        self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands))
+                        self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands, modifiers))
                 self.pc = off
                 if retry_wave:
                     self.exec_known = off in self.reduction_entry_exec
@@ -7220,12 +7228,64 @@ class Stage:
         and the second of v_swap_b32), or None."""
         for i in range(before - 1, after, -1):
             _, _, name, asm = self.ins[i]
-            ops = parse(asm)[1]
-            for tok in (ops[:2] if name.startswith('v_swap') else ops[:1]):
+            _, ops, mods = parse(asm)
+            for tok in (ops[:2] if name.startswith('v_swap') else destinations(name, ops, mods)):
                 r = reg_range(tok)
                 if r and r[0] == 'v' and r[1] <= reg <= r[2]:
                     return i
         return None
+
+    def pixel_nonhelper_atomic_sites(self, cfg):
+        """Prove that the atomic's EXEC is a subset of entry EXEC on every incoming path.
+
+        Discards shrink the saved live mask. Whole-quad mode can re-enable those lanes for derivatives.
+        D3D suppresses UAV writes and atomics from discarded and helper invocations (D3D11.3 §16.13).
+        After the shader restores the live mask, the translated EXEC guard also skips those lanes.
+        """
+        bounds, _, successors, _ = cfg
+        incoming = {0: (True, frozenset())}
+        sites = set()
+        pending = [0]
+        while pending:
+            block = pending.pop()
+            exact, saved = incoming[block]
+            lo, hi = bounds[block]
+            for pc, _, name, asm in self.ins[lo:hi]:
+                _, ops, mods = parse(asm)
+                if name in PIXEL_IMAGE_ATOMICS:
+                    (sites.add if exact else sites.discard)(pc)
+                # AND is bounded by either input. ANDN2 is bounded only by its uncomplemented input.
+                limits = []
+                if name == 's_and_b64' and len(ops) == 3:
+                    limits = ops[1:]
+                elif name == 's_andn2_b64' and len(ops) == 3:
+                    limits = ops[1:2]
+                pairs = {reg_range(tok) for tok in limits}
+                if writes_exec(name, ops, mods) or scalar_effects(name, asm)[2] & EXEC_KEYS:
+                    restore = ops[:1] == ['exec'] and (
+                        bool(pairs & saved) or
+                        (name == 's_mov_b64' and len(ops) == 2 and reg_range(ops[1]) in saved))
+                    narrow = self.exec_write_only_narrows(name, ops)
+                    narrow |= ops[:1] == ['exec'] and 'exec' in limits
+                    exact = restore or (exact and narrow)
+                dest = reg_range(ops[0]) if ops else None
+                shrinks_saved = dest in saved and dest in pairs
+                writes = scalar_destinations(name, asm)
+                saved = (frozenset() if 'any' in writes else
+                         frozenset(r for r in saved if not writes.intersection(range(r[1], r[2] + 1))))
+                save_exec = (exact and name == 's_mov_b64' and ops[1:] == ['exec']
+                             and dest and dest[0] == 's' and dest[2] == dest[1] + 1 and dest[2] <= 105)
+                if shrinks_saved or save_exec:
+                    saved |= {dest}
+                if name.startswith(('s_swappc', 's_call')):
+                    exact, saved = False, frozenset()
+            for succ in successors[block]:
+                old_exact, old_saved = incoming.get(succ, (True, saved))
+                merged = (exact and old_exact, saved & old_saved)
+                if incoming.get(succ) != merged:
+                    incoming[succ] = merged
+                    pending.append(succ)
+        return sites
 
     def tid_shift(self, count, source):
         """The uniform expression of `v_lshrrev_b32 vD, count, source` in the entry block of a compute program, or None.
@@ -7568,7 +7628,7 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
-        if writes_exec(name, ops):
+        if writes_exec(name, ops, mods):
             self.exec_generation += 1
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
@@ -7715,14 +7775,14 @@ class Stage:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
         if extra_proof:
-            for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops):
+            for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
-            for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
+            for token in (ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods)):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.entry_written_v.difference_update(range(reg[1], reg[2] + 1))
@@ -8565,6 +8625,8 @@ class Stage:
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
+        if base in PIXEL_IMAGE_ATOMICS and self.kind == 'ps':
+            return self.pixel_image_atomic(base, ops, mods)
         if base in LDS_DUAL_OPS:
             return self.lds_dual(base, ops, mods)
         if base in LDS_ATOMIC_OPS:
@@ -12101,6 +12163,43 @@ class Stage:
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
+    def pixel_image_atomic(self, name, ops, mods):
+        # RDNA 2 ISA §8.1.10, §8.2 and §12.16: with GLC clear, VDATA is only a source.
+        if 'glc' in mods:
+            raise Unsupported('%s with glc: returning the previous texel is unsupported' % name)
+        if len(ops) != 3:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        if dims != ['SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s requires dim:SQ_RSRC_IMG_2D' % name)
+        if [m for m in mods if m.startswith('dmask:')] != ['dmask:0x1']:
+            raise Unsupported('%s requires dmask:0x1 for one 32-bit data word' % name)
+        for m in mods:
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'slc', 'unorm')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        data, coords, desc = ops
+        if not re.fullmatch(r'v\d+', data) or int(data[1:]) > 255:
+            raise Unsupported('%s requires one data VGPR' % name)
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
+        if len(cs) != 2 or not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
+            raise Unsupported('%s requires two full-width address VGPRs' % name)
+        if self.pc not in self.nonhelper_atomic_sites:
+            raise Unsupported('%s: EXEC may include helper lanes' % name)
+        if self.null_descriptor(desc):
+            self.descriptor(desc)
+            return
+        image = self.pipe.uav(self.descriptor(desc), 'tex2du')
+        index = 'uint2(%s, %s)' % tuple(self.u(c) for c in cs)
+        value = self.u(data)
+        if name == 'image_atomic_sub':
+            value = '0u - ' + value
+        body = 'Interlocked%s(%s[%s], %s);' % (PIXEL_IMAGE_ATOMICS[name], image, index, value)
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
                         array_ok=False):
         level_zero = name == 'image_gather4_lz'
@@ -13880,9 +13979,10 @@ class Stage:
             if interp and (len(ops) != (3 if name == 'v_interp_p1ll_f16' else 4) or
                            not all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:])):
                 return  # the instruction handler rejects the malformed pair member
-            written = lds_vgpr_writes(name, ops)
-            _, sources = effect_destinations(name, ops)
-            if name == 'exp' or name.startswith(INTERP_STORE_PREFIXES + ('v_swap', 'v_movrel')) or '_atomic' in name:
+            written = lds_vgpr_writes(name, ops, mods)
+            _, sources = effect_destinations(name, ops, mods)
+            if name == 'exp' or name.startswith(INTERP_STORE_PREFIXES + ('v_swap', 'v_movrel')) or (
+                    '_atomic' in name and not image_atomic_no_return(name, mods)):
                 sources = ops
             elif name.startswith(READ_MODIFY_WRITE):
                 sources = ops
@@ -13895,7 +13995,7 @@ class Stage:
             # Relative reads may access any VGPR, including ones absent from the printed operands.
             if name.startswith('v_movrel'):
                 read.update(dict.fromkeys(range(256), 3))
-            exec_write = writes_exec(name, ops)
+            exec_write = writes_exec(name, ops, mods)
             effects = self.interp_exec_effects(name, asm, ops, exec_write)
             exec_effects.append(effects)
             rows.append((name, read, written, self.interp_write_halves(name, mods), self.interp_lane_local(name)))
@@ -15456,6 +15556,17 @@ class Stage:
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
+PIXEL_IMAGE_ATOMICS = {
+    'image_atomic_add': 'Add',
+    'image_atomic_sub': 'Add',
+    'image_atomic_umin': 'Min',
+    'image_atomic_umax': 'Max',
+    'image_atomic_and': 'And',
+    'image_atomic_or': 'Or',
+    'image_atomic_xor': 'Xor',
+}
+
+
 MUBUF_ATOMIC_OPS = {
     'buffer_atomic_swap': ('Exchange', False, False, 1),
     'buffer_atomic_cmpswap': ('CompareExchange', False, False, 2),
@@ -16440,7 +16551,7 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex2du': 'RWTexture2D<uint>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:

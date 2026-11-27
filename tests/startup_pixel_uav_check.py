@@ -32,9 +32,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from startup_stream_check import container, gfx2hlsl  # noqa: E402
 from startup_stream_draw_check import vertex  # noqa: E402
+from startup_pixel_image_atomic_check import runtime_words  # noqa: E402
 from startup_pixel_image_store_check import (  # noqa: E402
     ARRAY_EXEC_OFF, ARRAY_EXEC_ON, ARRAY_GUARDED_LINE, ARRAY_STORE_LINE, ARRAY_WORDS, ARRAY_WORDS_LAST,
-    BITS, EXEC_OFF, EXEC_ON, GUARDED_LINE, STORE_LINE, WORDS, rw_program,
+    BITS, EXEC_OFF, EXEC_ON, GUARDED_LINE, STORE_LINE, VS_WORDS, WORDS, root_blob, rw_program,
 )
 
 SIDE, MIPS, TEXTURES, ARRAY_SLICES = 4, 2, 4, 6
@@ -66,7 +67,7 @@ LINES = (
     ('a.float-line', 'uav 0 tex2d float table 0 0', None, 'uav line refused (a view qualifier is not read for pixel stores)'),
     ('a.compute-line', 'uav 0 tex2d float table 0 0 channels 4', None,
      'uav line refused (a view qualifier is not read for pixel stores)'),
-    ('a.tex3d-line', 'uav 0 tex3d table 0 0', None, 'uav line refused (only tex2d and tex2da views are bound)'),
+    ('a.tex3d-line', 'uav 0 tex3d table 0 0', None, 'uav line refused (only tex2d, tex2da and tex2du views are bound)'),
     ('a.buffer-line', 'uav 0 raw table 0 0', None, 'uav line refused (buffer view (raw uav) is not bound)'),
     ('a.uint-line', 'uav 0 tex2d uint table 0 0', None, 'uav line refused (a view qualifier is not read for pixel stores)'),
     ('a.channels-field', 'uav 0 tex2d table 0 0 channels 4', None,
@@ -133,6 +134,14 @@ def expected_words(written):
     return words
 
 
+def expected_atomic_words(written):
+    return [
+        min(sentinel(t, m, texel, 0), 0x80000010)
+        if t == written and m == 0 and texel == 2 * SIDE + 1 else sentinel(t, m, texel, 0)
+        for t in range(TEXTURES) for m in range(MIPS) for texel in range((SIDE >> m) ** 2)
+    ]
+
+
 def describe(index):
     """texture, mip, texel and channel of word index of the .uav file."""
     for t in range(TEXTURES):
@@ -168,7 +177,7 @@ class Program:
                 ['srv 0 %s table 0 %d' % (kind, stride)] if stale else []), lines
             assert [line for line in lines if line.startswith('uavload ')] == (['uavload 0'] if load else []), lines
         else:
-            assert not any(line.startswith('srv ') for line in lines), lines
+            assert not any(line.startswith(('srv ', 'uavload ')) for line in lines), lines
 
 
 def run_case(program, name, env, backend, cache=None):
@@ -193,7 +202,7 @@ def run_case(program, name, env, backend, cache=None):
     return run.returncode, run.stdout + run.stderr, log, pixels, words
 
 
-def verdict(name, result, written, reason, drawn, array=False):
+def verdict(name, result, written, reason, drawn, array=False, *, atomic=False):
     """None when the case holds, otherwise the first difference."""
     returncode, out, log, pixels, words = result
     if returncode:
@@ -202,13 +211,16 @@ def verdict(name, result, written, reason, drawn, array=False):
         return 'device removed or no report\n%s' % out[-3000:]
     if 'debug layer: on' in out and 'debug layer: on, errors: 0' not in out:
         return 'debug layer errors\n%s' % out[-3000:]
-    want = expected_array_words(written) if array else expected_words(written)
+    if atomic:
+        want = expected_atomic_words(written)
+    else:
+        want = expected_array_words(written) if array else expected_words(written)
     if len(words) != len(want):
         return '%d texture words read back, expected %d' % (len(words), len(want))
     for i, (got, expected) in enumerate(zip(words, want)):
         if got != expected:
             return 'texel_mismatch %s: got %08x, expected %08x' % (
-                describe_array(i) if array else describe(i), got, expected)
+                describe_array(i) if array else describe(i * (4 if atomic else 1)), got, expected)
     if (DRAWN_LINE in log) != drawn:
         return 'translated draw %s' % ('missing' if drawn else 'present although refused')
     if reason and reason not in log:
@@ -313,11 +325,51 @@ def check_read_write(directory, consumer, env):
         print('%s: stale SRV fails the two-draw CPU oracle; typed-load denial names the format capability' % kind)
 
 
-def check(directory, consumer, backend):
+def draw_environment():
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
                X2W_D3D12_DEBUG='0', X2W_D3D12_DEVICE_NOOP='1', X2W_TEST_DEBUG_LAYER='1')
     if os.environ.get('X2W_PIXEL_UAV_NO_DEBUG') == '1':
         env.pop('X2W_TEST_DEBUG_LAYER')
+    return env
+
+
+def check_atomics(directory, consumer):
+    env = draw_environment()
+    # Typed interlocked operations still work when the runtime's typed-load capability is masked.
+    env['X2W_TEST_PIXEL_UAV_NO_TYPED_LOAD'] = '1'
+    atomic = Program(directory / 'atomic', consumer, runtime_words(), env, kind='tex2du')
+    store = Program(directory / 'store', consumer, WORDS, env)
+    for program, name, written, reason in (
+        (atomic, 'atomic-uint', 0, None),
+        (atomic, 'atomic-cast', 3, None),
+        (atomic, 'atomic-float', None, 'uav 0 refused: tex2du view needs R32_UINT'),
+        (atomic, 'atomic-sint', None, 'uav 0 refused: tex2du view needs R32_UINT'),
+        (store, 'atomic-uint', None, 'uav 0 refused: integer format for a float view'),
+    ):
+        result = run_case(program, name, env, 'warp')
+        if result[0] == 77:
+            print(result[1])
+            return 77
+        problem = verdict(name, result, written, reason, reason is None, atomic=True)
+        assert problem is None, (program.kind, name, problem)
+        print(program.kind, name, reason or 'matches CPU readback with typed loads disabled')
+    return 0
+
+
+def controls():
+    fixture = gfx2hlsl.Pipeline(VS_WORDS, runtime_words(), root_blob())
+    manifest = fixture.manifest()
+    assert 'uav 0 tex2du table 0 0' in manifest and 'uavload' not in manifest, manifest
+    initial = expected_atomic_words(None)
+    for texture in (0, 3):
+        actual = expected_atomic_words(texture)
+        assert [i for i, (a, b) in enumerate(zip(initial, actual)) if a != b] == [20 * texture + 9]
+        assert actual[20 * texture + 9] == 0x80000010
+    print('runtime atomic fixture: R32_UINT manifest and per-texture CPU reference')
+
+
+def check(directory, consumer, backend):
+    env = draw_environment()
     store = Program(directory / 'store', consumer, WORDS, env)
     failures = []
 
@@ -442,7 +494,12 @@ def check(directory, consumer, backend):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
+    if len(sys.argv) == 1:
+        controls()
+    elif len(sys.argv) == 3:
+        with tempfile.TemporaryDirectory() as temporary:
+            if sys.argv[2] == 'atomic':
+                sys.exit(check_atomics(Path(temporary), sys.argv[1]))
+            sys.exit(check(Path(temporary), *sys.argv[1:]))
+    else:
         raise SystemExit(__doc__)
-    with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
