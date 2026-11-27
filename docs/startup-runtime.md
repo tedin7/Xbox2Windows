@@ -2687,7 +2687,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `x2w-dstorage progress <n> s: pending <p> (oldest <ms> ms), read <x> MB/s, inflated <y> MB/s, enqueued <e> retired <r> (written <w>, failed <f>), total read <KiB> inflated <KiB>`
   (pending = enqueued minus retired; retired = written + failed, "written" = requests that really wrote their destination; the oldest age comes from a ring of 4096 enqueue ticks and is approximate with several queues)
   and `x2w-dstorage disk <n> s: <r> reads (+<d>), <x> MB/s while reading, reading <p>% of the window; read sizes <=4K <=16K <=64K <=256K <=1M >1M;
-  offsets sequential/forward/backward/first; read failures; mean <ms> ms/read since start`. A high share of the window in reads with low MB/s is a seek-bound disk (a
+  offsets sequential/forward/backward/first; read failures`. A high share of the window in reads with low MB/s is a seek-bound disk (a
   hard disk); a low share means the time goes to inflating or to waiting for the title. `startup_storage_failure_counts` checks the
   counters, the read classification and the exact lines.
 - **DirectStorage HDD mode (`X2W_STORAGE_HDD=1`, off by default).** The queue's worker plans the file reads of its next 1024 entries
@@ -2697,17 +2697,6 @@ These are measured on one executable; treat them as hypotheses for others.
   prefetch groups ..., disk reads saved by merging ...`, shows what it did. `startup_dstorage_read_plan` tests the plan;
   `startup_dstorage_hdd_queue_on` / `_off` run 48 shuffled requests through the real queue and compare every byte (on: 47 cache hits, a few
   merged reads; off: 48 reads).
-  Set `X2W_STORAGE_HDD_ADAPTIVE=1` with HDD mode to use a 512 KiB gap and an
-  8 MiB merged span when the latest 16 successful file reads average over 3 ms
-  (use the available samples at startup). The queue returns to its ordinary
-  limits when the rolling mean falls to 3 ms or less. The cumulative diagnostic
-  includes all read attempts. The tester prints `cold disk` above 3 ms using
-  the exit total when available, or labels the latest cumulative heartbeat when
-  the process was stopped before reporting its exit total.
-  The synthetic delayed-reader fixture checks every destination byte and requires
-  at most 12 file reads for 48 requests. Its control uses the ordinary planner
-  and must miss that target with 48 reads.
-  Run `ctest --preset dev --no-tests=error -V -R '^startup_dstorage_hdd_cold(_control)?$'`.
 - **DirectStorage page-request ends (#1198).** After the failure causes, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: page requests by end against the first 64 KiB page` with
   `inside-completed`, `inside-failed`, `at-page-end-completed`, `at-page-end-failed`,
