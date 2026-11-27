@@ -662,11 +662,6 @@ add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
 add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
 set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 
-add_executable(startup_debug_noise_check tests/startup_debug_noise_check.cpp)
-target_include_directories(startup_debug_noise_check PRIVATE src)
-target_compile_features(startup_debug_noise_check PRIVATE cxx_std_17)
-add_test(NAME startup_debug_noise_check COMMAND startup_debug_noise_check)
-
 add_executable(startup_view_desc tests/startup_view_desc_check.cpp)
 target_include_directories(startup_view_desc PRIVATE src)
 target_compile_features(startup_view_desc PRIVATE cxx_std_17)
@@ -1984,6 +1979,11 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_clear_uav_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+
+add_executable(startup_debug_noise_check tests/startup_debug_noise_check.cpp)
+target_include_directories(startup_debug_noise_check PRIVATE src)
+target_compile_features(startup_debug_noise_check PRIVATE cxx_std_17)
+add_test(NAME startup_debug_noise_check COMMAND startup_debug_noise_check)
 
 # Resource slot 10: GetDesc on console resource wrappers.
 add_executable(startup_resource_desc tests/startup_resource_desc.cpp)
