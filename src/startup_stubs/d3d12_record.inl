@@ -479,6 +479,12 @@ void record_arguments(ArgumentCapture& capture)
             capture.arg(3, sizeof(GUID));
             capture.output(4);
             break;
+        case 133:  // CreatePlacedResourceX(title address, desc, state, clear, IID, out) without a desktop heap placement
+            capture.arg(1, sizeof(D3D12_RESOURCE_DESC));
+            capture.arg(3, sizeof(D3D12_CLEAR_VALUE));
+            capture.arg(4, sizeof(GUID));
+            capture.output(5);
+            break;
         case 57:
         case 67: record_pipeline_desc(capture); break;
         case 1:   // AddRef and Release take no argument: the words are the caller's stack
