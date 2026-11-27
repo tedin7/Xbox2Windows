@@ -1276,7 +1276,34 @@ def odd_tail_words(base, components, red_only):
 ODD_TAIL_CASES = ((3, False), (1, False), (3, True))
 
 
+PRESET_HIGH = 0x3ab40000
+KEEP_HIGH = '(v21 & 0xffff0000u) | '
+
+
+def preset_odd_tail_hlsl(*, branch_between=False, preset=True):
+    # v21 gets a known value, then a three-component packed load writes only its low half. The whole
+    # word is exported raw, so the kept upper half is observable.
+    load = encode_mimg(IMG_LOAD, dmask=7, vaddr=8, vdata=20, d16=1)
+    before = (0x7e2a02ff, PRESET_HIGH) if preset else ()  # v_mov_b32_e32 v21, literal
+    if branch_between:
+        before += (0xbf820000,)  # s_branch to the next instruction: a block boundary
+    after = (0xbf8c3f70, 0xf800180f, 21 * 0x01010101, 0xbf810000)  # s_waitcnt, exp mrt0 v21 x4, s_endpgm
+    program = PRE_WORDS + struct.pack(f'<{len(before)}I', *before) + load + struct.pack('<4I', *after)
+    return G.Pipeline(VS_WORDS, program, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+
+
+def preset_odd_tail_words():
+    words = []
+    for i in range(WIDTH * HEIGHT):
+        words.extend((PRESET_HIGH | (0x4400 + i),) * 4)
+    return words
+
+
 def check_odd_tail_programs():
+    kept = preset_odd_tail_hlsl()
+    assert kept.count(KEEP_HIGH) == 1, kept
+    for label, options in (('no earlier write', {'preset': False}), ('block boundary before the load', {'branch_between': True})):
+        expect_refused(lambda: preset_odd_tail_hlsl(**options), 'whole-word read of v21 after odd d16 image_load', label)
     for components, red_only in ODD_TAIL_CASES:
         odd_tail_variants(components, red_only=red_only)
     expect_refused(lambda: odd_tail_hlsl(1, unsafe=True),
@@ -1317,6 +1344,19 @@ def check_odd_tail_draw(dxc, renderer, adapter):
                     run = run_d16_draw(renderer, adapter, mode, vs, ps, wrong, directory, tag + '_mutated_model')
                 assert run.returncode == 0, (run.stdout, run.stderr)
                 print(f'{tag}: readback matched expected outcome', flush=True)
+
+        expected = preset_odd_tail_words()
+        for mutant in (False, True):
+            source = preset_odd_tail_hlsl()
+            tag = 'preset_odd_tail_zero_high' if mutant else 'preset_odd_tail'
+            ps = compile_hlsl(dxc, 'dxc', source.replace(KEEP_HIGH, '') if mutant else source, tag,
+                              'ps_6_0', directory)
+            run = run_d16_draw(renderer, adapter, 'rgba16f', vs, ps, expected, directory, tag)
+            if mutant:
+                assert run.returncode == 1 and '16 of 16 pixels differ' in run.stderr, (run.stdout, run.stderr)
+            else:
+                assert run.returncode == 0, (run.stdout, run.stderr)
+            print(f'{tag}: readback matched expected outcome', flush=True)
 
         expected = masked_odd_tail_words()
         for wrong_overwrite in (False, True):
