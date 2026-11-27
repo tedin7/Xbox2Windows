@@ -3,12 +3,14 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
@@ -413,6 +415,80 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 }
 }  // namespace
 
+extern "C" __declspec(dllimport) LONG64 x2w_d3d12_thread_draw_lock_calls();
+
+static int draw_during_resets(ID3D12Device* desktop, void* guest, StreamTarget& frame, const char* pixels)
+{
+    constexpr unsigned worker_count = 4, rounds = 256;
+    const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    const auto succeeded = [](Word hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); };
+    const auto make_allocator = [&](void*& allocator) {
+        return succeeded(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
+                                arg(&allocator)));
+    };
+    struct Worker { void* allocator{}; void* list{}; LONG64 calls{}; bool failed{}; };
+    std::array<Worker, worker_count> workers{};
+    void* next_allocator = nullptr;
+    void* gate = nullptr;
+    if (!make_allocator(next_allocator) ||
+        !succeeded(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate)))) return 80;
+    for (auto& worker : workers) {
+        if (!make_allocator(worker.allocator) ||
+            !succeeded(invoke(guest, 73, arg(list_desc), arg(worker.allocator), 0,
+                              arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&worker.list)))) return 81;
+    }
+    if (!succeeded(invoke(frame.queue, 17, arg(gate), 1))) return 82;
+
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::array<std::thread, worker_count> threads;
+    for (unsigned i = 0; i < worker_count; ++i) {
+        threads[i] = std::thread([&, i] {
+            auto& worker = workers[i];
+            ++ready;
+            while (!start.load()) SwitchToThread();
+            for (unsigned j = 0; j < rounds; ++j) {
+                const LONG64 before = x2w_d3d12_thread_draw_lock_calls();
+                const bool reset = succeeded(invoke(worker.list, 139, arg(worker.allocator)));
+                worker.calls += x2w_d3d12_thread_draw_lock_calls() - before;
+                if (!reset || !succeeded(invoke(worker.list, 9)) ||
+                    !succeeded(invoke(worker.allocator, 8))) {
+                    worker.failed = true;
+                    break;
+                }
+            }
+        });
+    }
+    while (ready.load() != worker_count) SwitchToThread();
+    start.store(true);
+    for (unsigned i = 0; i < 16; ++i) invoke(frame.list, 12, 3, 1);
+    const bool closed = succeeded(invoke(frame.list, 9));
+    if (closed) invoke(frame.queue, 10, 1, arg(&frame.list));
+    const bool signaled = closed && succeeded(invoke(frame.queue, 14, arg(frame.fence), 1));
+
+    // Reset the sampler-bearing recording before its submit can execute.
+    const LONG64 before = x2w_d3d12_thread_draw_lock_calls();
+    const bool reset = signaled && succeeded(invoke(frame.list, 139, arg(next_allocator)));
+    LONG64 calls = x2w_d3d12_thread_draw_lock_calls() - before;
+    const bool pending = invoke(frame.fence, 8) == 0;
+    const bool unblocked = succeeded(invoke(gate, 10, 1));
+    for (auto& thread : threads) thread.join();
+    for (const auto& worker : workers) {
+        if (worker.failed) return 83;
+        calls += worker.calls;
+        invoke(worker.list, 2);
+        invoke(worker.allocator, 2);
+    }
+    if (!reset || !pending || !unblocked || !succeeded(invoke(frame.list, 9))) return 84;
+    const auto deadline = GetTickCount64() + 10000;
+    while (invoke(frame.fence, 8) < 1 && GetTickCount64() < deadline) Sleep(1);
+    if (invoke(frame.fence, 8) != 1) return 85;
+    invoke(gate, 2);
+    invoke(next_allocator, 2);
+    std::printf("x2w-reset-bench resets=%u draw_lock_acquires=%lld\n", worker_count * rounds + 1, calls);
+    return read_stream_target(desktop, frame, pixels);
+}
+
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
@@ -443,6 +519,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
+    if (GetEnvironmentVariableW(L"X2W_TEST_RESET_BENCH", nullptr, 0))
+        return draw_during_resets(desktop.Get(), guest, frame, pixels);
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;

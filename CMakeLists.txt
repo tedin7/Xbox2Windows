@@ -5097,6 +5097,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_list_cost_bench_${adapter} startup_list_cost_bench_nolock_refuse_${adapter}
             PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_list_cost_bench_reset_nolock_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        "${DXC_EXECUTABLE}" warp --reset)
+    set_tests_properties(startup_list_cost_bench_reset_nolock_warp PROPERTIES TIMEOUT 240)
     add_test(NAME startup_compute_nolock_refuse_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
         "${DXC_EXECUTABLE}" warp --nolock)
