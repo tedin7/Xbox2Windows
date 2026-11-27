@@ -70,6 +70,7 @@
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/create_srv.h"
+#include "startup_stubs/target_view_check.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/refused_dispatch_census.h"
@@ -6015,6 +6016,63 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             }
         } else {
             args[0] = reinterpret_cast<u64>(materialize_lazy_texture(lazy_wrapper));
+        }
+    }
+    if constexpr (N >= 19 && N <= 21) {
+        using namespace x2w_startup::target_view;
+        auto* resource = reinterpret_cast<ID3D12Resource*>(args[0]);
+        if (is_unmaterialized_lazy && !resource) {
+            refuse_view();
+            return 0;
+        }
+        D3D12_RESOURCE_DESC backing{};
+        if (resource) backing = resource->GetDesc();
+        D3D12_RESOURCE_DESC counter_desc{};
+        auto* counter = N == 19 ? reinterpret_cast<ID3D12Resource*>(args[1]) : nullptr;
+        if (counter) counter_desc = counter->GetDesc();
+        using Desc = std::conditional_t<N == 19, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+            std::conditional_t<N == 20, D3D12_RENDER_TARGET_VIEW_DESC, D3D12_DEPTH_STENCIL_VIEW_DESC>>;
+        Desc checked{};
+        Desc* view = nullptr;
+        if (args[desc_index]) {
+            auto* input = reinterpret_cast<const Desc*>(args[desc_index]);
+            if (!x2w_local::readable(input, sizeof(*input))) {
+                refuse_view();
+                return 0;
+            }
+            std::memcpy(&checked, input, sizeof(checked));
+            view = &checked;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+        if (resource && view && view->Format != backing.Format && !x2w_startup::is_typeless(backing.Format))
+            device_of(self)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
+        const auto repair = [&](const char* field, UINT64 old_value, UINT64 new_value) {
+            static LONG counts[6]{};
+            const unsigned index = !std::strcmp(field, "ArraySize") ? 0 : !std::strcmp(field, "WSize") ? 1 :
+                !std::strcmp(field, "PlaneSlice") ? 2 : !std::strcmp(field, "Flags") ? 3 :
+                !std::strcmp(field, "Format") ? 4 : 5;
+            if (first_calls(counts[index], 6))
+                log("x2w-d3d12 view repaired: slot%d %s %llu -> %llu (resource %llux%u mips %u fmt %u)",
+                    N, field, old_value, new_value, backing.Width, backing.Height, backing.MipLevels, backing.Format);
+        };
+        const unsigned dropped = lazy_wrapper ? lazy_wrapper->own().drop_levels : 0;
+        Refusal refusal;
+        if constexpr (N == 19)
+            refusal = check_uav(view, resource ? &backing : nullptr, counter ? &counter_desc : nullptr,
+                                repair, options.CastingFullyTypedFormatSupported != FALSE, dropped);
+        else
+            refusal = check(view, resource ? &backing : nullptr, repair,
+                            options.CastingFullyTypedFormatSupported != FALSE, dropped);
+        if (refusal != Refusal::none) {
+            static LONG counts[static_cast<unsigned>(Refusal::plane) + 1]{};
+            if (first_calls(counts[static_cast<unsigned>(refusal)], 6))
+                log("x2w-d3d12 view refused: slot%d %s", N, reason(refusal));
+            refuse_view();
+            return 0;
+        }
+        if (view) {
+            std::memcpy(desc_copy, view, sizeof(*view));
+            args[desc_index] = reinterpret_cast<u64>(desc_copy);
         }
     }
     const LONG removed_before = removal_reported;
