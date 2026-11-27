@@ -3510,6 +3510,10 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    if(adapter STREQUAL "warp")
+        add_test(NAME startup_sampler_reduction_warp COMMAND offscreen_check warp --startup-sampler-reduction)
+        set_tests_properties(startup_sampler_reduction_warp PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endif()
     # The dropped control resets the decoded LOD limits and must read the wrong mip for both entries.
     add_test(NAME startup_sampler_lod_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod)
     add_test(NAME startup_sampler_lod_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod-dropped)

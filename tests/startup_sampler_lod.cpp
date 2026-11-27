@@ -19,7 +19,10 @@
 #include "startup_sampler_lod_vs.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 
+#include <algorithm>
 #include <array>
+#include <iterator>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +52,13 @@ constexpr x2w_startup::SamplerWords heap_words[]{
     {clamp_xy, full_lod, 0, 0},                  // mipmapping disabled
     {clamp_xy, full_lod, point_mip, 0},          // point mip control
 };
+constexpr UINT linear_xy = (1u << 20) | (1u << 22);
+constexpr x2w_startup::SamplerWords reduction_words[]{
+    {clamp_xy, 0, linear_xy, 0},
+    {clamp_xy | (1u << 29), 0, linear_xy, 0},
+    {clamp_xy | (2u << 29), 0, linear_xy, 0},
+};
+constexpr std::array<float, 4> reduction_texels{0.1f, 0.9f, 0.3f, 0.7f};
 constexpr UINT heap_count = sizeof(heap_words) / sizeof(heap_words[0]);
 // LESS (word 0 bits 14:12 = 1), with MAX_LOD 1 encoded in word 1.
 constexpr const char* comparison_line = "smpc 0 0x1012 0x100000 0x0 0x0";
@@ -86,11 +96,15 @@ int mip_of(float value)
 }  // namespace
 
 int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADER_BYTECODE translated,
-                              const char* sampler_line, float expected_bias_pixel)
+                              const char* sampler_line, float expected_bias_pixel, bool reduction_draw)
 {
     using namespace x2w_startup;
     const bool bias_draw = sampler_line != nullptr;
-    const UINT mip_count = bias_draw ? 3u : mip_levels;
+    const bool min_max_filtering = reduction_draw && supports_sampler_min_max(device);
+    if (reduction_draw && !min_max_filtering) return 77;
+    const UINT mip_count = reduction_draw ? 1u : bias_draw ? 3u : mip_levels;
+    const UINT probe_count = reduction_draw ? static_cast<UINT>(std::size(reduction_words))
+                                            : static_cast<UINT>(probes.size());
     constexpr UINT bias_target_size = 4;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_R32_FLOAT};
     check(check_feature(device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)), "Query R32_FLOAT support");
@@ -132,10 +146,12 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
     // Decode the synthetic heap words through the production snapshot path.
     ComPtr<ID3D12DescriptorHeap> sampler_heap;
     if (!bias_draw) {
-        const auto snapshot = snapshot_samplers({reinterpret_cast<std::uintptr_t>(heap_words), heap_count}, true);
+        const auto* entries = reduction_draw ? reduction_words : heap_words;
+        const UINT entry_count = reduction_draw ? probe_count : heap_count;
+        const auto snapshot = snapshot_samplers({reinterpret_cast<std::uintptr_t>(entries), entry_count}, true);
         NullSamplerCounts counts;
         check(create_sampler_snapshot_heap(device, snapshot, [&](const SamplerWords& words, D3D12_SAMPLER_DESC& out) {
-            out = dynamic_sampler(words);
+            out = dynamic_sampler(words, min_max_filtering);
             if (out.MinLOD > out.MaxLOD) throw std::runtime_error("Fixture sampler has MinLOD above MaxLOD");
             std::printf("heap entry words %08x %08x: MinLOD=%g MaxLOD=%g Bias=%g", words[0], words[1], out.MinLOD, out.MaxLOD, out.MipLODBias);
             if (drop_clamp && words[1] != full_lod) {
@@ -146,13 +162,13 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
             std::printf("\n");
             return true;
         }, sampler_heap.GetAddressOf(), counts), "Create sampler LOD heap");
-        if (counts.unbound || counts.unreadable || counts.invalid_token || counts.out_of_range != translated_sampler_fallback - heap_count)
+        if (counts.unbound || counts.unreadable || counts.invalid_token || counts.out_of_range != translated_sampler_fallback - entry_count)
             throw std::runtime_error("Unexpected null sampler counts");
     }
 
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = td.Height = texture_size;
+    td.Width = td.Height = reduction_draw ? 2u : texture_size;
     td.DepthOrArraySize = 1;
     td.MipLevels = static_cast<UINT16>(mip_count);
     td.Format = DXGI_FORMAT_R32_FLOAT;
@@ -169,7 +185,7 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
         const auto& f = footprints[mip];
         for (UINT y = 0; y < f.Footprint.Height; ++y) {
             auto* row = reinterpret_cast<float*>(static_cast<std::uint8_t*>(mapped) + f.Offset + y * f.Footprint.RowPitch);
-            for (UINT x = 0; x < f.Footprint.Width; ++x) row[x] = mip_value(mip);
+            for (UINT x = 0; x < f.Footprint.Width; ++x) row[x] = reduction_draw ? reduction_texels[y * 2 + x] : mip_value(mip);
         }
     }
     const D3D12_RANGE written{0, static_cast<SIZE_T>(upload_size)};
@@ -177,7 +193,7 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = bias_draw ? bias_target_size : probe_size * probes.size();
+    rd.Width = bias_draw ? bias_target_size : probe_size * probe_count;
     rd.Height = bias_draw ? bias_target_size : probe_size;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
@@ -227,10 +243,14 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
         list->RSSetScissorRects(1, &scissor);
         list->DrawInstanced(3, 1, 0, 0);
     } else {
-        for (UINT i = 0; i < probes.size(); ++i) {
-            std::uint32_t constants[4]{probes[i].mode, probes[i].entry};
-            std::memcpy(&constants[2], &probes[i].lod, sizeof(float));
-            std::memcpy(&constants[3], &probes[i].reference, sizeof(float));
+        for (UINT i = 0; i < probe_count; ++i) {
+            std::uint32_t constants[4]{3, i, 0, 0};
+            if (!reduction_draw) {
+                constants[0] = probes[i].mode;
+                constants[1] = probes[i].entry;
+                std::memcpy(&constants[2], &probes[i].lod, sizeof(float));
+                std::memcpy(&constants[3], &probes[i].reference, sizeof(float));
+            }
             list->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
             const LONG left = static_cast<LONG>(i * probe_size);
             const D3D12_VIEWPORT viewport{static_cast<float>(left), 0, probe_size, probe_size, 0, 1};
@@ -267,11 +287,27 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADE
     }
 
     std::array<float, probes.size()> actual{};
-    const D3D12_RANGE read{0, sizeof(float) * probe_size * probes.size()};
+    const D3D12_RANGE read{0, sizeof(float) * probe_size * probe_count};
     check(readback->Map(0, &read, &mapped), "Map sampler LOD readback");
     const auto* row = reinterpret_cast<const float*>(static_cast<const std::uint8_t*>(mapped) + target_footprint.Offset);
-    for (UINT i = 0; i < probes.size(); ++i) actual[i] = row[i * probe_size];
+    for (UINT i = 0; i < probe_count; ++i) actual[i] = row[i * probe_size];
     readback->Unmap(0, &none);
+
+    if (reduction_draw) {
+        const auto bounds = std::minmax_element(reduction_texels.begin(), reduction_texels.end());
+        float sum = 0.0f;
+        for (float texel : reduction_texels) sum += texel;
+        const float expected[]{sum / reduction_texels.size(), *bounds.first, *bounds.second};
+        unsigned mismatches = 0;
+        for (UINT i = 0; i < probe_count; ++i) {
+            std::printf("startup_sampler_reduction filter_mode=%u read=%g expected=%g\n", i, actual[i], expected[i]);
+            mismatches += !(std::abs(actual[i] - expected[i]) <= 1e-6f);
+        }
+        // Mutant: ignoring filter_mode makes both min and max read 0.5 and fail.
+        std::printf("startup_sampler_reduction mismatches=%u (ignoring filter_mode makes min and max read 0.5 and fail)\n",
+                    mismatches);
+        return mismatches ? 1 : 0;
+    }
 
     UINT mismatches = 0, wrong_mip = 0, unexpected = 0;
     for (UINT i = 0; i < probes.size(); ++i) {

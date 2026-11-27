@@ -358,7 +358,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     const UINT constants = (std::max)(1u, entries + (tr.dynamic_heap ? 1u : 0u));
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants,
+    if (FAILED(create_title_translated_root(device_of(the_device), constants,
             static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};

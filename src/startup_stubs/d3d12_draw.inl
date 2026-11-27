@@ -601,6 +601,32 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
+void observe_title_sampler(const x2w_startup::SamplerWords& words)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static x2w_startup::SamplerCensus census;
+    AcquireSRWLockExclusive(&lock);
+    if (census.observe(words)) {
+        const auto& c = census.counts();
+        log("x2w-d3d12 sampler bits: samplers %u filter_min %u filter_max %u force_unnorm %u "
+            "force_degamma %u skip_degamma %u trunc_coord %u mc_trunc %u no_cube_wrap %u "
+            "z_filter_point %u z_filter_linear %u lod_bias_sec %u",
+            c.samplers, c.filter_min, c.filter_max, c.force_unnorm, c.force_degamma, c.skip_degamma,
+            c.trunc_coord, c.mc_trunc, c.no_cube_wrap, c.z_filter_point, c.z_filter_linear, c.lod_bias_sec);
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+HRESULT create_title_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
+                                     const x2w_startup::TranslatedSamplers& samplers, ID3D12RootSignature** out,
+                                     UINT uavs, bool dynamic_heap)
+{
+    const HRESULT hr = x2w_startup::create_translated_root(device, constants, srvs, samplers, out, uavs, dynamic_heap);
+    if (SUCCEEDED(hr))
+        for (const auto& words : samplers.statics) observe_title_sampler(words);
+    return hr;
+}
+
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
     tr.state = 2;
@@ -738,7 +764,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     }
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u),
+    const HRESULT hr = create_title_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u),
         static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
@@ -1564,10 +1590,12 @@ void retire_address_uploads(ID3D12CommandQueue* queue, const std::vector<ID3D12C
     }
 }
 
-bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler)
+bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler,
+                          bool min_max_filtering)
 {
     if (words[0] != view_token_magic) {
-        sampler = x2w_startup::dynamic_sampler(words);
+        observe_title_sampler(words);
+        sampler = x2w_startup::dynamic_sampler(words, min_max_filtering);
         return true;
     }
     note_lock_acquire(false);
@@ -1586,8 +1614,12 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
     if (pass.sampler_snapshot && *pass.sampler_snapshot == snapshot) return true;
     x2w_startup::NullSamplerCounts counts;
     DrawSamplerHeap heap;
-    const HRESULT hr = x2w_startup::create_sampler_snapshot_heap(device_of(the_device), snapshot,
-        resolve_draw_sampler, heap.GetAddressOf(), counts);
+    auto* device = device_of(the_device);
+    const bool min_max_filtering = snapshot.readable.any() && x2w_startup::supports_sampler_min_max(device);
+    const HRESULT hr = x2w_startup::create_sampler_snapshot_heap(device, snapshot,
+        [min_max_filtering](const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler) {
+            return resolve_draw_sampler(words, sampler, min_max_filtering);
+        }, heap.GetAddressOf(), counts);
     if (FAILED(hr)) {
         log("x2w-draw sampler heap creation failed 0x%08lx", static_cast<unsigned long>(hr));
         return false;

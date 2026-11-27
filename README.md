@@ -107,6 +107,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
 | Compute loads from a program-image table on WARP | `ctest --preset dev --no-tests=error -R '^startup_compute_global_load_image_warp$' -V` · [Address proof and controls](docs/experiments/compute-program-image.md) |
 | SPIR-V sampler views at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V` |
+| Translated samplers: reduction encodings, S# census and WARP readback | `ctest --preset dev --no-tests=error -R '^(startup_translated_sampler_bindings(_shared_axis_control)?\|startup_sampler_reduction_warp\|startup_sampler_lod(_dropped)?_warp)$' -V` |
 | SPIR-V standalone sampler split for 1D and cube images, including arrays (SPIRV-Tools) | `python3 -B tests/spirv_window/check.py` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |
