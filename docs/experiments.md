@@ -485,21 +485,27 @@ The draw is refused, not read as zeros, whenever a translated formatted load has
 - an invalid component mapping or a reserved DST_SEL (2, 3);
 - a buffer larger than the 16 MiB copy.
 
-Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for the first 6 occurrences and counts as `formatted-load draws refused` in the `x2w-render totals` line. Because the shader reads the raw copy at `vindex * stride`, the alignment of the upload ring does not constrain 12-byte formats.
+Set `X2W_D3D12_FORMATTED_BGRA=1` to enable formatted draws with
+`DXGI_FORMAT_B8G8R8A8_UNORM` (87). The view uses FORMAT 56. DST_SEL maps the
+stored B and R bytes to the view's logical R and B channels and preserves forced
+constants. With the switch enabled, the first buffer-view refusal per pipeline
+key and DXGI format reports the DXGI value, element count and component mapping.
+Every refusal still increments `formatted-load draws refused`. The switch
+defaults to off.
 
-`startup_buffer_format_word3_table` checks that the DXGI table equals `DESC_FORMAT_CODES`, agrees with `FETCH_DXGI` and with `formatted_buffer_supported()`; a header that gives `R32G32B32A32_FLOAT` code 74 must fail it. `startup_buffer_format_word3` checks words and refusal reasons, and its `mapping` control, which ignores the view mapping, must fail. `startup_formatted_view_draw_{warp,hardware}` draws one source-built pixel stage through the stand-in: `buffer_load_format_xyzw` with `idxen` of element 1 into an `R32G32B32A32_FLOAT` target, compared as four 32-bit words with distinct sentinels per channel. One translation serves every view:
-
-- `R32G32B32A32_FLOAT` and `R16G16B16A16_FLOAT`;
-- `R16G16_FLOAT`, whose z and w must be the defaults 0 and 1.0;
-- `R16G16_SNORM` with -32768 and 0, which gives -1.0 and 0;
-- `R32G32B32A32_FLOAT` mapped (w, 0, x, 1);
-- `R8G8B8A8_UNORM` mapped (z, 1, 0, w).
-
-An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
+The table check compares the DXGI mappings, decoder bodies, descriptor codes,
+vertex-fetch mappings and runtime code allowlist. Removing an entry from either
+side or swapping the adjacent 16-bit UNORM and SNORM codes must fail.
+The draw fixture reads four elements into four pixels of a float target and
+compares them with an independent CPU decoder. It checks all 15 legacy formats
+with the switch off and on, BGRA identity and forced constants, and refusal
+logging with a repeated draw. The runtime FORMAT swap and a shader with the W
+selector reading Z each must produce a readback mismatch.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3|formatted_view_draw_(warp|hardware)|vertex_fetch_formats_)' -V
+ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3(_table|_mapping_control)?|formatted_view_draw_(warp|hardware))$' -V
 ```
+
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 

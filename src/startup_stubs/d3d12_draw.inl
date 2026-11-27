@@ -2625,10 +2625,30 @@ struct FormattedBufferDescriptor {
     std::uint32_t words[8] = {};
 };
 
+bool formatted_bgra_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_D3D12_FORMATTED_BGRA", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+// Readback control for the formatted-view fixture: exchange the adjacent 16-bit pair codes.
+void mutate_formatted_view_code_for_test(std::uint32_t& word)
+{
+    static const bool swap = GetEnvironmentVariableA("X2W_TEST_FORMATTED_SWAP_23_24", nullptr, 0) != 0;
+    if (!swap) return;
+    const auto code = x2w_startup::formatted_buffer_code(word);
+    if (code == 23 || code == 24)
+        word = (word & ~(127u << 12)) | ((code == 23 ? 24u : 23u) << 12);
+}
+
 // Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
 // buffer view the title created (words[0] its token) the word the driver builds from its format and component
 // mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
-const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format,
+                                   D3D12_SHADER_RESOURCE_VIEW_DESC* draw_view = nullptr)
 {
     if (words[0] == view_token_magic) {
         ViewRecord record{};
@@ -2637,9 +2657,13 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
-        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         std::memcpy(&view, record.desc, 40);
-        return x2w_startup::view_word3(view, words[3]);
+        if (draw_view) *draw_view = view;
+        const bool enabled = draw_view && formatted_bgra_enabled();
+        const char* const refusal = x2w_startup::view_word3(view, words[3], enabled);
+        if (enabled && !refusal) mutate_formatted_view_code_for_test(words[3]);
+        return refusal;
     }
     if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
         format = code;
@@ -2648,10 +2672,20 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
     return x2w_startup::descriptor_word3_refusal(words[3]);
 }
 
+// draw_lock held, including for the diagnostic deduplication set.
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
-    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0,
+                            const D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr) {
         InterlockedIncrement(&formatted_draws_refused);
+        if (view && view->ViewDimension == D3D12_SRV_DIMENSION_BUFFER && formatted_bgra_enabled()) {
+            static std::unordered_map<u64, std::unordered_set<UINT>> logged;
+            const UINT dxgi = static_cast<UINT>(view->Format);
+            if (logged[tr.key].insert(dxgi).second)
+                log("x2w-draw %016llx srv %d: formatted buffer refused (%s; DXGI format=%u elements=%u mapping=0x%x)",
+                    tr.key, slot, reason, dxgi, view->Buffer.NumElements, view->Shader4ComponentMapping);
+            return false;
+        }
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
@@ -2671,7 +2705,9 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
         std::uint32_t format = 0;
-        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format, &view))
+            return refuse(ud.a, reason, format, &view);
         descriptor.entry = entry;
     }
     return true;
@@ -3258,7 +3294,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
                 if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
                     const bool typed_view = !view.Buffer.StructureByteStride && view.Format != DXGI_FORMAT_R32_TYPELESS;
-                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                    // A validated formatted BGRA view uses the RGBA8 decoder over four raw bytes.
+                    const UINT element = formatted.entry && view.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? 4
+                                         : view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
                                          : typed_view ? x2w_startup::typed_buffer_format_bytes(view.Format) : 4;
                     address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
                     bytes = std::size_t{view.Buffer.NumElements} * element;

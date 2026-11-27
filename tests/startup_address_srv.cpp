@@ -510,7 +510,7 @@ void release_placed_vertices(bool done)
 
 // X2W_TEST_FORMATTED_VIEW=<DXGI format>:<component mapping>:<raw 0|1>:<64 hex bytes>: one typed (or raw) buffer view
 // the title creates over a placed buffer holding those bytes, at table entry 0, then one draw. The translated pixel
-// shader in tests/startup_formatted_view_draw_check.py reads element 1 through buffer_load_format_xyzw.
+// shader in tests/startup_formatted_view_draw_check.py reads one element per pixel through buffer_load_format_xyzw.
 int draw_formatted_view(void* guest, void* list)
 {
     char spec[256]{};
@@ -540,6 +540,7 @@ int draw_formatted_view(void* guest, void* list)
     view.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
     invoke(guest, 18, ptr(placed), ptr(&view), cpu);
     invoke(list, 12, 3, 1);
+    if (GetEnvironmentVariableA("X2W_TEST_FORMATTED_REPEAT", nullptr, 0)) invoke(list, 12, 3, 1);
     return 0;
 }
 

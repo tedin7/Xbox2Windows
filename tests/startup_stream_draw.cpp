@@ -425,7 +425,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     const bool single = typed;
     const bool legacy = !single;
-    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const bool formatted_view = GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0;
+    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128
+                      : formatted_view ? 4 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
@@ -537,7 +539,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", nullptr, 0)) {
         extern int draw_single_element_srvs(void*, void*);
         if (const int result = draw_single_element_srvs(guest, list)) return result;
-    } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
+    } else if (formatted_view) {
         extern int draw_formatted_view(void*, void*);
         if (const int result = draw_formatted_view(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV", nullptr, 0)) {

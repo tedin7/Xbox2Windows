@@ -56,6 +56,13 @@ int main(int argc, char** argv)
     const std::uint32_t swizzled = ignore_mapping ? identity : (7u | 0u << 3 | 4u << 6 | 1u << 9);
     check("float4 swizzled", !x2w_startup::view_word3(typed(DXGI_FORMAT_R32G32B32A32_FLOAT, swizzle), word) &&
                                  word == (77u << 12 | swizzled));
+    const auto bgra = typed(DXGI_FORMAT_B8G8R8A8_UNORM);
+    refused("BGRA disabled", x2w_startup::view_word3(bgra, word), "view format has no decoded buffer FORMAT");
+    check("BGRA identity", !x2w_startup::view_word3(bgra, word, true) &&
+                              word == (56u << 12 | 6u | 5u << 3 | 4u << 6 | 7u << 9));
+    check("BGRA swizzle with constants",
+          !x2w_startup::view_word3(typed(DXGI_FORMAT_B8G8R8A8_UNORM, swizzle), word, true) &&
+          word == (56u << 12 | 7u | 6u << 6 | 1u << 9));
 
     // Every decoded DXGI format gives a code the translation decodes; a few others give none.
     const DXGI_FORMAT decoded[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R32_FLOAT,
@@ -64,6 +71,11 @@ int main(int argc, char** argv)
         DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R10G10B10A2_UNORM};
     for (DXGI_FORMAT f : decoded) {
         const std::uint32_t code = x2w_startup::buffer_format_code(f);
+        std::uint32_t off_word = 0, on_word = 0;
+        const auto view = typed(f);
+        check("legacy words identical with BGRA enabled",
+              !x2w_startup::view_word3(view, off_word) && !x2w_startup::view_word3(view, on_word, true) &&
+              off_word == on_word);
         if (!code || !x2w_startup::formatted_buffer_supported(code)) {
             ++failures;
             std::printf("FAIL DXGI format %d: code %u\n", static_cast<int>(f), code);
