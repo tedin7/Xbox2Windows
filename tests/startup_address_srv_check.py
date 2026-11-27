@@ -96,22 +96,28 @@ def check(directory, consumer, backend):
     if backend == "warp":
         one_d = directory / "texture1d"
         one_d.mkdir()
-        return check_1d(one_d, consumer, backend)
+        check_1d(one_d, consumer, backend)
+        placed = directory / "unregistered_1d"
+        placed.mkdir()
+        check_unregistered_1d(placed, consumer, backend)
     return 0
 
 
-def check_1d(directory, consumer, backend):
-    hlsl = """Texture1D<float> ramp : register(t0);
+RAMP_SHADER = """Texture1D<float> ramp : register(t0);
 SamplerState point_sampler : register(s0);
 float4 main(float4 p : SV_Position) : SV_Target {
     return float4(ramp.SampleLevel(point_sampler, p.x / 8.0, 0), 0, 0, 1);
 }
 """
+
+
+def check_1d(directory, consumer, backend):
     env, args, output = prepare_draw_cache(
-        directory, consumer, hlsl, {"X2W_TEST_ADDRESS_SRV_1D": "1"},
+        directory, consumer, RAMP_SHADER, {"X2W_TEST_ADDRESS_SRV_1D": "1"},
         "srv 0 tex1d table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
     )
     env.pop("X2W_PLACED_SRV_1D", None)
+    env.pop("X2W_PLACED_1D_TEXTURE", None)
     for enabled in (False, True):
         if enabled:
             env["X2W_PLACED_SRV_1D"] = "1"
@@ -135,6 +141,44 @@ float4 main(float4 p : SV_Position) : SV_Target {
                 raise AssertionError(f"missing descriptor check {marker!r}")
     print(f"{backend}: 1D ramp and unset switch control; all 32 RGBA pixels exact per case")
     return 0
+
+
+def check_unregistered_1d(directory, consumer, backend):
+    env, args, output = prepare_draw_cache(
+        directory, consumer, RAMP_SHADER, {"X2W_TEST_UNREGISTERED_1D_SRV": "1"},
+        "srv 0 tex1d table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
+    )
+    env.pop("X2W_PLACED_SRV_1D", None)
+    env.pop("X2W_PLACED_1D_TEXTURE", None)
+    env.pop("X2W_TEST_PLACED_1D_WRONG_WIDTH", None)
+
+    def reference(width):
+        return bytes(c for y in range(4) for x in range(8)
+                     for c in (11 + 19 * ((2 * x + 1) * width // 16) + 73 * (y // 2) if width else 0,
+                               0, 0, 255))
+
+    expected = reference(8)
+    cases = (
+        ("switch off", 0, {"X2W_PLACED_SRV_1D": "1"}),
+        ("enabled", 8, {"X2W_PLACED_1D_TEXTURE": "1"}),
+        ("wrong width", 4, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_WRONG_WIDTH": "1"}),
+    )
+    for case, width, switches in cases:
+        output.unlink(missing_ok=True)
+        result = subprocess.run([*args, backend, output], env={**env, **switches}, capture_output=True, text=True)
+        print(result.stdout, end="")
+        if result.returncode:
+            raise RuntimeError(f"{case}: consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+        marker = f"unregistered 1D descriptor_changed={int(bool(width))}"
+        refusals = sum("reason=texture_no_resource" in line for line in result.stderr.splitlines())
+        if marker not in result.stdout.splitlines() or refusals != (0 if width else 2):
+            raise AssertionError(f"{case}: descriptor or refusal count mismatch\n{result.stderr[-5000:]}")
+        actual = output.read_bytes()
+        if actual != reference(width):
+            raise AssertionError(f"{case}: actual {actual.hex()} expected {reference(width).hex()}")
+        if width != 8 and actual == expected:
+            raise AssertionError(f"{case}: unexpectedly passed the width-8 oracle")
+        print(f"{backend}: placed 1D {case}; all 32 RGBA pixels exact for its CPU reference")
 
 
 if __name__ == "__main__":

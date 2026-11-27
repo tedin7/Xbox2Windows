@@ -1,3 +1,4 @@
+#include <windows.h>
 #include <d3d12.h>
 #include <array>
 #include <cstddef>
@@ -103,6 +104,41 @@ int draw_1d_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     const D3D12_RECT full{0, 0, 8, 4};
     invoke(list, 22, 1, ptr(&full));
     invoke(list, 12, 3, 1);
+    return 0;
+}
+
+int draw_unregistered_1d_address_srv(void* guest, void* list)
+{
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 44;
+    const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 8u, 1,
+        1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    // A single R8 footprint consists of one row starting at offset zero.
+    static std::array<unsigned char, 8> memory;
+    ViewAt view{};
+    view.address = ptr(memory.data());
+    view.view.Format = desc.Format;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Texture1D.MipLevels = 1;
+    invoke(guest, 18, 0, ptr(&view.view), cpu);
+    const auto* slot = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), slot, previous.size());
+
+    const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
+    invoke(list, 21, 1, ptr(&viewport));
+    for (LONG phase = 0; phase < 2; ++phase) {
+        for (UINT x = 0; x < memory.size(); ++x)
+            memory[x] = static_cast<unsigned char>(11 + 19 * x + 73 * phase);
+        // Republish the same address after a title-side write, in the same frame.
+        invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+        const D3D12_RECT rows{0, phase * 2, 8, phase * 2 + 2};
+        invoke(list, 22, 1, ptr(&rows));
+        invoke(list, 12, 3, 1);
+    }
+    std::printf("unregistered 1D descriptor_changed=%d\n", std::memcmp(previous.data(), slot, previous.size()) != 0);
     return 0;
 }
 
