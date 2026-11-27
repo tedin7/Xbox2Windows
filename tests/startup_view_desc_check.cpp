@@ -404,7 +404,7 @@ static bool run_and_wait(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 // level) and through the SRV made from a UAV of mip 1 (t1). Each texel read back must equal the uploaded one.
 static bool mip_zero_readback(ID3D12Device* device)
 {
-    constexpr UINT side = 4, mips = 3, pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, out_bytes = 4 * 16 * 4;
+    constexpr UINT side = 4, mips = 3, pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, out_bytes = 4 * 4 * 4 * 16;  // 4x4x4 threads, 16 bytes each
     const auto heap = [](D3D12_HEAP_TYPE type) { D3D12_HEAP_PROPERTIES p{}; p.Type = type; return p; };
     const auto buffer = [&](D3D12_HEAP_TYPE type, UINT64 bytes, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
