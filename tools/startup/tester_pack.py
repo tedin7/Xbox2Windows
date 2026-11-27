@@ -930,6 +930,8 @@ def end_cause(logdir):
         code, at = int(found.group(1), 16), found.group(2)
         if code == 0:
             cause = "title exited by itself (code 0x0) at %s s" % at
+        elif code == 0xE2571455:
+            cause = "xmem lazy commit failed (exit code %s) at %s s" % (found.group(1), at)
         elif code >= 0xC0000000 and code != 0xFFFFFFFF:
             cause = "title crashed (exit code %s) at %s s" % (found.group(1), at)
         else:
