@@ -2691,6 +2691,11 @@ add_test(NAME startup_local_log_wrap_control COMMAND startup_local_log_check --m
 set_tests_properties(startup_local_log_wrap_control PROPERTIES
     PASS_REGULAR_EXPRESSION "FAIL first_calls passes no call at the wrap point")
 # Trap-by-default export macros and env switches (src/startup_stubs/trap.h, #1149).
+add_executable(buffer_descriptor_range_check tests/buffer_descriptor_range_check.cpp)
+target_include_directories(buffer_descriptor_range_check PRIVATE src)
+target_compile_features(buffer_descriptor_range_check PRIVATE cxx_std_17)
+add_test(NAME buffer_descriptor_range COMMAND buffer_descriptor_range_check)
+
 add_executable(startup_trap_header_check tests/startup_trap_header_check.cpp)
 target_include_directories(startup_trap_header_check PRIVATE src)
 target_compile_features(startup_trap_header_check PRIVATE cxx_std_17)

@@ -12,6 +12,7 @@
 // object in rdx (desktop: object first); those slots accept either order.
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
+#include "startup_stubs/buffer_descriptor_range.h"
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"

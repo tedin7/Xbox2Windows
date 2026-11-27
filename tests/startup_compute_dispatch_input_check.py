@@ -122,6 +122,24 @@ def check_title_inputs(directory, cache, consumer, dxc, env, untouched):
                                f'from plain title memory {plain}, ring retries {retries}, ring full 0'), totals
         compare(got, mode)
 
+    # The third record is a sentinel at byte 64. The stride-times-records mutant
+    # admits it in the raw leg and produces the same wrong sum as the mode 0 control.
+    for mode, records, size in (('raw-range', 2, 64), ('raw-range-control', 3, 1024)):
+        got, result = run(mode, enabled)
+        assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
+        cpu_sum = sum((r + 1) * 37 + i * 9 for r in range(records) for i in range(4))
+        assert got == [cpu_sum] + untouched[1:], (mode, got[0], cpu_sum)
+        paths = lines(result, 'comes from plain title memory')
+        assert len(paths) == 1 and paths[0].endswith(f'({size} bytes)'), paths
+        raw_logs = lines(result, 'x2w-draw V# raw range:')
+        if mode == 'raw-range':
+            assert len(raw_logs) == 1 and raw_logs[0].endswith(
+                'OOB_SELECT 3 stride 16 num_records 64 -> 64 bytes (Table 37 reading would be 1024)'), raw_logs
+        else:
+            assert not raw_logs, raw_logs
+    print('V# range readback: 64-byte raw view excludes the sentinel, 1024-byte mode 0 view includes it. '
+          'Stride-times-records mutant mismatches the raw CPU reference.')
+
     refused('protected', enabled, 'an input range in title memory is not readable')
     full = refused('ring-full', enabled, 'an input range could not be copied from title memory (ring full)')
     totals, = lines(full, 'x2w-render compute dispatches:')
