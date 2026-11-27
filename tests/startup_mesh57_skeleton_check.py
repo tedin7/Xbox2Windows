@@ -729,6 +729,35 @@ def vector_count_guard_mesh(case='select mask'):
     return mesh
 
 
+CARRY_PRODUCER = "d5283a3e 00e900c1"  # v_add_co_ci_u32_e64 v62, s[58:59], -1, 0, s[58:59]
+CARRY_ADD = "d5283a3c 00ea7880"  # v_add_co_ci_u32_e64 v60, s[58:59], 0, v60, s[58:59]
+CARRY_PREFIXES = {
+    "uniform": CARRY_ADD,
+    "lane operand": "d5283a3c 00ea0080",
+    "lane carry": "d4c4003a 00020086 " + CARRY_ADD,
+    "partial EXEC": "7d860086 bea4246a " + CARRY_ADD + " befe04c1",
+    "DPP": "7e7802fa ff09113c " + CARRY_ADD,
+    "lane phi": CARRY_ADD,
+    "divergent phi": CARRY_ADD,
+    "SDWA preserve": "7e780300 027878f9 0606103c " + CARRY_ADD,
+}
+
+
+def carry_bound_mesh(case="uniform"):
+    mesh = vector_count_guard_mesh()
+    if case == "lane phi":
+        arm = mesh.index("d569003c")
+        mesh[arm:arm + 2] = ["7e780300", "bf800000"]  # v_mov_b32 v60, v0; s_nop 0
+    if case == "divergent phi":
+        arm = mesh.index("d569003c")
+        mesh[arm - 2] = "bf068006"  # s_cmp_eq_u32 s6, 0 (wave index)
+    at = mesh.index("7e2c053c")
+    # The producer overflows exactly when carry-in is set. Both scalar
+    # branch arms execute it and then use its carry-out in the bound add.
+    mesh[at:at] = (CARRY_PRODUCER + " " + CARRY_PREFIXES[case]).split()
+    return mesh
+
+
 def rewritten_guarded_position():
     """Overwriting v50 under the primitive mask invalidates its older position definition."""
     mesh = GUARDED_POSITIONS['select']
@@ -1272,6 +1301,26 @@ def vector_count_guard_controls(tmp):
         expect('VGPR bound clamp mutant changes prefix arm %d' % bit, guest != wrong, True)
 
 
+
+def carry_bound_controls(tmp):
+    for label in CARRY_PREFIXES:
+        expect("carry bound: " + label, request(tmp, carry_bound_mesh(label))[1],
+               "ok" if label == "uniform" else GUARDED_REFUSAL)
+
+    operands = G.mesh_uniform_operands
+
+    def ignore_lane_operand(tokens, *state):
+        return tokens == ["0", "v0"] or operands(tokens, *state)
+
+    with patch.object(G, "mesh_uniform_operands", ignore_lane_operand):
+        expect("mutant accepts a lane-dependent add operand",
+               request(tmp, carry_bound_mesh("lane operand"))[1], "ok")
+    for bit in (0, 1):
+        _, guest, _ = count_guard_reference(bit, vector_bound=True, carry_bound=True)
+        _, no_carry, _ = count_guard_reference(bit, vector_bound=True)
+        expect(f"carry-in changes CPU raster pixels for root bit {bit}", guest != no_carry, bit == 0)
+
+
 def count_entry_guard_controls(tmp):
     for label in ('scalar bound', 'vector bound'):
         key, result = request(tmp, count_entry_guard_mesh(label))
@@ -1344,6 +1393,7 @@ def lane_mask_controls(tmp):
             expect('export count mutant changes the CPU image', good != bad, True)
     count_guard_controls(tmp)
     vector_count_guard_controls(tmp)
+    carry_bound_controls(tmp)
     count_entry_guard_controls(tmp)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
@@ -1821,6 +1871,22 @@ s_load_dwordx4 s[28:31], s[26:27], s24
 buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
 """), HEAP_SETUP + HEAP_ARM)
     lane_mask_binary(mc)
+    expect("carry producer words",
+           assemble(mc, "v_add_co_ci_u32_e64 v62, s[58:59], -1, 0, s[58:59]"), CARRY_PRODUCER.split())
+    add = "v_add_co_ci_u32_e64 v60, s[58:59], 0, v60, s[58:59]"
+    encodings = {
+        "uniform": add,
+        "lane operand": add.replace("0, v60,", "0, v0,"),
+        "lane carry": "v_cmp_gt_u32_e64 s[58:59], 6, v0\n" + add,
+        "partial EXEC": "v_cmp_le_u32_e32 vcc, 6, v0\ns_and_saveexec_b64 s[36:37], vcc\n"
+                        + add + "\ns_mov_b64 exec, -1",
+        "DPP": "v_mov_b32_dpp v60, v60 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1\n" + add,
+        "SDWA preserve": "v_mov_b32_e32 v60, v0\n"
+                         "v_cndmask_b32_sdwa v60, v60, v60, vcc dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE "
+                         "src0_sel:DWORD src1_sel:DWORD\n" + add,
+    }
+    for label, assembly in encodings.items():
+        expect("carry bound words: " + label, assemble(mc, assembly), CARRY_PREFIXES[label].split())
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
     expect('group words match llvm-mc', assemble(mc, mesh.replace(
@@ -2102,7 +2168,8 @@ def draw_lane_masks(dxc, renderer, adapter):
             status = draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=vector_bound)
             if status:
                 return status
-    return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        return draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=True, carry_bound=True)
 
 
 def guarded_position_reference():
@@ -2157,7 +2224,7 @@ def draw_guarded_positions(tmp, dxc, renderer, adapter):
     return 0
 
 
-def count_guard_reference(bit, *, vector_bound=False):
+def count_guard_reference(bit, *, vector_bound=False, carry_bound=False):
     """Build the two synthetic prefix inputs and model the guest index clamp."""
     points, colours, _ = geometry()
     triangles = [(7, 2, 15)]
@@ -2179,6 +2246,9 @@ def count_guard_reference(bit, *, vector_bound=False):
         struct.pack_into('<2I', data, 480, 8, 0)
         packed = struct.unpack_from('<I', data, 464 if bit else 480)[0]
         verts, prims = (packed & 63) + 1, ((packed >> 8) & 255) + 1
+    if carry_bound:
+        # The clear-bit arm puts one in every lane of the input carry mask.
+        verts += int(not bit)
     guest = [tuple(min(i, verts - 1) for i in tri) for tri in triangles]
     wrong = [tuple(min(i, verts - 2) for i in tri) for tri in guest]
     return data, rasterise(points, colours, guest, verts, prims), rasterise(points, colours, wrong, verts, prims)
@@ -2191,9 +2261,9 @@ def clamp_with_rewritten_count(source):
     return source.replace(old, new)
 
 
-def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False):
-    mesh = vector_count_guard_mesh() if vector_bound else count_guard_mesh()
-    bound = 'VGPR' if vector_bound else 'SGPR'
+def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False, carry_bound=False):
+    mesh = carry_bound_mesh() if carry_bound else vector_count_guard_mesh() if vector_bound else count_guard_mesh()
+    bound = "carry VGPR" if carry_bound else "VGPR" if vector_bound else "SGPR"
     key, result = request(tmp, mesh)
     expect(f'two wave-load guards with a {bound} position bound compile', result, 'ok')
     if result != 'ok':
@@ -2212,7 +2282,7 @@ def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False):
     path = tmp / 'count-guard.bin'
     for bit in (0, 1):
         struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), bit)
-        data, guest, wrong = count_guard_reference(bit, vector_bound=vector_bound)
+        data, guest, wrong = count_guard_reference(bit, vector_bound=vector_bound, carry_bound=carry_bound)
         differences = sum(a != b for a, b in zip(guest, wrong))
         expect('the index clamp affects the image', differences > 0, True)
         cases = (('guest', base.with_suffix('.ms57.cso'), guest, 0),

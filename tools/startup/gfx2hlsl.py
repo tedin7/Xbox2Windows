@@ -3446,8 +3446,9 @@ def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read
     return mesh_uniform_operands(sources, scalars, vectors, uniform)
 
 
-def mesh_value_mask(i, name, ops, mods, state, next_s, uniform):
-    """Number full-width masks. RDNA 2 ISA p. 20: V_CMP writes EXEC[n] & result."""
+def mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry=False):
+    """Number full-width masks and report a uniform carry-producing VALU result."""
+    # RDNA 2 ISA p. 20: V_CMP writes EXEC[n] & result.
     ss, vs, full = state
     if name.startswith('v_cmp_') and len(ops) == 3:
         words = mask_words(lane_mask_operands(name, ops)[0], 2)
@@ -3471,8 +3472,25 @@ def mesh_value_mask(i, name, ops, mods, state, next_s, uniform):
             uniform.add(number)
             next_s.update(dict.fromkeys(words, number))
 
+    if uniform_carry and LANE_MASK_CARRY.fullmatch(name) and len(ops) in (4, 5):
+        args = lane_mask_operands(name, ops)
+        words = mask_words(args[1], 2)
+        if words and args[1] != 'exec':
+            # RDNA 2 ISA, V_ADD_CO_CI_U32 and EXECute Mask (§3.3): both
+            # outputs are per-lane, and carry-in is the bit for this lane.
+            carry_uniform = (full and not mods and name == 'v_add_co_ci_u32_e64' and len(args) == 5
+                             and mesh_uniform_lane_mask(args[4], ss, uniform)
+                             and mesh_uniform_operands(args[2:4], ss, vs, uniform))
+            number = ('lane-mask', i)
+            if carry_uniform:
+                uniform.add(number)
+                next_s.update(dict.fromkeys(words, number))
+                return True
+            next_s.update({word: ('def', i, word) for word in words})
+    return False
 
-def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
+
+def mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_carry=False):
     """Number scalar and vector writes using the RDNA 2 ISA (SMEM p. 51, first-lane read p. 137)."""
     ss, vs, full = state
     _, ops, mods = parse(asm)
@@ -3503,10 +3521,11 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
             uniform.add(('group-index',))
         elif mesh_uniform_value(source, uniform):
             next_s[ops[0]] = source
-    mesh_value_mask(i, name, ops, mods, state, next_s, uniform)
+    carry_uniform = mesh_value_mask(i, name, ops, mods, state, next_s, uniform, uniform_carry)
     vector_writes = mesh_vector_writes(name, asm)
     if vector_writes:
-        vector_uniform = full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only)
+        vector_uniform = carry_uniform or (
+            full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only))
         for word in vector_writes:
             token = f'v{word}'
             number = ('def', i, token)
@@ -3516,7 +3535,7 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
     return next_s, next_v, asm == 's_mov_b64 exec, -1' or (full and not writes_exec(name, ops))
 
 
-def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
+def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only, uniform_carry=False):
     """Number forward paths. GS user data starts at s8; the root starts at s16."""
     if any(first <= i < exchange for i in constant_trips) or any(
             first <= i < exchange and not i < dest <= exchange for i, dest in edges.items()):
@@ -3540,7 +3559,7 @@ def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
         if i == exchange:
             break
         name, asm = ins[i][2:]
-        state = mesh_value_step(i, name, asm, state, uniform, selects, read_only)
+        state = mesh_value_step(i, name, asm, state, uniform, selects, read_only, uniform_carry)
         if i in edges:
             incoming.setdefault(edges[i], []).append(state)
             if name == 's_branch':
@@ -3742,7 +3761,7 @@ def mesh_full_exec_reset(ins, floor, compare, edges):
 
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
                   mask_arm_sites=None, standalone_selects=None, pixel_writes=False, count_rewrites=None,
-                  uniform_bounds=None, coherent_sites=None):
+                  uniform_bounds=None, coherent_sites=None, uniform_carry=False):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -4200,7 +4219,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     if load_branches or count_entry is not None:
         read_only = not (pixel_writes or mesh_memory_writes(ins[:start] + ins[a_end:count_at] + ins[b_end:]))
         value_at, uniform_values, count_selects = mesh_value_numbers(
-            ins, a_end, count_at, edges, constant_trips, read_only)
+            ins, a_end, count_at, edges, constant_trips, read_only, uniform_carry)
     count_words = value_at[count_at][0] if count_at in value_at else {}
     published = {key: count_words.get(env[key]) for key in ('verts', 'prims')}
     count_regs = {env[key]: key for key in published}
@@ -4688,19 +4707,21 @@ class Stage:
             proofs = (self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads,
                       self.mesh_wave_votes, self.mesh_wave_scalars, self.mesh_wave_scalar_joins,
                       self.mesh_mask_arm_sites)
-            passes = ((None, None), (self.mesh_standalone_selects, None),
-                      (self.mesh_standalone_selects, self.mesh_coherent_sites))
-            for selects, coherent in passes:
+            # Preserve the legacy lowering whenever one of its three passes succeeds.
+            passes = ((None, None, False), (self.mesh_standalone_selects, None, False),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, False),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, True))
+            for selects, coherent, uniform_carry in passes:
                 try:
                     self.ins = mesh_skeleton(
                         self.ins, *proofs, selects, pixel_writes, self.mesh_count_rewrites,
-                        self.mesh_uniform_bounds, coherent)
+                        self.mesh_uniform_bounds, coherent, uniform_carry)
                     break
                 except Unsupported as reason:
-                    if coherent is not None or not str(reason).startswith('slot 57 mesh:'):
+                    if uniform_carry or not str(reason).startswith('slot 57 mesh:'):
                         raise
                     for proof in proofs + (self.mesh_standalone_selects, self.mesh_count_rewrites,
-                                           self.mesh_uniform_bounds):
+                                           self.mesh_uniform_bounds, self.mesh_coherent_sites):
                         proof.clear()
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
