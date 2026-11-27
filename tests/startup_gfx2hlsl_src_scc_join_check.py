@@ -59,7 +59,8 @@ SOP1_MOV_B32, SOP1_WQM_B64 = 0x03, 0x0A
 SOP2_AND_B32 = 0x0E
 SOPC_CMP_EQ_U32 = 0x06
 SOPC_BITCMP1_B32 = 0x0D
-SOPP_NOP, SOPP_ENDPGM, SOPP_BRANCH, SOPP_CBRANCH_SCC0, SOPP_CBRANCH_EXECZ = 0x00, 0x01, 0x02, 0x04, 0x08
+SOPP_NOP, SOPP_ENDPGM, SOPP_BRANCH = 0x00, 0x01, 0x02
+SOPP_CBRANCH_SCC0, SOPP_CBRANCH_SCC1, SOPP_CBRANCH_EXECZ = 0x04, 0x05, 0x08
 
 S_SCC = 253
 S_THREE = 131      # inline integer 3
@@ -340,6 +341,72 @@ def pixel_controls():
     return accepted
 
 
+def lane_mask_join_program(mode='branch_only'):
+    """A uniform branch skips a VALU compare that repurposes the numeric s10:s11."""
+    # s9 is the draw flag and s10 is a second root constant. v0 is packed pixel position.
+    setup = sop1(SOP1_MOV_B32, 11, 132)  # s_mov_b32 s11, 4
+    if mode == 'back_edge':
+        setup += sop1(SOP1_MOV_B32, 13, 129)  # s_mov_b32 s13, 1
+    compare_flag = sopc(SOPC_CMP_EQ_U32, 9, 128)  # s_cmp_eq_u32 s9, 0
+    masked = struct.pack('<II', 0xd4c1000a, 131 | 256 << 9)  # v_cmp_lt_u32_e64 s10, 3, v0
+    masked += struct.pack('<II', 0xd5010001, 135 | 141 << 9 | 10 << 18)  # v_cndmask_b32_e64 v1, 7, 13, s10
+    numeric = sop2(0, 12, 10, 11)  # s_add_u32 s12, s10, s11
+    numeric += struct.pack('<I', 0x7e02020c)  # v_mov_b32_e32 v1, s12
+    select_numeric = SOPP_CBRANCH_SCC0
+    if mode == 'through_join':
+        # After the first join, the zero-flag path still carries a mask even though
+        # program order saw the nonzero path overwrite the pair with numbers.
+        plain = sop1(SOP1_MOV_B32, 10, 133) + sop1(SOP1_MOV_B32, 11, 132)
+        mask_path = masked + sopp(SOPP_BRANCH, len(plain) // 4)
+        setup += compare_flag + sopp(SOPP_CBRANCH_SCC0, len(mask_path) // 4) + mask_path + plain
+        setup += sop1(SOP1_MOV_B32, 10, 10)  # copy the reaching value of s10
+        select_numeric = SOPP_CBRANCH_SCC1
+    if mode == 'loop_exit':
+        setup += sop1(SOP1_MOV_B32, 13, 128)  # start with s13 = 0
+        header = len(setup)
+        masked += sop1(SOP1_MOV_B32, 13, 129)  # the next iteration exits with the mask
+        code = setup + sopc(SOPC_CMP_EQ_U32, 13, 129) + sopp(SOPP_CBRANCH_SCC1, len(masked) // 4 + 1) + masked
+        code += branch(SOPP_BRANCH, len(code), header) + numeric
+    else:
+        if mode != 'fall_through':
+            masked += sopp(SOPP_BRANCH, len(numeric) // 4)
+        code = setup + compare_flag + sopp(select_numeric, len(masked) // 4) + masked
+        numeric_at = len(code)
+        code += numeric
+        if mode == 'back_edge':
+            code += sop2(1, 13, 13, 129)  # s_sub_u32 s13, s13, 1
+            code += branch(SOPP_CBRANCH_SCC0, len(code), numeric_at)
+    return code + bytes.fromhex(
+        '010d047e'            # v_cvt_f32_u32_e32 v2, v1
+        '0f0800f802020202'    # exp mrt0, v2, v2, v2, v2 done
+        '000081bf')           # s_endpgm
+
+
+def lane_mask_join_controls():
+    try:
+        accepted = firstlane_pixel.pipeline(lane_mask_join_program())
+        hlsl = accepted.hlsl_ps()
+    except G.Unsupported as error:
+        check('numeric read in the branch-only arm', False, str(error))
+        result = None
+    else:
+        check('numeric read in the branch-only arm', True)
+        result = hlsl, accepted.uds
+    for mode, label in (
+        ('fall_through', 'mask on the fall-through edge'),
+        ('back_edge', 'mask at a back-edge target'),
+        ('through_join', 'mask copied after an earlier join'),
+        ('loop_exit', 'mask on a loop exit'),
+    ):
+        try:
+            firstlane_pixel.pipeline(lane_mask_join_program(mode))
+        except G.Unsupported as error:
+            check(label, str(error) == 's_add_u32 reads lane mask s10 as numeric data', str(error))
+        else:
+            check(label, False, 'translated a numeric read with an arriving lane mask')
+    return result
+
+
 def pixel_reference(scale):
     result = bytearray()
     # The loop's final latch is false even though two earlier bits sum to 2.
@@ -385,7 +452,7 @@ def check_pixel_draw(dxc, runner, shaders):
               run.stdout + run.stderr)
 
 
-def check_firstlane_draw(dxc, runner, hlsl, bindings, whole_quad):
+def check_firstlane_draw(dxc, runner, hlsl, bindings, whole_quad, mask_join):
     def float_word(value):
         return struct.unpack('<I', struct.pack('<f', value))[0]
 
@@ -403,12 +470,12 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings, whole_quad):
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'firstlane_vs', 'vs_6_0', directory)
 
-        def draw(name, shader, flag, bindings, reference, mismatch=False):
+        def draw(name, shader, flag, bindings, reference, mismatch=False, fallback_word=float_word(fallback)):
             expected = directory / (name + '.bin')
             expected.write_bytes(b''.join(
                 struct.pack('<4f', *reference(x | (y << 16), y, flag))
                 for y in range(8) for x in range(8)))
-            constants = {('rootconst', 1, 0): flag, ('rootconst', 1, 1): float_word(fallback),
+            constants = {('rootconst', 1, 0): flag, ('rootconst', 1, 1): fallback_word,
                          ('descword3', 0): word3}
             entry = hex_words(constants.get(key, 0) for key in bindings)
             ps = compile_hlsl(dxc, 'dxc', shader, name, 'ps_6_0', directory)
@@ -432,11 +499,24 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings, whole_quad):
             picked = values[2] if flag else fallback
             return pos + picked, pos, float(y >= 4), 1.0
 
+        def mask_join_reference(pos, _y, flag):
+            value = 19 + 4 if flag else (13 if pos > 3 else 7)
+            return (float(value),) * 4
+
         whole_quad_hlsl, swapped, whole_quad_bindings = whole_quad
+        mask_join_hlsl, mask_join_bindings = mask_join
         for flag in (0, 1):
             draw(f'firstlane_flag_{flag}', hlsl, flag, bindings, entry_reference)
             draw(f'whole_quad_flag_{flag}', whole_quad_hlsl, flag, whole_quad_bindings, whole_quad_reference)
+            draw(f'mask_join_flag_{flag}', mask_join_hlsl, flag, mask_join_bindings, mask_join_reference,
+                 fallback_word=19)
         draw('mutant_whole_quad_swapped_arms', swapped, 1, whole_quad_bindings, whole_quad_reference, mismatch=True)
+
+        original = 's12 = ud2 + 0x00000004u;'
+        assert mask_join_hlsl.count(original) == 1, mask_join_hlsl
+        mutant = mask_join_hlsl.replace(original, 's12 = ud2;')
+        draw('mutant_mask_join_dropped_addend', mutant, 1, mask_join_bindings, mask_join_reference,
+             mismatch=True, fallback_word=19)
 
         for name, original, mutant in (
             ('mutant_join_scc', 's14 = scc ?', 's14 = !scc ?'),
@@ -613,12 +693,13 @@ if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
         check_compute_join_dispatch(*sys.argv[2:], compute)
 elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
     shaders = pixel_controls()
+    mask_join = lane_mask_join_controls()
     firstlane_hlsl, bindings = firstlane_pixel.check_translation()
     vertex = vertex_controls()
     whole_quad = firstlane_pixel.check_whole_quad_translation()
     if not failures:
         check_pixel_draw(*sys.argv[2:], shaders)
-        check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings, whole_quad)
+        check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings, whole_quad, mask_join)
         check_vertex_draw(*sys.argv[2:], vertex)
 elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     for name, (source, prefix, _) in PIXEL_CASES.items():
@@ -626,6 +707,7 @@ elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     check('vertex encoding', assemble(sys.argv[2], VERTEX_SOURCE) == SCALAR_WORDS + VERTEX_TAIL_WORDS)
 elif len(sys.argv) == 1:
     pixel_controls()
+    lane_mask_join_controls()
     vertex_controls()
     compute_controls()
 else:
