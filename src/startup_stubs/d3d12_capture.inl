@@ -47,6 +47,7 @@ struct ResourceInfo {
     D3D12_RESOURCE_DESC console;     // the description as the title passed it
     u64 bytes;                       // allocation size when known, else 0
     Placement placement{};
+    x2w_startup::BufferSrvBacking buffer_srv_backing{};
     const Wrapper* placement_device{};
     D3D12_RESOURCE_STATES initial_state{};
     const Wrapper* texture_alias_device{};
@@ -352,12 +353,13 @@ void index_resource(const Wrapper* w, const ResourceInfo& info)
     x2w_startup::note_placement_change();
 }
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes,
-                   const Wrapper* texture_alias_device = nullptr, u64 texture_alias_bytes = 0)
+                   const Wrapper* texture_alias_device = nullptr, u64 texture_alias_bytes = 0,
+                   x2w_startup::BufferSrvBacking backing = x2w_startup::BufferSrvBacking::committed)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
     x2w_startup::note_placement_change();
-    const ResourceInfo info{*console, bytes, Placement::none, nullptr, {}, texture_alias_device, texture_alias_bytes};
+    const ResourceInfo info{*console, bytes, Placement::none, backing, nullptr, {}, texture_alias_device, texture_alias_bytes};
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
         resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
@@ -382,7 +384,8 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false,
+                                     x2w_startup::BufferRefusalDetail* overlap = nullptr)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
@@ -399,6 +402,10 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
                 continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
+            if (overlap) {
+                overlap->base = base;
+                overlap->bytes = info.bytes;
+            }
             if (result.owner || start < base || bytes > info.bytes - (start - base)) {
                 result = {nullptr, nullptr, true}; // Ambiguous or crossing an allocation.
                 break;

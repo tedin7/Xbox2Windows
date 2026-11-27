@@ -3985,6 +3985,23 @@ descriptions with:
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
+The process-wide `x2w-slot70 buffer_unavailable split` line logs cumulative totals at powers
+of two and on device teardown. A is a stride mismatch against a cached 64 KiB-aligned upload
+copy. B is an alias overlap introduced by page rounding. C is a stride mismatch inside a title
+placed buffer. D is overlap with the requested byte range. E–M name the remaining checks in
+the line. The first four calls per reason log the request and the conflicting range, when
+available. Cache hits count under their original reason, and successful shadow recovery
+does not count as a refusal.
+
+The census tracks distinct starts and distinct (64 KiB page, element size, offset in page
+modulo element size) keys in two fixed 4,096-entry tables. The exact-copy estimate sums
+the largest observed span per tracked address, rounded up to 64 KiB. Each truncation flag
+marks the corresponding distinct count as a lower bound. Address truncation also makes
+the copy estimate a lower bound.
+
+The synthetic split fixture and its all-A negative control run with
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_buffer(_all-a_control)?$' -V`.
+
 With `X2W_SLOT70_MEMORY_BUFFER=1`, a structured view with first element 0, count 1 and
 stride equal to the buffer width can recover from `buffer_unavailable` if its exact byte range
 is readable and outside live resources. Slot 70 copies the requested bytes to a D3D12 upload
