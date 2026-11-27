@@ -17246,18 +17246,23 @@ def note_retried(out_dir, stamp, keys):
 
 
 def run_weights(path):
-    """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
+    """{key: draws not drawn (graphics) or refused dispatches (compute and mesh57)} from a run's stderr.txt, each
     key's newest cumulative line; {} when the file cannot be read."""
+    from tester_pack import REFUSED_DISPATCH_RE
+
     if family_retry_enabled():
         return scene_weights(Path(path))
-    weights, uses = {}, {}
+    weights, uses, refused = {}, {}, {}
     try:
         with open(path, encoding='utf-8', errors='replace') as handle:
             for line in handle:
                 if not line.startswith('x2w-render '):
                     continue
                 drawn, census, use = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line), USE_LINE.match(line)
-                if drawn:
+                dispatch = REFUSED_DISPATCH_RE.match(line)
+                if dispatch:
+                    refused[int(dispatch[2], 16)] = int(dispatch[3])
+                elif drawn:
                     weights[int(drawn.group(1), 16)] = int(drawn.group(2))
                 elif census:
                     weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
@@ -17266,11 +17271,11 @@ def run_weights(path):
     except OSError:
         return {}
     # A key with no draw/dispatch line (a run killed before its census) counts by how often the title used it.
-    return {**{key: count for key, count in uses.items() if count > 0}, **weights}
+    return {**{key: count for key, count in uses.items() if count > 0}, **weights, **refused}
 
 
 def scene_weights(path, need_census=True):
-    from tester_pack import KEY_USE_RE
+    from tester_pack import KEY_USE_RE, REFUSED_DISPATCH_RE
 
     if path.is_dir():
         candidates = []
@@ -17287,10 +17292,14 @@ def scene_weights(path, need_census=True):
         return {}
 
     census = False
-    weights = {}
+    weights, refused = {}, {}
     try:
         with path.open(encoding='utf-8', errors='replace') as handle:
             for line in handle:
+                dispatch = REFUSED_DISPATCH_RE.match(line)
+                if dispatch:
+                    census = True
+                    refused[int(dispatch[2], 16)] = int(dispatch[3])
                 if (line.startswith(('x2w-render scene census', 'x2w-render compute census:',
                                      'x2w-render not drawn by pipeline key:'))
                         or CENSUS_LINE.match(line) or NOT_DRAWN_LINE.match(line)):
@@ -17301,7 +17310,7 @@ def scene_weights(path, need_census=True):
                     weights[key] = max(count, weights.get(key, 0))
     except OSError:
         return {}
-    return weights if census or not need_census else {}
+    return {**weights, **refused} if census or not need_census else {}
 
 
 class RetryReport:

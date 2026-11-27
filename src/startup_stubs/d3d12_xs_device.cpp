@@ -69,6 +69,7 @@
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
+#include "startup_stubs/refused_dispatch_census.h"
 #include "startup_stubs/rect_indirect_args.h"
 #include "startup_stubs/split_indirect_dispatch.h"
 #include "startup_stubs/profile_zone.h"
@@ -283,7 +284,7 @@ void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -3430,6 +3431,7 @@ struct Pass {
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
+    u64 requested_mesh_key = 0;
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
@@ -4018,6 +4020,60 @@ bool split_indirect_dispatch_enabled()
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
 }
 
+using RefusedDispatchCensus = x2w_startup::RefusedDispatchCensus;
+
+struct RuntimeRefusedDispatchCensus {
+    SRWLOCK lock = SRWLOCK_INIT;
+    RefusedDispatchCensus* census = nullptr;
+
+    void note(RefusedDispatchCensus::Kind kind, u64 key, const char* reason, std::optional<u64> groups)
+    {
+        x2w_startup::ExclusiveNoteLock guard(lock);
+        if (!census) census = new RefusedDispatchCensus(kind);
+        if (census->note(key, reason, groups))
+            census->report([](const char* line) { log("%s", line); });
+    }
+
+    ~RuntimeRefusedDispatchCensus()
+    {
+        // Process termination can stop a recorder while it owns the lock.
+        if (!TryAcquireSRWLockExclusive(&lock)) return;
+        if (census) {
+            census->report([](const char* line) {
+                char text[400];
+                const int bytes = std::snprintf(text, sizeof(text), "%s\r\n", line);
+                if (bytes > 0 && bytes < static_cast<int>(sizeof(text)))
+                    x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(bytes));
+            });
+            if (!x2w_startup::d3d12_process_terminating) delete census;
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+};
+
+RuntimeRefusedDispatchCensus refused_compute_dispatches, refused_mesh57_dispatches;
+
+void note_refused_compute_dispatch(u64 key, const char* reason)
+{
+    refused_compute_dispatches.note(RefusedDispatchCensus::Kind::compute, key, reason, {});
+}
+
+std::optional<u64> read_mesh57_groups(void* argument, u64 offset)
+{
+    const Wrapper* buffer = as_wrapper(argument);
+    if (!buffer || buffer->own().kind != resource_kind || (offset & 3)) return {};
+    const auto* info = resource_info(buffer);
+    const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
+    D3D12_DISPATCH_MESH_ARGUMENTS args{};
+    if (!info || info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        offset > info->console.Width || sizeof(args) > info->console.Width - offset ||
+        !base || offset > ~u64{} - base || sizeof(args) - 1 > ~u64{} - (base + offset))
+        return {};
+    // The refused command never executes. Only a CPU-readable argument snapshot can contribute groups.
+    if (!x2w_local::guarded_memcpy(&args, reinterpret_cast<const void*>(base + offset), sizeof(args), true)) return {};
+    return x2w_startup::mesh_dispatch_groups(args.ThreadGroupCountX, args.ThreadGroupCountY, args.ThreadGroupCountZ);
+}
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -4096,11 +4152,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
             // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
             // nothing is drawn.
-            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real &&
-                (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
-                pass.requested_mesh_pipeline = pass.pipeline;
-                pass.requested_mesh_root = pass.root;
-                request_slot57_mesh(pass.pipeline, pass.root);
+            static constexpr char reason[] = "indirect graphics requires a direct list with a matching desktop pipeline and root";
+            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real) {
+                if (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root) {
+                    pass.requested_mesh_pipeline = pass.pipeline;
+                    pass.requested_mesh_root = pass.root;
+                    pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root);
+                }
+                if (pass.requested_mesh_key)
+                    refused_mesh57_dispatches.note(RefusedDispatchCensus::Kind::mesh57, pass.requested_mesh_key,
+                                                   reason, read_mesh57_groups(argument, offset));
             } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
@@ -4111,8 +4172,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                     log("x2w-render slot86 mesh %016llx: no matching desktop pipeline/root for indirect execution",
                         pass.pipeline->own().mesh86_key);
             }
-            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
-                          indirect_graphics_pipeline);
+            return refuse(reason, indirect_graphics_pipeline);
         }
         if (pass.indirect_graphics.cached_mesh) {
             const auto& pso = pass.indirect_graphics;
