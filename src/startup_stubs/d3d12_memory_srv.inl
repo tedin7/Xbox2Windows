@@ -59,11 +59,49 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
     return plan.size == UINT64_MAX ? 0 : (plan.size + 0xFFFF) & ~u64{0xFFFF};
 }
 
+bool cube_memory_srv_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_CUBE");
+    return enabled;
+}
+
+bool cube_memory_view(const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    return v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE ||
+           v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+}
+
+bool cube_memory_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    constexpr UINT faces_per_cube = 6;
+    if (!cube_memory_srv_enabled() || r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        !r.Width || r.Width != r.Height || !r.DepthOrArraySize || r.DepthOrArraySize % faces_per_cube ||
+        r.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
+        r.SampleDesc.Count != 1 || r.SampleDesc.Quality ||
+        (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        !x2w_startup::address_view_format(r.Format, v.Format) ||
+        !x2w_startup::address_component_mapping(v.Shader4ComponentMapping))
+        return false;
+    const auto mips_fit = [&](UINT first, UINT count) {
+        return first < r.MipLevels && count && (count == UINT_MAX || count <= r.MipLevels - first);
+    };
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+        const auto& cube = v.TextureCube;
+        return mips_fit(cube.MostDetailedMip, cube.MipLevels) && cube.ResourceMinLODClamp == 0;
+    }
+    const auto& array = v.TextureCubeArray;
+    return array.First2DArrayFace < r.DepthOrArraySize && array.NumCubes &&
+           array.NumCubes <= (r.DepthOrArraySize - array.First2DArrayFace) / faces_per_cube &&
+           mips_fit(array.MostDetailedMip, array.MipLevels) && array.ResourceMinLODClamp == 0;
+}
+
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
 // The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
 // addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
+    if (cube_memory_view(v))
+        return cube_memory_view_fits(r, v) && (r.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN || console_layout_srv(r));
     if (supports_placed_memory_srv(r, v)) return true;
     return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
 }
@@ -138,6 +176,8 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &view, sizeof(view))) ||
         !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
         return false;
+
+    if (cube_memory_view(v) && !(view.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE)) return false;
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
     if (r.Format == v.Format) storage = view;
@@ -962,8 +1002,12 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
     // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
-    if (console_layout_srv(*resource)) {
-        if ((!texture || !supports_placed_memory_srv(*resource, input->view)) &&
+    const bool cube = cube_memory_view(input->view);
+    if (cube && !desktop_address_view_supported(self, *resource, input->view)) {
+        held = "unsupported_desktop_format";
+        texture = nullptr;
+    } else if (console_layout_srv(*resource)) {
+        if (!cube && (!texture || !supports_placed_memory_srv(*resource, input->view)) &&
             !desktop_address_view_supported(self, *resource, input->view)) {
             held = "unsupported_desktop_format";
             texture = nullptr;
