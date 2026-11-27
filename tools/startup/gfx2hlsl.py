@@ -1774,13 +1774,23 @@ def vertex_image_getpc_proof(code, ins):
             if off in vector_pairs.values():
                 continue
             refuse('GETPC pair escapes the vector carry chain')
-        next_pc, _, next_name, next_line = ins[j + 1]
+        next_pc, next_size, next_name, next_line = ins[j + 1]
         _, next_ops, next_mods = parse(next_line)
         next_base = re.sub(r'_e(32|64)$', '', next_name)
         if (next_base != 'v_add_co_ci_u32' or next_mods or len(next_ops) != 5
                 or next_ops[1] != args[1] or next_ops[4] != args[1]
                 or next_ops[2:4].count(high_reg) != 1 or low_reg in next_ops[2:4]):
             refuse('GETPC vector carry is incomplete')
+        # RDNA 2 ISA guide, VOP3B, pp. 55-56: reject unmodelled
+        # source and output modifiers on the carry instructions we elide.
+        if n != 8 or next_size != 8:
+            refuse('GETPC vector carry has an unsupported encoding length')
+        low_word, low_sources = struct.unpack_from('<2I', code, off)
+        high_word, high_sources = struct.unpack_from('<2I', code, next_pc)
+        if (low_word & (1 << 15) or high_word & (1 << 15)
+                or low_sources & 0xf8000000 or high_sources & 0xf8000000
+                or (low_sources >> 18) & 0x1ff):
+            refuse('GETPC vector carry has unsupported encoding bits')
         vector_pairs[off] = next_pc
     if not vector_pairs:
         refuse('GETPC pair has no vector carry chain')

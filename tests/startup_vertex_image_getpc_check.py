@@ -54,6 +54,17 @@ def main():
         assert 'GETPC vector carry is incomplete' in str(error), error
     else:
         raise AssertionError('missing carry accepted')
+    # An unprinted VOP3B source field must not be silently elided.
+    code, ins = program()
+    malformed = bytearray(code)
+    low_word, = struct.unpack_from('<I', malformed, 20)
+    struct.pack_into('<I', malformed, 20, low_word | (1 << 18))
+    try:
+        G.vertex_image_getpc_proof(bytes(malformed), G.decode(bytes(malformed[:36])))
+    except G.Unsupported as error:
+        assert 'unsupported encoding bits' in str(error), error
+    else:
+        raise AssertionError('hidden carry source accepted')
     print('vertex image GETPC controls: passed')
 
 

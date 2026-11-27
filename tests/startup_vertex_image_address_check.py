@@ -61,6 +61,42 @@ def graphics_program(*, before_exports=b'', **kwargs):
     return program(initial=initial, extra=extra, addressed=True, **kwargs)[0]
 
 
+
+def multi_graphics_program():
+    """Three adjacent table words per UNORM8 index, with separate VADDR pairs."""
+    code = words(0xf4080400, 0xfa000010)
+    code += encode_mtbuf(vdata=9, offen=1, vaddr=0)
+    code += words(0xbeb2047e)  # s_mov_b64 s[50:51], exec
+    code += b''.join(encode_vop1(1, reg, 128) for reg in (4, 5, 6))
+    code += words(0xd54b000f, 255 | (268 << 9) | (240 << 18), 0x437f0000)
+    code += encode_vop1(7, 15, 271)
+    code += words(0x7c000000 | (0xd5 << 17) | (15 << 9) | 255, 255)
+    branch_pc = len(code)
+    code += words(0xbf880000)  # s_cbranch_execz, fixed up at the join
+    code += words(0xd7460012, 271 | (129 << 9) | (271 << 18))
+    code += encode_vop2(0x25, 20, 129, 18) + encode_vop2(0x25, 22, 130, 18)
+    for low in (18, 20, 22):
+        code += encode_vop2(0x18, low + 1, 159, low)
+    for low in (18, 20, 22):
+        code += words(0xd6ff0000 | low, 130 | ((256 + low) << 9))
+    getpc = len(code)
+    code += words(0xbe901f00, 0x8010ff10, 0, 0x82118011)
+    for low in (18, 20, 22):
+        code += words(*vop3b(0x30f, low, 106, 256 + low, 16, 0))
+        code += words(*vop3b(0x128, low + 1, 106, 17, 257 + low, 106))
+    for destination, address in ((4, 18), (5, 20), (6, 22)):
+        code += encode_global(GLOBAL_LOAD_DWORD, destination, address, 0x7d)
+    join = len(code)
+    code += words(0xbefe0432)  # s_mov_b64 exec, s[50:51]
+    displacement = (join - branch_pc - 4) // 4
+    code = code[:branch_pc] + words(0xbf880000 | displacement) + code[branch_pc + 4:]
+    code += encode_vop1(1, 8, 242) + export(12, (8, 8, 8, 8))
+    code += export(32, (4, 5, 6, 4)) + export(33, (4, 5, 6, 4), done=True)
+    code += words(0xbf810000)
+    code = code[:getpc + 8] + words(len(code) - getpc - 4) + code[getpc + 12:]
+    return code + b''.join(words(0x10000000 + i) for i in range(765))
+
+
 def pipeline(code):
     pixel = export(0, (0, 1, 2, 3), done=True) + words(0xbf810000)
     return G.Pipeline(code, pixel, root_with_one_constant())
@@ -73,6 +109,14 @@ def translator_controls():
     assert source.count('static const uint x2w_image_table[') == 1
     assert source.count('x2w_image_table[x2w_image_index_') == 1
     assert 'program image' not in pipe.manifest()
+    multi = pipeline(multi_graphics_program()).hlsl_vs()
+    assert multi.count('static const uint x2w_image_table[') == 1
+    assert multi.count('x2w_image_table[x2w_image_index_') == 3
+    table_words = [0x10000000 + i for i in range(765)]
+    for byte in range(255):
+        actual = [table_words[3 * byte + channel] for channel in range(3)]
+        assert actual == [0x10000000 + 3 * byte + channel for channel in range(3)]
+    assert 3 * 254 + 2 == len(table_words) - 1
     for value in range(255):
         assert 3 * value < 763
     table = [0x10000000 + i for i in range(763)]
@@ -101,6 +145,11 @@ def translator_controls():
             path = Path(tmp)
             word_image = list(struct.unpack('<%dI' % (len(image) // 4), image))
             status, _ = stream_interface.translate(path / 'new', streams.vertex(word_image),
+                                                   stream_interface.pixel(), root_with_one_constant())
+            assert status == 'ok', status
+            multi_image = multi_graphics_program()
+            multi_words = list(struct.unpack('<%dI' % (len(multi_image) // 4), multi_image))
+            status, _ = stream_interface.translate(path / 'multi', streams.vertex(multi_words),
                                                    stream_interface.pixel(), root_with_one_constant())
             assert status == 'ok', status
             status, _ = stream_interface.translate(path / 'old', stream_interface.vertex(), stream_interface.pixel())
@@ -158,11 +207,13 @@ def main():
 
 def draw(compiler, renderer, adapter):
     samples = (0, 1, 2, 7, 31, 83, 126, 253)
-    table = [0x10000000 + i for i in range(763)]
-    expected_words = [table[3 * value] for value in samples]
-    wrong_words = [table[3 * value + 1] for value in samples]
+    table = [0x10000000 + i for i in range(765)]
+    expected_words = [(table[3 * value], table[3 * value + 1], table[3 * value + 2], table[3 * value])
+                      for value in samples]
+    wrong_words = [(table[3 * value + 1], table[3 * value + 2], table[3 * value + 3], table[3 * value + 1])
+                   for value in samples]
     assert all(a != b for a, b in zip(expected_words, wrong_words))
-    source = pipeline(graphics_program()).hlsl_vs().replace('VSOut main(', 'VSOut guest_main(', 1)
+    source = pipeline(multi_graphics_program()).hlsl_vs().replace('VSOut main(', 'VSOut guest_main(', 1)
     source += """
 struct DrawOut { float4 pos : SV_Position; nointerpolation float4 color : COLOR; };
 DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
@@ -184,7 +235,7 @@ DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
         inputs = ','.join('%08x' % (sample << 24) for sample in samples)
 
         def run(values, expect_success):
-            expected.write_bytes(b''.join(struct.pack('<4I', *([value] * 4)) for value in values))
+            expected.write_bytes(b''.join(struct.pack('<4I', *value) for value in values))
             result = gpu_case_runner.run(renderer, adapter, [
                 '--startup-instanced-vertex-buffer-words', vs, ps, '8', '1', expected,
                 '0,0,0,0', inputs])
