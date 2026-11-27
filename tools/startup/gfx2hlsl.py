@@ -15951,7 +15951,7 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 if len(ops) != 2:
                     raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
                 symbols = [self.sym.get(r[1]) if (r := reg_range(t)) and r[0] == 's' else None for t in ops]
-                descriptor = (getattr(self, 'kind', None) in ('ps', 'vs')
+                descriptor = (getattr(self, 'kind', None) in ('ps', 'vs', 'ms')
                               and any(s and s[0] in ('desc', 'descnum') for s in symbols))
                 if descriptor:
                     if mods or any(self.is_lane_mask(t) or t == 'src_scc' for t in ops):

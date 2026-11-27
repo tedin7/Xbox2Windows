@@ -19,6 +19,22 @@ def check_descriptor_shift_add():
     assert '(ud%s << 2) + 0x00000001u' % word in hlsl, hlsl
 
 
+def check_descriptor_compare():
+    program = SERIAL_MESH[:8] + [
+        'f4081909', 'fa000000',  # s_load_dwordx4 s[100:103], s[18:19], 0
+        'bf008066',              # s_cmp_eq_i32 s102, 0
+        'bf850001',              # s_cbranch_scc1 over the second write to v0
+        '7e000281',              # v_mov_b32 v0, 1
+    ] + SERIAL_MESH[8:]
+    status, output = run(program, 'force', artifacts=True)
+    assert status == 'ok', status
+    manifest = output['ms57.txt'].decode().splitlines()
+    word, = [line.split()[1] for line in manifest if line.endswith(' descword 1 8')]
+    hlsl = output['ms57.hlsl'].decode()
+    assert 'scc = int(ud%s) == int(0x00000000u);' % word in hlsl, hlsl
+    assert 'block_pc = (scc) ?' in hlsl, hlsl
+
+
 def check_exec_zero_non_rejoining_exit():
     prefix = SERIAL_MESH[:8]
     suffix = ['7e020214'] + SERIAL_MESH[8:]  # v_mov_b32 v1, s20
@@ -86,6 +102,7 @@ def check_sdwa_float_source_modifiers():
 
 if __name__ == '__main__':
     check_descriptor_shift_add()
+    check_descriptor_compare()
     check_exec_zero_non_rejoining_exit()
     check_descriptor_pair_moves_through_vcc()
     check_runtime_scalar_join()
