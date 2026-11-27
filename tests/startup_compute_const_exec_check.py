@@ -47,6 +47,17 @@ PIECE_PACK = (
     (('v_lshlrev_b32_e32 v7, 16, v12', '90180e34'), ('v_or_b32_e32 v7, s24, v7', '180e0e38')),
     (('v_lshlrev_b32_e32 v7, 16, v11', '90160e34'), ('v_or_b32_e32 v7, s25, v7', '190e0e38')),
 )
+LANE_GROUP = (128, 1, 1)
+LANE_COMPARE = ('v_cmp_gt_u32_e32 vcc, s4, v0', '0400887d')
+LANE_SAVE = ('s_and_saveexec_b64 s[26:27], vcc', '6a249abe')
+LANE_RESTORE = ('s_or_b64 exec, exec, s[26:27]', '7e1afe88')
+LANE_STORE = ('buffer_store_dword v7, v4, s[16:19], 0 offen offset:512', '001270e004070480')
+MIXED_MASK = (*HIGH64[:2], ('s_and_b64 exec, vcc, s[30:31]', '6a1efe87'))
+LANE_THRESHOLDS = (0, 40, 97)
+UNKNOWN_EXEC = 'compute constant EXEC: s_andn2_b64 writes EXEC from an unknown whole-word value'
+WAVE32_EXEC_HI = 'compute constant EXEC: s_mov_b32 writes EXEC_HI in wave32'
+WAVE32_SAVE = 'compute constant EXEC: s_and_saveexec_b64 writes 64-bit SAVEEXEC in wave32'
+MISSING_OLD_EXEC = 'compute constant EXEC: s_mov_b32 needs a known old mask for a partial EXEC write'
 
 
 def flat_id(group):
@@ -153,6 +164,32 @@ def piecewise_reference(group, width, values, component):
     return output
 
 
+def lane_program(*, narrow=(), restore=LANE_RESTORE):
+    prefix = piecewise_program(LANE_GROUP, 64, 0)[:-2]
+    return (*prefix, LANE_COMPARE, LANE_SAVE, *narrow, ('s_cbranch_execz 2', '020088bf'),
+            waterfall.STORE, restore, LANE_STORE, waterfall.END)
+
+
+def lane_reference(threshold, mask):
+    """Interpret the compare, SAVEEXEC, branch and restore for each 64-lane guest wave."""
+    values = (threshold, *PIECE_VALUES[1:])
+    packed = piecewise_reference(LANE_GROUP, 64, values, 0)
+    output = [SENTINEL] * WORDS
+    for start in range(0, math.prod(LANE_GROUP), 64):
+        saved = (1 << 64) - 1
+        vcc = sum(1 << lane for lane in range(64) if start + lane < threshold)
+        exec_mask = saved & vcc & mask
+        if exec_mask:  # s_cbranch_execz skips the first store on an empty wave.
+            for lane in range(64):
+                if exec_mask & (1 << lane):
+                    output[start + lane] = packed[start + lane]
+        exec_mask |= saved
+        for lane in range(64):
+            if exec_mask & (1 << lane):
+                output[128 + start + lane] = packed[start + lane]
+    return output
+
+
 def broadcast_exec(hlsl):
     # Negative control: turn the first EXEC restriction into the legacy broadcast of bit 0 to all threads.
     mutant, count = re.subn(r'^(\s*exec = )[^\n]*tid\.x[^\n]*;$', r'\g<1>1u;', hlsl, count=1, flags=re.M)
@@ -164,7 +201,7 @@ def check_piecewise_reads(hlsl, inputs):
     for reg, (scalar, vector) in zip(inputs, ((23, 10), (24, 12), (25, 11))):
         assignment = re.search(r'\bs%d = (ul[0-9a-f]+_%d);' % (scalar, vector), hlsl)
         assert assignment, (scalar, vector, hlsl)
-        assert re.search(r'^    %s = %s;$' % (assignment[1], re.escape(reg)), hlsl, re.M), assignment[1]
+        assert re.search(r'^ +%s = %s;$' % (assignment[1], re.escape(reg)), hlsl, re.M), assignment[1]
 
 
 def piecewise_controls():
@@ -187,8 +224,8 @@ def piecewise_controls():
     unknown = (('s_mov_b32 s21, 0', '800395be'),
                ('s_andn2_b64 exec, -1, s[20:21]', 'c114fe8a'))
     varying = (('v_mov_b32_e32 v10, v0', '0003147e'), *PIECE_ZEROS[1:])
-    for change in (dict(switch=unknown), dict(writes=PIECE_WRITES[1:]),
-                   dict(restore=(ZERO64,)), dict(zeros=varying)):
+    refused(UNKNOWN_EXEC, lambda: translate(piecewise_program(group, 64, 0, switch=unknown), group, 64))
+    for change in (dict(writes=PIECE_WRITES[1:]), dict(restore=(ZERO64,)), dict(zeros=varying)):
         refused(REFUSAL, lambda: translate(piecewise_program(group, 64, 0, **change), group, 64))
     hlsl = translate(piecewise_program(group, 64, 0, restore=(TWO64,)), group, 64).hlsl_cs()
     check_piecewise_reads(hlsl, ('0x00000000u',) * 3)
@@ -200,6 +237,13 @@ def piecewise_controls():
     partial = (65, 1, 1)
     translate(piecewise_program(partial, 64, 0), partial, 64)
     refused(REFUSAL, lambda: translate(piecewise_program(partial, 64, 0, restore=(TWO64,)), partial, 64))
+
+    dynamic = (LANE_COMPARE, LANE_SAVE)
+    refused(REFUSAL, lambda: translate(piecewise_program(group, 64, 0, restore=dynamic), group, 64))
+    rows = piecewise_program(group, 64, 0, restore=(*dynamic, ALL64))
+    check_piecewise_reads(translate(rows, group, 64).hlsl_cs(), PIECE_INPUTS)
+    rows = piecewise_program(group, 64, 0, restore=(*dynamic, varying[0], ALL64))
+    refused(REFUSAL, lambda: translate(rows, group, 64))
 
 
 def mask_logic_controls():
@@ -232,7 +276,43 @@ def mask_logic_controls():
             ], op
 
 
+def lane_cases():
+    yield 'lane-execz', lane_program(), (1 << 64) - 1
+    yield 'lane-execz-projected', lane_program(narrow=MIXED_MASK, restore=RESTORE64), 1 << 32
+
+
+def lane_controls():
+    for label, rows, mask in lane_cases():
+        refusals = []
+        pipe = translate(rows, LANE_GROUP, 64, refusals)
+        assert pipe.retry_const_exec and not refusals, (label, refusals)
+        hlsl = pipe.hlsl_cs()
+        check_piecewise_reads(hlsl, PIECE_INPUTS)
+        assert 's26 = exec;' in hlsl and 'exec = (vcc & exec) & 1; scc = exec != 0;' in hlsl, label
+        assert hlsl.count('if (exec & 1) u0.Store(a, v7);') == 2, label
+        assert '+ 512' in hlsl, label
+        assert ('exec = (s26 & 1u);' if mask == 1 << 32 else 'exec = (exec | s26) & 1;') in hlsl, label
+        if mask == 1 << 32:
+            assert re.search(r'exec = \(vcc & .*< 32u \? 0x00000000u : 0x00000001u\)', hlsl), label
+        for threshold in LANE_THRESHOLDS:
+            expected = lane_reference(threshold, mask)
+            assert [i for i, value in enumerate(expected[:128]) if value != SENTINEL] == [
+                i for i in range(threshold) if mask & (1 << (i % 64))
+            ], (label, threshold)
+            values = (threshold, *PIECE_VALUES[1:])
+            assert expected[128:256] == piecewise_reference(LANE_GROUP, 64, values, 0)[:128]
+
+    high = ('s_mov_b32 exec_hi, 0', '8003ffbe')
+    group32 = (64, 1, 1)
+    for op, reason in ((high, WAVE32_EXEC_HI), (LANE_SAVE, WAVE32_SAVE)):
+        rows = program(group32, 32, after_restore=(op,))
+        refused(reason, lambda: translate(rows, group32, 32))
+    rows = program(LANE_GROUP, 64, after_restore=(LANE_COMPARE, LANE_SAVE, ALL32))
+    refused(MISSING_OLD_EXEC, lambda: translate(rows, LANE_GROUP, 64))
+
+
 def controls():
+    lane_controls()
     for label, group, width, mask, saved, rows_mask in programs():
         rows = program(group, width, saved=saved, mask=rows_mask)
         with patch.object(waterfall.G.ComputePipeline, 'retry_const_exec_for', return_value=False):
@@ -256,7 +336,8 @@ def controls():
     assert translate(program(group, 64, before_read=(ONE64,)), group, 64).retry_const_exec
     refused(REFUSAL, lambda: translate(program(group, 64, before_read=(TWO64,)), group, 64))
     high_clobber = (('s_mov_b32 s27, 0', '80039bbe'),)
-    refused(REFUSAL, lambda: translate(program(group, 64, saved=True, before_read=high_clobber), group, 64))
+    refused('compute constant EXEC: s_mov_b64 writes EXEC from an unknown whole-word value',
+            lambda: translate(program(group, 64, saved=True, before_read=high_clobber), group, 64))
     join = (('s_branch 0', '000082bf'),)
     refused(REFUSAL, lambda: translate(program(group, 64, before_read=join), group, 64))
     partial = (65, 1, 1)
@@ -265,7 +346,7 @@ def controls():
     refused(waterfall.G.CONST_EXEC_WAVE_SIZE, lambda: translate(mixed, group, None))
     piecewise_controls()
     mask_logic_controls()
-    print('constant EXEC: multi-wave projections, piecewise recomputation and refusal controls passed')
+    print('constant EXEC: multi-wave projections, piecewise recomputation, lane flow and refusal controls passed')
 
 
 def dispatch(directory, dxc, runner, adapter):
@@ -293,7 +374,8 @@ def dispatch(directory, dxc, runner, adapter):
             subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
             if check_references(name, runner, adapter, shader, checks, allow_skip=True) == 77:
                 return 77
-    return dispatch_piecewise(directory, dxc, runner, adapter, source)
+    result = dispatch_piecewise(directory, dxc, runner, adapter, source)
+    return result or dispatch_lanes(directory, dxc, runner, adapter, source)
 
 
 def dispatch_piecewise(directory, dxc, runner, adapter, source):
@@ -313,6 +395,26 @@ def dispatch_piecewise(directory, dxc, runner, adapter, source):
             if check_references(name, runner, adapter, shader, [(case, f's{scalar} and v{vector}', None)],
                                 allow_skip=True) == 77:
                 return 77
+    return 0
+
+
+def dispatch_lanes(directory, dxc, runner, adapter, source):
+    for name, rows, mask in lane_cases():
+        pipe = translate(rows, LANE_GROUP, 64)
+        src, shader = directory / f'{name}.hlsl', directory / f'{name}.cso'
+        src.write_text(pipe.hlsl_cs(), encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+        cases = []
+        for threshold in LANE_THRESHOLDS:
+            expected = lane_reference(threshold, mask)
+            values = {('rootconst', 0, 0): threshold, ('rootconst', 0, 1): PIECE_VALUES[2]}
+            constants = [values[ud] for ud in pipe.uds]
+            words = [1, *expected, *constants, *([0] * (16 - len(constants))), *source]
+            case = directory / f'{name}-{threshold}.case'
+            case.write_bytes(struct.pack('<%dI' % len(words), *words))
+            cases.append((case, f'threshold {threshold}', None))
+        if check_references(name, runner, adapter, shader, cases, allow_skip=True) == 77:
+            return 77
     return 0
 
 

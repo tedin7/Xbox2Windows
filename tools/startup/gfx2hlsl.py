@@ -9313,22 +9313,22 @@ class Stage:
         self.const_exec_width = 64 if width == 64 else 32
         return x, y, threads, self.const_exec_width
 
-    def emit_const_exec(self, mask, layout, *, restore=None, pair=False):
-        x, y, threads, width = layout
-        lane = '((tid.x + %du * (tid.y + %du * tid.z)) & %du)' % (x, y, width - 1)
-        has_high_lanes = width == 64 and threads > 32
-        if restore is not None:
-            bit = '(%s & 1u)' % self.S(restore)
-            if has_high_lanes and not pair:
-                bit = '(%s < 32u ? %s : exec)' % (lane, bit)
-        else:
-            word = '0x%08xu' % (mask & 0xffffffff)
-            shift = lane
-            if has_high_lanes:
-                shift = '(%s & 31u)' % lane
-                word = '(%s < 32u ? %s : 0x%08xu)' % (lane, word, mask >> 32)
-            bit = '((%s >> %s) & 1u)' % (word, shift)
-        self.emit('exec = %s;' % bit)
+    def const_exec_lane(self, layout):
+        x, y, _, width = layout
+        return '((tid.x + %du * (tid.y + %du * tid.z)) & %du)' % (x, y, width - 1)
+
+    def const_exec_bit(self, mask, layout):
+        _, _, threads, width = layout
+        lane = self.const_exec_lane(layout)
+        word = '0x%08xu' % (mask & 0xffffffff)
+        shift = lane
+        if width == 64 and threads > 32:
+            shift = '(%s & 31u)' % lane
+            word = '(%s < 32u ? %s : 0x%08xu)' % (lane, word, mask >> 32)
+        return '((%s >> %s) & 1u)' % (word, shift)
+
+    def emit_const_exec(self, mask, layout):
+        self.emit('exec = %s;' % self.const_exec_bit(mask, layout))
         self.const_exec_mask = mask
         self.exec_known = self.exec_narrow_only = False
 
@@ -9337,6 +9337,69 @@ class Stage:
             word = (value >> (32 * (n - reg[1]))) & 0xffffffff
             self.set_s(n, '0x%08xu' % word, ('const', word))
             self.mask_high.discard(n)
+
+    def lower_dynamic_exec(self, base, dst, srcs, values, layout, save_reg):
+        """Keep the one-lane representation once a constant EXEC write depends on a dynamic mask."""
+        _, _, threads, width = layout
+        bits = int(base[-2:])
+        pair = bits == 64
+        high = dst == 'exec_hi'
+        partial = width == 64 and not pair
+        word_mask = (1 << bits) - 1
+        aliases = ('exec_hi', 'vcc_hi') if high else ('exec_lo', 'vcc_lo')
+        operands = []
+        for tok, value in zip(srcs, values):
+            if (pair and tok == 'exec') or (not pair and tok == aliases[0]):
+                operands.append('exec')  # The current EXEC is already projected onto the lane.
+            elif value is not None:
+                value &= word_mask
+                if value in (0, word_mask):
+                    operands.append('1u' if value else '0u')
+                else:
+                    operands.append(self.const_exec_bit(value << (32 if high else 0), layout))
+            else:
+                source = reg_range(tok)
+                sym = self.sym.get(source[1]) if source and source[0] == 's' else None
+                # A low-word mask tag can survive an overwrite of its partner. It no longer proves the pair.
+                valid_mask = (not source or (source[0] == 's' and source[2] <= 105
+                              and source[2] - source[1] == int(pair)
+                              and (not pair or source[2] in self.mask_high)))
+                if not pair and tok == aliases[1]:
+                    operands.append(self.u('vcc'))
+                elif not high and valid_mask and self.exec_write_exact((tok,), (sym,)):
+                    operands.append(self.u(tok))
+                else:
+                    raise Unsupported('compute constant EXEC: %s writes EXEC from an unknown whole-word value' % base)
+
+        in_half = None
+        if partial and (threads > 32 or high):
+            in_half = '%s %s 32u' % (self.const_exec_lane(layout), '>=' if high else '<')
+        if save_reg:
+            # Capture the source before saving EXEC when the source and destination pairs overlap.
+            _, lo, hi = save_reg
+            source = reg_range(srcs[0])
+            if source and source[0] == 's' and source[1] == lo:
+                self.emit('w = %s;' % operands[0])
+                operands[0] = 'w'
+            saved = '(uint)(%s) * exec' % in_half if in_half is not None else 'exec'
+            self.set_s(lo, saved, uniform=False)
+            self.masks.add(lo)
+            if pair:
+                self.set_s(hi, '0u', uniform=False)
+                self.mask_high.add(hi)
+
+        template, scc = SCA[base.replace('_saveexec', '')]
+        expr = template.format(*operands)
+        if scc and in_half is None:
+            self.set_exec_scc(expr)
+            return
+        bit = '(%s) & 1u' % expr if scc else '%s & 1u' % expr
+        if in_half is not None:
+            bit = '%s ? (%s) : exec' % (in_half, bit)
+        self.emit('exec = (%s);' % bit)
+        self.exec_known = self.exec_narrow_only = False
+        if scc:
+            self.set_scc('(%s) && exec != 0' % in_half)
 
     def const_exec_scalar(self, base, ops, old):
         match = CONST_EXEC_SALU.fullmatch(base)
@@ -9364,26 +9427,26 @@ class Stage:
 
         layout = self.const_exec_layout()
         width = layout[3]
-        if width == 32 and (dst == 'exec_hi' or save and pair):
-            raise Unsupported(READFIRSTLANE_UNIFORM)
+        if width == 32 and dst == 'exec_hi':
+            raise Unsupported('compute constant EXEC: %s writes EXEC_HI in wave32' % base)
+        if width == 32 and save and pair:
+            raise Unsupported('compute constant EXEC: %s writes 64-bit SAVEEXEC in wave32' % base)
         word_mask = (1 << bits) - 1
-        values = [self.const_exec_operand(tok, bits, old) for tok in ops[1:]]
+        srcs = list(ops[1:])
         if save:
             # RDNA 2 ISA SOP1 SAVEEXEC: capture S0 before writing the destination, then compute S0 op EXEC.
-            values.append(None if old is None else old & word_mask)
+            srcs.append('exec' if pair else 'exec_lo')
+        values = [self.const_exec_operand(tok, bits, old) for tok in srcs]
         if None in values:
-            if op == 'mov' and dst != 'exec_hi' and self.exec_restore_copy(base, ops) is not None:
-                # An entry EXEC copy still holds each thread's bit, even when we have no constant for the wave.
-                self.emit_const_exec(None, layout, restore=reg_range(ops[1])[1], pair=pair)
-                return True
-            raise Unsupported(READFIRSTLANE_UNIFORM)
+            self.lower_dynamic_exec(base, dst, srcs, values, layout, reg if save else None)
+            return True
         value = values[0] if op == 'mov' else ~values[0] if op == 'not' else CONST_EXEC_BINARY[op](*values)
         value &= word_mask
         if save:
             self.set_const_exec_words(reg, old)
         if width == 64 and not pair:
             if old is None:
-                raise Unsupported(READFIRSTLANE_UNIFORM)
+                raise Unsupported('compute constant EXEC: %s needs a known old mask for a partial EXEC write' % base)
             shift = 32 if dst == 'exec_hi' else 0
             mask = (old & ~(word_mask << shift)) | (value << shift)
         else:
