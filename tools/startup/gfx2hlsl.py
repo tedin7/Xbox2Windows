@@ -36,6 +36,8 @@ WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
                            'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
+WAVE_BRANCH_UNIFORM = ('wave-wide read in a program with a branch (%s) that is '
+                       'neither wave-uniform nor an EXEC / VCC vote')
 
 
 class Unsupported(Exception):
@@ -3500,8 +3502,9 @@ class Stage:
     address_carry_pairs = ()
     address_carry_reader = None
 
-    def __init__(self, pipe, kind, code, refusals=None, decoded=None):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None, *, refine_joins=False):
         self.pipe, self.kind = pipe, kind
+        self.refine_joins = refine_joins
         self.refusals = refusals
         self.raw_code = strip_header(code)
         self.image_proof = None
@@ -4912,7 +4915,43 @@ class Stage:
         return False
 
     # ---- instruction translation -------------------------------------------------------------
-    def joined_registers(self, with_cfg=False):
+    def single_reaching_writes(self, bounds, pred, everything):
+        """Registers whose last textual write is the sole reaching definition at each block entry."""
+        multiple = -1
+        outputs, proved = [], []
+        last_textual_write = {}
+        for b, (lo, hi) in enumerate(bounds):
+            incoming = [outputs[p] for p in pred[b] if outputs[p] is not None]
+            if b == 0:
+                definitions = {}
+            elif incoming:
+                definitions = incoming[0].copy()
+                for other in incoming[1:]:
+                    # An absent key denotes the entry value. Disagreement survives until a definite write.
+                    for reg in definitions.keys() | other.keys():
+                        if definitions.get(reg) != other.get(reg):
+                            definitions[reg] = multiple
+            else:
+                definitions = None  # unreachable from entry
+            proved.append({r for r, site in definitions.items() if site == last_textual_write.get(r)}
+                          if definitions is not None else set())
+            for i in range(lo, hi):
+                name, asm = self.ins[i][2:]
+                dests = scalar_destinations(name, asm)
+                definite = name.startswith('s_') and not name.startswith(('s_cmov', 's_wqm')) and 'any' not in dests
+                if 'any' in dests:
+                    dests = everything
+                elif name.startswith(('v_cmp',) + TWO_SCALAR_DESTINATIONS):
+                    # The decoder may spell a wave64 mask destination as just its low word.
+                    dests |= {r + 1 for r in dests if isinstance(r, int) and r % 2 == 0}
+                # Conditional and indirect writes, vector mask writes and unlowered WQM cannot kill a definition here.
+                last_textual_write.update(dict.fromkeys(dests, i))
+                if definitions is not None:
+                    definitions.update(dict.fromkeys(dests, i if definite else multiple))
+            outputs.append(definitions)
+        return proved
+
+    def joined_registers(self, with_cfg=False, *, refine=False):
         """{branch target: registers whose program-order symbol may not hold on every path into it}.
 
         Program order carries the state after every instruction above the target into it. That state holds on every
@@ -4920,6 +4959,9 @@ class Stage:
         order), and which no block that reaches it from at or below it writes (a loop body, or a later block that
         branches back). Computed over the basic blocks, so a path that leaves a loop's textual range and comes back
         counts.
+
+        A forward-only retry can also retain a last textual write proved to reach the target on every path, even if
+        earlier writes were on non-dominating arms.
 
         With ``with_cfg=True``, returns ``(joined, forward_splits, div_targets)`` where ``forward_splits`` keeps only
         writes on non-dominating forward arms between a target's dominators and the target (excluding loop back edges)
@@ -4957,6 +4999,14 @@ class Stage:
         writes = [set().union(*(scalar_destinations(*ins[i][2:]) for i in range(lo, hi))) for lo, hi in bounds]
         everything = set(range(106)) | {'m0'}
         writes = [everything if 'any' in w else w for w in writes]
+        single_writes = None
+        if (refine and ins[0][0] == 0
+                and all(b > a for a, edges in enumerate(succ) for b in edges)
+                and all(not name.startswith(('s_swappc', 's_call', 's_rfe', 's_trap', 's_return', 's_endpgm_'))
+                        and (not branch(name) or target_of(off, name, asm) in index)
+                        for off, _, name, asm in ins)
+                and all(off + size == nxt[0] for (off, size, _, _), nxt in zip(ins, ins[1:]))):
+            single_writes = self.single_reaching_writes(bounds, pred, everything)
         # Dominators of each block (iterative; the entry block is block 0).
         dom = [set(range(len(bounds))) for _ in bounds]
         dom[0] = {0}
@@ -4988,9 +5038,10 @@ class Stage:
                     regs |= writes[b]  # a loop body or a later block that comes back
             # Writes in dominating blocks hold on every path only if their textual order is their execution order.
             non_chain = any(not (a in dom[c]) for a, c in zip(above_dominators, above_dominators[1:]))
+            retained = single_writes[t] if single_writes is not None and not non_chain else set()
             if non_chain:
                 regs |= set().union(*(writes[b] for b in above_dominators))
-            joined[target] = regs
+            joined[target] = regs - retained
             if with_cfg:
                 above_set = dom[t] - {t}
                 split_blks, stodo = set(), [p for p in pred[t] if p < t and p not in above_set]
@@ -5002,7 +5053,7 @@ class Stage:
                 fwd = set().union(*(writes[b] for b in split_blks)) if split_blks else set()
                 if non_chain:
                     fwd |= set().union(*(writes[b] for b in above_dominators))
-                forward_splits[target] = fwd
+                forward_splits[target] = fwd - retained
         if not with_cfg:
             return joined
         pdom = [set(range(len(bounds))) if succ[b] else {b} for b in range(len(bounds))]
@@ -5456,7 +5507,8 @@ class Stage:
                        and math.prod(getattr(self.pipe, 'group', (5,))) <= 4)
         if scalar_vote:
             self.wave_exec = True
-        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(
+            with_cfg=True, refine=getattr(self, 'refine_joins', False))
         self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
@@ -5914,8 +5966,7 @@ class Stage:
                             # A branch that is neither wave-uniform nor a vote parts the host wave, so no wave intrinsic
                             # can be trusted to see every lane. Refused at the end of the pass, so that an earlier
                             # refusal of the program keeps its own reason.
-                            self.wave_unsound = Unsupported('wave-wide read in a program with a branch (%s) that is '
-                                                            'neither wave-uniform nor an EXEC / VCC vote' % name)
+                            self.wave_unsound = Unsupported(WAVE_BRANCH_UNIFORM % name)
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -15043,22 +15094,39 @@ class Pipeline:
     def _build_pixel_stage(self, code, refusals=None, decoded=None):
         # Translation can allocate bindings before refusing. Restore the state left
         # by the vertex stage so the retry allocates only the bindings it uses.
-        state = deepcopy(self.__dict__, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+        memo = {id(self.vs): self.vs} if hasattr(self, 'vs') else {}
+        state = deepcopy(self.__dict__, memo.copy())
         before = len(refusals) if refusals is not None else 0
-        try:
-            stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
-        except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
-                raise
-        else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
-                return stage
-        self.__dict__.clear()
-        self.__dict__.update(state)
-        self.retry_firstlane = True
-        if refusals is not None:
-            del refusals[before:]
-        return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+
+        def restore():
+            self.__dict__.clear()
+            self.__dict__.update(deepcopy(state, memo.copy()))
+            if refusals is not None:
+                del refusals[before:]
+
+        wave_branch = WAVE_BRANCH_UNIFORM % 's_cbranch_scc0'
+        for firstlane in (False, True):
+            if firstlane:
+                restore()
+                self.retry_firstlane = True
+            try:
+                stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+            except Unsupported as reason:
+                if not firstlane and str(reason) == READFIRSTLANE_UNIFORM:
+                    continue
+                if str(reason) != wave_branch:
+                    raise
+            else:
+                reported = refusals[before:] if refusals is not None else []
+                if not firstlane and (READFIRSTLANE_UNIFORM, 'ps') in reported:
+                    continue
+                if reported != [(wave_branch, 'ps')]:
+                    return stage
+            # Change the join facts only after the legacy pixel passes have refused the SCC branch.
+            restore()
+            if firstlane:
+                self.retry_firstlane = True
+            return Stage(self, 'ps', code, refusals=refusals, decoded=decoded, refine_joins=True)
 
     def _graphics_pixel_stage(self, code, pixel_refusal):
         if code is None:
