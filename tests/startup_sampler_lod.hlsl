@@ -13,9 +13,18 @@ cbuffer Probe : register(b0)
     float reference;
 };
 
-float4 vs_main(uint id : SV_VertexID) : SV_Position
+struct Vertex
 {
-    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.0, 1.0);
+    float4 pos : SV_Position;
+    float4 uv : PARAM0;
+};
+
+Vertex vs_main(uint id : SV_VertexID)
+{
+    Vertex output;
+    output.pos = float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.0, 1.0);
+    output.uv = float4(id == 1 ? 2.0 : 0.0, id == 2 ? 2.0 : 0.0, 0.0, 0.0);
+    return output;
 }
 
 float4 ps_main() : SV_Target

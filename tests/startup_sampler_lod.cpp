@@ -11,6 +11,9 @@
 // The dropped-clamp control decodes the same words and then resets MinLOD and MaxLOD to 0 and
 // D3D12_FLOAT32_MAX, the values table entries had before #2221. It must read mip 0 for entry 0 at LOD 0 and
 // mip 3 for entry 1 at LOD 3, the wrong mips.
+//
+// With a translated pixel shader and an smpl line, draw a 4x4 viewport over
+// three mips and compare every red channel against the CPU reference.
 #include "desktop_gpu.h"
 #include "startup_sampler_lod_ps.h"
 #include "startup_sampler_lod_vs.h"
@@ -68,30 +71,38 @@ int mip_of(float value)
 }
 }  // namespace
 
-int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
+int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp, D3D12_SHADER_BYTECODE translated,
+                              const char* sampler_line, float expected_bias_pixel)
 {
     using namespace x2w_startup;
+    const bool bias_draw = sampler_line != nullptr;
+    const UINT mip_count = bias_draw ? 3u : mip_levels;
+    constexpr UINT bias_target_size = 4;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_R32_FLOAT};
     check(check_feature(device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)), "Query R32_FLOAT support");
-    const auto needed = D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_MIP |
-                        D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+    UINT needed = D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_MIP |
+                  D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+    if (!bias_draw) needed |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON;
     if ((support.Support1 & needed) != needed) return 77;
 
     TranslatedSamplers bindings;
-    if (!bindings.read_manifest_line("smpheap 2048 1 fallback 2047") || !bindings.read_manifest_line(comparison_line))
+    if ((!bias_draw && !bindings.read_manifest_line("smpheap 2048 1 fallback 2047")) ||
+        !bindings.read_manifest_line(bias_draw ? sampler_line : comparison_line) || bindings.statics.size() != 1)
         throw std::runtime_error("Sampler LOD manifest refused");
-    const auto statics = decode_statics(bindings);
-    if (statics.size() != 1 || statics[0].ComparisonFunc != D3D12_COMPARISON_FUNC_LESS)
-        throw std::runtime_error("Comparison sampler lost its function");
-    std::printf("static comparison sampler: Filter=0x%x ComparisonFunc=%u MinLOD=%g MaxLOD=%g\n", statics[0].Filter,
-                statics[0].ComparisonFunc, statics[0].MinLOD, statics[0].MaxLOD);
+    if (!bias_draw) {
+        const auto statics = decode_statics(bindings);
+        if (statics[0].ComparisonFunc != D3D12_COMPARISON_FUNC_LESS)
+            throw std::runtime_error("Comparison sampler lost its function");
+        std::printf("static comparison sampler: Filter=0x%x ComparisonFunc=%u MinLOD=%g MaxLOD=%g\n", statics[0].Filter,
+                    statics[0].ComparisonFunc, statics[0].MinLOD, statics[0].MaxLOD);
+    }
 
     ComPtr<ID3D12RootSignature> root;
     check(create_translated_root(device, 4, 1, bindings, root.GetAddressOf()), "Create translated sampler LOD root");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
     pd.VS = {startup_sampler_lod_vs, sizeof(startup_sampler_lod_vs)};
-    pd.PS = {startup_sampler_lod_ps, sizeof(startup_sampler_lod_ps)};
+    pd.PS = bias_draw ? translated : D3D12_SHADER_BYTECODE{startup_sampler_lod_ps, sizeof(startup_sampler_lod_ps)};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -105,40 +116,42 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create sampler LOD PSO");
 
     // The two entries as title memory, decoded by the production path.
-    const auto snapshot = snapshot_samplers({reinterpret_cast<std::uintptr_t>(heap_words), 2}, true);
     ComPtr<ID3D12DescriptorHeap> sampler_heap;
-    NullSamplerCounts counts;
-    check(create_sampler_snapshot_heap(device, snapshot, [&](const SamplerWords& words, D3D12_SAMPLER_DESC& out) {
-        out = dynamic_sampler(words);
-        if (out.MinLOD > out.MaxLOD) throw std::runtime_error("Fixture sampler has MinLOD above MaxLOD");
-        std::printf("heap entry words %08x %08x: MinLOD=%g MaxLOD=%g", words[0], words[1], out.MinLOD, out.MaxLOD);
-        if (drop_clamp) {
-            out.MinLOD = 0.0f;
-            out.MaxLOD = D3D12_FLOAT32_MAX;
-            std::printf(", dropped to MinLOD=0 MaxLOD=max");
-        }
-        std::printf("\n");
-        return true;
-    }, sampler_heap.GetAddressOf(), counts), "Create sampler LOD heap");
-    if (counts.unbound || counts.unreadable || counts.invalid_token || counts.out_of_range != translated_sampler_fallback - 2)
-        throw std::runtime_error("Unexpected null sampler counts");
+    if (!bias_draw) {
+        const auto snapshot = snapshot_samplers({reinterpret_cast<std::uintptr_t>(heap_words), 2}, true);
+        NullSamplerCounts counts;
+        check(create_sampler_snapshot_heap(device, snapshot, [&](const SamplerWords& words, D3D12_SAMPLER_DESC& out) {
+            out = dynamic_sampler(words);
+            if (out.MinLOD > out.MaxLOD) throw std::runtime_error("Fixture sampler has MinLOD above MaxLOD");
+            std::printf("heap entry words %08x %08x: MinLOD=%g MaxLOD=%g", words[0], words[1], out.MinLOD, out.MaxLOD);
+            if (drop_clamp) {
+                out.MinLOD = 0.0f;
+                out.MaxLOD = D3D12_FLOAT32_MAX;
+                std::printf(", dropped to MinLOD=0 MaxLOD=max");
+            }
+            std::printf("\n");
+            return true;
+        }, sampler_heap.GetAddressOf(), counts), "Create sampler LOD heap");
+        if (counts.unbound || counts.unreadable || counts.invalid_token || counts.out_of_range != translated_sampler_fallback - 2)
+            throw std::runtime_error("Unexpected null sampler counts");
+    }
 
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = td.Height = texture_size;
     td.DepthOrArraySize = 1;
-    td.MipLevels = mip_levels;
+    td.MipLevels = static_cast<UINT16>(mip_count);
     td.Format = DXGI_FORMAT_R32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, mip_levels> footprints{};
     UINT64 upload_size = 0;
-    device->GetCopyableFootprints(&td, 0, mip_levels, 0, footprints.data(), nullptr, nullptr, &upload_size);
+    device->GetCopyableFootprints(&td, 0, mip_count, 0, footprints.data(), nullptr, nullptr, &upload_size);
     const auto upload = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     const D3D12_RANGE none{0, 0};
     void* mapped = nullptr;
     check(upload->Map(0, &none, &mapped), "Map sampler LOD texels");
-    for (UINT mip = 0; mip < mip_levels; ++mip) {
+    for (UINT mip = 0; mip < mip_count; ++mip) {
         const auto& f = footprints[mip];
         for (UINT y = 0; y < f.Footprint.Height; ++y) {
             auto* row = reinterpret_cast<float*>(static_cast<std::uint8_t*>(mapped) + f.Offset + y * f.Footprint.RowPitch);
@@ -150,8 +163,8 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = static_cast<UINT64>(probes.size());
-    rd.Height = 1;
+    rd.Width = bias_draw ? bias_target_size : static_cast<UINT64>(probes.size());
+    rd.Height = bias_draw ? bias_target_size : 1u;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R32_FLOAT;
@@ -175,7 +188,7 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    for (UINT mip = 0; mip < mip_levels; ++mip) {
+    for (UINT mip = 0; mip < mip_count; ++mip) {
         D3D12_TEXTURE_COPY_LOCATION dst{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         dst.SubresourceIndex = mip;
         D3D12_TEXTURE_COPY_LOCATION src{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -187,19 +200,30 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
     list->SetGraphicsRootSignature(root.Get());
     bind_translated_heaps(list, views.Get(), sampler_heap.Get());
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    list->SetGraphicsRootDescriptorTable(sampler_root_parameter(1), sampler_heap->GetGPUDescriptorHandleForHeapStart());
+    if (sampler_heap)
+        list->SetGraphicsRootDescriptorTable(sampler_root_parameter(1), sampler_heap->GetGPUDescriptorHandleForHeapStart());
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    for (UINT i = 0; i < probes.size(); ++i) {
-        std::uint32_t constants[4]{probes[i].mode, probes[i].entry};
-        std::memcpy(&constants[2], &probes[i].lod, sizeof(float));
-        std::memcpy(&constants[3], &probes[i].reference, sizeof(float));
+    if (bias_draw) {
+        const UINT constants[4]{};
         list->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
-        const D3D12_VIEWPORT viewport{static_cast<float>(i), 0, 1, 1, 0, 1};
-        const D3D12_RECT scissor{static_cast<LONG>(i), 0, static_cast<LONG>(i + 1), 1};
+        const D3D12_VIEWPORT viewport{0, 0, bias_target_size, bias_target_size, 0, 1};
+        const D3D12_RECT scissor{0, 0, bias_target_size, bias_target_size};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->DrawInstanced(3, 1, 0, 0);
+    } else {
+        for (UINT i = 0; i < probes.size(); ++i) {
+            std::uint32_t constants[4]{probes[i].mode, probes[i].entry};
+            std::memcpy(&constants[2], &probes[i].lod, sizeof(float));
+            std::memcpy(&constants[3], &probes[i].reference, sizeof(float));
+            list->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+            const D3D12_VIEWPORT viewport{static_cast<float>(i), 0, 1, 1, 0, 1};
+            const D3D12_RECT scissor{static_cast<LONG>(i), 0, static_cast<LONG>(i + 1), 1};
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->DrawInstanced(3, 1, 0, 0);
+        }
     }
     transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION out{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -207,6 +231,25 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
     D3D12_TEXTURE_COPY_LOCATION in{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     list->CopyTextureRegion(&out, 0, 0, 0, &in, nullptr);
     commands.submit_and_wait(device);
+
+    if (bias_draw) {
+        const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_size)};
+        check(readback->Map(0, &read, &mapped), "Map sampler bias readback");
+        UINT mismatches = 0;
+        for (UINT y = 0; y < bias_target_size; ++y) {
+            const auto* row = reinterpret_cast<const float*>(static_cast<const std::uint8_t*>(mapped) +
+                target_footprint.Offset + y * target_footprint.Footprint.RowPitch);
+            for (UINT x = 0; x < bias_target_size; ++x) {
+                if (row[x] != expected_bias_pixel)
+                    std::fprintf(stderr, "sampler_bias_mismatch x=%u y=%u expected=%g actual=%g\n",
+                                 x, y, expected_bias_pixel, row[x]);
+                mismatches += row[x] != expected_bias_pixel;
+            }
+        }
+        readback->Unmap(0, &none);
+        std::printf("startup_sampler_bias pixels=%u mismatches=%u\n", bias_target_size * bias_target_size, mismatches);
+        return mismatches ? 1 : 0;
+    }
 
     std::array<float, probes.size()> actual{};
     const D3D12_RANGE read{0, sizeof(actual)};
