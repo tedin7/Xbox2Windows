@@ -519,7 +519,7 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('%s with neg/abs' % name)
         if name in VOP3_ONLY_VEC_U and (word1 >> 18) & 0x1ff:
             raise Unsupported('%s with unused src2 field set' % name)
-    if name in ('v_cvt_pknorm_u16_f32', 'v_cvt_pknorm_i16_f32'):
+    if name == 'v_cvt_pknorm_u16_f32':
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0xfc00 or word1 & 0x9ffc0000:
             raise Unsupported('%s with reserved operand or modifier bits' % name)
@@ -5003,8 +5003,6 @@ class Stage:
         if scalar_vote:
             self.wave_exec = True
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
-        self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
-                                       if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
             self.reduction_restores = set()
             self.reduction_entry_exec = self.entry_exec_sites(self.spill_cfg, self.reduction_restores)
@@ -7521,27 +7519,6 @@ class Stage:
                 return i
         return None
 
-    def dead_vcc_high(self):
-        """Follow each path until it exits or a full write replaces the old high word."""
-        bounds, block_of, succ, _ = self.spill_cfg
-        index = self.descriptor_instruction_index
-        pending = [(block_of[index], index + 1)]
-        seen = set()
-        while pending:
-            block, start = pending.pop()
-            if (block, start) in seen:
-                continue
-            seen.add((block, start))
-            for _, _, name, asm in self.ins[start:bounds[block][1]]:
-                reads, writes, _ = scalar_effects(name, asm)
-                if reads & {'vcc_hi', 's107'} or name.startswith(('s_movrel', 's_setpc', 's_swappc')):
-                    return False
-                if name.startswith('s_') and writes & {'vcc', 's106'} and writes & {'vcc_hi', 's107'}:
-                    break
-            else:
-                pending.extend((target, bounds[target][0]) for target in succ[block])
-        return True
-
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -7626,15 +7603,6 @@ class Stage:
                 tracked_pair = high == source[1] + 1 and high <= 107 and all(
                     word and word[0] in ('desc', 'const') for word in words)
                 if any(word and word[0] == 'desc' for word in words):
-                    wave = getattr(self.pipe, 'wave_size', None)
-                    if (source[1] % 2 == 0 and source[2] == source[1] + 1 and source[1] in self.masks
-                            and (not words[0] or words[0][0] != 'desc') and words[1] and words[1][0] == 'desc'
-                            and (wave == 32 or wave is None and wave32_exec_proof(self.ins))
-                            and self.dead_vcc_high()):
-                        self.sym.pop(106, None)
-                        self.sym.pop(107, None)
-                        self.emit('vcc = (%s) & 1;' % self.S(source[1]))
-                        return None
                     if not tracked_pair:
                         raise Unsupported('mask from descriptor data: vcc needs a pair of tracked descriptor words or constants')
                     self.sym[106], self.sym[107] = words
@@ -10464,21 +10432,6 @@ class Stage:
         self.pipe.uses_pknorm_u16 = True
         self.set_v(dst[1], 'pknorm_u16(asuint(%s)) | (pknorm_u16(asuint(%s)) << 16u)' % (lo, hi))
 
-    def op_v_cvt_pknorm_i16_f32(self, ops, mods):
-        name = 'v_cvt_pknorm_i16_f32'
-        if mods or len(ops) != 3:
-            raise Unsupported('%s needs a destination and two sources without modifiers' % name)
-        dst = reg_range(ops[0])
-        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
-            raise Unsupported('%s destination %s' % (name, ops[0]))
-        for token in ops[1:]:
-            r = reg_range(token)
-            if not (r and r[0] == 'v' and r[1] == r[2]) and self.const_u32(token) is None:
-                raise Unsupported('%s source %s is not a lane register or constant' % (name, token))
-        lo, hi = (self.u(token) for token in ops[1:])
-        self.pipe.uses_pknorm_i16 = True
-        self.set_v(dst[1], 'pknorm_i16(%s) | (pknorm_i16(%s) << 16u)' % (lo, hi))
-
     def op_v_cvt_pk_u8_f32(self, ops, mods):
         # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
         #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
@@ -12426,52 +12379,6 @@ class Stage:
             self.set_s(d, expr)
             self.masks.add(d)
 
-    def signed_pack_export(self, token):
-        """Identify signed normalized words on all paths to this compressed export."""
-        reg = reg_range(token)
-        entry_exec = getattr(self, 'signed_pack_entry_exec', None)
-        if not reg or entry_exec is None:
-            return False
-        bounds, block_of, succ, _ = self.spill_cfg
-        pred = [[] for _ in bounds]
-        for b, edges in enumerate(succ):
-            for target in edges:
-                pred[target].append(b)
-        index = self.descriptor_instruction_index
-        pending = [(block_of[index], index, reg[1])]
-        seen, forms = set(), set()
-        # A masked VGPR write can leave the previous value live in inactive lanes.
-        while pending:
-            item = pending.pop()
-            if item in seen:
-                continue
-            seen.add(item)
-            block, stop, word = item
-            start = bounds[block][0]
-            for i in range(stop - 1, start - 1, -1):
-                off, _, name, asm = self.ins[i]
-                _, ops, mods = parse(asm)
-                if word not in lds_vgpr_writes(name, ops):
-                    continue
-                if name in ('v_mov_b32_e32', 'v_mov_b32_e64') and not mods:
-                    src = reg_range(ops[1])
-                    if src and src[0] == 'v' and src[1] == src[2]:
-                        pending.append((block, i, src[1]))
-                        if off in entry_exec:
-                            break
-                        continue
-                forms.add(name == 'v_cvt_pknorm_i16_f32')
-                partial = name.startswith(('v_movrel', 'v_writelane')) or name.endswith('_sdwa') or 'd16' in name
-                if off in entry_exec and not partial:
-                    break
-            else:
-                if block == 0 or not pred[block]:
-                    forms.add(False)
-                pending.extend((b, bounds[b][1], word) for b in pred[block])
-        if forms == {True, False}:
-            raise Unsupported('compressed export mixes signed normalized and other reaching values')
-        return True in forms
-
     def export(self, asm):
         # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
         # an explicit en:0x.. flag. As in pixel_aot, such a mask is refused rather than guessed.
@@ -12533,20 +12440,6 @@ class Stage:
             for c in (0, 2):
                 v = vals[c]
                 r = self.u(v, low16_only=red_only and c == 0) if v != 'off' else None
-                if r and name.startswith('mrt') and self.signed_pack_export(v):
-                    slot = int(name[3:])
-                    formats = self.pipe.rtv_formats
-                    fmt = formats[slot] if slot < len(formats) else 0
-                    if fmt in (11, 35, 56):  # 16-bit UNORM, RGBA / RG / R
-                        pairs += ['(float((%s) & 0xffffu) / 65535.0)' % r,
-                                  '(float((%s) >> 16u) / 65535.0)' % r]
-                        continue
-                    if fmt in (13, 37, 58):  # 16-bit SNORM, RGBA / RG / R
-                        pairs += ['max(-1.0, float(asint((%s) << 16u) >> 16) / 32767.0)' % r,
-                                  'max(-1.0, float(asint(%s) >> 16) / 32767.0)' % r]
-                        continue
-                    if fmt not in (10, 34, 54):  # 16-bit FLOAT, RGBA / RG / R
-                        raise Unsupported('signed normalized compressed export to %s with RTV format %d' % (name, fmt))
                 pairs += ['f16tof32(%s)' % r, 'f16tof32(%s >> 16)' % r] if r else ['0.0', '0.0']
             exprs = pairs
             words = ['0u' if e == '0.0' else 'U(%s)' % e for e in exprs]
@@ -14087,35 +13980,6 @@ class Pipeline:
                 '        sticky = (lo & ((1u << (shift - 1u)) - 1u)) != 0u;',
                 '    }',
                 '    return q + (guard & uint(sticky || (q & 1u) != 0u));',
-                '}',
-            ))
-        if getattr(self, 'uses_pknorm_i16', False):
-            # RDNA 2 SNORM: round the exact significand product before applying the sign.
-            # (m << 15) - m spans 39 bits. Split it into two uints for SM 5.1.
-            out.extend((
-                'uint pknorm_i16(uint bits) {',
-                '    uint mag = bits & 0x7fffffffu;',
-                '    if (mag > 0x7f800000u || mag < 0x37800000u) return 0u;',
-                '    uint packed = 32767u;',
-                '    if (mag < 0x3f800000u) {',
-                '        uint m = 0x800000u | (mag & 0x7fffffu);',
-                '        uint lo = (m << 15u) - m;',
-                '        uint hi = (m >> 17u) - uint((m << 15u) < m);',
-                '        uint shift = 150u - (mag >> 23u);',
-                '        uint q, guard; bool sticky;',
-                '        if (shift > 32u) {',
-                '            uint k = shift - 32u;',
-                '            q = hi >> k;',
-                '            guard = (hi >> (k - 1u)) & 1u;',
-                '            sticky = lo != 0u || (hi & ((1u << (k - 1u)) - 1u)) != 0u;',
-                '        } else {',
-                '            q = shift == 32u ? hi : (hi << (32u - shift)) | (lo >> (shift & 31u));',
-                '            guard = (lo >> (shift - 1u)) & 1u;',
-                '            sticky = (lo & ((1u << (shift - 1u)) - 1u)) != 0u;',
-                '        }',
-                '        packed = q + (guard & uint(sticky || (q & 1u) != 0u));',
-                '    }',
-                '    return ((bits >> 31u) != 0u ? 0u - packed : packed) & 0xffffu;',
                 '}',
             ))
         if getattr(self, 'uses_ldexp', False):
