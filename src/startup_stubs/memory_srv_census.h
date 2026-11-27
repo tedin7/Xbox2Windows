@@ -26,8 +26,8 @@
 
 namespace x2w_startup {
 
-// Every refusal reason src/startup_stubs/d3d12_memory_srv.inl logs, in the order of its checks.
-// tools/startup/triage_run.py keeps the same list (SLOT70_REASONS).
+// Slot 70 refusal reasons come first. tools/startup/triage_run.py keeps that
+// prefix as SLOT70_REASONS. The opt-in shape census also uses the entries below it.
 constexpr const char* memory_srv_reasons[] = {
     "null_destination", "unreadable_resource", "unreadable_view", "null_address",
     "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource",
@@ -41,6 +41,16 @@ constexpr const char* memory_srv_reasons[] = {
     // the console-layout holds of device_memory_srv (#2015)
     "unsupported_desktop_format", "console_layout_xg_rows", "console_layout_without_footprints",
     "console_layout_beyond_xg_size", "overlapping_resource",
+    // Opt-in diagnostics. Keep absent entries out of the legacy refusal report.
+    "snapshot_already_owned", "snapshot_placement_rejected", "snapshot_resource_overlap",
+    "alias_multiple_overlaps", "alias_range_not_covered", "alias_owner_retired",
+    "alias_backing_unavailable", "alias_description_incompatible", "alias_mip_shape_mismatch",
+    "alias_slice_window_mismatch", "alias_subresource_layout_mismatch", "alias_view_dimension_mismatch",
+    "alias_native_view_incompatible",
+    "alias_ineligible_shape", "alias_existing_texture", "alias_unsupported_desktop_format",
+    "format_plane_count", "format_view_support", "format_storage_support",
+    "format_dimension_support", "format_mip_support", "texture_1d_layout_unmapped",
+    "texture_1d_shape_unsupported", "texture_1d_footprint_unavailable",
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
 
@@ -156,7 +166,7 @@ public:
     }
 
     template <class Emit>
-    bool report(Emit emit, bool only_if_changed)
+    bool report(Emit emit, bool only_if_changed, bool diagnostics = false)
     {
         AcquireSRWLockExclusive(&lock_);
         const bool changed = total_ != reported_;
@@ -165,13 +175,19 @@ public:
             ReleaseSRWLockExclusive(&lock_);
             return false;
         }
-        char line[1024];
-        int n = std::snprintf(line, sizeof(line), "x2w-d3d12 memory SRV refusals (slot 70): total %llu;",
+        char line[2048];
+        int n = std::snprintf(line, sizeof(line), "x2w-d3d12 memory SRV %s (slot 70): total %llu;",
+                              diagnostics ? "diagnostics" : "refusals",
                               static_cast<unsigned long long>(total_));
-        for (int r = 0; r <= memory_srv_reason_count && n > 0 && n < static_cast<int>(sizeof(line)); ++r)
-            n += std::snprintf(line + n, sizeof(line) - n, "%s %s %llu", r ? "," : "",
+        const int first_diagnostic = memory_srv_reason_index("snapshot_already_owned");
+        bool first = true;
+        for (int r = 0; r <= memory_srv_reason_count && n > 0 && n < static_cast<int>(sizeof(line)); ++r) {
+            if (!reasons_[r] && (diagnostics || (r >= first_diagnostic && r < memory_srv_reason_count))) continue;
+            n += std::snprintf(line + n, sizeof(line) - n, "%s %s %llu", first ? "" : ",",
                                r < memory_srv_reason_count ? memory_srv_reasons[r] : "other",
                                static_cast<unsigned long long>(reasons_[r]));
+            first = false;
+        }
         if (n > 0 && n < static_cast<int>(sizeof(line)))
             std::snprintf(line + n, sizeof(line) - n, "; distinct shapes %u (calls past the shape table %llu)", shape_count_,
                           static_cast<unsigned long long>(more_shape_calls_));
@@ -182,8 +198,8 @@ public:
             if (only_if_changed && s.calls == s.reported_calls) continue;
             if (only_if_changed) s.reported_calls = s.calls;
             std::snprintf(line, sizeof(line),
-                          "x2w-d3d12 memory SRV refused shape %u: reason=%s dim=%u fmt=%u size=%llux%ux%u mips=%u layout=0x%x flags=0x%x calls=%llu",
-                          i + 1, s.reason < memory_srv_reason_count ? memory_srv_reasons[s.reason] : "other", s.dimension, s.format,
+                          "x2w-d3d12 memory SRV %s shape %u: reason=%s dim=%u fmt=%u size=%llux%ux%u mips=%u layout=0x%x flags=0x%x calls=%llu",
+                          diagnostics ? "diagnostic" : "refused", i + 1, s.reason < memory_srv_reason_count ? memory_srv_reasons[s.reason] : "other", s.dimension, s.format,
                           static_cast<unsigned long long>(s.width), s.height, s.depth, s.mips, s.layout, s.flags,
                           static_cast<unsigned long long>(s.calls));
             emit(static_cast<const char*>(line));
