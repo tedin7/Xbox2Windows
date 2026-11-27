@@ -3390,7 +3390,9 @@ struct Pass {
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
     // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
     bool viewport_set = false;
+    D3D12_VIEWPORT viewport0{};  // the title's first viewport, when viewport_set (depth_clear_census.h)
     bool scissor_set = false;
+    D3D12_RECT scissor0{};  // the title's first scissor rect, when scissor_set (depth_clear_census.h)
     // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
     // the title flags above so a later render target 0 of another size gets a fresh default.
     UINT64 default_viewport_w = 0, default_scissor_w = 0;
@@ -4800,6 +4802,7 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
         pass_of(self).viewport_set = true;
+        pass_of(self).viewport0 = viewports[0];
     }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
@@ -4807,6 +4810,7 @@ void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
         pass_of(self).scissor_set = true;
+        pass_of(self).scissor0 = rects[0];
     }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
