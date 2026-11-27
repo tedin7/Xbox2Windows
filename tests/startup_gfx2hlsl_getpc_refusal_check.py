@@ -98,7 +98,7 @@ def export(target, registers, done=False):
 
 
 def vertex(*, shift=0, size=TABLE_SIZE, flags=FLAGS, high=None, byte_skew=0, extra=b'',
-           skip_setup=False, branch_to_load=False, short_size=False):
+           skip_setup=False, branch_to_load=False, short_size=False, before=b''):
     # v0 is supplied by the test's vertex entry point as 4 * instance + corner.
     # Compute the row number and then its byte offset, leaving v4..v7 for its four words.
     getpc = words(0xbe801f00 | DESC << 16)
@@ -116,7 +116,11 @@ def vertex(*, shift=0, size=TABLE_SIZE, flags=FLAGS, high=None, byte_skew=0, ext
     branch = words(0xbf820007) if skip_setup else b''
     disp = len(size_and_flags) + len(tail) + len(padding) + 8 + shift
     add = words(0x8000ff00 | DESC << 16 | DESC, disp)
-    return G.PREFETCH + branch + getpc + size_and_flags + add + tail + padding + DATA + words(0xf8000000)
+    return G.PREFETCH + branch + before + getpc + size_and_flags + add + tail + padding + DATA + words(0xf8000000)
+
+
+# s_branch over one s_nop: lands exactly on the GETPC, so the vertex program has control flow before its table setup.
+skip_one = words(0xbf820001, 0xbf800000)
 
 
 def pipeline(code, decoded=None, refusals=None):
@@ -155,6 +159,14 @@ def table_controls():
     assert pipeline(vertex(high=0)).hlsl_vs() == source
     assert pipeline(vertex(short_size=True)).hlsl_vs() == source
     assert pipeline(vertex(branch_to_load=True)).vs.embedded_buffer
+    # Control flow that rejoins at the read, and ordinary code that uses the window before it, leave the proof intact.
+    assert pipeline(vertex(before=skip_one)).hlsl_vs().count('= embedded_vs_load(') == 4
+    window_use = words(0xbe800385 | DESC << 16)  # s_mov_b32 s<DESC>, 5 before the read: an ordinary definition
+    assert pipeline(vertex(before=window_use)).hlsl_vs().count('= embedded_vs_load(') == 4
+    # After the loads the window may be rewritten and then read: the new value is an ordinary definition.
+    rewrite = words(0xbe800385 | DESC << 16) + words(0x7e140200 | DESC)
+    rewritten = pipeline(vertex(extra=rewrite)).hlsl_vs()
+    assert rewritten.count('= embedded_vs_load(') == 4 and 's%d = 0x00000005u;' % DESC in rewritten, rewritten
     assert G.lifted_family(REASON) == 'embedded-vertex-table'
     assert reference(shift=16) != reference()
     assert reference(size=7 * STRIDE)[-STRIDE:] == bytes(STRIDE)
@@ -170,6 +182,11 @@ def table_controls():
         'formatted load': vertex(extra=mubuf(0x00, 10, 0)),
         'numeric read': vertex(extra=words(0x7e140200 | DESC)),
         'branch bypasses setup': vertex(skip_setup=True),
+        'branch before the read lands after it': vertex(before=words(0xbf820005, 0xbf800000, 0xbf800000, 0xbf800000,
+                                                                  0xbf800000)),
+        'window read before the rewrite': vertex(extra=words(0x7e140200 | DESC) + words(0xbe800385 | DESC << 16)
+                                                 + words(0xbe8003ff | (DESC + 2) << 16, 1)
+                                                 + mubuf(0x0c, 4, 0)),
         'calculated branch': vertex(extra=words(0xbe802000 | DESC)),
     }.items():
         try:
@@ -313,10 +330,10 @@ DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
         for label, kwargs in (
                 ('table', {}), ('shifted', {'shift': STRIDE}),
                 ('bounded', {'size': 7 * STRIDE}), ('unaligned', {'byte_skew': 1}),
-                ('carry', {'high': 0})):
+                ('carry', {'high': 0}), ('branched', {'before': skip_one})):
             source = pipeline(vertex(**kwargs)).hlsl_vs().replace('VSOut main(', 'VSOut guest_main(', 1)
             vs = compile_hlsl(compiler, kind, source + entry, label, 'vs_' + model, directory)
-            draw(vs, reference(**{k: v for k, v in kwargs.items() if k != 'high'}))
+            draw(vs, reference(**{k: v for k, v in kwargs.items() if k not in ('high', 'before')}))
             if label == 'shifted':
                 draw(vs, reference(), differing=8)
             elif label == 'bounded':
