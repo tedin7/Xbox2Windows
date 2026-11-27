@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 #include "heap_indexed_root.h"
+#include "sampler_desc_check.h"
 
 #include <array>
 #include <bitset>
@@ -116,6 +117,7 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
             const int bias = static_cast<int>(words[2] & 0x3fffu);
             sampler.MipLODBias = static_cast<float>((bias ^ 0x2000) - 0x2000) / 256.0f;
         }
+        sanitize_static_sampler(sampler);
         statics.push_back(sampler);
     }
     return statics;
@@ -212,8 +214,10 @@ inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
     const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
     const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
                          s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
-    return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
+    D3D12_SAMPLER_DESC result{s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
             {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
+    sanitize_sampler(result);
+    return result;
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
@@ -255,10 +259,15 @@ HRESULT create_sampler_snapshot_heap(ID3D12Device* device, const SamplerSnapshot
             ++counts.invalid_token;
             sampler = fallback;
         }
+        sanitize_sampler(sampler);
         device->CreateSampler(&sampler, dest);
         dest.ptr += stride;
     }
-    if (snapshot.reserved_fallback) device->CreateSampler(reserved ? reserved : &fallback, dest);
+    if (snapshot.reserved_fallback) {
+        auto sampler = reserved ? *reserved : fallback;
+        sanitize_sampler(sampler);
+        device->CreateSampler(&sampler, dest);
+    }
     return S_OK;
 }
 
