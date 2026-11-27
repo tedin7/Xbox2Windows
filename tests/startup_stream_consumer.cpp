@@ -235,8 +235,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool root_views = mode.rfind("dispatch-root-views", 0) == 0;
+    const bool root_mutant = mode == "dispatch-root-views-mutant";
+    static constexpr UINT root_input_offset = 32, root_output_offset = 48, root_cbv_offset = 256;
+    static constexpr UINT root_addend = 37;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect || root_views ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
     for (UINT i = 0; i < words; ++i) {
@@ -258,12 +262,25 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     UINT descriptors[2][4]{};
     for (int i = 0; i < 2; ++i) {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i || root_mutant ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
         const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
+    }
+    UINT* const root_cbv = memory + 0x20000 / sizeof(UINT);
+    void* root_readback = nullptr;
+    if (root_views) {
+        root_cbv[root_cbv_offset / sizeof(UINT)] = root_addend;
+        D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 512, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        void* placed_cbv = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(root_cbv), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                word(&__uuidof(ID3D12Resource)), word(&placed_cbv))))) return 71;
+        desc.Width = 2 * sizeof(input);
+        root_readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!root_readback) return 71;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
@@ -375,6 +392,43 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // The token is wider than a table descriptor: the output descriptor after it is written again.
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
+    }
+    const auto submit = [&]() -> int {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
+        for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
+            if (GetTickCount64() >= deadline) return 78;
+            Sleep(1);
+        }
+        return 0;
+    };
+    if (root_views) {
+        const auto src = word(buffers[0]) + root_input_offset;
+        const auto dst = word(buffers[1]) + root_output_offset;
+        invoke(list, 43, 0, src);
+        invoke(list, 45, 1, root_mutant ? src : dst);
+        invoke(list, 41, 2, word(root_cbv) + root_cbv_offset);
+        invoke(list, 45, 0, dst);  // a UAV call cannot replace the SRV binding
+        invoke(list, 34, word(slot67_root));
+        invoke(list, 46, 1, dst);
+        if (mode == "dispatch-root-views-changed") {
+            invoke(list, 33, word(slot67_other_root));
+            invoke(list, 33, word(slot67_root));
+        }
+        invoke(list, 14, 1, 1, 1);
+        for (UINT i = 0; i < 2; ++i)
+            invoke(list, 15, word(root_readback), i * sizeof(input), word(placed[i]), 0, sizeof(input));
+        if (const int rc = submit()) return rc;
+        x2w_d3d12_compute_census();
+        char path[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
+        void* mapped = nullptr;
+        if (!n || n >= MAX_PATH || FAILED(static_cast<HRESULT>(invoke(root_readback, 8, 0, 0, word(&mapped)))) || !mapped)
+            return 79;
+        std::ofstream(path, std::ios::binary).write(static_cast<const char*>(mapped), 2 * sizeof(input));
+        invoke(root_readback, 9, 0, 0);
+        return 0;
     }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
@@ -509,13 +563,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         }
     } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
-        Sleep(1);
-    }
+    if (const int rc = submit()) return rc;
     if (indirect && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written

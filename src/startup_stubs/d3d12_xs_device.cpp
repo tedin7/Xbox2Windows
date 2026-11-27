@@ -2951,6 +2951,8 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
+    x2w_startup::RootViews compute_root_address;
+    x2w_startup::RootViews graphics_root_uavs;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -3255,7 +3257,10 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
     // A different root signature invalidates the title's cached compute root arguments.
-    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    if (pass.compute_root_wrapper != w) {
+        pass.compute_constants.clear();
+        pass.compute_root_address.clear();
+    }
     pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
@@ -3889,6 +3894,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (pass.root != params) {
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
+        pass.graphics_root_uavs.clear();
         std::memset(pass.constants, 0, sizeof(pass.constants));
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
@@ -4337,9 +4343,35 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
         list->OMSetStencilRef(reference);
     }
 }
+struct RootViewTotals {
+    LONG calls, fitting, placed, upload, unknown;
+};
+std::array<RootViewTotals, 6> root_view_totals{};
+
+template<UINT Slot, D3D12_ROOT_PARAMETER_TYPE Type>
+void __stdcall list_record_root_view(Wrapper* self, UINT parameter, UINT64 address)
+{
+    auto& totals = root_view_totals[Slot - 41];
+    InterlockedIncrement(&totals.calls);
+    if (recording(self)) {
+        auto& pass = pass_of(self);
+        const auto* params = Slot == 46 ? pass.root
+            : static_cast<const std::vector<RootParameter>*>(pass.compute_tables.signature());
+        auto& views = Slot == 46 ? pass.graphics_root_uavs : pass.compute_root_address;
+        if (views.record(params, parameter, Type, Slot, address)) InterlockedIncrement(&totals.fitting);
+    }
+    if (address && placed_buffer_range(self->own().list_device, address, 1).owner)
+        InterlockedIncrement(&totals.placed);
+    else if (address && list_upload_range(self, address, 1).resource)
+        InterlockedIncrement(&totals.upload);
+    else
+        InterlockedIncrement(&totals.unknown);
+}
+
 // List slot 43 (desktop 39 + 4), set a compute root SRV backed by this recording's upload pages.
 void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 address)
 {
+    list_record_root_view<43, D3D12_ROOT_PARAMETER_TYPE_SRV>(self, parameter, address);
     auto* list = recording(self);
     auto& pass = pass_of(self);
     const auto* params = pass.compute_params;
@@ -4484,6 +4516,21 @@ std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
+LONG compute_root_view_inputs, compute_root_view_outputs;
+
+void log_root_view_census()
+{
+    for (const UINT slot : {41u, 43u, 45u, 46u}) {
+        auto& t = root_view_totals[slot - 41];
+        const auto count = [](LONG& value) { return InterlockedCompareExchange(&value, 0, 0); };
+        log("x2w-render root view slot %u: calls=%ld fitting=%ld placed=%ld upload=%ld unknown=%ld",
+            slot, count(t.calls), count(t.fitting), count(t.placed), count(t.upload), count(t.unknown));
+    }
+    log("x2w-render compute root view dispatches: input=%ld output=%ld",
+        InterlockedCompareExchange(&compute_root_view_inputs, 0, 0),
+        InterlockedCompareExchange(&compute_root_view_outputs, 0, 0));
+}
+
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
@@ -7909,6 +7956,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
+        log_root_view_census();
         log_key_use_census();
         log_dispatch_phases();
         log_not_drawn_causes();
@@ -8152,9 +8200,12 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[41] = reinterpret_cast<ListTyped>(&list_record_root_view<41, D3D12_ROOT_PARAMETER_TYPE_CBV>);
+        list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
-        list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
+        list_typed[45] = reinterpret_cast<ListTyped>(&list_record_root_view<45, D3D12_ROOT_PARAMETER_TYPE_UAV>);
+        list_typed[46] = reinterpret_cast<ListTyped>(&list_record_root_view<46, D3D12_ROOT_PARAMETER_TYPE_UAV>);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);

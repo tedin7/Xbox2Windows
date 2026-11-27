@@ -1,6 +1,6 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
-// <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
+// <key>.cs.cso. Bound from root views when opted in, or from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
@@ -27,6 +27,7 @@ struct ComputeTranslation {
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
+        bool root_view = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -124,6 +125,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         return nullptr;
     }
     tr.retry_manifest_at = 0;
+    const bool allow_root_views = x2w_local::env_on("X2W_COMPUTE_ROOT_VIEWS");
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
         std::size_t end = manifest.find('\n', at);
@@ -157,7 +159,15 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         else if (std::sscanf(line.c_str(), "udsrc %u %15s %d%n", &i, name, &a, &used) == 3 && whole() && i == tr.uds.size() &&
                  source() != ComputeTranslation::root_constant)
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
-        else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+        else if (allow_root_views && std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 && whole() &&
+                 a >= 0 && i == tr.srvs.size()) {
+            tr.srvs.push_back({a, 0, false, false});
+            tr.srvs.back().root_view = true;
+        } else if (allow_root_views && std::sscanf(line.c_str(), "uav %u root %d%n", &i, &a, &used) == 2 && whole() &&
+                   a >= 0 && i == tr.uavs.size()) {
+            tr.uavs.push_back({a, 0, false, false});
+            tr.uavs.back().root_view = true;
+        } else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
@@ -218,7 +228,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     for (const ComputeTranslation::Slot& ud : tr.uds) {
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
-            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
+            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture || slots[ud.a].root_view))
             return "an entry value names a descriptor that is not a buffer input or output";
     }
     x2w_startup::ComPtr<ID3DBlob> code;
@@ -311,6 +321,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    bool root_input = false, root_output = false;
     phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
@@ -319,46 +330,77 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
-        std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
+        u64 entry = 0;
         std::memset(words, 0, sizeof(words));
-        if (slot.word_param >= 0) {
-            // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
-            // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
-            const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
-            if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
-                reason = "a table descriptor is not bound";
+        if (slot.root_view) {
+            const auto bound = pass.compute_root_address.view(static_cast<unsigned>(slot.a));
+            if (!bound.address || (output ? bound.slot != 45 : bound.slot != 43 && bound.slot != 41)) {
+                reason = "a compute root view is not bound";
                 break;
             }
-            std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
-            const std::uint32_t at = slot.at + index * slot.times;
-            const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-            const UINT stride = (words[1] >> 16) & 0x3fff;
-            if (!(words[0] | words[1] | words[2] | words[3])) {
-                // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
-                // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
-                index = 0;
-            } else {
-                if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
-                    reason = "a heap index word is not in the list's upload memory";
-                    break;
-                }
-                if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
-                    reason = "a heap index word is outside its table buffer";
-                    break;
-                }
-                std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+            const auto placed = placed_buffer_range(self->own().list_device, bound.address, 1);
+            const auto* info = placed.owner ? resource_info(placed.owner) : nullptr;
+            if (!info) {
+                reason = "a compute root view is not in a placed buffer";
+                break;
             }
+            // A root address has no length field. Use the remainder of its buffer as a raw descriptor range.
+            const u64 offset = bound.address - reinterpret_cast<u64>(placed.owner->own().title_memory);
+            const u64 width = info->console.Width;
+            const u64 bytes = offset < width ? width - offset : 0;
+            if ((bound.address >> 48) || offset % (bound.slot == 41 ? D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT
+                                                                   : D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) ||
+                !bytes || bytes % 4 || bytes > (16u << 20) || static_cast<UINT>(bound.address) == view_token_magic) {
+                reason = "a compute root view has an invalid buffer range or alignment";
+                break;
+            }
+            // Feed the same raw-view validation and state handling used for table descriptors.
+            words[0] = static_cast<UINT>(bound.address);
+            words[1] = static_cast<UINT>(bound.address >> 32);
+            words[2] = static_cast<UINT>(bytes);
+            if (output) root_output = true;
+            else root_input = true;
+        } else {
+            std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
+            if (slot.word_param >= 0) {
+                // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
+                // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
+                const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
+                if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
+                    reason = "a table descriptor is not bound";
+                    break;
+                }
+                std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+                const std::uint32_t at = slot.at + index * slot.times;
+                const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+                const UINT stride = (words[1] >> 16) & 0x3fff;
+                if (!(words[0] | words[1] | words[2] | words[3])) {
+                    // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
+                    // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
+                    index = 0;
+                } else {
+                    if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                        reason = "a heap index word is not in the list's upload memory";
+                        break;
+                    }
+                    if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                        reason = "a heap index word is outside its table buffer";
+                        break;
+                    }
+                    std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+                }
+            }
+            // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
+            // title memory of the list's view heap: a literal byte offset, as a table's is.
+            entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+                : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
+            const std::size_t entry_bytes = slot.texture ? 32 : 16;
+            if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
+                reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
+                break;
+            }
+            std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
         }
-        // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
-        // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
-            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
-        const std::size_t entry_bytes = slot.texture ? 32 : 16;
-        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
-            reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
-            break;
-        }
-        std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
         if (slot.texture) {
             // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
             // a null view would read zeros or drop the program's stores without a trace.
@@ -623,6 +665,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     draw_lock_release_exclusive();
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
+    if (root_input) InterlockedIncrement(&compute_root_view_inputs);
+    if (root_output) InterlockedIncrement(&compute_root_view_outputs);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
     if (!dispatch.signature && first_calls(logged, 8))
@@ -733,6 +777,7 @@ void log_key_use_census()
 extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
+    log_root_view_census();
     log_key_use_census();
 }
 

@@ -8,6 +8,7 @@
 // tables, setting a different one (or none) leaves no table bound, and so does a change of the title's view heap.
 // A parameter past the kept range is refused and counted.
 
+#include <array>
 #include <cstdint>
 
 #include "startup_stubs/logical_view_table.h"
@@ -25,6 +26,29 @@ struct ViewHeapSelection {
         if (shader_visible) compute = wrapper;
         if (logical_count > desktop_count) graphics = wrapper;
     }
+};
+
+struct RootView {
+    std::uint64_t address;
+    unsigned slot;
+};
+
+class RootViews {
+public:
+    template<typename Params, typename Type>
+    bool record(const Params* params, unsigned parameter, Type type, unsigned slot, std::uint64_t address)
+    {
+        if (!params || parameter >= params->size() || parameter >= views_.size() ||
+            (*params)[parameter].type != type) return false;
+        views_[parameter] = {address, slot};
+        return true;
+    }
+
+    RootView view(unsigned parameter) const { return parameter < views_.size() ? views_[parameter] : RootView{}; }
+    void clear() { views_.fill({}); }
+
+private:
+    std::array<RootView, 64> views_{};
 };
 
 class ComputeTables {

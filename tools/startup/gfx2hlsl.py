@@ -474,16 +474,18 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('image_load_mip tfe')
         if word1 & (1 << 30):
             raise Unsupported('image_load_mip a16')
-    if name == 'global_load_dword':
+    if name in ('global_load_dword', 'global_store_dword'):
         if n != 8 or off + 8 > len(code):
-            raise Unsupported('global_load_dword encoding length %d at +0x%x' % (n, off))
+            raise Unsupported('%s encoding length %d at +0x%x' % (name, n, off))
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & (1 << 25):
-            raise Unsupported('global_load_dword reserved bit 25 set at +0x%x' % off)
+            raise Unsupported('%s reserved bit 25 set at +0x%x' % (name, off))
         if word1 & (1 << 23):
-            raise Unsupported('global_load_dword nv')
-        if word1 & 0x0000ff00:
+            raise Unsupported(name + ' nv')
+        if name == 'global_load_dword' and word1 & 0x0000ff00:
             raise Unsupported('global_load_dword unused data field set at +0x%x' % off)
+        if name == 'global_store_dword' and word1 & 0xff000000:
+            raise Unsupported('global_store_dword unused destination field set at +0x%x' % off)
     if name in LDS_UNUSED_W1_MASK:
         if n != 8 or off + 8 > len(code):
             raise Unsupported('%s encoding length %d at +0x%x' % (name, n, off))
@@ -1049,7 +1051,7 @@ VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v
 
 def destinations(name, ops):
     """The operands an instruction writes: the first, and the SGPR destination of the VOP3b forms. Compares write none."""
-    if not ops or name.startswith(('s_cmp', 's_bitcmp')):
+    if not ops or name.startswith(('s_cmp', 's_bitcmp', 'global_store')):
         return []
     return [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
 
@@ -6916,65 +6918,71 @@ class Stage:
     def op_buffer_load_dwordx4(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 4)
 
-    def op_global_load_dword(self, ops, mods):
-        # Compute-stage one-dword GLOBAL load in the saddr form (RDNA 2 ISA §9.2, LLVM 15 SelectGlobalSAddr):
+    def global_root_address(self, ops, mods, store):
+        # Compute-stage one-dword GLOBAL memory access in the saddr form (RDNA 2 ISA §9.2, LLVM 15 SelectGlobalSAddr):
         # ADDR = SADDR[63:0] + zext(VADDR[31:0]) + sext(OFFSET[11:0]), where SADDR is a proven 64-bit root
         # buffer pointer pair s[base:base+1] (optionally copied or advanced by completed literal s_add_u32 /
         # s_addc_u32). Modifiers are checked before the operand count so the two-operand `lds` form refuses on
         # its modifier rather than arity.
+        action = 'global store' if store else 'global load'
         if getattr(self, 'kind', None) != 'cs':
-            raise Unsupported('global_load_dword')
+            raise Unsupported(action.replace(' ', '_') + '_dword')
         offset = 0
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', m[7:]):
                 imm = int(m[7:], 0)
                 if not -2048 <= imm <= 2047:
-                    raise Unsupported('global load offset %s' % m[7:])
+                    raise Unsupported(action + ' offset %s' % m[7:])
                 offset += imm
             elif m not in ('glc', 'slc', 'dlc'):
-                raise Unsupported('global load modifier %s' % m)
+                raise Unsupported(action + ' modifier %s' % m)
         if len(ops) != 3:
-            raise Unsupported('global load with %d operands, expected 3' % len(ops))
-        dst = reg_range(ops[0])
+            raise Unsupported(action + ' with %d operands, expected 3' % len(ops))
+        data, vaddr_op, scalar = (ops[1], ops[0], ops[2]) if store else ops
+        dst = reg_range(data)
         if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
-            raise Unsupported('global load destination %s' % ops[0])
-        if ops[2] == 'off':
-            raise Unsupported('global load without a scalar address pair')
-        base = reg_range(ops[2])
+            raise Unsupported('%s %s %s' % (action, 'data register' if store else 'destination', data))
+        if scalar == 'off':
+            raise Unsupported(action + ' without a scalar address pair')
+        base = reg_range(scalar)
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[1] % 2 or base[2] > 105:
-            raise Unsupported('global load base %s' % ops[2])
-        vaddr = reg_range(ops[1])
+            raise Unsupported(action + ' base %s' % scalar)
+        vaddr = reg_range(vaddr_op)
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
-            raise Unsupported('global load vaddr %s' % ops[1])
+            raise Unsupported(action + ' vaddr %s' % vaddr_op)
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
-            raise Unsupported('global load through s%d holding %s' % (base[1], p))
+            raise Unsupported(action + ' through s%d holding %s' % (base[1], p))
         if len(p) > 2 and not isinstance(p[2], int):
-            raise Unsupported('global load through s%d: the pointer was advanced by an untracked offset' % base[1])
+            raise Unsupported(action + ' through s%d: the pointer was advanced by an untracked offset' % base[1])
         if p[1][0] != 'root':
-            raise Unsupported('global load through %s' % (p[1],))
+            raise Unsupported(action + ' through %s' % (p[1],))
         base_off = p[2] if len(p) > 2 else 0
         if not isinstance(base_off, int) or isinstance(base_off, bool) or base_off < 0:
-            raise Unsupported('global load through s%d: invalid pointer byte offset %r' % (base[1], base_off))
+            raise Unsupported(action + ' through s%d: invalid pointer byte offset %r' % (base[1], base_off))
         if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[2]) != ptr_high_symbol(p[1], base_off):
-            raise Unsupported('global load through s%d: its high word is not the matching pair' % base[1])
+            raise Unsupported(action + ' through s%d: its high word is not the matching pair' % base[1])
         # RDNA 2 low-bit GLOBAL alignment depends on SH_MEM_CONFIG.ALIGNMENT_MODE (DWORD rounds down, STRICT /
         # DWORD_STRICT faults, UNALIGNED gathers across neighbouring DWORDs; Scarlett's setting is unmeasured),
         # and HLSL ByteAddressBuffer.Load requires a multiple of four. Require proven 4-byte-aligned components.
         if offset % 4:
-            raise Unsupported('global load at unaligned immediate offset %d' % offset)
+            raise Unsupported(action + ' at unaligned immediate offset %d' % offset)
         if base_off % 4:
-            raise Unsupported('global load through s%d at unaligned pointer offset %d' % (base[1], base_off))
-        if not self.operand_align4(ops[1]):
-            raise Unsupported('global load vaddr %s is not proven 4-byte aligned' % ops[1])
+            raise Unsupported(action + ' through s%d at unaligned pointer offset %d' % (base[1], base_off))
+        if not self.operand_align4(vaddr_op):
+            raise Unsupported(action + ' vaddr %s is not proven 4-byte aligned' % vaddr_op)
         total_off = base_off + offset
         if total_off > 0xffffffff or total_off < -0xffffffff:
-            raise Unsupported('global load byte offset %#x' % total_off)
-        buf = self.pipe.resource((p[1], None), 'buf')
+            raise Unsupported(action + ' byte offset %#x' % total_off)
+        return (p[1], None), dst[1], vaddr_op, total_off
+
+    def op_global_load_dword(self, ops, mods):
+        key, dst, vaddr, total_off = self.global_root_address(ops, mods, False)
+        buf = self.pipe.resource(key, 'buf')
         # Guard the signed 64-bit view-relative byte offset (zext(vaddr) + base_off + sext(offset)) against
         # [0, 0xffffffff] before converting to a 32-bit ByteAddressBuffer offset so overflow above 4 GiB or
         # underflow below base cannot wrap into an in-bounds word of a bounded root view.
-        self.emit('a = %s;' % self.u(ops[1]))
+        self.emit('a = %s;' % self.u(vaddr))
         if total_off > 0:
             load_expr = '(a <= 0x%08xu ? %s.Load(a + %du) : 0u)' % (0xffffffff - total_off, buf, total_off)
         elif total_off < 0:
@@ -6982,7 +6990,23 @@ class Stage:
             load_expr = '(a >= %du ? %s.Load(a - %du) : 0u)' % (mag, buf, mag)
         else:
             load_expr = '%s.Load(a)' % buf
-        self.set_v(dst[1], load_expr)
+        self.set_v(dst, load_expr)
+
+    def op_global_store_dword(self, ops, mods):
+        key, data, vaddr, offset = self.global_root_address(ops, mods, True)
+        if self.pipe.root['params'][key[0][1]]['type'] != 4:
+            raise Unsupported('global store requires a root UAV')
+        buf = self.pipe.uav(key, 'raw', rw=True)
+        self.emit('a = %s;' % self.u(vaddr))
+        guard, address = '', 'a'
+        if offset > 0:
+            guard, address = 'a <= 0x%08xu' % (0xffffffff - offset), 'a + %du' % offset
+        elif offset < 0:
+            guard, address = 'a >= %du' % -offset, 'a - %du' % -offset
+        if not self.exec_known:
+            guard = '(exec & 1) && ' + guard if guard else 'exec & 1'
+        store = '%s.Store(%s, %s);' % (buf, address, self.u('v%d' % data))
+        self.emit('if (%s) %s' % (guard, store) if guard else store)
 
     def op_buffer_store_vs(self, ops, mods, count):
         # Vertex-stage store in the `off` form: scalar byte offset plus the 12-bit immediate, through a
@@ -11954,9 +11978,12 @@ class ComputePipeline(Pipeline):
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for (source, off), r in self.uavs.items():
-            if source[0] != 'table':
+            if source[0] == 'root' and r['kind'] == 'raw':
+                where = 'root %d' % source[1]
+            elif source[0] == 'table':
+                where = 'table %d %d' % (source[1], off)
+            else:
                 raise Unsupported('store through %s' % (source,))
-            where = 'table %d %d' % (source[1], off)
             if r['kind'] == 'raw':
                 lines.append('uav %d %s' % (r['index'], where))
             else:
@@ -12936,6 +12963,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('global-root-store', r'^global_store_dword(?:$| in )'),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),

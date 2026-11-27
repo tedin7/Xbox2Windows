@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <array>
 
 namespace {
 using x2w_startup::ComputeTables;
@@ -104,6 +105,22 @@ int main()
         check(s.set_table(ComputeTables::max_parameters - 1, at(2)) && s.table(ComputeTables::max_parameters - 1).address, "the last parameter is kept");
         check(!s.set_table(ComputeTables::max_parameters, at(3)) && s.out_of_range_count() == 1, "a parameter out of range is refused and counted");
         check(s.table(ComputeTables::max_parameters).address == 0 && s.table(1).address == cpu_base + stride, "a refused call leaves the other tables alone");
+    }
+    {
+        enum Type { srv, uav, cbv };
+        struct Parameter { Type type; };
+        const std::array<Parameter, 3> params{{{srv}, {uav}, {cbv}}};
+        x2w_startup::RootViews views;
+        check(views.record(&params, 0, srv, 43, 0x1010), "slot 43 records its SRV address");
+        check(views.record(&params, 1, uav, 45, 0x2020), "slot 45 records its UAV address");
+        check(views.record(&params, 2, cbv, 41, 0x3100), "slot 41 records its CBV address");
+        check(!views.record(&params, 0, uav, 45, 0x4040), "a UAV slot cannot write an SRV parameter");
+        check(!views.record(&params, 3, uav, 45, 0x4040), "an undeclared parameter is refused");
+        check(views.view(0).slot == 43 && views.view(0).address == 0x1010 &&
+            views.view(1).slot == 45 && views.view(1).address == 0x2020 &&
+            views.view(2).slot == 41 && views.view(2).address == 0x3100, "only fitting views are kept");
+        views.clear();
+        check(!views.view(0).address && !views.view(1).address && !views.view(2).address, "clearing drops all views");
     }
     std::printf("startup_compute_root: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
