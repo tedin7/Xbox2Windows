@@ -100,11 +100,12 @@ bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request&
     result.stream.resize(bytes);
     if (!copy_title_bytes(result.stream.data(), desc.pPipelineStateSubobjectStream, bytes)) return false;
     UINT seen = 0;
+    DXGI_FORMAT title_depth = DXGI_FORMAT_UNKNOWN;
     for (std::size_t offset = 0; offset < bytes;) {
         auto* record = result.stream.data() + offset;
         const UINT type = mesh86_word(record);
         const bool mesh = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS; // Xbox MS tag 24.
-        const auto size = mesh ? 24 : type < std::size(stream_sizes) ? stream_sizes[type] : 0;
+        const auto size = mesh ? 24 : desktop_stream_size(type);
         if (!size || size > bytes - offset || (seen & (1u << type))) return false;
         seen |= 1u << type;
         auto* payload = record + 8;
@@ -133,6 +134,8 @@ bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request&
                 }
             }
             std::memset(payload, 0, sizeof(source));
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+            std::memcpy(&title_depth, record + sizeof(type), sizeof(title_depth));
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT ||
                    type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT ||
                    type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
@@ -153,6 +156,7 @@ bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request&
         mesh86_clear_state_padding(record, type, size);
         offset += size;
     }
+    if ((seen & (1u << rasterizer1_tag)) && title_depth != d16s8_format) return false;
     return recognized && result.root && result.root->own().kind == root_signature_kind;
 }
 

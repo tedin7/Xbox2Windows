@@ -101,6 +101,7 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -2834,9 +2835,57 @@ DxilMeshStage desktop_dxil_mesh_stage(const D3D12_SHADER_BYTECODE& code)
     return stage;
 }
 
+constexpr UINT rasterizer1_tag = 27;
+constexpr auto d16s8_format = static_cast<DXGI_FORMAT>(118);
+
+bool rescale_d16s8_bias(DXGI_FORMAT title, DXGI_FORMAT desktop)
+{
+    return title == d16s8_format && desktop == DXGI_FORMAT_D24_UNORM_S8_UINT;
+}
+
+bool integral_depth_bias(double bias, INT& out)
+{
+    if (!(bias >= INT_MIN && bias <= INT_MAX)) return false;
+    const INT integral = static_cast<INT>(bias);
+    if (static_cast<double>(integral) != bias) return false;
+    out = integral;
+    return true;
+}
+
+// For UNORM depth, one D16 bias unit is approximately 256 D24 units.
+bool desktop_depth_bias(INT& bias, bool floating, bool rescale)
+{
+    if (!floating && !rescale) return true;
+    double old = 0;
+    if (floating) {
+        float value;
+        std::memcpy(&value, &bias, sizeof(value));
+        old = value;
+    } else {
+        old = bias;
+    }
+    if (!rescale) return integral_depth_bias(old, bias);
+
+    const double scaled = std::clamp(old * 256.0, static_cast<double>(INT_MIN), static_cast<double>(INT_MAX));
+    if (!integral_depth_bias(scaled, bias)) return false;
+
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::array<std::pair<double, INT>, 24> logged;
+    static std::size_t count = 0;
+    x2w_startup::ExclusiveNoteLock guard(lock);
+    const auto pair = std::make_pair(old, bias);
+    const auto end = logged.begin() + count;
+    if (end != logged.end() && std::find(logged.begin(), end, pair) == end) {
+        logged[count++] = pair;
+        log("x2w-d3d12 depth bias rescaled for D16S8 on D24: %.9g -> %d", old, bias);
+    }
+    return true;
+}
+
 std::size_t desktop_stream_size(UINT type)
 {
     if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) return 24;
+    if (type == rasterizer1_tag) return stream_sizes[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER];
     return type < std::size(stream_sizes) ? stream_sizes[type] : 0;
 }
 
@@ -2859,7 +2908,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     bool amplification = false, console_mesh = false;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
     D3D12_RT_FORMAT_ARRAY targets{};
-    DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN, title_depth = DXGI_FORMAT_UNKNOWN;
+    bool has_rasterizer1 = false;
     DXGI_SAMPLE_DESC samples{1, 0};
     bool depth_enabled = false, depth_writes = false, untracked_depth_state = false;
     bool ok = true;
@@ -2952,8 +3002,11 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             targets = *formats;
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
+            title_depth = *format;
             *format = desktop_format(*format);
             depth = *format;
+        } else if (type == rasterizer1_tag) {
+            has_rasterizer1 = true;
         } else if (cached_mesh && (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
                                   type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)) {
             D3D12_DEPTH_STENCIL_DESC1 state{};
@@ -2984,6 +3037,22 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
          samples.Count != 1 || samples.Quality)) {
         std::snprintf(why, why_size, "desktop indirect graphics stream needs VS/PS or MS/PS, triangles, one single-sample target and no vertex layout or depth");
         ok = false;
+    }
+    const bool rescale = rescale_d16s8_bias(title_depth, depth);
+    if (ok && has_rasterizer1 && !rescale) {
+        std::snprintf(why, why_size, "unsupported native RASTERIZER1 subobject");
+        ok = false;
+    }
+    for (std::size_t offset = 0; ok && rescale && offset < bytes;) {
+        auto& type = *reinterpret_cast<UINT*>(stream + offset);
+        const auto size = desktop_stream_size(type);
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER || type == rasterizer1_tag) {
+            auto& raster = *reinterpret_cast<D3D12_RASTERIZER_DESC*>(stream + offset + sizeof(type));
+            ok = desktop_depth_bias(raster.DepthBias, type == rasterizer1_tag, true);
+            if (!ok) std::snprintf(why, why_size, "unrepresentable rescaled depth bias");
+            type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        }
+        offset += size;
     }
     ID3D12PipelineState* pipeline = nullptr;
     if (ok) {
@@ -7726,7 +7795,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     bool has_depth_stencil = false;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RASTERIZER_DESC rasterizer{};
-    bool has_rasterizer = false;
+    bool has_rasterizer = false, floating_bias = false;
     bool compute = false;
     ID3D12RootSignature* pipeline_root = nullptr;
     IndirectGraphicsPipeline graphics;
@@ -7741,7 +7810,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
             real_pipeline = try_cached_mesh86(*desc, why, sizeof(why), graphics, mesh_cache_request, mesh86_key);
         if (!mesh_cache_request && (!real_pipeline || graphics.root))
             translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format,
-                                             rasterizer, has_rasterizer);
+                                             rasterizer, has_rasterizer, floating_bias);
         static LONG built;
         if ((real_pipeline || !translation) && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
@@ -7759,7 +7828,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,
                   translation ? dsv_format : DXGI_FORMAT_UNKNOWN,
-                  translation && has_rasterizer ? &rasterizer : nullptr);
+                  translation && has_rasterizer ? &rasterizer : nullptr, floating_bias);
     return S_OK;
 }
 
