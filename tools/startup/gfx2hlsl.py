@@ -1164,7 +1164,7 @@ UNIFORM_VALU = frozenset((
     'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_cvt_off_f32_i4',
     'v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32',
     'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_log_f32', 'v_ceil_f32',
-    'v_med3_f32', 'v_mov_b32',
+    'v_med3_f32', 'v_mov_b32', 'v_max_f32', 'v_min_f32', 'v_add_f32', 'v_sub_f32', 'v_subrev_f32',
     # Pure 32-bit integer ALU: each lane computes the result from its own sources only, so equal sources give
     # equal results in every lane (no carry-out, no lane ID, no cross-lane read).
     'v_add_nc_u32', 'v_sub_nc_u32', 'v_subrev_nc_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32', 'v_not_b32',
@@ -6230,21 +6230,14 @@ class Stage:
             return False
         return True
 
-    def uniform_image_load_regs(self, base, ops, mods):
-        """Return the range of destination VGPRs written uniformly by `image_load`, or () when unproved."""
-        if (base not in UNIFORM_IMAGE_LOADS or len(ops) < 3 or not self.tracks_uniformity() or
-                getattr(self, 'kind', None) != 'cs' or not getattr(self, 'exec_known', False) or
-                getattr(self, 'has_image_writes', True)):
-            return ()
-        past_entry = getattr(self, 'past_entry', None)
-        if past_entry is None or (past_entry and (getattr(self, 'uniform_expr', None) is None or
-                                                self.pc in getattr(self, 'loads_after_exec_write', ()))):
-            return ()
-        rsrc = reg_range(ops[2])
+    def uniform_fixed_image(self, desc):
+        """The eight SGPRs at `desc` hold one image descriptor read from a fixed table entry that no store or
+        descriptor write changes: every lane sees the same image."""
+        rsrc = reg_range(desc)
         first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 7 and rsrc[2] <= 105 else None
         if (not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or
                 first[3] % 8 or not names_one_value(first)):
-            return ()
+            return False
         masks = getattr(self, 'masks', ())
         varying_s = getattr(self, 'varying_s', ())
         modified = getattr(self.pipe, 'modified', ())
@@ -6252,13 +6245,74 @@ class Stage:
         stored = self.pipe.stored_images() if hasattr(self.pipe, 'stored_images') else (getattr(self.pipe, 'uavs', None) or ())
         key = desc_key(first)
         if key in modified or key in other_modified or key in stored:
-            return ()
+            return False
         for i in range(8):
             reg = rsrc[1] + i
             word = desc_word(first, first[3] + i)
             if (reg in masks or reg in varying_s or self.sym.get(reg) != word or
                     desc_key(word) in modified):
+                return False
+        return True
+
+    def uniform_image_sample_regs(self, base, ops, mods):
+        """Destination VGPRs of a level-zero `image_sample_lz` that every lane reads identically, or ().
+
+        Entry block with known EXEC, a fixed table image, a sampler held in uniform scalars and coordinates that are
+        uniform VGPRs: the sample has no derivative and no lane input, so equal inputs give equal texels."""
+        if (base != 'image_sample_lz' or len(ops) < 4 or not self.tracks_uniformity() or
+                getattr(self, 'kind', None) not in ('vs', 'ps') or not getattr(self, 'exec_known', False) or
+                getattr(self, 'has_image_writes', True) or not self.uniform_fixed_image(ops[2])):
+            return ()
+        # Past the entry block the read recomputes the definition (see op_v_readfirstlane_b32), as for a load.
+        past_entry = getattr(self, 'past_entry', None)
+        if past_entry is None or (past_entry and (getattr(self, 'uniform_expr', None) is None or
+                                                self.pc in getattr(self, 'loads_after_exec_write', ()))):
+            return ()
+        sampler = reg_range(ops[3])
+        if (not sampler or sampler[0] != 's' or sampler[2] - sampler[1] != 3 or sampler[2] > 105 or
+                not all(self.uniform_source('s%d' % reg) for reg in range(sampler[1], sampler[2] + 1))):
+            return ()
+        dims = [m for m in mods if m.startswith('dim:')]
+        dmasks = [m for m in mods if m.startswith('dmask:')]
+        if (len(dims) != 1 or len(dmasks) != 1 or dims[0][4:] not in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_2D') or
+                any(not m.startswith(('dim:', 'dmask:')) and m not in ('unorm', 'glc', 'slc', 'dlc') for m in mods)):
+            return ()
+        try:
+            dmask = int(dmasks[0][6:], 0)
+        except ValueError:
+            return ()
+        if not dmask or dmask & ~0xf:
+            return ()
+        wanted = 1 if dims[0][4:] == 'SQ_RSRC_IMG_1D' else 2
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            if not r or r[0] != 'v':
                 return ()
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        if len(cs) != wanted or not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 and self.uniform_source(c)
+                                        for c in cs):
+            return ()
+        candidate = reg_range(ops[0])
+        if (not candidate or candidate[0] != 'v' or candidate[2] > 255 or
+                candidate[2] - candidate[1] + 1 != bin(dmask).count('1')):
+            return ()
+        return range(candidate[1], candidate[2] + 1)
+
+    def uniform_image_load_regs(self, base, ops, mods):
+        """Return the range of destination VGPRs written uniformly by `image_load`, or () when unproved."""
+        if (base not in UNIFORM_IMAGE_LOADS or len(ops) < 3 or not self.tracks_uniformity() or
+                getattr(self, 'kind', None) not in ('cs', 'vs', 'ps') or not getattr(self, 'exec_known', False) or
+                getattr(self, 'has_image_writes', True)):
+            return ()
+        past_entry = getattr(self, 'past_entry', None)
+        if past_entry is None or (past_entry and (getattr(self, 'uniform_expr', None) is None or
+                                                self.pc in getattr(self, 'loads_after_exec_write', ()))):
+            return ()
+        if not self.uniform_fixed_image(ops[2]):
+            return ()
         dims = [m for m in mods if m.startswith('dim:')]
         dmasks = [m for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(dmasks) != 1:
@@ -6375,7 +6429,7 @@ class Stage:
             else:
                 loaded = recomputed = False
         if dst is None:
-            img_regs = self.uniform_image_load_regs(base, ops, mods)
+            img_regs = self.uniform_image_load_regs(base, ops, mods) or self.uniform_image_sample_regs(base, ops, mods)
             if img_regs:
                 dst, loaded_regs = img_regs.start, img_regs
                 loaded = not getattr(self, 'past_entry', True)
