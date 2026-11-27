@@ -893,8 +893,22 @@ def parse_record_spec(spec):
     return {"spec": ("f" if by == "frame" else "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
 
 
-def folder_report(folder):
-    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console)."""
+PREFIX_ONLY_LINE = "the cap stopped the recording BEFORE the window opened"
+
+
+def recording_unusable(log_dir):
+    """"prefix only" when the run's stderr.txt says the cap stopped the recording before its window opened (the file holds only the
+    state-making prefix: nothing to replay), else None."""
+    try:
+        with open(os.path.join(log_dir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            return "prefix only" if any(PREFIX_ONLY_LINE in line for line in handle) else None
+    except OSError:
+        return None
+
+
+def folder_report(folder, log_dir=None):
+    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console);
+    with log_dir, "unusable": "prefix only" when the run's log says the recording never reached its window."""
     sizes = []
     for root, _, names in os.walk(folder):
         for name in names:
@@ -902,7 +916,11 @@ def folder_report(folder):
             if os.path.isfile(path):
                 sizes.append((os.path.relpath(path, folder).replace(os.sep, "/"), os.path.getsize(path)))
     sizes.sort(key=lambda item: -item[1])
-    return {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+    report = {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+    unusable = recording_unusable(log_dir) if log_dir and sizes else None
+    if unusable:
+        report["unusable"] = unusable
+    return report
 
 
 def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
@@ -991,6 +1009,7 @@ def main(argv):
     sub.add_parser("record-defaults")
     rr = sub.add_parser("record-report")
     rr.add_argument("folder")
+    rr.add_argument("--logs", default=None)
     cb = sub.add_parser("combine")
     cb.add_argument("zip")
     cb.add_argument("--matrix", default="matrix")
@@ -1010,7 +1029,7 @@ def main(argv):
         print("%s %d %d" % (RECORD_DEFAULT_SPEC, RECORD_DEFAULT_MAX_MIB, RECORD_EXPLICIT_MAX_MIB))
         return 0
     if args.cmd == "record-report":
-        print(json.dumps(folder_report(args.folder)))
+        print(json.dumps(folder_report(args.folder, args.logs)))
         return 0
     if args.cmd == "combine":
         runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]

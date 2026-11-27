@@ -49,6 +49,7 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 }
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window.png"), [byte[]](1, 2, 3))
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
+if ($env:STUB_PREFIX_ONLY) { Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, 20 calls, 1000 bytes" }
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_KILL_SELF) { Stop-Process -Id $PID -Force }   # the tester pressed Ctrl-C / closed the window: nothing after this runs
@@ -482,6 +483,16 @@ def check_shell(shell):
         uploads = list((tree / "out" / "tester").glob("record_*_upload"))
         assert uploads and list(uploads[-1].glob("record_*_0001.part")) and (uploads[-1] / ("record_%s.json" % uploads[-1].name.split("_")[1])).is_file(), (uploads, rec.stdout[-1800:], rec.stderr[-600:])
         assert ("recording" in rec.stdout and ("uploaded to the shared Drive folder" in rec.stdout or "UPLOAD_THESE_FILES.txt" in rec.stdout)), rec.stdout[-1500:]
+        # A prefix-only recording (the cap stopped it before the window opened) is flagged, not uploaded.
+        before_uploads = set((tree / "out" / "tester").glob("record_*_upload"))
+        prefix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64",
+                            extra_env={"STUB_PREFIX_ONLY": "1"})
+        assert prefix.returncode == 0, (prefix.stdout[-2000:], prefix.stderr[-1000:])
+        assert "recording UNUSABLE: prefix only" in prefix.stdout and "uploaded" not in prefix.stdout and "UPLOAD_THESE_FILES" not in prefix.stdout, prefix.stdout[-1500:]
+        assert set((tree / "out" / "tester").glob("record_*_upload")) == before_uploads, "an unusable recording is not staged for upload"
+        newest_prefix = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_prefix) as z:
+            assert json.loads(z.read("manifest.json").decode("utf-8-sig"))["record"]["unusable"] == "prefix only"
         plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         newest_plain2 = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_plain2) as z:

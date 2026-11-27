@@ -617,6 +617,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         list->Dispatch(x, y, z);
     }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+        replay_dump::note(self, views[i].resource);
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;

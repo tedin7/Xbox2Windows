@@ -497,12 +497,13 @@ $scanRoots = if ($ScanRoots.Count) { $ScanRoots } else { @($env:LOCALAPPDATA, $e
 # Size report of the recording (empty when the runtime wrote nothing: an older build without the recorder).
 $recordReport = $null
 if ($recordDir) {
-    $recordReport = (Invoke-Native { & $python -B $pack record-report $recordDir } | Out-String | ConvertFrom-Json)
+    $recordReport = (Invoke-Native { & $python -B $pack record-report $recordDir --logs $logDir } | Out-String | ConvertFrom-Json)
     $recordReport | Add-Member -NotePropertyName spec -NotePropertyValue $env:X2W_REPLAY_RECORD -Force
     $recordReport | Add-Member -NotePropertyName dir -NotePropertyValue $recordDir -Force
     $recordReport | Add-Member -NotePropertyName max_mib -NotePropertyValue $RecordMaxMiB -Force
     Write-Host ("tester_run: recording: {0} files, {1:N1} MB in {2} (cap {3} MiB){4}" -f $recordReport.files, ($recordReport.bytes / 1MB), $recordDir, $RecordMaxMiB,
         $(if ($recordReport.files -eq 0) { " - NOTHING was recorded (this build has no recorder, or the window was never reached)" } else { "" }))
+    if ($recordReport.unusable) { Write-Host ("tester_run: recording UNUSABLE: {0} (the cap stopped it BEFORE the window opened): it is not sent; send the report zip only." -f $recordReport.unusable) }
 }
 $scanClock = [System.Diagnostics.Stopwatch]::StartNew()
 $changedFiles = @()
@@ -538,7 +539,7 @@ foreach ($line in $parts) {
 }
 Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
 Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
-if ($recordDir -and $recordReport -and $recordReport.files -gt 0 -and -not $NoUpload) {
+if ($recordDir -and $recordReport -and $recordReport.files -gt 0 -and -not $recordReport.unusable -and -not $NoUpload) {
     $transfer = Join-Path $PSScriptRoot "record_transfer.py"
     $staging = $recordDir + "_upload"
     $null = Invoke-Native { & $python -B $transfer pack $recordDir $staging --id $stamp }

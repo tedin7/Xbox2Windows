@@ -1,13 +1,13 @@
 // Record for replay (docs/startup-runtime.md#d3d12-replay-record). X2W_REPLAY_RECORD=all | <start s>,<seconds> |
 // f<first present>,<presents> writes every call the title makes into the stand-in's objects (every kind, every wrapped
 // slot) to X2W_REPLAY_RECORD_FILE (default replay.x2wr): the call with its register and stack arguments and return value,
-// the memory its pointer arguments name (deduplicated blobs, one level of pointers followed), and the wrapper an output
+// the memory its pointer arguments name (deduplicated blobs from declared argument ranges), and the wrapper an output
 // pointer received. A replay feeds the same calls to this stand-in, so the runtime and the translator run for real.
 //
 // Each thread appends to its own buffer (no lock shared between title threads per call: a shared lock would serialise
 // them and hide the cost being recorded); full buffers are written under the file lock. Calls are ordered by a global
-// sequence number taken before the call; nothing else runs before the real slot, so float arguments in xmm registers
-// reach it unchanged (their values are not recorded yet).
+// sequence number taken before the call. The opt-in page scan only runs before slots without float arguments.
+// Float arguments in xmm registers reach the real slot unchanged (their values are not recorded yet).
 //
 // File: the capture chunk framing (tag, header bytes, data bytes). XREC (version, timer frequency), CALL, ARGM (argument
 // memory: seq, arg, address, bytes, blob hash), BLOB (hash, bytes; once per content), OUTP (seq, arg, the pointer an
@@ -19,13 +19,16 @@ namespace replay_record {
 constexpr int wide_slots = 256;   // device and command-list slots wrapped
 constexpr int narrow_slots = 64;  // slots wrapped for the other kinds
 constexpr std::size_t flush_bytes = 1u << 20;
-constexpr std::size_t blob_follow_bytes = 0x400;  // pointer words looked at inside an argument's memory
-constexpr std::size_t blob_default_bytes = 0x100;
-constexpr std::size_t blob_max_bytes = 4u << 20;
-constexpr int record_depth = 2;  // argument memory, the memory it points at (a pipeline stream), and one more (its shaders)
+constexpr std::size_t argument_memory_limit = 1u << 20;
 
 void* original[kind_count][wide_slots];
-bool armed;
+std::atomic<bool> active{false};
+// A recording was installed in this process (set once by install(), never cleared, so it stays set after the recording
+// stops). The submission dump reads it: the recorder writes dump rows only while its window is open; a replay
+// (nothing installed) writes them all.
+bool armed = false;
+static_assert(device_kind == x2w_replay_slots::device && list_kind == x2w_replay_slots::list);
+bool scan_submit_pages;
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -36,14 +39,13 @@ HANDLE file = INVALID_HANDLE_VALUE;
 SRWLOCK file_lock = SRWLOCK_INIT, blob_lock = SRWLOCK_INIT, buffers_lock = SRWLOCK_INIT;
 LONG64 volatile calls_written, blobs_stored;
 u64 bytes_written;
-LONG volatile stopped, stop_requested, cap_reached;
+LONG volatile stop_requested, cap_reached;
 u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the file is this large
-// Read by every wrapped slot before it calls the real one: a plain load, so nothing touches the xmm registers that carry
-// float arguments. present() keeps it current (the window is checked per present).
-bool volatile window_open;
-// Before the window (a timed window, not "all"): the calls that make the state the window's calls name are recorded
-// too, so a replay of a mid-game window knows every object: see prefix_slot. Cleared when the window opens.
-bool volatile prefix_open;
+// The thunk checks active before doing any recorder work. Window and prefix
+// selection is published by present(); the prefix ends when the window opens.
+std::atomic<bool> window_open{false}, prefix_open{false};
+std::atomic<unsigned> memory_epoch{0};
+constexpr LONG memory_cache_presents = 16;
 // "slow": the window opens at the first present after slow_after_s whose gap to the previous present is at least
 // slow_gap_s, or at slow_fallback_s; it lasts slow_seconds.
 bool slow_mode;
@@ -52,7 +54,6 @@ double slow_after_s = 120, slow_gap_s = 0.5, slow_seconds = 10, slow_fallback_s 
 struct ThreadBuffer {
     SRWLOCK lock = SRWLOCK_INIT;
     std::vector<unsigned char> bytes;
-    std::unordered_map<u64, u64> blobs;  // address -> content hash last recorded from this thread
 };
 std::vector<ThreadBuffer*>& thread_buffers() { static std::vector<ThreadBuffer*> v; return v; }
 std::unordered_set<u64>& stored_blobs() { static std::unordered_set<u64> s; return s; }  // blob_lock
@@ -107,7 +108,6 @@ double seconds_now()
 }
 bool in_window()
 {
-    if (!armed || stopped) return false;
     const LONG present = presents;
     if (present < first_present || present >= last_present) return false;
     const double t = seconds_now();
@@ -115,11 +115,8 @@ bool in_window()
 }
 void update_window()
 {
-    const bool was_prefix = prefix_open;
     window_open = in_window();
     if (window_open) prefix_open = false;
-    if (window_open && was_prefix)
-        log("x2w-replay record: window opens after a prefix of %lld calls, %llu bytes written", calls_written, bytes_written);
 }
 
 // The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
@@ -138,80 +135,368 @@ u64 content_hash(const unsigned char* data, std::size_t bytes)
     return hash;
 }
 
-// Records the memory at `address` (an argument, or a pointer found in an argument's memory) as an ARGM chunk, and its
-// content once as a BLOB. The window is the larger of a default and `size_hint` (the word after the pointer, when it is a
-// plausible size: a shader is a pointer, then its byte count). depth > 0 follows pointer words in its first bytes. A
-// followed pointer's ARGM names its direct parent: `arg` = the call's argument | 0x100 * (word index + 1), and the
-// parent is the last ARGM of the same call with depth one higher (they are written parent first).
-void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth)
+// Cache only the queried region within its 64 KiB granule. Page protection
+// and commitment can change on smaller boundaries inside a granule.
+std::size_t committed_readable_prefix(u64 start, std::size_t bytes)
 {
-    if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address))) return;
-    const std::size_t wanted = size_hint > blob_default_bytes ? size_hint : blob_default_bytes;
-    const std::size_t bytes = readable_window(address, wanted);
-    if (!bytes) return;
-    std::vector<unsigned char> copy(bytes);
-    SIZE_T got = 0;
-    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), copy.data(), bytes, &got) || got != bytes)
-        return;
-    const u64 hash = content_hash(copy.data(), bytes);
-    struct { u64 seq; std::uint32_t arg, depth; u64 address, bytes, hash; } header{seq, arg, static_cast<std::uint32_t>(depth),
-                                                                                    address, bytes, hash};
-    append_chunk(b.bytes, "ARGM", &header, sizeof(header), nullptr, 0);
-    AcquireSRWLockExclusive(&blob_lock);
-    const bool fresh = stored_blobs().insert(hash).second;
-    ReleaseSRWLockExclusive(&blob_lock);
-    if (fresh) {
-        struct { u64 hash, bytes; } blob{hash, bytes};
-        append_chunk(b.bytes, "BLOB", &blob, sizeof(blob), copy.data(), bytes);
-        InterlockedIncrement64(&blobs_stored);
+    constexpr u64 granule = 0x10000;
+    constexpr u64 user_end = 0x800000000000ull;
+    if (start < granule || start >= user_end || bytes > user_end - start) return 0;
+    struct Region {
+        u64 first, end;
+        bool readable;
+    };
+    struct Cache {
+        unsigned epoch;
+        Region entries[256];
+    };
+    static thread_local Cache cache{};
+    const unsigned epoch = memory_epoch.load(std::memory_order_relaxed);
+    if (cache.epoch != epoch) cache = Cache{epoch, {}};
+    const u64 end = start + bytes;
+    u64 at = start;
+    while (at < end) {
+        const u64 base = at & ~(granule - 1);
+        Region& region = cache.entries[(base / granule) % std::size(cache.entries)];
+        if (at < region.first || at >= region.end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) break;
+            const u64 first = reinterpret_cast<u64>(info.BaseAddress);
+            const DWORD protection = info.Protect & 0xff;
+            const bool readable = info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) &&
+                (protection == PAGE_READONLY || protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+                 protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
+            const Region found{(std::max)(first, base), (std::min)(first + info.RegionSize, base + granule), readable};
+            // Only readable spans are kept: memory reserved now is often committed later (a title heap grows inside a
+            // granule), and the prefix can run for minutes without a present to expire the cache.
+            if (!found.readable) break;
+            region = found;
+        }
+        at = (std::min)(end, region.end);
     }
-    if (depth <= 0) return;
-    const std::size_t scan = (bytes < blob_follow_bytes ? bytes : blob_follow_bytes) / 8;
-    const auto* words = reinterpret_cast<const u64*>(copy.data());
-    for (std::size_t i = 0; i < scan; ++i) {
-        const u64 value = words[i];
-        if (value < 0x10000 || value >= 0x7fffffffffffull || (value & 3)) continue;
-        const u64 next = i + 1 < scan ? words[i + 1] : 0;
-        record_memory(b, seq, (arg & 0xffu) | 0x100u * static_cast<std::uint32_t>(i + 1), value,
-                      next > 0 && next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, depth - 1);
-    }
+    return static_cast<std::size_t>(at - start);
 }
+
+bool readable_range(u64 address, std::size_t bytes)
+{
+    return bytes && committed_readable_prefix(address, bytes) == bytes;
+}
+
+bool copy_readable(u64 address, void* destination, std::size_t bytes)
+{
+    // A mapping can change after VirtualQuery. Let the kernel copy and report
+    // failure instead of dereferencing the address on a title thread.
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), destination, bytes, &got) &&
+        got == bytes;
+}
+
+constexpr int call_args = 11;      // raw argument words after rcx, all recorded (format 3)
+constexpr std::uint32_t rcx_arg = 15;  // ARGM argument index of a struct-return buffer
 
 struct Call {
     u64 seq;
     std::uint32_t thread;
     std::uint16_t kind, slot;
     u64 object;
-    u64 args[7];
+    u64 args[call_args];
     u64 ret;
     double seconds;
     std::int32_t present, pad;
 };
 
+struct ArgumentCapture {
+    ThreadBuffer& buffer;
+    const Call& call;
+    std::size_t remaining = argument_memory_limit;
+
+    std::vector<unsigned char> memory(std::uint32_t arg, u64 address, u64 bytes, unsigned depth = 0)
+    {
+        if (bytes > remaining || !readable_range(address, static_cast<std::size_t>(bytes))) return {};
+        remaining -= static_cast<std::size_t>(bytes);
+        std::vector<unsigned char> copy(static_cast<std::size_t>(bytes));
+        if (!copy_readable(address, copy.data(), copy.size())) return {};
+
+        const u64 hash = content_hash(copy.data(), copy.size());
+        struct { u64 seq; std::uint32_t arg, depth; u64 address, bytes, hash; } header{call.seq, arg, depth, address, bytes, hash};
+        append_chunk(buffer.bytes, "ARGM", &header, sizeof(header), nullptr, 0);
+        AcquireSRWLockExclusive(&blob_lock);
+        const bool fresh = stored_blobs().insert(hash).second;
+        ReleaseSRWLockExclusive(&blob_lock);
+        if (fresh) {
+            struct { u64 hash, bytes; } blob{hash, bytes};
+            append_chunk(buffer.bytes, "BLOB", &blob, sizeof(blob), copy.data(), copy.size());
+            InterlockedIncrement64(&blobs_stored);
+        }
+        return copy;
+    }
+
+    void arg(unsigned i, u64 bytes) { memory(i, call.args[i], bytes); }
+
+    // The committed readable start of [address, address + wanted), within the call's remaining budget.
+    std::vector<unsigned char> prefix(std::uint32_t arg, u64 address, std::size_t wanted, unsigned depth)
+    {
+        if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address)))
+            return {};
+        const std::size_t bytes = committed_readable_prefix(address, (std::min)(wanted, remaining));
+        return bytes ? memory(arg, address, bytes, depth) : std::vector<unsigned char>{};
+    }
+
+    void output(unsigned i)
+    {
+        if (FAILED(static_cast<HRESULT>(call.ret))) return;
+        const auto copy = memory(i, call.args[i], sizeof(u64));
+        if (copy.empty()) return;
+        u64 value;
+        std::memcpy(&value, copy.data(), sizeof(value));
+        if (!as_wrapper(reinterpret_cast<const void*>(value))) return;
+        struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{call.seq, i, 0, value};
+        append_chunk(buffer.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
+    }
+
+    void create(unsigned iid)
+    {
+        arg(iid, sizeof(GUID));
+        output(iid + 1);
+    }
+
+    bool descriptor_arrays()
+    {
+        const u64* args = call.args;
+        u64 sizes[6]{};
+        u64 total = 0;
+        for (const unsigned i : {1u, 2u, 4u, 5u}) {
+            if (!args[i]) continue;
+            const u64 count = static_cast<UINT>(args[i < 3 ? 0 : 3]);
+            sizes[i] = count * ((i == 1 || i == 4) ? sizeof(u64) : sizeof(UINT));
+            total += sizes[i];
+        }
+        if (total > remaining) return false;
+        remaining -= static_cast<std::size_t>(total);
+        std::vector<unsigned char> arrays(static_cast<std::size_t>(total));
+        std::size_t offset = 0;
+        for (const unsigned i : {1u, 2u, 4u, 5u}) {
+            const auto bytes = static_cast<std::size_t>(sizes[i]);
+            if (!bytes) continue;
+            if (!readable_range(args[i], bytes) || !copy_readable(args[i], arrays.data() + offset, bytes)) return false;
+            offset += bytes;
+        }
+        append_chunk(buffer.bytes, "DARR", &call.seq, sizeof(call.seq), arrays.data(), arrays.size());
+        return true;
+    }
+};
+
+
+void record_stream(ArgumentCapture& capture, unsigned arg)
+{
+    const auto copy = capture.memory(arg, capture.call.args[arg], sizeof(D3D12_PIPELINE_STATE_STREAM_DESC), 2);
+    if (copy.empty()) return;
+    D3D12_PIPELINE_STATE_STREAM_DESC desc;
+    std::memcpy(&desc, copy.data(), sizeof(desc));
+    const auto stream = capture.memory(arg | 0x200u, reinterpret_cast<u64>(desc.pPipelineStateSubobjectStream),
+                                       desc.SizeInBytes, 1);
+    for (std::size_t at = 0; stream.size() - at >= sizeof(UINT);) {
+        UINT type;
+        std::memcpy(&type, stream.data() + at, sizeof(type));
+        const auto bytes = desktop_stream_size(type);
+        if (!bytes || bytes > stream.size() - at) break;
+        if ((type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
+            D3D12_SHADER_BYTECODE blob;
+            std::memcpy(&blob, stream.data() + at + 8, sizeof(blob));
+            capture.memory(arg | (static_cast<std::uint32_t>(at / 8 + 2) << 8),
+                           reinterpret_cast<u64>(blob.pShaderBytecode), blob.BytecodeLength);
+        }
+        at += bytes;
+    }
+}
+
+// Device slots without a declared layout (pipeline descriptions of slots 57 and 67, command signatures, derived
+// pipelines, footprints, residency arrays): every pointer argument as a readable window, sized by the word after it
+// when that is a plausible size, the pointers in its first words one level further, and the wrapper it holds (OUTP).
+// The player needs that memory and the created objects. Device calls are rare, and the call budget bounds them.
+constexpr std::size_t generic_window_bytes = 0x100;
+constexpr std::size_t generic_scan_bytes = 0x400;
+constexpr u64 generic_hint_limit = 4u << 20;
+constexpr std::uint32_t generic_followed_args = 7;  // later words are mostly the caller's stack: a short look only
+
+void generic_memory(ArgumentCapture& capture, std::uint32_t arg, u64 address, u64 hint, unsigned depth)
+{
+    const std::size_t wanted = hint > generic_window_bytes && hint <= generic_hint_limit
+        ? static_cast<std::size_t>(hint) : generic_window_bytes;
+    const auto copy = capture.prefix(arg, address, wanted, depth);
+    if (!depth || copy.empty()) return;
+    const std::size_t scan = (std::min)(copy.size(), generic_scan_bytes) / 8;
+    for (std::size_t i = 0; i < scan; ++i) {
+        u64 value = 0, next = 0;
+        std::memcpy(&value, copy.data() + 8 * i, 8);
+        if (value < 0x10000 || value >= 0x7fffffffffffull || (value & 3)) continue;
+        if (i + 1 < scan) std::memcpy(&next, copy.data() + 8 * (i + 1), 8);
+        generic_memory(capture, (arg & 0xffu) | 0x100u * static_cast<std::uint32_t>(i + 1), value, next, depth - 1);
+    }
+}
+
+void record_generic(ArgumentCapture& capture)
+{
+    const Call& call = capture.call;
+    for (std::uint32_t i = 0; i < call_args; ++i) {
+        const u64 value = call.args[i];
+        if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
+        u64 held = 0;
+        if (readable_range(value, sizeof(held)) && copy_readable(value, &held, sizeof(held)) &&
+            as_wrapper(reinterpret_cast<const void*>(held))) {
+            struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{call.seq, i, 0, held};
+            append_chunk(capture.buffer.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
+        }
+        const bool followed = i < generic_followed_args;
+        generic_memory(capture, i, value, followed && i + 1 < generic_followed_args ? call.args[i + 1] : 0, followed ? 2 : 0);
+    }
+}
+
+void record_arguments(ArgumentCapture& capture)
+{
+    const Call& call = capture.call;
+    const auto& a = call.args;
+    if (const auto* layout = x2w_replay_slots::find(call.kind, call.slot); layout && layout->known_memory) {
+        for (unsigned i = 0; i < std::size(layout->memory); ++i) {
+            if (!layout->memory[i]) continue;
+            if (static_cast<int>(i) == layout->follow) record_stream(capture, i);
+            else if (static_cast<int>(i) == layout->wrapper_output) capture.output(i);
+            else capture.arg(i, layout->memory[i]);
+        }
+        return;
+    }
+    if (call.slot == 0) {
+        capture.create(0);  // QueryInterface
+        return;
+    }
+    switch (call.kind) {
+    case device_kind:
+        switch (call.slot) {
+        case 8: capture.arg(0, sizeof(D3D12_COMMAND_QUEUE_DESC)); capture.create(1); break;
+        case 9: capture.create(1); break;
+        case 12: capture.create(4); break;
+        case 14: capture.arg(0, sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + 2 * sizeof(u64)); capture.create(1); break;
+        case 16: capture.arg(1, a[2]); capture.create(3); break;
+        case 17: capture.arg(0, sizeof(D3D12_CONSTANT_BUFFER_VIEW_DESC)); break;
+        case 18: capture.arg(1, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)); break;
+        case 19: capture.arg(2, sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC)); break;
+        case 20: capture.arg(1, sizeof(D3D12_RENDER_TARGET_VIEW_DESC)); break;
+        case 21: capture.arg(1, sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC)); break;
+        case 22: capture.arg(0, sizeof(D3D12_SAMPLER_DESC)); break;
+        case 27:
+        case 76:
+        case 127:
+            capture.arg(0, sizeof(D3D12_HEAP_PROPERTIES));
+            [[fallthrough]];
+        case 29:
+            capture.arg(2, sizeof(D3D12_RESOURCE_DESC));
+            capture.arg(4, sizeof(D3D12_CLEAR_VALUE));
+            capture.create(call.slot == 127 ? 8 : 5);
+            break;
+        case 28: capture.arg(0, sizeof(D3D12_HEAP_DESC)); capture.create(1); break;
+        case 30:
+            capture.arg(0, sizeof(D3D12_RESOURCE_DESC));
+            capture.arg(2, sizeof(D3D12_CLEAR_VALUE));
+            capture.create(3);
+            break;
+        case 36: capture.create(2); break;
+        case 39: capture.arg(0, sizeof(D3D12_QUERY_HEAP_DESC)); capture.create(1); break;
+        case 15:  // descriptor increment size: no memory
+        case 23:  // CopyDescriptors: the exact DARR arrays only
+        case 24:  // CopyDescriptorsSimple: CPU handles, which the player translates
+            break;
+        default: record_generic(capture); break;
+        }
+        break;
+    case list_kind:
+        switch (call.slot) {
+        case 21: capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(D3D12_VIEWPORT)); break;
+        case 22: capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(D3D12_RECT)); break;
+        case 50:
+            capture.arg(1, (static_cast<BOOL>(a[2]) && static_cast<UINT>(a[0]) ? 1ull : static_cast<UINT>(a[0])) * sizeof(u64));
+            capture.arg(3, sizeof(u64));
+            break;
+        case 52:
+            capture.arg(1, 4 * sizeof(float));
+            capture.arg(3, static_cast<u64>(static_cast<UINT>(a[2])) * sizeof(D3D12_RECT));
+            break;
+        }
+        break;
+    case queue_kind:
+        if (call.slot == 10) capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
+        if (call.slot == 32) {
+            const auto stride = x2w_startup::present_plane_stride;
+            const auto planes = capture.memory(1, a[1], static_cast<u64>(static_cast<UINT>(a[0])) * stride, 1);
+            for (std::size_t at = 0; at < planes.size(); at += stride) {
+                u64 count, resources;
+                std::memcpy(&count, planes.data() + at + 8, 8);
+                std::memcpy(&resources, planes.data() + at + 16, 8);
+                if (count) capture.memory(1u | (static_cast<std::uint32_t>(at / 8 + 3) << 8), resources, sizeof(u64));
+            }
+        }
+        break;
+    case descriptor_heap_kind:
+        if ((call.slot == 9 || call.slot == 10) && as_wrapper(reinterpret_cast<const void*>(a[0])) &&
+            !as_wrapper(reinterpret_cast<const void*>(call.object))) capture.memory(rcx_arg, call.object, sizeof(u64));
+        break;
+    case resource_kind:
+        // Map(subresource, read range, out CPU address) and Unmap(subresource, written range): null ranges stay null.
+        if ((call.slot == 8 || call.slot == 9) && call.args[1]) capture.arg(1, sizeof(D3D12_RANGE));
+        if (call.slot == 8) capture.arg(2, sizeof(void*));  // Map's output CPU address
+        break;
+    }
+}
+
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
-void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], u64 ret)
+// HPLC describes the desktop heap used by a successful slot 133 placement.
+struct HeapPlacement {
+    u64 id, base, bytes, offset;
+};
+thread_local HeapPlacement* active_placement = nullptr;
+
+void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy, const HeapPlacement& placement)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
-    const Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object,
-                    {args[0], args[1], args[2], args[3], args[4], args[5], args[6]}, ret, seconds_now(), presents, 0};
+    if (!active.load(std::memory_order_relaxed)) {
+        ReleaseSRWLockExclusive(&b.lock);
+        return;
+    }
+    Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object, {}, ret,
+              seconds_now(), presents, 0};
+    std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
-    // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
-    // memory after the call is the returned value; ARGM argument 7.
-    if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, 7, object, 0, 0);
-    for (std::uint32_t i = 0; i < 7; ++i) {
-        const u64 value = args[i];
-        if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
-        if (x2w_local::readable(reinterpret_cast<const void*>(value), 8)) {
-            const u64 now = *reinterpret_cast<const u64*>(value);
-            if (as_wrapper(reinterpret_cast<const void*>(now))) {
-                struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{seq, i, 0, now};
-                append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
-            }
+    if (kind == device_kind && slot == 14 && SUCCEEDED(static_cast<HRESULT>(ret))) {
+        // Copied, never dereferenced: the recorder must not fault on title memory.
+        u64 created = 0, extra[2] = {};
+        const auto* heap = copy_readable(args[2], &created, sizeof(created)) ? as_wrapper(reinterpret_cast<const void*>(created)) : nullptr;
+        // The wrapper has already validated the extension against the heap's descriptor count and stride.
+        if (heap && heap->own().kind == descriptor_heap_kind && heap->own().title_cpu &&
+            copy_readable(args[0] + sizeof(D3D12_DESCRIPTOR_HEAP_DESC), extra, sizeof(extra)) &&
+            extra[0] == heap->own().title_cpu && extra[1]) {
+            const u64 backing[] = {seq, extra[0], extra[1]};
+            append_chunk(b.bytes, "DHPM", backing, sizeof(backing), nullptr, 0);
         }
-        const u64 next = i + 1 < 7 ? args[i + 1] : 0;
-        record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
+    }
+    ArgumentCapture capture{b, call};
+    const bool typed_arrays = descriptor_copy && capture.descriptor_arrays();
+    if (descriptor_copy && !typed_arrays) {
+        static LONG unrecorded;
+        if (InterlockedIncrement(&unrecorded) <= 8)
+            log("x2w-replay record: CopyDescriptors arrays of call %llu not recorded exactly (unreadable or over the size cap); "
+                "the replay will skip that copy", static_cast<unsigned long long>(seq));
+    }
+    if (placement.id && SUCCEEDED(static_cast<HRESULT>(ret))) {
+        const struct { u64 seq; HeapPlacement placement; } header{seq, placement};
+        append_chunk(b.bytes, "HPLC", &header, sizeof(header), nullptr, 0);
+        capture.arg(1, sizeof(D3D12_RESOURCE_DESC));
+        capture.arg(4, sizeof(GUID));
+        capture.output(5);
+    } else {
+        record_arguments(capture);
     }
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
@@ -224,6 +509,10 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
 }
 
 void stop(bool at_exit);
+bool extra_title_pages;  // set before installing the recording thunks
+void remember_heap_start(u64 object, u64 second);
+u64 pages_before_call(bool root, u64 address, bool submit);
+void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
 __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6,
@@ -231,15 +520,40 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
 {
     // Eleven arguments after rcx reach the real slot (D3D12's longest, UpdateTileMappings, has ten): stack words past
     // the caller's own arguments are read and passed on unused, which the x64 convention allows (the caller reserves
-    // the home area; a slot reads only what it declares). The first seven are recorded.
+    // the home area; a slot reads only what it declares). All eleven are recorded.
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
-    if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    // Nothing but the sequence number (an interlocked instruction) before the real call.
-    const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    if (!active.load(std::memory_order_relaxed) ||
+        (!window_open.load(std::memory_order_relaxed) && !(prefix_slot(K, N) && prefix_open.load(std::memory_order_relaxed))))
+        return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    // CopyDescriptors takes no float arguments, so its counted arrays are read from the call's own registers.
+    constexpr bool descriptor_copy = K == device_kind && N == 23;
+    // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
+    // ranges X2W_REPLAY_TITLE_RANGES, or a scan before each submit X2W_REPLAY_PAGES_AT_SUBMIT).
+    constexpr bool root = K == list_kind && N >= 41 && N <= 46;
+    constexpr bool submit = K == queue_kind && N == 10;
+    constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
+                                    (K == device_kind && (N == 23 || N == 24)) || submit;
+    u64 seq;
+    if constexpr (consumes_pages)
+        seq = (extra_title_pages || (submit && (scan_submit_pages || replay_dump_enabled()) && window_open)) ? pages_before_call(root, r8, submit)
+                                                                                   : static_cast<u64>(InterlockedIncrement64(&next_seq));
+    else
+        seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    if constexpr (K == device_kind && N == 17)
+        if (extra_title_pages) remember_cbv_pages(rdx);
+    HeapPlacement placement{};
+    HeapPlacement* previous = nullptr;
+    if constexpr (K == device_kind && N == 133) {
+        previous = active_placement;
+        active_placement = &placement;
+    }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    const u64 args[7] = {rdx, r8, r9, s0, s1, s2, s3};
-    record_call(K, N, seq, rcx, args, ret);
+    if constexpr (K == device_kind && N == 133) active_placement = previous;
+    const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
+    record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
+    if constexpr (K == descriptor_heap_kind && N == 9)
+        if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
     return ret;
 }
@@ -290,12 +604,6 @@ void flush_all(bool at_exit)
 // so a large cache cannot hold the exit up. file_lock held.
 void write_shader_cache(bool at_exit)
 {
-    // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
-    char shaders[8]{};
-    if (GetEnvironmentVariableA("X2W_REPLAY_SHADERS", shaders, sizeof(shaders)) && shaders[0] == '0') {
-        if (!at_exit) log("x2w-replay record: shader cache not written (X2W_REPLAY_SHADERS=0)");
-        return;
-    }
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH - 4) return;
@@ -339,10 +647,22 @@ void write_shader_cache(bool at_exit)
 }
 
 // Ends the recording: every buffer is written, then the end chunk with the totals. Called once.
+// Puts the title's slots back: after the recording ends no call goes through a thunk. A thread already inside one finds
+// active cleared and calls straight through.
+void unwrap_all()
+{
+    for (int k = 0; k < kind_count; ++k)
+        for (int i = 0; i < wide_slots; ++i)
+            if (original[k][i]) tables[k][i] = original[k][i];
+}
+
 void stop(bool at_exit)
 {
-    if (!armed || InterlockedExchange(&stopped, 1)) return;
+    if (!active.exchange(false)) return;
+    const bool in_prefix = prefix_open;  // for the log: tester_pack.py flags a prefix-only file by this line
     window_open = false;
+    prefix_open = false;
+    unwrap_all();
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
@@ -355,12 +675,12 @@ void stop(bool at_exit)
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
-    if (at_exit) return;
-    if (prefix_open)
+    if (!at_exit && in_prefix && cap_reached)
         log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
-            "%.1f s, %ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, seconds_now(), presents, max_bytes >> 20);
-    log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs, end.bytes,
-        presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
+            "%ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, presents, max_bytes >> 20);
+    if (!at_exit)
+        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
+            end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
@@ -368,8 +688,15 @@ void stop(bool at_exit)
 
 void present()
 {
-    if (!armed || stopped) return;
+    if (!active.load(std::memory_order_relaxed)) return;
+    ThreadBuffer& b = my_buffer();
+    AcquireSRWLockExclusive(&b.lock);
+    if (!active.load(std::memory_order_relaxed)) {
+        ReleaseSRWLockExclusive(&b.lock);
+        return;
+    }
     const LONG present = InterlockedIncrement(&presents);
+    if (present % memory_cache_presents == 0) memory_epoch.fetch_add(1, std::memory_order_relaxed);
     const bool was_open = window_open;
     if (slow_mode && end_s >= 1e300) {
         const double t = seconds_now(), gap = last_present_s < 0 ? 0 : t - last_present_s;
@@ -383,16 +710,27 @@ void present()
     }
     update_window();
     if (window_open || present == first_present) {
-        ThreadBuffer& b = my_buffer();
-        AcquireSRWLockExclusive(&b.lock);
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (window_open && !was_open) pages_at_window_open(b, seq, present);
-        else if (window_open) pages_at_present(b, seq, present);
+        if (!extra_title_pages) {
+            if (window_open && !was_open) pages_at_window_open(b, seq, present);
+            else if (window_open) pages_at_present(b, seq, present);
+        }
         ReleaseSRWLockExclusive(&b.lock);
     }
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
+    ReleaseSRWLockExclusive(&b.lock);
+}
+
+// A setting whose value names a file or folder on this machine (a drive path or a share) stays out of XENV: recordings
+// are mailed, and such paths carry the user's name. The player sets its own paths (and skips path settings anyway).
+bool local_path_setting(const wchar_t* entry)
+{
+    const wchar_t* value = std::wcschr(entry, L'=');
+    if (!value) return false;
+    ++value;
+    return std::wcsstr(value, L":\\") || std::wcsstr(value, L":/") || std::wcsncmp(value, L"\\\\", 2) == 0;
 }
 
 // X2W_REPLAY_RECORD: all | <start s>,<seconds> | f<first present>,<presents> | slow[,<after s>,<gap ms>,<seconds>,
@@ -463,13 +801,15 @@ void install()
         started.QuadPart -= static_cast<LONGLONG>(alive / 10000 * static_cast<u64>(frequency.QuadPart) / 1000);
     }
     std::vector<unsigned char> head;
-    struct { std::uint32_t version, call_bytes; u64 frequency; } header{2, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
+    struct { std::uint32_t version, call_bytes; u64 frequency; } header{3, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);
     // XENV: the process's X2W_ settings (name=value, NUL-separated), so a replay runs the stand-in as it ran here.
     if (wchar_t* block = GetEnvironmentStringsW()) {
         std::string settings;
         for (const wchar_t* entry = block; *entry; entry += std::wcslen(entry) + 1) {
-            if (std::wcsncmp(entry, L"X2W_", 4) != 0 || std::wcsncmp(entry, L"X2W_REPLAY_RECORD", 17) == 0) continue;
+            if (std::wcsncmp(entry, L"X2W_", 4) != 0 || std::wcsncmp(entry, L"X2W_REPLAY_RECORD", 17) == 0 ||
+                local_path_setting(entry))
+                continue;
             char narrow[2048];
             const int n = WideCharToMultiByte(CP_UTF8, 0, entry, -1, narrow, sizeof(narrow), nullptr, nullptr);
             if (n > 0) settings.append(narrow, static_cast<std::size_t>(n));  // n counts the NUL
@@ -478,9 +818,14 @@ void install()
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
     write_raw(head.data(), head.size());
-    armed = true;
+    scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
+    char ranges[8]{}, pages[8]{};
+    extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
+        !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
+    armed = true;
+    active.store(true);
     wrap_all(std::make_index_sequence<kind_count>{});
     log("x2w-replay record: on (%s) -> %s", value, path);
 }
@@ -492,4 +837,10 @@ void install()
 extern "C" __declspec(dllexport) void x2w_d3d12_replay_record_stop(int at_exit)
 {
     replay_record::stop(at_exit != 0);
+}
+
+// Recorder work completed, including calls whose chunks have been flushed.
+extern "C" __declspec(dllexport) u64 x2w_d3d12_replay_record_calls()
+{
+    return static_cast<u64>(InterlockedCompareExchange64(&replay_record::calls_written, 0, 0));
 }

@@ -8,11 +8,14 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
     writes the same picture names, every one equal to the recorded run's, every call played on an
     object it knows, and one "x2w-replay score" line;
   - a window in the middle (f6,6: frames 7-12) replays to the same pictures, every object known
-    (the state-making calls before the window are recorded too);
+    (the state-making calls before the window are recorded too). A prefix-only ranged descriptor copy
+    supplies the render target. Changing the last destination handle in the exact arrays (DARR) leaves the fallback clear visible;
+  - a target made through device slot 127 (ten argument words) replays equal (format 3 records eleven);
+  - opt-in player timing reports every recorded slot and accounts for at least 90% of playback wall time;
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
 
-usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware>
+usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware> [slot-layouts|null-views]
 """
 import json
 import os
@@ -28,7 +31,7 @@ from startup_stream_draw_check import pixel, vertex
 
 PRESENTS = 12
 LIST_KIND, CLEAR_SLOT = 4, 52
-CALL = struct.Struct("<QIHHQ7QQdii")
+CALL = struct.Struct("<QIHHQ11QQdii")
 
 
 def pixels(path):
@@ -76,7 +79,7 @@ def chunks(data):
         at += 16 + header_bytes + data_bytes
 
 
-def change_last_clear(source, target):
+def change_last_clear(source, target, clear_count=PRESENTS):
     """Copies the recording with the colour of the last ClearRenderTargetView changed (its blob's first float)."""
     data = bytearray(source.read_bytes())
     clears, argm, blobs = [], {}, {}
@@ -90,7 +93,7 @@ def change_last_clear(source, target):
             argm[(seq, arg)] = blob_hash
         elif tag == b"BLOB":
             blobs[struct.unpack_from("<Q", data, header)[0]] = payload
-    assert len(clears) == PRESENTS, clears
+    assert len(clears) == clear_count, clears
     at = blobs[argm[(clears[-1], 1)]]
     struct.pack_into("<f", data, at, 1.0 - struct.unpack_from("<f", data, at)[0])
     target.write_bytes(bytes(data))
@@ -101,22 +104,184 @@ def run(args, env):
     return result.returncode, result.stdout + result.stderr
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS):
+def check_timing(summary, recording, progress):
+    data = recording.read_bytes()
+    expected = {struct.unpack_from("<QIHH", data, header)[2:]
+                for tag, header, *_ in chunks(data) if tag == b"CALL"}
+    slots = summary["slot_times"]
+    keys = [(entry["kind"], entry["slot"]) for entry in slots]
+    assert len(keys) == len(expected) and set(keys) == expected, keys
+    assert all(entry["total_us"] >= 0 for entry in slots), slots
+    # Per-call cost needs the call count: every recorded call is counted once, under its own slot.
+    counts = {}
+    for tag, header, *_ in chunks(data):
+        if tag == b"CALL":
+            key = struct.unpack_from("<QIHH", data, header)[2:]
+            counts[key] = counts.get(key, 0) + 1
+    assert {(e["kind"], e["slot"]): e["calls"] for e in slots} == counts, (slots, counts)
+    slot_us = sum(entry["total_us"] for entry in slots)
+    wall_us = summary["wall_s"] * 1_000_000
+    assert wall_us > 0 and abs(slot_us - wall_us) <= 0.10 * wall_us, (slot_us, wall_us)
+
+    if slot_us >= 1_000_000:
+        assert progress, "no timing report after a second of playback"
+    calls = presents = 0
+    for line in progress:
+        _, _, calls_label, call_count, presents_label, present_count, top_label, *top = line.split()
+        assert (calls_label, presents_label, top_label) == ("calls", "presents", "top_us"), line
+        calls += int(call_count)
+        presents += int(present_count)
+        assert 1 <= len(top) <= 5, line
+        times = []
+        for entry in top:
+            key, duration = entry.split("=")
+            assert tuple(map(int, key.split(":"))) in expected, line
+            times.append(float(duration))
+        assert times == sorted(times, reverse=True) and all(t >= 0 for t in times), line
+    assert calls <= summary["played"] and presents <= summary["presents"], progress
+
+
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
+    if timing:
+        env["X2W_REPLAY_TIMING"] = "1"
     code, text = run([player, recording, out, "--adapter", backend], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
-        raise AssertionError("x2w_replay exit %d\n%s\n%s" % (code, text[-2000:], log))
+        raise AssertionError("x2w_replay exit %d on %s (%d bytes)\n%s\n%s" % (code, recording.name, recording.stat().st_size,
+                                                                        text[-2000:], log))
     score = [line for line in text.splitlines() if line.startswith("x2w-replay score ")]
     assert len(score) == 1, text
     summary = json.loads((out / "replay_summary.json").read_text())
     assert summary["unknown_object"] == 0 and summary["missing_blob"] == 0, summary
     assert summary["presents"] == presents and summary["fence_timeouts"] == 0, summary
+    progress = [line for line in text.splitlines() if line.startswith("x2w-replay timing ")]
+    if timing:
+        check_timing(summary, recording, progress)
+    else:
+        assert "slot_times" not in summary and not progress, (summary, progress)
     return score[0], pictures(out)
 
 
-def main(scene, player, backend):
+def check_slot_layouts(scene, player, backend, env, directory, vs, ps, root):
+    # The first wait is in the prefix. The list no-op enters the log only after the window opens.
+    frames = 3
+    recorded_dir = directory / "recorded"
+    recorded_dir.mkdir()
+    recording = directory / "slots.x2wr"
+    code, text = run([scene, vs, ps, root, backend, frames],
+                     dict(env, X2W_REPLAY_RECORD="f1,2", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_REPLAY_SLOT_LAYOUTS="1", X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = bytearray(recording.read_bytes())
+    calls, call_headers, memory, blobs = {}, {}, {}, {}
+    for tag, header, _hb, payload, size in chunks(data):
+        if tag == b"CALL":
+            call = CALL.unpack_from(data, header)
+            calls[call[0]] = call
+            call_headers[call[0]] = header
+        elif tag == b"ARGM":
+            seq, arg, depth, _address, length, blob_hash = struct.unpack_from("<QIIQQQ", data, header)
+            memory.setdefault(seq, []).append((arg, depth, length, blob_hash))
+        elif tag == b"BLOB":
+            blobs[struct.unpack_from("<Q", data, header)[0]] = (payload, size)
+
+    def sequences(kind, slot):
+        return sorted(seq for seq, call in calls.items() if call[2:4] == (kind, slot))
+
+    waits, barriers = sequences(0, 80), sequences(LIST_KIND, 146)
+    assert len(waits) == 3 and len(barriers) == 2, (waits, barriers)
+    assert all(not memory.get(seq) for seq in barriers), barriers
+    for expected, seq in enumerate(waits, 1):
+        [(arg, depth, length, blob_hash)] = memory[seq]
+        assert (arg, depth, length) == (4, 0, 8), memory[seq]
+        at, size = blobs[blob_hash]
+        assert size == 8 and struct.unpack_from("<Q", data, at)[0] == expected, seq
+
+    memory_views, uploads = sequences(0, 70), sequences(LIST_KIND, 148)
+    assert len(memory_views) == 3 and len(uploads) == 2, (memory_views, uploads)
+    assert all(not memory.get(seq) for seq in uploads), uploads
+    for seq in memory_views:
+        assert [(arg, depth, length) for arg, depth, length, _hash in memory[seq]] == [(0, 0, 56), (1, 0, 48)]
+
+    [list_create] = sequences(0, 73)
+    assert [(arg, length) for arg, _depth, length, _hash in memory[list_create]] == [(0, 16), (3, 16), (4, 8)]
+    pipeline_creates = sequences(0, 86)
+    assert len(pipeline_creates) == 2, pipeline_creates
+    for seq in pipeline_creates:
+        args = memory[seq]
+        assert [(arg, length) for arg, _depth, length, _hash in args if arg < 256] == [(0, 16), (1, 16), (2, 8)]
+        [stream_length] = [length for arg, depth, length, _hash in args if (arg, depth) == (512, 1)]
+        desc_at, _ = blobs[args[0][3]]
+        assert stream_length == struct.unpack_from("<Q", data, desc_at)[0], args
+
+    out = directory / "replayed"
+    _score, rendered = replay(player, recording, out, backend, env, presents=2)
+    recorded = pictures(recorded_dir)
+    assert sorted(rendered) == ["present_0001.png", "present_0002.png"]
+    for frame in (1, 2):
+        assert rendered["present_%04d.png" % frame] == recorded["present_%04d.png" % (frame + 1)], frame
+    summary = json.loads((out / "replay_summary.json").read_text())
+    assert summary["slot_layouts"] == {"frame_waits": 3, "barrier_noops": 2, "upload_ranges": 2, "result_mismatches": 0}, summary
+
+    # Mutate both expected results. The calls and rendered pixels should be unaffected.
+    struct.pack_into("<Q", data, at, 99)
+    ret_offset = CALL.size - struct.calcsize("<Qdii")
+    struct.pack_into("<Q", data, call_headers[barriers[-1]] + ret_offset, 1)
+    mutant = directory / "bad-results.x2wr"
+    mutant.write_bytes(data)
+    out = directory / "mutant"
+    clean_env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
+    code, text = run([player, mutant, out, "--adapter", backend], clean_env)
+    assert code == 6, text[-3000:]
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert f"WaitFrameEvent result mismatch at seq {waits[-1]}" in log, log[-3000:]
+    assert f"BarrierLikeNoop result mismatch at seq {barriers[-1]}" in log, log[-3000:]
+    assert pictures(out) == rendered
+    print("slot layouts: 3 matching waits including the prefix, 2 matching no-ops, 2 matching pictures, both mutations detected")
+    return 0
+
+
+def check_null_views(scene, player, backend, env, directory, vs, ps, root):
+    frames = 3
+    recorded_dir = directory / "recorded"
+    recorded_dir.mkdir()
+    recording = directory / "null_views.x2wr"
+    code, text = run([scene, vs, ps, root, backend, frames],
+                     dict(env, X2W_TEST_REPLAY_NULL_VIEWS="1", X2W_REPLAY_PAGES="0",
+                          X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = recording.read_bytes()
+    backing, calls = [], []
+    for tag, header, header_bytes, _payload, size in chunks(data):
+        if tag == b"DHPM":
+            assert header_bytes == 24 and size == 0
+            backing.append(struct.unpack_from("<QQQ", data, header))
+        elif tag == b"CALL":
+            calls.append(CALL.unpack_from(data, header))
+        assert tag not in (b"PAGE", b"MAP "), tag
+    [(seq, address, length)] = backing
+    [create] = [call for call in calls if call[0] == seq]
+    assert create[2:4] == (0, 14), create
+    null_rtv, render_rtv = sorted(call for call in calls if call[2:4] == (0, 20))
+    assert seq < null_rtv[0] < render_rtv[0] and null_rtv[5] == 0 and render_rtv[5] != 0
+    assert length > 0 and (null_rtv[7], render_rtv[7]) == (address, address + length // 2)
+    out = directory / "replayed"
+    _score, rendered = replay(player, recording, out, backend, env, presents=frames)
+    summary = json.loads((out / "replay_summary.json").read_text())
+    [reserved] = summary["ranges"]
+    base = int(reserved["address"], 16)
+    assert base <= address < address + length <= base + reserved["bytes"], reserved
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == frames and len(set(recorded.values())) > 1
+    assert recorded == rendered, "null_views replay differs from the recorded scene"
+    print("null_views: stack-backed RTV heap replayed with all three pictures equal")
+    return 0
+
+
+def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         cache = directory / "cache"
@@ -127,7 +292,8 @@ def main(scene, player, backend):
         env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
-        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES"):
+        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES", "X2W_REPLAY_SLOT_LAYOUTS",
+                     "X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", "X2W_TEST_REPLAY_NULL_VIEWS"):
             env.pop(name, None)
         code, text = run([scene, vs, ps, root, backend, 1], env)
         if code == 77 and backend == "hardware":
@@ -135,6 +301,11 @@ def main(scene, player, backend):
             return 77
         assert code == 0, text[-3000:]
         subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
+
+        if mode == "slot-layouts":
+            return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "null-views":
+            return check_null_views(scene, player, backend, env, directory, vs, ps, root)
 
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()
@@ -148,7 +319,7 @@ def main(scene, player, backend):
         assert sorted(recorded) == names, sorted(recorded)
         assert recorded[names[0]] != recorded[names[-1]], "the scene does not change between presents"
 
-        score, replayed = replay(player, recording, directory / "replayed", backend, env)
+        score, replayed = replay(player, recording, directory / "replayed", backend, env, timing=True)
         assert sorted(replayed) == names, sorted(replayed)
         differ = [n for n in names if replayed[n] != recorded[n]]
         assert not differ, "replayed pictures differ from the recorded run: %s\n%s\n%s" % (
@@ -168,6 +339,7 @@ def main(scene, player, backend):
         window_dir.mkdir()
         code, text = run([scene, vs, ps, root, backend, PRESENTS],
                          dict(env, X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(windowed),
+                              X2W_TEST_REPLAY_DESCRIPTOR_WINDOW="1",
                               X2W_PRESENT_PICTURES=str(window_dir)))
         assert code == 0, text[-3000:]
         whole = pictures(window_dir)
@@ -178,8 +350,51 @@ def main(scene, player, backend):
         assert not differ, "window replay differs from the recorded run at %s\n%s" % (
             differ, explain(whole[differ[0]], played["present_%04d.png" % (int(differ[0][8:12]) - 6)],
                             directory / "window_replayed" / "stderr.txt"))
+        data = windowed.read_bytes()
+        arrays, source_calls = [], []
+        control = bytearray()
+        for tag, header, _hb, payload, size in chunks(data):
+            if tag == b"DARR":
+                arrays.append((struct.unpack_from("<Q", data, header)[0], size))
+                # The control points the last destination handle at the one before it in the exact arrays: the replay runs the
+                # copy from them, so the descriptor the frames draw through is never written.
+                swapped = bytearray(data[payload:payload + size])
+                swapped[39 * 8:40 * 8] = swapped[38 * 8:39 * 8]
+                control.extend(data[header - 16:payload])
+                control.extend(swapped)
+                continue
+            if tag == b"CALL":
+                seq, _tid, kind, slot = struct.unpack_from("<QIHH", data, header)
+                if kind == 0 and slot in (20, 23):
+                    source_calls.append(seq)
+            control.extend(data[header - 16:payload + size])
+        assert len(arrays) == 1 and arrays[0][1] == 40 * 8 + 8 + 4, arrays
+        assert len(source_calls) == 41 and arrays[0][0] == source_calls[-1], (len(source_calls), arrays)
+        missing = directory / "window_without_snapshot.x2wr"
+        missing.write_bytes(control)
+        _score, without_snapshot = replay(player, missing, directory / "window_without_snapshot", backend, env, presents=6)
+        for a, b in pairs:
+            assert without_snapshot[a] != whole[b], "changing the exact descriptor arrays did not change " + b
+            (width, _height), pixels = without_snapshot[a]
+            last_pixel = 1 + 4 * (width - 1)
+            assert pixels[last_pixel:last_pixel + 4] == bytes((255, 255, 0, 255)), "fallback clear missing in " + a
+        # The target made through device slot 127 (ten arguments: its output is the tenth): replays equal too.
+        wide_dir, wide = directory / "wide_recorded", directory / "wide.x2wr"
+        wide_dir.mkdir()
+        code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                         dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(wide), X2W_PRESENT_PICTURES=str(wide_dir),
+                              X2W_TEST_REPLAY_CREATE127="1"))
+        assert code == 0, text[-3000:]
+        wide_recorded = pictures(wide_dir)
+        _score, wide_played = replay(player, wide, directory / "wide_replayed", backend, env)
+        differ = [n for n in names if wide_played.get(n) != wide_recorded[n]]
+        # A failure names the pictures and shows the first one's rows and the replay log, so a rare difference is diagnosable.
+        assert not differ, "slot-127 replay differs at %s\n%s" % (differ, explain(
+            wide_recorded[differ[0]], wide_played.get(differ[0], ((0, 0), b"")), directory / "wide_replayed" / "stderr.txt")
+            if differ else "")
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
-              "window f6,6 replays presents 7-12 equal; %s" % (PRESENTS, score))
+              "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
+              (PRESENTS, score))
     return 0
 
 

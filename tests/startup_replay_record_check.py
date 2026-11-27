@@ -22,7 +22,7 @@ from startup_stream_check import gfx2hlsl
 from startup_stream_draw_check import pixel, vertex
 
 DEVICE_KIND, LIST_KIND = 0, 4
-CALL = struct.Struct("<QIHHQ7QQdii")
+CALL = struct.Struct("<QIHHQ11QQdii")
 
 
 def chunks(data):
