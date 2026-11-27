@@ -1,4 +1,4 @@
-"""Translate and draw a pixel shader that takes a heap record byte offset in s8."""
+"""Translate and draw pixel shaders that take a heap record byte offset in s8: a raw buffer (x4) and an image view (x8)."""
 import struct
 import subprocess
 import sys
@@ -37,6 +37,48 @@ PS = bytes.fromhex(
     '000081bf')
 
 
+# s_load_dwordx8 of the 32-byte heap record at byte offset s8, then image_load of texel (0, 0) from that view.
+# (The words are assembled from the listing in the comments; the vertex stage and the root fixture are shared.)
+IMAGE_HEAD = ('80038bbe'          # s_mov_b32 s11, 0
+              '05040cf400000010'  # s_load_dwordx8 s[16:23], s[10:11], s8
+              '7fc08cbf')         # s_waitcnt lgkmcnt(0)
+IMAGE_LOAD = ('8002107e'          # v_mov_b32 v8, 0
+              '8002127e'          # v_mov_b32 v9, 0
+              '080f00f008040400'  # image_load v[4:7], v[8:9], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D
+              '703f8cbf')         # s_waitcnt vmcnt(0)
+IMAGE_TAIL = '0f1800f804050607' '000081bf'  # exp mrt0 v4, v5, v6, v7 done vm; s_endpgm
+IMAGE_PS = bytes.fromhex(IMAGE_HEAD + IMAGE_LOAD + IMAGE_TAIL)
+# The load comes first and a uniform branch on root constant s9 skips the view's use (the record is read in one arm).
+IMAGE_ARM_PS = bytes.fromhex(IMAGE_HEAD + '098006bf' '040085bf' + IMAGE_LOAD + IMAGE_TAIL)
+# The load sits in the skipped arm only, so after the join the record is not defined on every path.
+IMAGE_JOINED_PS = bytes.fromhex('80038bbe' '098006bf' '020085bf' '05040cf400000010' '7fc08cbf'
+                                + IMAGE_LOAD + IMAGE_TAIL)
+IMAGE_UNALIGNED_PS = bytes.fromhex('80038bbe' '05040cf410000010' '7fc08cbf' + IMAGE_LOAD + IMAGE_TAIL)  # offset:0x10
+# An s_buffer_load through the first four words of the image record (a record read as a buffer is refused).
+IMAGE_AS_BUFFER_PS = bytes.fromhex(IMAGE_HEAD + '480120f4000000fa' '7fc08cbf'  # s_buffer_load_dword s5, s[16:19], 0
+                                   '0502087e' '0f1800f804040404' '000081bf')  # v_mov_b32 v4, s5; exp mrt0 v4 x4; s_endpgm
+
+
+def translate_image():
+    pipe = G.Pipeline(VS_WORDS, IMAGE_PS, root_blob())
+    ps = pipe.hlsl_ps()
+    assert 'dynamic_heap\n' in pipe.manifest() and pipe.ps_profile() == 'ps_6_6'
+    assert 'Texture2D<float4> heap_tex_' in ps and 'ResourceDescriptorHeap[NonUniformResourceIndex(' in ps
+    assert '(ud1 + 0u) >> 5;' in ps and 'heap_count ?' in ps
+    arm = G.Pipeline(VS_WORDS, IMAGE_ARM_PS, root_blob()).hlsl_ps()
+    assert 'Texture2D<float4> heap_tex_' in arm
+    for code, fragment in ((IMAGE_JOINED_PS, 'joined at a branch target'),
+                           (IMAGE_UNALIGNED_PS, 'register offset through'),
+                           (IMAGE_AS_BUFFER_PS, 'eight intact words')):
+        try:
+            G.Pipeline(VS_WORDS, code, root_blob())
+        except G.Unsupported as reason:
+            assert fragment in str(reason), (fragment, str(reason))
+        else:
+            raise AssertionError('accepted, expected a refusal naming %r' % fragment)
+    return pipe, ps
+
+
 def translate():
     pipe = G.Pipeline(VS_WORDS, PS, root_blob())
     vs, ps = pipe.hlsl_vs(), pipe.hlsl_ps()
@@ -58,12 +100,15 @@ def mutate(source, old, new):
     return source.replace(old, new)
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False):
-    entry = [0] * count + [2]  # physical descriptor 2 is a poison view outside the logical heap
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, heap_count=2):
+    # Physical descriptor 2 is a poison view outside the buffer heap of the first cases (heap_count 2); the image cases
+    # open the whole five-slot heap.
+    entry = [0] * count + [heap_count]
     entry[1] = offset
     as_hex = lambda words: ','.join(f'{word:08x}' for word in words)
+    expected = reference if isinstance(reference, list) else [reference] * 4
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
-                             as_hex([reference] * 4)], capture_output=True, text=True)
+                             as_hex(expected)], capture_output=True, text=True)
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
@@ -89,10 +134,20 @@ def main(offscreen, dxc):
                                    mutate(ps_source, 'index >= heap_count', 'index > heap_count'))
         draw(offscreen, vs, unbounded, 64, 0, count, negative=True)
 
+        # Slots 3 and 4 hold 1x1 float textures: (1.25, 2.5, 4, 8) and (16, 32, 64, 128).
+        _, image_source = translate_image()
+        first, second = [0x3fa00000, 0x40200000, 0x40800000, 0x41000000], [0x41800000, 0x42000000, 0x42800000, 0x43000000]
+        image = compile_shader(dxc, directory, 'ps_6_6', image_source)
+        draw(offscreen, vs, image, 96, first, count, heap_count=5)
+        draw(offscreen, vs, image, 128, second, count, heap_count=5)
+        shifted = compile_shader(dxc, directory, 'ps_6_6', mutate(image_source, '(ud1 + 0u) >> 5;', '(ud1 + 32u) >> 5;'))
+        draw(offscreen, vs, shifted, 96, first, count, negative=True, heap_count=5)
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         translate()
+        translate_image()
     else:
         main(*sys.argv[1:])
     print('dynamic graphics heap: readback and controls matched' if len(sys.argv) > 1
