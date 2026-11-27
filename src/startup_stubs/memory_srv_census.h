@@ -171,7 +171,8 @@ public:
         AcquireSRWLockExclusive(&lock_);
         const bool changed = total_ != reported_;
         if (only_if_changed) reported_ = total_;  // a forced report leaves the periodic one alone
-        if (only_if_changed && !changed) {
+        // The opt-in diagnostics report names only what was counted: nothing counted, no line.
+        if ((only_if_changed && !changed) || (diagnostics && !total_)) {
             ReleaseSRWLockExclusive(&lock_);
             return false;
         }
