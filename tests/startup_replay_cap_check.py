@@ -87,7 +87,7 @@ def main(scene, backend):
         env.setdefault("X2W_D3D12_DEBUG", "0")
         for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_DIR", "X2W_REPLAY_MAX_MIB",
                      "X2W_PRESENT_PICTURES", "X2W_TEST_REPLAY_RECORDER", "X2W_TEST_INPUT_LAYOUT", "X2W_REPLAY_PAGES",
-                     "X2W_REPLAY_SHADERS", "X2W_REPLAY_PREFIX_MAX_MIB"):
+                     "X2W_REPLAY_SHADERS", "X2W_REPLAY_PREFIX_MAX_MIB", "X2W_TEST_REPLAY_FINISHER_STALL_MS"):
             env.pop(name, None)
         args = [scene, vs, ps, root, backend]
         code, text, _ = timed(args + [1], env)
@@ -206,6 +206,13 @@ def main(scene, backend):
         end_totals(tail)
         shaders = sum(tag == "SHDR" for tag, _, _ in chunks(tail.read_bytes()))
         print("replay finisher: XEND last, %d shader cache files in the file" % shaders)
+
+        stalled_tail = directory / "stalled_tail.x2wr"
+        code, text, _ = timed(args + [6], dict(env, X2W_SHADER_CACHE=str(big_cache), X2W_REPLAY_RECORD="f3,2",
+                                              X2W_REPLAY_RECORD_FILE=str(stalled_tail),
+                                              X2W_TEST_REPLAY_FINISHER_STALL_MS="200"))
+        assert code == 0, text[-3000:]
+        end_totals(stalled_tail)
 
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),

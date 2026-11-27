@@ -737,6 +737,10 @@ void write_shader_cache(bool at_exit)
         if (!at_exit) log("x2w-replay record: shader cache not written (X2W_REPLAY_SHADERS=0)");
         return;
     }
+    // X2W_TEST_REPLAY_FINISHER_STALL_MS=<ms>: pause after each SHDR chunk to exercise process exit during finalization.
+    char stall[16]{};
+    const DWORD stall_length = at_exit ? 0 : GetEnvironmentVariableA("X2W_TEST_REPLAY_FINISHER_STALL_MS", stall, sizeof(stall));
+    const DWORD stall_ms = stall_length && stall_length < sizeof(stall) ? std::strtoul(stall, nullptr, 10) : 0;
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH - 4) return;
@@ -774,6 +778,7 @@ void write_shader_cache(bool at_exit)
         whole_bytes = bytes_written;
         ++files;
         total += size;
+        if (stall_ms) Sleep(stall_ms);
     } while (FindNextFileW(find, &found));
     FindClose(find);
     if (!at_exit)
@@ -803,9 +808,10 @@ void write_end_and_close()
 
 // When a present ends the recording, the file's tail (shader cache, end chunk) is written by a finisher thread: a cache
 // of thousands of files takes minutes on a tester's disk and must not stall the title's presents. finished is set once
-// the file is closed; a later stop (a fixture, FreeLibrary) waits for it. At process exit the finisher has been
-// terminated with the other threads: the file then ends at its last whole chunk, with the end chunk after it.
+// the file is closed; a later stop (a fixture, FreeLibrary) waits for it. At process exit an interrupted recording
+// is cut back to its last whole chunk and closed with the end chunk.
 HANDLE finished = nullptr;
+HANDLE finisher_thread = nullptr;  // retained for process exit
 bool stopped_in_prefix;
 
 void close_cut_file();
@@ -813,7 +819,7 @@ void close_cut_file();
 void finish_file(bool at_exit)
 {
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) {
-        close_cut_file();  // a thread that is gone holds the lock: the file still ends with its XEND
+        close_cut_file();  // the writer may have exited while holding the file lock
         return;
     }
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
@@ -857,10 +863,13 @@ DWORD WINAPI finisher(void*)
     return 0;
 }
 
-// The process is ending and the thread that was writing the file is gone, maybe in the middle of a chunk: the file is cut
-// back to its last whole chunk and closed with its end chunk.
+// ExitProcess can interrupt the finisher mid-chunk. Its synchronous write can still complete, so wait for the thread
+// handle to signal before cutting the file or that write could overwrite XEND or extend the file past it.
 void close_cut_file()
 {
+    if (finisher_thread && GetThreadId(finisher_thread) != GetCurrentThreadId() &&
+        WaitForSingleObject(finisher_thread, 10000) == WAIT_TIMEOUT)
+        log("x2w-replay record: the finisher thread did not end within 10 s");
     if (file == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER at;
     at.QuadPart = static_cast<LONGLONG>(whole_bytes);
@@ -876,7 +885,7 @@ void wait_finisher(bool at_exit)
         WaitForSingleObject(finished, INFINITE);
         return;
     }
-    // The process is ending and its other threads are gone, the finisher with whatever lock it held.
+    // The finisher may still have pending I/O even though process exit has terminated it.
     close_cut_file();
 }
 
@@ -894,10 +903,8 @@ void stop(bool at_exit, bool from_present)
     if (from_present && !at_exit) {
         finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (finished) {
-            if (const HANDLE thread = CreateThread(nullptr, 0, finisher, nullptr, 0, nullptr)) {
-                CloseHandle(thread);
-                return;
-            }
+            finisher_thread = CreateThread(nullptr, 0, finisher, nullptr, 0, nullptr);
+            if (finisher_thread) return;
             CloseHandle(finished);
             finished = nullptr;
         }
