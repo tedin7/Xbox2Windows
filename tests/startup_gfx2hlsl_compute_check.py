@@ -1628,6 +1628,15 @@ def check_descriptor_scc():
     assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, SCC_LANE_SELECT).hlsl_cs()
 
 
+def legacy_lds_check(name, rsrc2=None, code=None, group=None):
+    # Keep the legacy proof's refusal controls separate from the general retry.
+    _, words, default_rsrc2, local, _ = CASES[name]
+    resource = default_rsrc2 if rsrc2 is None else rsrc2
+    G.check_lds_exchange(G.decode(G.strip_header(code or words)), group or local,
+                         ((resource >> 15) & 0x1ff) * 128)
+    return translate(name, rsrc2=rsrc2, code=code, group=group)
+
+
 def check_lds():
     # Actual instruction substitutions in the LLVM-assembled exchange. Keep the prefix, except where the
     # local-ID proof itself is under test; a different first refusal would hide the regression.
@@ -1660,11 +1669,11 @@ def check_lds():
         (store, '8003febe' + store, 'entry EXEC'),
         (store, '020084bf' + store, 'straight-line'),
     ):
-        refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
+        refused(reason, lambda: legacy_lds_check('F', code=patch(WORDS_F, old, new)))
     base = USER7 | TGID_X
     for units in (0, 65):
-        refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
-    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+        refused('allocation', lambda: legacy_lds_check('F', rsrc2=base | units << 15))
+    refused('1D group', lambda: legacy_lds_check('F', group=(32, 2, 1)))
     # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
     at_end = patch(WORDS_F, store, '000134d804050000')
     at_end = patch(at_end, peer, '0001d8d808000006')
@@ -1690,7 +1699,7 @@ def check_lds():
         (second, second + '800234d804040000', 'two'),                 # third fill
         (second, nop + second, 'bounded'),                            # address proof no longer adjacent
     ):
-        refused(reason, lambda: translate('F-two-fills', code=patch(WORDS_F2, old, new)))
+        refused(reason, lambda: legacy_lds_check('F-two-fills', code=patch(WORDS_F2, old, new)))
 
     pair = '0524dcd806000006'
     # The first result overwrites v6. Both loads must use the address saved before that write.
@@ -1705,7 +1714,7 @@ def check_lds():
         ('0505dcd806000006', 'distinct offsets'),
         ('0000dcd806000006', 'distinct offsets'),
     ):
-        refused(reason, lambda: translate('G', code=patch(WORDS_G, pair, other)))
+        refused(reason, lambda: legacy_lds_check('G', code=patch(WORDS_G, pair, other)))
     # The binary decoder only emits unsigned 8-bit offsets and consecutive pairs. Exercise
     # the proof's operand checks directly for inputs the instruction cannot encode.
     decoded = list(G.decode(WORDS_G))
