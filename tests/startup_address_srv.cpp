@@ -114,9 +114,15 @@ static void print_slot70_switch_census()
 {
     std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
     x2w_d3d12_census_report(report.data(), report.size());
-    const auto first = report.find("x2w-d3d12 memory SRV switches:");
-    if (first != std::string::npos)
-        std::puts(report.substr(first, report.find('\n', first) - first).c_str());
+    const std::string prefix = "x2w-d3d12 memory SRV ";
+    for (auto first = report.find(prefix); first != std::string::npos;) {
+        const auto end = report.find('\n', first);
+        const auto kind = first + prefix.size();
+        if (!report.compare(kind, 9, "switches:") || !report.compare(kind, 10, "diagnostic"))
+            std::puts(report.substr(first, end - first).c_str());
+        if (end == std::string::npos) break;
+        first = report.find(prefix, end + 1);
+    }
 }
 
 int draw_unregistered_1d_address_srv(void* guest, void* list)
@@ -125,12 +131,13 @@ int draw_unregistered_1d_address_srv(void* guest, void* list)
     if (!bind_view_table(guest, list, cpu)) return 44;
     const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
     const bool console_layout = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", nullptr, 0) != 0;
+    const bool srgb = console_layout || GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_SRGB", nullptr, 0) != 0;
     const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 7u, 1, 1, 1,
-        console_layout ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8_UNORM, {1, 0},
+        srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8_UNORM, {1, 0},
         console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(0x100) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_NONE};
-    // A single R8 footprint consists of one row starting at offset zero.
-    static std::array<unsigned char, 8> memory;
+    // The desktop footprint starts at offset zero. sRGB endpoints decode exactly.
+    static std::array<unsigned char, 8 * 4> memory;
     ViewAt view{};
     view.address = ptr(memory.data());
     view.view.Format = desc.Format;
@@ -145,8 +152,10 @@ int draw_unregistered_1d_address_srv(void* guest, void* list)
     const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
     invoke(list, 21, 1, ptr(&viewport));
     for (LONG phase = 0; phase < 2; ++phase) {
-        for (UINT x = 0; x < memory.size(); ++x)
-            memory[x] = static_cast<unsigned char>(11 + 19 * x + 73 * phase);
+        for (UINT x = 0; x < 8; ++x) {
+            if (srgb) memory[4 * x] = ((x + phase) % 3 == 1) ? 255 : 0;
+            else memory[x] = static_cast<unsigned char>(11 + 19 * x + 73 * phase);
+        }
         // Republish the same address after a title-side write, in the same frame.
         invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
         const D3D12_RECT rows{0, phase * 2, 8, phase * 2 + 2};
