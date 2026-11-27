@@ -39,3 +39,20 @@ output dwords retain the sentinel. Changing the record size or index-word
 address must change readback. A separate bounds mutant must read the poison
 descriptor immediately past the logical end. The WARP tests require Shader
 Model 6.6 and resource binding tier 3 and skip when either is unavailable.
+
+## Formatted loads
+
+Formatted dynamic buffer loads use the same raw views as ordinary heap loads.
+The snapshot places the record views first, a raw format-information view at
+index `heap_count`, then the translated descriptor tables. Each information
+entry contains the record stride and descriptor word 3. Missing or unsupported
+records have a zero word 3, so every selected component reads as zero.
+The translation reads FORMAT and DST_SEL from that word; see the AMD RDNA 2
+Instruction Set Architecture, sections 8.1.2, 8.1.5 and 8.1.8.
+
+Run the Python translation controls with
+`python3 -B tests/startup_gfx2hlsl_heap_format_check.py` and
+`python3 -B tests/startup_compute_heap_format_check.py`. On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_heap_format|compute_heap_format)_warp$' -V`
+for WARP readback through the offscreen and runtime dispatch fixtures. A capability
+skip is separate from a pass. The Python controls do not exercise the runtime or GPU.

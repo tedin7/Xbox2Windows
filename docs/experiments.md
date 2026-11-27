@@ -497,16 +497,19 @@ Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for th
 - `R32G32B32A32_FLOAT` mapped (w, 0, x, 1);
 - `R8G8B8A8_UNORM` mapped (z, 1, 0, w).
 
-An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
+These two tests run with `X2W_EXTENDED_BUFFER_FORMATS=0`, so an `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
 
 The runtime logs the DXGI
 format number and component mapping on the first view refusal per pipeline
-and SRV slot (`X2W_FORMATTED_BUFFER_DIAGNOSTICS=0` turns it off). Set `X2W_EXTENDED_BUFFER_FORMATS=1` in both the runtime and the
-translator to enable 25 additional formats for translated draws. The expanded
-graphics cache keys are scoped to that setting. The default uses the
-existing keys and shader source.
+and SRV slot (`X2W_FORMATTED_BUFFER_DIAGNOSTICS=0` turns it off). Translated
+draws decode 25 additional formats by default, among them `R32_UINT`; set
+`X2W_EXTENDED_BUFFER_FORMATS=0` in both the runtime and the translator to
+go back to the smaller table. Graphics and mesh cache keys hash the feature
+word `extended-buffer-formats1` after the revision when the table is on, so
+the two settings never share a cached translation.
 
-`startup_formatted_view_draw_extended_warp` compares the 25 added formats
+`startup_formatted_view_draw_extended_warp` runs without the switch (the
+default) and compares the 25 added formats
 against a CPU byte decode, with identity and swizzled mappings. It reads the
 words back from an integer colour target. It also checks the 16 MiB draw
 copy limit and reruns a signed byte with the adjacent unsigned FORMAT case

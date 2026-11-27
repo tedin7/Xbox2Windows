@@ -67,7 +67,7 @@ def check_plain_load_layouts(llvm_mc):
     runtime = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12_draw.inl'
     revision = re.search(rb'constexpr char revision\[\] = "([^"]+)";', runtime.read_bytes())
     assert revision, 'desktop startup cache revision missing'
-    runtime_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(revision[1]))))
+    runtime_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.shader_cache_seed(revision[1]))))
     assert key == runtime_key, 'offline and desktop startup cache revisions differ'
 
     # LLVM accepts [v0] as the same packed encoding and rejects a second address VGPR.

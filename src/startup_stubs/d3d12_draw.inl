@@ -168,6 +168,7 @@ struct Translation {
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     bool dynamic_heap = false;
+    bool dynamic_heap_formats = false;
     std::string placeholder_ps;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
@@ -538,11 +539,12 @@ bool extended_buffer_formats()
 {
     static const bool enabled = [] {
         const DWORD saved = GetLastError();
+        // Default on: typed buffer views such as R32_UINT decode in translated draws. Only "0" opts out.
         char value[2]{};
-        const bool on = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
-                        value[0] == '1';
+        const bool off = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
+                         value[0] == '0';
         SetLastError(saved);
-        return on;
+        return !off;
     }();
     return enabled;
 }
@@ -550,7 +552,7 @@ bool extended_buffer_formats()
 u64 shader_cache_seed(const char* revision, std::size_t bytes)
 {
     const u64 seed = fnv_bytes(revision, bytes);
-    // Keep graphics bytecode with extended cases out of the default request namespace.
+    // Translations with and without the extended cases (X2W_EXTENDED_BUFFER_FORMATS=0) never share a request key.
     constexpr char feature[] = "extended-buffer-formats1";
     return extended_buffer_formats() ? fnv_bytes(feature, sizeof(feature) - 1, seed) : seed;
 }
@@ -647,6 +649,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             tr.placeholder_ps = line.substr(15);
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
+        } else if (line == "dynamic_heap_formats") {
+            tr.dynamic_heap_formats = true;
         } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -723,7 +727,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
-    if ((!tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if ((tr.dynamic_heap_formats && !tr.dynamic_heap) || (!tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
     if (!tr.integer_srvs.valid(static_cast<UINT>(tr.srvs.size()), static_cast<UINT>(tr.uds.size()),
                               [&](UINT i) { return tr.srvs[i].kind != 0; })) return;
     const UINT twins = static_cast<UINT>(tr.integer_srvs.twins.size());
@@ -901,27 +905,27 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
-    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return 0;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return;  // VS at +0x48
+    if (words[9] || words[10]) return 0;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return;
+    if (!root || root_info(root) != bound_root) return 0;
     std::vector<unsigned char> root_blob;
     {
         note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return;
+    if (root_blob.empty()) return 0;
     std::vector<unsigned char> mesh, pixel;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
@@ -931,13 +935,13 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
     const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, seed)));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
-    if (written.count(key)) return;
+    if (written.count(key)) return key;
     const unsigned char none = 0;
     if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
@@ -948,6 +952,7 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
     }
+    return key;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -3143,18 +3148,21 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
 
 // Mirror the readable buffer records at their original indices. The translated tables follow those
 // records in the same shader-visible heap, since D3D12 binds only one CBV/SRV/UAV heap at a time.
+struct FormattedViewDetails;
+const char* formatted_buffer_word3(std::uint32_t*, std::uint32_t&, bool, FormattedViewDetails*);
+
 template <typename Writable>
 ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RESOURCE_STATES state,
-                                          Writable writable, UINT& count)
+                                          Writable writable, bool formats, UINT& count)
 {
     const auto source = pass_of(self).title_view_heap;
     constexpr UINT record_bytes = 32;
     const UINT entries = pass_of(self).title_view_heap_entries;
-    if (u64{entries} + tables > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2) return nullptr;
+    if (u64{entries} + 1 + tables > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2) return nullptr;
     count = entries;
     auto* device = device_of(self->own().list_device);
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        (std::max)(1u, count + tables), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        count + 1 + tables, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     x2w_upload::DescriptorSnapshot snapshot;
     if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&snapshot.heap)))) return nullptr;
     auto* heap = snapshot.heap.Get();
@@ -3162,6 +3170,10 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
     auto dest = heap->GetCPUDescriptorHandleForHeapStart();
     const bool readable_heap = x2w_local::readable(reinterpret_cast<const void*>(source.address),
                                                     std::size_t{count} * record_bytes);
+    u64 info_offset = 0;
+    ID3D12Resource* info_resource = nullptr;
+    auto* info = formats && count ? reserve_upload_ring(self, std::size_t{count} * 8, &info_offset, &info_resource) : nullptr;
+    if (formats && count && !info) return nullptr;
     try {
         std::unordered_set<ID3D12Resource*> retained, transitions;
         for (UINT i = 0; i < count; ++i, dest.ptr += stride) {
@@ -3174,12 +3186,27 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
                     view = indirect_table_buffer(self, words);
             }
             if (view.resource && writable(view.resource)) view = {};
+            if (info) {
+                std::uint32_t pair[2] = {view.resource ? view.stride : 0u, 0u};
+                if (view.resource) {
+                    std::uint32_t format = 0;
+                    const char* reason = (words[0] != view_token_magic && (words[1] & 0x80000000u))
+                        ? "swizzle enabled" : formatted_buffer_word3(words, format, extended_buffer_formats(), nullptr);
+                    if (!reason) pair[1] = words[3];
+                    else {
+                        static LONG zeroed_records = 0;
+                        if (first_calls(zeroed_records, 8)) log("x2w-heap format record %u zeroed: %s", i, reason);
+                    }
+                }
+                std::memcpy(info + std::size_t{i} * 8, pair, sizeof(pair));
+            }
             if (view.resource) {
                 if (retained.insert(view.resource).second) snapshot.resources.emplace_back(view.resource);
                 if (!view.upload) transitions.insert(view.resource);
             }
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
         }
+        buffer_view(dest, info_resource, info_offset, info_resource ? std::size_t{count} * 8 : 0);
         if (!retain_descriptor_snapshot(self, std::move(snapshot))) return nullptr;
         for (auto* resource : transitions) require_state(self, resource, state);
     } catch (const std::bad_alloc&) {
@@ -3819,7 +3846,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT views = srv_count + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
     ID3D12DescriptorHeap* view_heap = draw_heap;
-    UINT first = 0;
+    UINT first = 0, heap_count = 0;
     if (tr->dynamic_heap) {
         if (!indirect) {
             view_heap = snapshot_buffer_heap(self, views, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
@@ -3827,7 +3854,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
-                }, first);
+                }, tr->dynamic_heap_formats, heap_count);
+            first = heap_count + 1;
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();
@@ -4529,7 +4557,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
     if (!tr->uds.empty() || !tr->integer_srvs.twins.empty()) list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size() + tr->integer_srvs.twins.size()), values, 0);
-    if (tr->dynamic_heap) list->SetGraphicsRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size() + tr->integer_srvs.twins.size()));
+    if (tr->dynamic_heap) list->SetGraphicsRoot32BitConstant(0, heap_count, static_cast<UINT>(tr->uds.size() + tr->integer_srvs.twins.size()));
     if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
