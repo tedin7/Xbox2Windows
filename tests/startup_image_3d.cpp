@@ -70,7 +70,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
                             bool two_dimensional, UINT first_mip, UINT view_levels, bool cube)
 {
-    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional && !cube))
         throw std::runtime_error("Unsupported image mip level count");
     if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");

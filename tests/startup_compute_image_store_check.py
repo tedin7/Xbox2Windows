@@ -380,7 +380,9 @@ def dispatch_partial(directory, compiler, renderer, adapter, shape):
              (4 - mask.bit_count()) * 4 * fixture.GROUPS,
              f'mip=0 word={first_zero} expected=00000000 actual=3f800000'),
         )
-        if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+        # The 1D and 2D float fixtures also bind a separate SRV copy of the image: a third block of the same size.
+        payload = initial + expected + (initial if shape in ('1d', '2d') else [])
+        if draw_cases(directory, compiler, renderer, adapter, payload, cases,
                       selector=fixture.GROUPS | shape_flag, compared=len(initial)) == 77:
             return 77
     return 0

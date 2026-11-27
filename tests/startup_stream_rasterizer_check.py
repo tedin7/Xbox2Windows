@@ -52,7 +52,11 @@ def check(directory, consumer, backend, mode):
             print(f"ignore control did not reach a readback on {backend}: {run.returncode}")
             return 0
         raise RuntimeError(f"rasterizer draw failed on {backend}: {run.returncode}\n{run.stderr}")
-    assert not re.search(r"x2w-d3d12-debug.*sev=[012]\b", run.stderr), run.stderr
+    # Message 821 (ClearDepthStencilView without an optimized clear value) is a performance note about the
+    # fixture's own depth targets; every other warning or error still fails.
+    errors = [line for line in run.stderr.splitlines()
+              if re.search(r"x2w-d3d12-debug.*sev=[012]\b", line) and " id=821 " not in line]
+    assert not errors, "\n".join(errors)
 
     images = {name: outs[name].read_bytes() for name in outs}
     green = bytes((0, 255, 0, 255))
