@@ -379,6 +379,34 @@ void log_dispatch_phases()
     log("%s", line);
 }
 
+// With the title inputs switch (X2W_COMPUTE_TITLE_INPUTS): a heap index word whose table buffer is not in the list's upload
+// memory lives in title memory (Run T keys 9d3600be, 949873e7, 5f3ba0b1: a table buffer at a title address, no
+// upload range). It is read now, as the title's own input ranges are snapshotted at record time. Returns nullptr
+// when the word was read, else the reason it cannot be. A placed buffer a GPU copy of this list filled is
+// refused: its newer bytes are not in title memory. Nothing GPU-written by an earlier submission is seen, as for inputs.
+const char* read_title_index_word(Wrapper* self, u64 address, std::uint32_t* word)
+{
+    static LONG logged;
+    const auto placed = placed_buffer_range(self->own().list_device, address, 4);
+    if (placed.reject) return "a heap index word crosses the end of a placed buffer";
+    const char* kind = "plain title memory";
+    if (placed.owner) {
+        kind = placed.alias ? "a placed buffer that aliases title memory" : "a placed buffer";
+        if (!placed.alias) {
+            auto* const native = static_cast<ID3D12Resource*>(placed.owner->own().real);
+            const u64 offset = address - reinterpret_cast<u64>(placed.owner->own().title_memory);
+            if (native && list_copied_gpu_range(self, native, offset, 4, true))
+                return "a heap index word is in a placed buffer a GPU copy of this list wrote";
+        }
+    }
+    if (!x2w_local::readable(reinterpret_cast<const void*>(address), 4) ||
+        !x2w_local::guarded_memcpy(word, reinterpret_cast<const void*>(address), 4, true))
+        return "a heap index word is in title memory that is not readable";
+    if (first_calls(logged, 8))
+        log("x2w-draw compute heap index word %08x at %llx read from %s", *word, static_cast<unsigned long long>(address), kind);
+    return nullptr;
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -470,7 +498,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
                 index = 0;
             } else {
-                if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                const bool in_upload = words[0] != view_token_magic && list_upload_range(self, address + at, 4).resource;
+                if (!in_upload && (words[0] == view_token_magic || !compute_title_inputs_enabled())) {
                     reason = "a heap index word is not in the list's upload memory";
                     break;
                 }
@@ -478,7 +507,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "a heap index word is outside its table buffer";
                     break;
                 }
-                std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+                if (in_upload) std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+                else if (const char* why = read_title_index_word(self, address + at, &index)) {
+                    reason = why;
+                    break;
+                }
             }
         }
         if (slot.root_view) {
