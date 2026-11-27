@@ -911,6 +911,13 @@ def check_null_inputs():
     marked = stderr + "\nx2w-render placeholder total: draws 2\nx2w-render placeholder total: draws 7\n"
     assert T.null_inputs_section(marked) == section.replace(totals, totals + ", placeholder draws 7")
     assert "placeholder draws 1" in T.null_inputs_section("x2w-render placeholder total: draws 1")
+    targets = ("x2w-render placeholder target 1280x720 format 28: draws 3, keys 1\n"
+               "x2w-render placeholder target 1280x720 format 28: draws 9, keys 2\n"
+               "x2w-render placeholder target 8x8 format 28: draws 40, keys 1\n")
+    listed = T.null_inputs_section(targets).split("placeholder draws by render target\n")[1].splitlines()
+    assert listed[:2] == ["x2w-render placeholder target 8x8 format 28: draws 40, keys 1",
+                          "x2w-render placeholder target 1280x720 format 28: draws 9, keys 2"], listed
+    assert "placeholder draws by render target" not in section
     assert f"not drawn by pipeline\n{pipeline}\n{old_pipeline}, targets unknown\n" in section
     assert T.key_weights(stderr)[key] == 7
     assert not T.null_inputs_section("unrelated log")

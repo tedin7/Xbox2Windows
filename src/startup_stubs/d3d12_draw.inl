@@ -3262,9 +3262,20 @@ void note_target_draw(const Pass& pass, LONG frame, bool poisoned, ID3D12Resourc
     ReleaseSRWLockExclusive(&target_draw_census_lock);
 }
 
+struct PlaceholderTarget {
+    u64 width = 0;
+    unsigned height = 0;
+    int format = 0;
+    bool depth = false;
+    u64 draws = 0;
+    bool operator==(const PlaceholderTarget& o) const
+    {
+        return width == o.width && height == o.height && format == o.format && depth == o.depth;
+    }
+};
 struct PlaceholderDraws {
     u64 draws = 0;
-    std::vector<x2w_startup::TargetDrawCensus::Surface> targets;
+    std::vector<PlaceholderTarget> targets;  // draws per render target (size + format), depth buffer marked
 };
 SRWLOCK placeholder_draw_lock = SRWLOCK_INIT;
 
@@ -3276,19 +3287,31 @@ auto& placeholder_draws()
 
 void note_placeholder_draw(u64 key, const Pass& pass)
 {
+    // A draw counts once for each distinct target it writes, so two same-size colour targets do not double count.
+    std::vector<PlaceholderTarget> hit;
+    const auto note = [&](const x2w_startup::TargetDrawCensus::Surface& surface, bool depth) {
+        if (!surface.resource) return;
+        const PlaceholderTarget target{surface.width, surface.height, surface.format, depth, 1};
+        if (std::find(hit.begin(), hit.end(), target) == hit.end()) hit.push_back(target);
+    };
+    for (UINT i = 0; i < pass.target_count; ++i) note(pass.target_surfaces[i], false);
+    note(pass.depth_surface, true);
+
     AcquireSRWLockExclusive(&placeholder_draw_lock);
     auto& row = placeholder_draws()[key];
     ++row.draws;
-    const auto note = [&](const x2w_startup::TargetDrawCensus::Surface& surface) {
-        if (!surface.resource) return;
-        const auto same = [&](const x2w_startup::TargetDrawCensus::Surface& target) {
-            return target.width == surface.width && target.height == surface.height && target.format == surface.format;
-        };
-        if (std::none_of(row.targets.begin(), row.targets.end(), same)) row.targets.push_back(surface);
-    };
-    for (UINT i = 0; i < pass.target_count; ++i) note(pass.target_surfaces[i]);
-    note(pass.depth_surface);
+    for (const auto& target : hit) {
+        const auto at = std::find(row.targets.begin(), row.targets.end(), target);
+        if (at != row.targets.end()) ++at->draws;
+        else row.targets.push_back(target);
+    }
     ReleaseSRWLockExclusive(&placeholder_draw_lock);
+}
+
+inline std::string placeholder_target_text(const PlaceholderTarget& target)
+{
+    return std::to_string(target.width) + "x" + std::to_string(target.height) + " format " +
+           std::to_string(target.format) + (target.depth ? " depth" : "");
 }
 
 template<class Emit>
@@ -3304,6 +3327,26 @@ void report_placeholder_draws(Emit emit)
     for (const auto& item : keys) total += item.second.draws;
     const auto total_line = "x2w-render placeholder total: draws " + std::to_string(total);
     emit(total_line.c_str());
+
+    // Per render target over all keys: how many placeholder draws and how many pipeline keys hit it.
+    std::vector<std::pair<PlaceholderTarget, std::size_t>> by_target;  // target, key count
+    for (const auto& item : keys) {
+        for (const auto& target : item.second.targets) {
+            const auto at = std::find_if(by_target.begin(), by_target.end(), [&](const auto& row) { return row.first == target; });
+            if (at != by_target.end()) { at->first.draws += target.draws; ++at->second; }
+            else by_target.emplace_back(target, 1);
+        }
+    }
+    std::sort(by_target.begin(), by_target.end(), [](const auto& a, const auto& b) {
+        if (a.first.draws != b.first.draws) return a.first.draws > b.first.draws;
+        return placeholder_target_text(a.first) < placeholder_target_text(b.first);
+    });
+    for (std::size_t i = 0; i < by_target.size() && i < 20; ++i) {
+        const auto line = "x2w-render placeholder target " + placeholder_target_text(by_target[i].first) + ": draws " +
+                          std::to_string(by_target[i].first.draws) + ", keys " + std::to_string(by_target[i].second);
+        emit(line.c_str());
+    }
+
     const auto end = keys.begin() + (std::min)(keys.size(), std::size_t{20});
     std::partial_sort(keys.begin(), end, keys.end(), [](const auto& a, const auto& b) {
         if (a.second.draws != b.second.draws) return a.second.draws > b.second.draws;
@@ -3317,10 +3360,8 @@ void report_placeholder_draws(Emit emit)
         const auto& targets = it->second.targets;
         if (targets.empty()) line += "unknown";
         for (std::size_t i = 0; i < targets.size(); ++i) {
-            const auto& target = targets[i];
             if (i) line += ", ";
-            line += std::to_string(target.width) + "x" + std::to_string(target.height) +
-                    " format " + std::to_string(target.format);
+            line += placeholder_target_text(targets[i]) + " x" + std::to_string(targets[i].draws);
         }
         emit(line.c_str());
     }
