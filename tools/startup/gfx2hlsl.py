@@ -10864,7 +10864,7 @@ class Stage:
             self.set_vf(dst, text_f.format(*[self.u(o, low16_only=low16) for o in ops[1:1 + arity]]), mods)
             return None
         if base in VEC_U:
-            arity, text = VEC_U[base]
+            arity, text = self.vec_u_text(base)
             high = (False, False)
             if base == 'v_mad_u32_u16' and len(mods) == 1 and mods[0].startswith('op_sel:'):
                 # RDNA 2 VOP3 op_sel: bit i set takes the high halfword of source i for a 16-bit operand. S2 is a
@@ -10896,7 +10896,10 @@ class Stage:
                             raise Unsupported('operand %r' % src)
                         if not -0x80000000 <= val <= 0xffffffff:
                             raise Unsupported('%s source %s' % (base, src))
-            if base == 'v_and_b32':
+            if base == 'v_cvt_f16_f32' and ops[1].startswith(('|', '-|', '-v', '-s')):
+                args = [self.f(ops[1])]
+                text = text.replace('F({0})', '{0}')
+            elif base == 'v_and_b32':
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
@@ -11115,7 +11118,7 @@ class Stage:
         if base == 'v_mov_b32':
             arity, text, kind = 1, '{0}', 'u'
         elif base in VEC_U:
-            (arity, text), kind = VEC_U[base], 'u'
+            (arity, text), kind = self.vec_u_text(base), 'u'
         elif base in VEC_F and base not in ('v_fmac_f32', 'v_mac_f32'):
             (arity, text), kind = VEC_F[base], 'f'
         else:
@@ -11449,7 +11452,7 @@ class Stage:
         if float_result:
             arity, text = VEC_U_TO_F[base]
         elif base in VEC_U:
-            arity, text = VEC_U[base]
+            arity, text = self.vec_u_text(base)
         elif base == 'v_mov_b32':
             arity, text = 1, '{0}'
             # A lane mask is one bit per lane here, so a byte or word of it is not the hardware's field.
@@ -11475,7 +11478,19 @@ class Stage:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             low16 = selection in ('BYTE_0', 'BYTE_1', 'WORD_0') or (
                 selection == 'DWORD' and not sext and base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1'))
-            sources.append(sdwa_source(self.u(token, low16_only=low16), selection, sext))
+            if base == 'v_cvt_f16_f32' and not sext:
+                neg, operand = self.split_neg(token)
+                absolute = operand.startswith('|') and operand.endswith('|')
+                if absolute:
+                    operand = operand[1:-1]
+                source = sdwa_source(self.u(operand, low16_only=low16), selection, False)
+                if absolute:
+                    source = '(%s & 0x7fffffffu)' % source
+                if neg:
+                    source = '(%s ^ 0x80000000u)' % source
+                sources.append(source)
+            else:
+                sources.append(sdwa_source(self.u(token, low16_only=low16), selection, sext))
         result = text.format(*sources)
         if float_result:
             # Output modifiers scale and then clamp the float value; dst_sel writes its bit pattern.
@@ -16333,6 +16348,13 @@ class Stage:
             raise Unsupported('s_round_mode uses directed binary16/binary64 rounding other than toward zero')
         return 2 if value == 12 else 1
 
+    def vec_u_text(self, base):
+        arity, text = VEC_U[base]
+        if base == 'v_cvt_f16_f32' and (self.round_modes or {}).get(getattr(self, 'pc', None), 1) == 2:
+            self.pipe.uses_f16rz = True
+            text = 'f16rz(F({0}))'
+        return arity, text
+
     @staticmethod
     def check_half_round_mode(base, mode):
         narrow_name = re.sub(r'_(?:sdwa|dpp)$', '', base)
@@ -16345,7 +16367,8 @@ class Stage:
         if narrow_result:
             if mode == 3:
                 raise Unsupported('%s with mixed binary16/binary64 rounding modes' % base)
-            if base not in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+            if (base not in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16') and
+                    narrow_name not in ('v_cvt_f16_f32', 'v_interp_p2_f16')):
                 raise Unsupported('%s with binary16/binary64 rounding toward zero' % base)
 
     def round_mode_flow(self):
@@ -16859,11 +16882,16 @@ class Stage:
             raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' % (ops[3], ops[2]))
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
+        # RDNA 2 ISA guide p.190 does not specify internal interpolation precision;
+        # rounding the binary32 interpolant is the closest available model.
+        convert = 'f16rz' if (self.round_modes or {}).get(getattr(self, 'pc', None), 1) == 2 else 'f16rn'
+        if convert == 'f16rz':
+            self.pipe.uses_f16rz = True
         if INTERP_DST_HIGH in mods:
             # A low half still belonging to an omitted p1ll is tracked by interp_f16_scan.
-            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(i.%s) << 16)' % (d, field))
+            self.set_v(d, '(v%d & 0xffffu) | (%s(i.%s) << 16)' % (d, convert, field))
         else:
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field),
+            self.set_v(d, '(v%d & 0xffff0000u) | %s(i.%s)' % (d, convert, field),
                        low16_only=d in self.low16_only_v)
 
     def note_attr(self, tok, how):
@@ -18545,7 +18573,7 @@ VEC_U = {
     'v_max3_i32': (3, 'uint(max(max(int({0}), int({1})), int({2})))'),
     'v_med3_i32': (3, 'uint(max(min(int({0}), int({1})), min(max(int({0}), int({1})), int({2}))))'),
     'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
-    'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
+    'v_cvt_f16_f32': (1, 'f16rn(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_mad_i32_i24': (3, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8) + {2}'),
     'v_mad_u32_u16': (3, '({0} & 0xffffu) * ({1} & 0xffffu) + {2}'),
