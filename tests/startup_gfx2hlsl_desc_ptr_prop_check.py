@@ -284,9 +284,95 @@ def draw_descriptor_number(dxc, renderer, adapter):
                     assert result.returncode == 1 and 'actual=' + actual in result.stderr, result.stderr
 
 
+def descriptor_limits_pipeline(size_word=2, invert=False):
+    from startup_gfx2hlsl_sload_s104_check import TABLE_ROOT, vs_words
+    from startup_gfx2hlsl_scalar_null_check import POST_WORDS, smem, sop2, sopc, sopp, vop2
+    from startup_image_sample_a16_check import DIM_2D, encode_mimg
+
+    body = smem(3, 64, 8, imm=0x40) + sopp(0x0c)
+    # Two four-bit size-minus-one fields. Combine each with the low bit of a
+    # third word before applying the mip shift from another descriptor field.
+    body += sop2(0x0e, 46, 64 + size_word, 143)
+    body += sop2(0x20, 47, 64 + size_word, 132)
+    body += sop2(0x0e, 47, 47, 143)
+    body += sop2(0x0e, 48, 68, 129)
+    body += sop2(0x20, 49, 68, 132)
+    for limit in (46, 47):
+        body += sop2(0x00, limit, limit, 129)
+        body += sop2(0x2e, limit, limit, 48)
+        body += sop2(0x20, limit, limit, 49)
+        body += sop2(0x09, limit, limit, 129)
+        body += sop2(0x01, limit, limit, 129)
+    body += sopc(0x06, 64, 128)
+    selects = b''
+    for dst, limit in ((50, 46), (51, 47)):
+        yes, no = (limit, 193) if invert else (193, limit)
+        selects += sop2(0x0a, dst, yes, no)
+    # Both edges reach the vector code with assigned runtime scalars.
+    body += selects + sopp(0x05, len(selects) // 4) + selects
+    body += vop2(0x1b, 8, 255, 0) + struct.pack('<I', 0xffff)
+    body += vop2(0x16, 9, 144, 0)
+    for coord, limit in ((8, 50), (9, 51)):
+        body += vop2(0x1a, 10, 129, coord)
+        body += vop2(0x25, coord, 266, coord)
+        body += vop2(0x13, coord, limit, coord)
+    body += encode_mimg(0, dim=DIM_2D, vaddr=8, vdata=12, srsrc=64) + sopp(0x0c)
+    return G.Pipeline(vs_words([(0, 0, 0)] * 4), body + POST_WORDS, TABLE_ROOT,
+                      ps_hw_inputs=(0x8000, 0x8000))
+
+
+def check_descriptor_limits():
+    pipe = descriptor_limits_pipeline()
+    expected = {('descword', 0, addr) for addr in (0x40, 0x48, 0x50)}
+    assert {source for source in pipe.uds if source[0] == 'descword'} == expected, pipe.uds
+    assert pipe.manifest().startswith('x2w-manifest 3\n')
+    assert 'r0.Load(' in pipe.hlsl_ps()
+
+
+def draw_descriptor_limits(dxc, renderer, adapter):
+    from startup_image_3d_check import FULLSCREEN_VS, compile_hlsl
+    from startup_gfx2hlsl_bit_alu_check import words_text
+    import gpu_case_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_limits', 'vs_6_0', directory)
+        correct = descriptor_limits_pipeline()
+        wrong_word = descriptor_limits_pipeline(size_word=3)
+        inverted = descriptor_limits_pipeline(invert=True)
+        descriptor = (1, 0, 0x13, 0x11, 0x10, 0, 0, 0)
+        for label, pipe, bound, mismatch in (
+            ('bound', correct, True, None),
+            ('unbound', correct, False, None),
+            ('wrong_word', wrong_word, True, '(1,0)'),
+            ('inverted', inverted, True, '(2,0)'),
+        ):
+            ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), label, 'ps_6_0', directory)
+            values = [descriptor[(source[2] - 0x40) // 4] if bound and source[0] == 'descword' else 0
+                      for source in pipe.uds]
+            expected = []
+            for y in range(8):
+                for x in range(8):
+                    texel = 1 + min(3 * x, 3) + 4 * min(3 * y, 1) if bound else 0
+                    expected.extend((G.fbits(float(texel)), 0, 0, 0))
+            path = directory / (label + '.bin')
+            path.write_bytes(struct.pack('<256I', *expected))
+            result = gpu_case_runner.run(renderer, adapter, [
+                '--startup-descriptor-limits', vs, ps, path, words_text(values), str(int(bound)),
+            ])
+            if result.returncode == 77:
+                raise SystemExit(77)
+            if mismatch is None:
+                assert result.returncode == 0, (result.stdout, result.stderr)
+            else:
+                assert result.returncode == 1 and f'pixel {mismatch} mismatch' in result.stderr, result.stderr
+
+
 check_descriptor_number()
+check_descriptor_limits()
 if len(sys.argv) > 1:
     if len(sys.argv) != 5 or sys.argv[1] != 'draw':
         raise SystemExit(__doc__)
     draw_descriptor_number(*sys.argv[2:])
+    draw_descriptor_limits(*sys.argv[2:])
 print('startup_gfx2hlsl_desc_ptr_prop: ok')
