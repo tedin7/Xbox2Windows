@@ -414,8 +414,14 @@ int main(int argc, char** argv)
         return 2;
     char layouts[2]{};
     const bool slot_layouts = GetEnvironmentVariableA("X2W_REPLAY_SLOT_LAYOUTS", layouts, sizeof(layouts)) == 1 && layouts[0] == '1';
+    // X2W_TEST_REPLAY_PACED=1: a 100 ms frame interval (device slot 78) and, before every frame, the frame-event wait that
+    // paces to it (device slot 80: origin event, no timeout limit), as a title waits for its next frame.
+    const bool paced = GetEnvironmentVariableA("X2W_TEST_REPLAY_PACED", nullptr, 0) != 0;
+    if (paced) invoke(device, 78, 0, 100000, 3, 0);
     for (UINT frame = 0; frame < frames; ++frame) {
         if (frame == pause_frame) Sleep(pause_ms);
+        Word token = 0;
+        if (paced && (invoke(device, 80, 0, 0xFFFFFFFFu, 0, 0, arg(&token)) != S_OK || !token)) return 38;
         if (const int rc = draw_frame(scene, device, pso, frame, frames, slot_layouts)) return rc;
     }
     if (std::strcmp(recorder_case, "cap") == 0)
