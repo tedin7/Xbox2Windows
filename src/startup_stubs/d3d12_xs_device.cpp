@@ -293,9 +293,9 @@ struct DescriptorRange {
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
 
-// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
-// API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
-// the accepted maximum is measured once and cached rather than assumed.
+// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: Resource
+// Binding documents 1,000,000 on every tier (descriptor_heap_rules.h clamps to it before the first call),
+// but a driver may accept fewer, so the accepted maximum is measured once and cached rather than assumed.
 constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
@@ -5318,8 +5318,14 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
     void* mapped = self->own().title_memory;
     if (!mapped) {
         ID3D12Resource* real = materialize_lazy_texture(self);
+        // Map needs a CPU-visible heap (DirectX-Specs "Resource Heaps", Map and Unmap): a DEFAULT heap, or a CUSTOM
+        // heap with no CPU pages, answers E_INVALIDARG and a debug-layer error, so it is answered here without the call.
+        D3D12_HEAP_PROPERTIES heap{};
+        const bool cpu_hidden = real && SUCCEEDED(real->GetHeapProperties(&heap, nullptr)) &&
+            (heap.Type == D3D12_HEAP_TYPE_DEFAULT ||
+             (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
         AcquireSRWLockExclusive(&resource_map_lock);
-        hr = real ? real->Map(subresource, range, &mapped) : E_FAIL;
+        hr = !real ? E_FAIL : cpu_hidden ? E_INVALIDARG : real->Map(subresource, range, &mapped);
         if (SUCCEEDED(hr)) ++resource_maps[self][subresource];
         ReleaseSRWLockExclusive(&resource_map_lock);
     }
