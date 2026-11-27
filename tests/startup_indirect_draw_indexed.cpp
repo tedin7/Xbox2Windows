@@ -221,6 +221,14 @@ float4 null_census_pixel() : SV_Target {
                   (census_buffer.Load(0) & 255u) / 255.0, 1);
 }
 
+float4 empty_input_pixel() : SV_Target {
+    uint bytes;
+    census_buffer.GetDimensions(bytes);
+    bool nonzero = any(census_buffer.Load4(0)) || any(census_buffer.Load3(16));
+    return float4(translated_texture.Load(int3(0, 0, 0)).r,
+                  bytes == 28 ? 28.0 / 255.0 : 0, nonzero ? 1 : 0, 1);
+}
+
 float4 translated_vertex(uint id : SV_VertexID) : SV_Position {
     return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1);
 }
@@ -362,7 +370,10 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
     if (publish) {
         const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
         const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel", "null_census_pixel", "starvation_source_pixel"};
-        const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
+        const bool empty_input = sample == TableSample::null_census &&
+            GetEnvironmentVariableW(L"X2W_TEST_EMPTY_DRAW_INPUT", nullptr, 0);
+        const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" :
+                                empty_input ? "empty_input_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
         write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
         write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
         constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
@@ -2027,6 +2038,7 @@ int check_starved_target(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQu
 
 int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQueue* info)
 {
+    const bool empty_input = GetEnvironmentVariableW(L"X2W_TEST_EMPTY_DRAW_INPUT", nullptr, 0) != 0;
     const auto cache = std::filesystem::current_path() / ("null-census-" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directory(cache);
     check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set null fixture cache");
@@ -2151,8 +2163,8 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
         std::memcpy(reinterpret_cast<void*>(cpu + i * stride), valid ? token[i] : unknown, sizeof(unknown));
     };
     alignas(16) const std::uint32_t data[]{blue_channel, 5, 9, 23, 31};
-    const auto draw = [&](UINT64 address) {
-        const std::uint32_t descriptor[]{static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 1};
+    const auto draw = [&](UINT64 address, UINT records = 1) {
+        const std::uint32_t descriptor[]{static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), records};
         std::memcpy(reinterpret_cast<void*>(cpu + 2 * stride), descriptor, sizeof(descriptor));
         slot<void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT)>(wrapped.Get(), 12)(wrapped.Get(), 3, 1, 0, 0);
     };
@@ -2177,39 +2189,56 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
         captures.push_back(std::move(image));
     };
 
-    bind_target(0);
-    draw(reinterpret_cast<UINT64>(&data[0]));
-    capture(0, {red_channel, green_channel, blue_channel, 255});
-    texture_token(1, false);
-    draw(reinterpret_cast<UINT64>(&data[0]));
-    capture(0, {red_channel, 0, blue_channel, 255});
-    texture_token(1, true);
-    bind_target(1);
-    draw(16);  // A nonzero descriptor with an unreadable address.
-    capture(1, {red_channel, green_channel, 0, 255});
-    // A 2 KiB ring holds four 512-byte-rounded reservations. The first two
-    // draws use the same buffer snapshot. Three more distinct snapshots fill
-    // the ring on this recording before we try to copy the fifth.
-    for (UINT i = 1; i < 4; ++i) draw(reinterpret_cast<UINT64>(&data[i]));
-    clear(1, sentinel);
-    draw(reinterpret_cast<UINT64>(&data[4]));
-    capture(1, {255, 255, 255, 255});
-
     const auto report = [] {
         std::string text(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
         x2w_d3d12_census_report(text.data(), text.size());
         return text;
     };
-    const std::string base = report();
-    // A second token failure on the same pipeline but a different input makes
-    // omission of the input index observable even when the cause is retained.
-    texture_token(0, false);
-    draw(reinterpret_cast<UINT64>(&data[0]));
-    capture(1, {0, green_channel, blue_channel, 255});
-    const std::string both = report();
+    std::string base, both;
+    if (empty_input) {
+        alignas(16) const std::array<std::uint32_t, 7> zeros{};
+        const unsigned nonzero = std::any_of(zeros.begin(), zeros.end(), [](auto word) { return word != 0; }) ? 255 : 0;
+        const std::array<unsigned, 4> expected{red_channel, static_cast<unsigned>(sizeof(zeros)), nonzero, 255};
+        bind_target(0);
+        draw(reinterpret_cast<UINT64>(zeros.data()), static_cast<UINT>(zeros.size()));
+        capture(0, expected);
+        for (unsigned i = 0; i < 2; ++i) {
+            clear(0, sentinel);
+            draw(0, static_cast<UINT>(zeros.size()));
+            capture(0, expected);
+        }
+        std::printf("empty input key %016llx table slot 0 offset %u\n", static_cast<unsigned long long>(key), stride * 2);
+    } else {
+        bind_target(0);
+        draw(reinterpret_cast<UINT64>(&data[0]));
+        capture(0, {red_channel, green_channel, blue_channel, 255});
+        texture_token(1, false);
+        draw(reinterpret_cast<UINT64>(&data[0]));
+        capture(0, {red_channel, 0, blue_channel, 255});
+        texture_token(1, true);
+        bind_target(1);
+        draw(16);  // A nonzero descriptor with an unreadable address.
+        capture(1, {red_channel, green_channel, 0, 255});
+        // A 2 KiB ring holds four 512-byte-rounded reservations. The first two
+        // draws use the same buffer snapshot. Three more distinct snapshots fill
+        // the ring on this recording before we try to copy the fifth.
+        for (UINT i = 1; i < 4; ++i) draw(reinterpret_cast<UINT64>(&data[i]));
+        clear(1, sentinel);
+        draw(reinterpret_cast<UINT64>(&data[4]));
+        capture(1, {255, 255, 255, 255});
+
+        base = report();
+        // A second token failure on the same pipeline but a different input makes
+        // omission of the input index observable even when the cause is retained.
+        texture_token(0, false);
+        draw(reinterpret_cast<UINT64>(&data[0]));
+        capture(1, {0, green_channel, blue_channel, 255});
+        both = report();
+    }
 
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped.Get(), 9)(wrapped.Get()), "close null fixture recording");
     submit(device, native.Get());
+    unsigned legacy_size_mismatches = 0;
     for (std::size_t i = 0; i < captures.size(); ++i) {
         const auto& image = captures[i];
         const D3D12_RANGE range_read{0, static_cast<SIZE_T>(image.bytes)}, no_write{0, 0};
@@ -2217,6 +2246,7 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
         check(image.readback->Map(0, &range_read, &mapped), "map null fixture readback");
         const unsigned element = image.target ? 2 : 1;
         bool pixels_ok = true;
+        bool legacy_pixels = empty_input && i > 0;
         for (UINT y = 0; y < height; ++y) {
             const auto* row = static_cast<const unsigned char*>(mapped) + image.footprint.Footprint.RowPitch * y;
             for (UINT x = 0; x < width; ++x) {
@@ -2224,6 +2254,7 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
                     unsigned value = 0;
                     std::memcpy(&value, row + (x * 4 + channel) * element, element);
                     const unsigned expected = image.expected[channel] * (image.target ? 257 : 1);
+                    legacy_pixels &= value == (channel == 1 ? 0 : expected);
                     if (pixels_ok && value != expected) {
                         std::fprintf(stderr, "capture %zu pixel (%u,%u) channel %u: read %u, expected %u\n",
                                      i, x, y, channel, value, expected);
@@ -2233,6 +2264,10 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
             }
         }
         image.readback->Unmap(0, &no_write);
+        if (legacy_pixels) {
+            ++legacy_size_mismatches;
+            continue;
+        }
         if (!pixels_ok) {
             std::fprintf(stderr, "null fixture readback %zu differs from CPU reference\n%s", i, base.c_str());
             return 1;
@@ -2240,6 +2275,15 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
     }
     if (info && info->GetNumStoredMessages()) return 1;
     std::filesystem::remove_all(cache);
+    if (empty_input) {
+        if (legacy_size_mismatches == captures.size() - 1) {
+            std::fprintf(stderr, "empty input readback differs from CPU reference in buffer size\n");
+            return 4;
+        }
+        if (legacy_size_mismatches) return 1;
+        std::puts("empty input readbacks match CPU zero buffer");
+        return 0;
+    }
     char prefix[80];
     std::snprintf(prefix, sizeof(prefix), "x2w-render null input: key %016llx input ", static_cast<unsigned long long>(key));
     const auto contains = [](const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; };

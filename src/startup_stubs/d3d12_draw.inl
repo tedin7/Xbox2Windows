@@ -181,6 +181,7 @@ struct Translation {
     x2w_startup::ComPtr<ID3D12CommandSignature> indexed_signature;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
+    std::uint32_t logged_zero_inputs = 0;  // Under draw_lock, one bit per translated SRV.
     LONG logged_draws = 0, logged_bindings = 0, logged_constants = 0, constants_seen = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
@@ -3669,6 +3670,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     phases.to(2);
     UINT indexed_vertices = UINT_MAX;
     bool has_null_input = false;
+    static const bool zero_missing_buffer = x2w_local::env_on("X2W_DRAW_NULL_ZERO");
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
     std::uint32_t values[32] = {};
     for (UINT i = 0; i < n; ++i) {
@@ -3683,7 +3685,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = pass.vb[srv.a].SizeInBytes;
             strides[i] = pass.vb[srv.a].StrideInBytes;
             const u64 skip = u64{static_cast<UINT>(vertex_first)} * strides[i];
-            if (strides[i] && vertex_count && skip < bytes) {
+            if ((!zero_missing_buffer || address) && strides[i] && vertex_count && skip < bytes) {
                 const u64 wanted = u64{vertex_count} * strides[i];
                 address += skip;
                 bytes = static_cast<std::size_t>(wanted < bytes - skip ? wanted : bytes - skip);
@@ -3880,7 +3882,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
-        if (srv.source == 0 && words[0] == view_token_magic && entry) {
+        const bool buffer_token = srv.source == 0 && words[0] == view_token_magic && entry;
+        bool empty_buffer_token = false;
+        if (buffer_token) {
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
             ViewRecord record{};
@@ -3893,11 +3897,19 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 std::memcpy(&address, record.desc, 8);
                 std::memcpy(&size, record.desc + 8, 4);
                 bytes = size;
+                empty_buffer_token = !address;
             } else if (record.slot == 18 && record.desc_bytes >= 40) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC view;
                 std::memcpy(&view, record.desc, 40);
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
-                if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
+                if (zero_missing_buffer && !record.resource && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                    empty_buffer_token = true;
+                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                        : view.Format == DXGI_FORMAT_R32_TYPELESS ? 4 : x2w_startup::typed_buffer_format_bytes(view.Format);
+                    bytes = std::size_t{view.Buffer.NumElements} * element;
+                    strides[i] = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                        : view.Format == DXGI_FORMAT_R32_TYPELESS ? 0 : element;
+                } else if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
                     const bool typed_view = !view.Buffer.StructureByteStride && view.Format != DXGI_FORMAT_R32_TYPELESS;
                     const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
                                          : typed_view ? x2w_startup::typed_buffer_format_bytes(view.Format) : 4;
@@ -3914,6 +3926,47 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         const std::size_t requested_bytes = bytes;
+        // A buffer binding that ends up without a readable range counts as a null binding with its cause.
+        const auto count_buffer = [&](bool bound, const char* why) {
+            x2w_local::BindingFacts buffer_facts;
+            buffer_facts.from_table = srv.source == 0;
+            buffer_facts.entry_readable = entry_ok;
+            buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
+            buffer_facts.token_known = buffer_token_known;
+            buffer_facts.bound = bound;
+            note_null(x2w_local::classify_null_binding(buffer_facts), requested_bytes, why);
+            has_null_input |= !bound;
+        };
+        if (zero_missing_buffer && srv.kind == 0 && !address && (!buffer_token || empty_buffer_token) &&
+            !placed.owner && !placed.reject) {
+            // A completely empty slot declares no size. Use one DWORD for that case. Reads past the end of a
+            // buffer view return zero, so a declared size above 64 KiB is backed by only 64 KiB of zeros
+            // instead of a huge upload (a huge declared size must not turn the placeholder into a refusal).
+            constexpr std::size_t zero_cap_bytes = std::size_t{64} << 10;
+            const std::size_t sized = bytes <= zero_cap_bytes ? (bytes ? bytes : 4) : zero_cap_bytes;
+            const std::size_t padded = (sized + 3) & ~std::size_t{3};
+            auto zero = reserve_upload_ring(self, padded);
+            if (!zero.mapped && padded > upload_ring_max_bytes() / 4)
+                zero = reserve_large_upload(self, padded, big_binding_buffers);
+            const std::uint32_t bit = std::uint32_t{1} << i;
+            if (!(tr->logged_zero_inputs & bit)) {
+                tr->logged_zero_inputs |= bit;
+                const char* source = srv.source == 0 ? "table" : srv.source == 1 ? "vertex" : "root";
+                log("x2w-draw zero input: key %016llx input %u source %s slot %d offset %d declared %zu bound %zu",
+                    static_cast<unsigned long long>(tr->key), i, source, srv.a, srv.source == 0 ? srv.b : 0,
+                    requested_bytes, zero.mapped ? padded : 0);
+            }
+            if (!zero.mapped) {
+                note_null(padded ? x2w_local::NullCause::ring_full : x2w_local::NullCause::buffer_unreadable,
+                          requested_bytes, padded ? "zero buffer allocation failed" : "zero buffer exceeds raw SRV limit");
+                draw_lock_release_exclusive();
+                return not_drawn(pass, list, not_drawn_key, buffer_copy_failed_site);
+            }
+            std::memset(zero.mapped, 0, padded);
+            buffer_view(dest, zero.resource, zero.offset, padded);
+            count_buffer(false, "address missing; zero buffer bound");
+            continue;
+        }
         const bool mirror_candidate = address && !formatted.entry && srv.source != 2 &&
             bytes >= gpu_mirror_min_bytes && bytes <= gpu_mirror_budget &&
             gpu_mirror_enabled() && bigbind_once_enabled();
@@ -3931,17 +3984,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return not_drawn(pass, list, not_drawn_key, 12);
             }
         }
-        // A buffer binding that ends up without a readable range counts as a null binding with its cause.
-        const auto count_buffer = [&](bool bound, const char* why) {
-            x2w_local::BindingFacts buffer_facts;
-            buffer_facts.from_table = srv.source == 0;
-            buffer_facts.entry_readable = entry_ok;
-            buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
-            buffer_facts.token_known = buffer_token_known;
-            buffer_facts.bound = bound;
-            note_null(x2w_local::classify_null_binding(buffer_facts), requested_bytes, why);
-            has_null_input |= !bound;
-        };
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
             buffer_view(dest, nullptr, 0, 0);
             count_buffer(false, placed.reject ? "ambiguous or invalid placed range" : "placed resource released");
