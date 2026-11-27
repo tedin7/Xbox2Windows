@@ -604,6 +604,29 @@ int draw_formatted_view(void* guest, void* list)
     return 0;
 }
 
+// Bind two hardware records. The pixel fixture reads the second record's NUM_RECORDS.
+int draw_descriptor_count(void* guest, void* list)
+{
+    char spec[16]{};
+    if (!GetEnvironmentVariableA("X2W_TEST_DESCRIPTOR_COUNT", spec, sizeof(spec))) return 48;
+    unsigned count = 0;
+    char extra = 0;
+    if (std::sscanf(spec, "%u%c", &count, &extra) != 1 || !count || count > 16) return 48;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu, 2)) return 42;
+    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (stride != 32) return 42;
+    alignas(16) static const std::uint32_t buffer[16]{};
+    const Word address = ptr(buffer);
+    std::uint32_t words[4]{static_cast<std::uint32_t>(address),
+        static_cast<std::uint32_t>(address >> 32) | (4u << 16), 1u, (22u << 12) | 4u};
+    std::memcpy(reinterpret_cast<void*>(cpu), words, sizeof(words));
+    words[2] = count;
+    std::memcpy(reinterpret_cast<void*>(cpu + stride), words, sizeof(words));
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 int draw_copied_vertex_buffer_srv(void* guest, void* list)
 {
     constexpr UINT full_bytes = 512;
