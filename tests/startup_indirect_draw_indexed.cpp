@@ -3268,6 +3268,7 @@ int main(int argc, char** argv) try
     }
     return 0;
 }
-catch (const std::exception&) {
+catch (const std::exception& error) {
+    std::fprintf(stderr, "startup_indirect_draw_indexed: unexpected exception: %s\n", error.what());
     return 3;
 }

@@ -1544,7 +1544,7 @@ def draw_runtime(dxc, guest):
                     ps = 'yes' if has_pixel else 'none'
                     line = f'x2w-render indirect mesh refusals key={key:016x} ps={ps} {surface} calls=1'
                     expect('one refusal in the report window', run.stderr.splitlines().count(line), 1)
-    return int(FAILED)
+    return 1 if FAILED else 0
 
 
 def main(argv):
