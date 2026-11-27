@@ -612,7 +612,7 @@ def scan_decoded(*instructions):
 def monotone_exec_controls():
     masked = (
         's_mov_b64 s[20:21], exec',
-        's_and_saveexec_b64 s[24:25], vcc',
+        's_and_saveexec_b64 s[36:37], vcc',
         's_mov_b64 s[22:23], exec',
         's_mov_b64 exec, s[20:21]',
         'v_interp_p1ll_f16 v12, v0, attr0.x',
@@ -685,10 +685,10 @@ def cfg_exec_and_memory_controls():
     def arm(join_clobber='s_nop 0', arm_clobber='s_nop 0', replacement=overwrite):
         # s24 preserves the entry EXEC on both paths. The condition and direct jump
         # split the narrowed arm before p1ll. s20 may be clobbered on just one path.
-        return ('s_mov_b64 s[24:25], exec', 's_and_saveexec_b64 s[20:21], vcc',
+        return ('s_mov_b64 s[36:37], exec', 's_and_saveexec_b64 s[20:21], vcc',
                 's_cbranch_scc0 label_0010', join_clobber, 's_branch label_0018', 's_nop 0',
                 *pair, arm_clobber, 's_mov_b64 exec, s[20:21]', replacement,
-                's_mov_b64 exec, s[24:25]', read)
+                's_mov_b64 exec, s[36:37]', read)
 
     scan_decoded(*arm())
     refuses('saved EXEC overwritten in the arm', *arm(arm_clobber='s_load_dwordx2 s[20:21], s[8:9], 0'))
@@ -700,7 +700,7 @@ def cfg_exec_and_memory_controls():
     # A restore of an already equal mask preserves other equal copies, as in
     # the original straight-line proof.
     scan_decoded('s_mov_b64 s[20:21], exec', 's_mov_b64 s[22:23], exec', 's_mov_b64 exec, s[20:21]',
-                 *pair, 's_and_saveexec_b64 s[24:25], vcc', 's_mov_b64 exec, s[22:23]', overwrite,
+                 *pair, 's_and_saveexec_b64 s[36:37], vcc', 's_mov_b64 exec, s[22:23]', overwrite,
                  's_mov_b64 exec, s[20:21]', read)
 
     # The full shader path also decodes and lowers an if-arm with two branch
@@ -718,16 +718,16 @@ def cfg_exec_and_memory_controls():
     # Equality must disappear at saveexec, even though the previously equal
     # pair and the pair just saved both bound the narrowed EXEC.
     stage = G.Stage.__new__(G.Stage)
-    instructions = ('s_mov_b64 s[24:25], exec', 's_and_saveexec_b64 s[20:21], vcc')
+    instructions = ('s_mov_b64 s[36:37], exec', 's_and_saveexec_b64 s[20:21], vcc')
     effects = []
     for asm in instructions:
         name, ops, _ = G.parse(asm)
         effects.append(stage.interp_exec_effects(name, asm, ops, G.writes_exec(name, ops)))
     effects.append((set(), None, None, False, ()))
     facts = stage.interp_exec_entry_facts([[1], [2], []], effects, set())
-    assert facts[2] == (frozenset(), {frozenset({20, 21}), frozenset({24, 25})}), 'saveexec must clear EQ'
+    assert facts[2] == (frozenset(), {frozenset({20, 21}), frozenset({36, 37})}), 'saveexec must clear EQ'
 
-    masked = ('s_mov_b64 s[24:25], exec', *pair, 's_and_saveexec_b64 s[20:21], vcc', overwrite)
+    masked = ('s_mov_b64 s[36:37], exec', *pair, 's_and_saveexec_b64 s[20:21], vcc', overwrite)
     load = 'image_load v30, [v12, v13], s[32:39]'
     store = 'buffer_store_dword v12, v13, s[32:35], 0 offen'
     scan_decoded(*masked, load, store)
@@ -750,7 +750,7 @@ def cfg_exec_and_memory_controls():
             'ds_bpermute_b32 v30, v12, v13',
     ):
         refuses('cross-lane read must still fail: ' + quad_read, *masked, quad_read)
-    refuses('restored active lanes may read a stale address', *masked, 's_mov_b64 exec, s[24:25]', load)
+    refuses('restored active lanes may read a stale address', *masked, 's_mov_b64 exec, s[36:37]', load)
     print('EXEC CFG facts and masked memory controls passed')
 
 
@@ -817,9 +817,9 @@ def extended_flow_controls():
     refused('alpha can reach blending on R-only targets', half_exec_fixture(alpha_stale=True),
             'reads it after', vs_words=vertex, rtv_formats=(61,))
     refuses_read('overlapping scalar load left a stale EXEC identity',
-                 's_mov_b64 exec, s[20:21]', 's_mov_b64 s[24:25], exec', *pair,
+                 's_mov_b64 exec, s[20:21]', 's_mov_b64 s[36:37], exec', *pair,
                  's_load_dwordx4 s[18:21], s[8:9], 0', 's_mov_b64 exec, s[20:21]', 'v_mov_b32 v12, v20',
-                 's_mov_b64 exec, s[24:25]', use)
+                 's_mov_b64 exec, s[36:37]', use)
 
 
 def f32(x):
