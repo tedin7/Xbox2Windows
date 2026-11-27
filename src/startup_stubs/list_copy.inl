@@ -276,6 +276,12 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
+    if (red_producers().tracks_writers()) {
+        const x2w_red::Input source_view{from.resource};
+        const x2w_red::Input target_view{to.resource};
+        red_producers().writer(static_cast<ID3D12GraphicsCommandList*>(self->own().real),
+                               target_view, "copy-buffer", 0, &source_view, 1);
+    }
     if (mesh_xmem_tracking()) {
         D3D12_HEAP_TYPE source_heap;
         const bool upload = fixed_heap(from.resource, source_heap) && source_heap == D3D12_HEAP_TYPE_UPLOAD;
@@ -318,6 +324,12 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
+    if (red_producers().tracks_writers()) {
+        const x2w_red::Input source_view{from.resource};
+        const x2w_red::Input target_view{to.resource};
+        red_producers().writer(static_cast<ID3D12GraphicsCommandList*>(self->own().real),
+                               target_view, "copy", 0, &source_view, 1);
+    }
     retire_hold(self, to.wrapper);
     retire_hold(self, from.wrapper);
     if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -351,6 +363,14 @@ void __stdcall list_resolve_subresource(Wrapper* self, u64 destination, UINT des
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->ResolveSubresource(to.resource, destination_subresource, from.resource, source_subresource, plan.format);
+    if (red_producers().tracks_writers()) {
+        const x2w_red::Input source_view{from.resource, 0, plan.format,
+            source_subresource % from_desc.MipLevels, source_subresource / from_desc.MipLevels};
+        const x2w_red::Input target_view{to.resource, 0, plan.format,
+            destination_subresource % to_desc.MipLevels, destination_subresource / to_desc.MipLevels};
+        red_producers().writer(static_cast<ID3D12GraphicsCommandList*>(self->own().real),
+                               target_view, "resolve", 0, &source_view, 1);
+    }
     retire_hold(self, to.wrapper);  // the source is multisampled, so never a member of the retire class
     mark_gpu_written(self, to);
     InterlockedIncrement(&list_resolves);

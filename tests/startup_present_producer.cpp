@@ -1,13 +1,40 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <array>
+#include <cstdarg>
+#include <iterator>
+#include <memory>
+#include <type_traits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#include "startup_stubs/red_producer_tree.h"
+
+bool producer_errors(ID3D12Device* device)
+{
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> messages;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&messages)))) return false;
+    for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+        SIZE_T size = 0;
+        if (FAILED(messages->GetMessage(i, nullptr, &size))) return true;
+        std::vector<char> storage(size);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(messages->GetMessage(i, message, &size))) return true;
+        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+            std::fprintf(stderr, "D3D12 error %u: %s\n", message->ID, message->pDescription);
+            return true;
+        }
+    }
+    return false;
+}
+
+#include "startup_present_producer_tree.inl"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -56,6 +83,11 @@ int main(int argc, char** argv)
     if (FAILED(adapter->GetDesc1(&adapter_desc))) return 3;
     std::printf("adapter=%ls vendor=0x%x device=0x%x debug=%d\n", adapter_desc.Description, adapter_desc.VendorId,
                 adapter_desc.DeviceId, debug ? 1 : 0);
+    if (argc >= 2 && std::strncmp(argv[1], "tree-", 5) == 0) {
+        if (std::strcmp(argv[1], "tree-baseline") == 0)
+            return producer_tree_fixture::run<false>(adapter.Get(), argv[1]);
+        return producer_tree_fixture::run<true>(adapter.Get(), argv[1]);
+    }
     void *device = nullptr, *queue = nullptr, *heap = nullptr, *target = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     const std::array<unsigned char, 64> init{};
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), init.data(), __uuidof(ID3D12Device), &device))) return 4;
@@ -156,18 +188,5 @@ int main(int argc, char** argv)
         }
     }
     if (FAILED(desktop->GetDeviceRemovedReason())) return 12;
-    ComPtr<ID3D12InfoQueue> messages;
-    if (debug && SUCCEEDED(desktop.As(&messages))) {
-        for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
-            SIZE_T size = 0;
-            if (FAILED(messages->GetMessage(i, nullptr, &size))) return 13;
-            std::vector<char> storage(size);
-            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-            if (SUCCEEDED(messages->GetMessage(i, message, &size)) && message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
-                std::fprintf(stderr, "D3D12 error %u: %s\n", message->ID, message->pDescription);
-                return 13;
-            }
-        }
-    }
-    return 0;
+    return debug && producer_errors(desktop.Get()) ? 13 : 0;
 }

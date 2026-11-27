@@ -72,6 +72,7 @@
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/red_producer_tree.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
@@ -1080,6 +1081,8 @@ void retire_drop_heap_views(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
+void discard_red_producer(ID3D12GraphicsCommandList* list);
+void forget_red_producer(ID3D12Resource* resource);
 void release_upload_recording(Wrapper* list);
 void retire_discard_holds(Wrapper* list);
 void residency_discard_list(Wrapper* list);
@@ -1151,11 +1154,15 @@ ULONG __stdcall release(Wrapper* self)
                 linear_buffers().retire(static_cast<ID3D12Resource*>(self->own().real));
         }
         if (self->own().kind == list_kind && self->own().real) {
+            discard_red_producer(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
             release_upload_recording(self);
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
-        if (self->own().kind == resource_kind && retire_reasons_enabled()) retire_diag_note_release(self);
+        if (self->own().kind == resource_kind) {
+            forget_red_producer(static_cast<ID3D12Resource*>(self->own().real));
+            if (retire_reasons_enabled()) retire_diag_note_release(self);
+        }
         const bool lazy_retired = self->own().kind == resource_kind && self->own().lazy_slot133_texture &&
             retire_unmaterialized_lazy_texture(self);
         if (self->own().retire_when_idle && !lazy_retired) retire_resource(self);
@@ -1524,7 +1531,6 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 }
 
 LONG draw_dump_frame();
-void discard_red_producer(ID3D12GraphicsCommandList* list);
 x2w_startup::DrawReadbacks& draw_dumps()
 {
     static x2w_startup::DrawReadbacks tracker;
@@ -3121,6 +3127,7 @@ void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self
 #include "startup_stubs/red_producer_diagnostic.inl"
 
 void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
+void forget_red_producer(ID3D12Resource* resource) { red_producers().forget(resource); }
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
@@ -4033,6 +4040,7 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    red_producers().writer(list, {target, 0, format}, "clear-dsv", 0);
     const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
                                 rect_count, rect_count ? rects : nullptr);
@@ -4064,6 +4072,8 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
+    if (red_producers().tracks_writers())
+        red_producers().writer(list, {target, 0, view_format_of(desktop, target)}, "clear-rtv", 0);
     const auto red_sample = red_producers().before(self, list, target, "clear-rtv", 0, 0);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
@@ -4134,6 +4144,8 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
+    if (red_producers().tracks_writers())
+        red_producers().writer(list, {target, 0, view_format_of(desktop, target)}, "clear-uav", 0);
     InterlockedIncrement(&render_clears);
 }
 // List slot 55 (desktop 51 + 4), DiscardResource(resource, region). Discard is only a hint, so a resource
@@ -7760,9 +7772,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
+    // The baseline uses the first resource of plane 0, independent of compositing.
+    Wrapper* surface = nullptr;
+    const auto* words = static_cast<const u64*>(plane_parameters);
+    if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
+        surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
+    auto* producer_surface = surface && surface->own().kind == resource_kind
+        ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
-    frame_number = frame;
+    red_producers().end_frame(static_cast<ID3D12CommandQueue*>(self->own().real), producer_surface, frame);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
@@ -7789,15 +7808,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     ID3D12Resource* raw_surface = nullptr;
     unsigned raw_plane = 0;
     {
-        // The baseline: plane 0's first resource, captured, sampled and read back as before the planes
-        // were decoded, with or without X2W_PRESENT_COMPOSITE.
-        Wrapper* surface = nullptr;
-        const auto* words = static_cast<const u64*>(plane_parameters);
-        if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
-            surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
-        if (surface && surface->own().kind == resource_kind)
-            red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
+        if (producer_surface) red_producers().present(producer_surface);
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
         // by default, every plane with X2W_PRESENT_COMPOSITE=1. The compositor draws the steps in order.
         if (render_mode()) {
@@ -8360,6 +8372,7 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
         block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
+    (void)red_producers();  // Allocate the opt-in writer tables before any recording lock can be held.
     x2w_startup::attach_device(device, out);
     if (!*out) return E_OUTOFMEMORY;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
