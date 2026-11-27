@@ -4070,6 +4070,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_global_load_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_compute_global_load_image_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_global_load_check.py" image-dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_compute_global_load_image_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl v_cvt_off_f32_i4 (VOP1 0x0e and VOP3A 0x18e): signed 4-bit nibble conversion with output modifiers,
     # low16_only provenance, uniformity tracking, refusals, and WARP/hardware draws with mutated controls.
     add_test(NAME startup_gfx2hlsl_cvt_off_f32_i4_controls COMMAND "${INTAKE_PYTHON}" -B

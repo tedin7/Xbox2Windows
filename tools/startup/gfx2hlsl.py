@@ -9,6 +9,7 @@ import bisect
 from contextlib import suppress
 import functools
 import hashlib
+import heapq
 import os
 from pathlib import Path
 import re
@@ -1387,6 +1388,393 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+class ImageAccessRefusal(Unsupported):
+    """A proved program-image use that cannot be lowered."""
+
+
+class ImageAddress:
+    """Image-relative byte address, independent of the loaded PC's low word."""
+
+    def __init__(self, base, offsets=()):
+        self.base, self.offsets = base, offsets
+
+    def advance(self, constant, offset=None):
+        return ImageAddress(self.base + constant, self.offsets + ((offset,) if offset else ()))
+
+
+class ImageLoadProof:
+    """Follow forward compute edges and erase address words only at proved uses.
+
+    A low addition yields a pending pair and an identity for its carry. The
+    high addition must consume that exact carry and the original high word.
+    Captures retain bounded numeric offsets at their uses, even if the source
+    register is subsequently overwritten.
+    """
+
+    MASK = 0xffffffff
+    UNKNOWN = (0, MASK, 1)
+    MOVES = {'s_mov_b32', 's_mov_b64', 'v_mov_b32'}
+    LOW_ADDS = {'s_add_u32', 'v_add_co_u32'}
+    HIGH_ADDS = {'s_addc_u32', 'v_add_co_ci_u32'}
+
+    def __init__(self, image, thread_dimensions):
+        self.image = image
+        self.words, self.carries, self.definitions = {}, {}, {}
+        self.numbers = {'v%d' % i: (0, size - 1, 1) for i, size in enumerate(thread_dimensions)}
+        self.instructions, self.lowered, self.loads, self.captures = [], {}, {}, {}
+        self.erased, self.scalar_reads = {}, {}
+        self.reaching_definitions = {}
+
+    @staticmethod
+    def registers(op):
+        row = reg_range(op)
+        if row:
+            kind, first, last = row
+            limit = 105 if kind == 's' else 255
+            if first <= last <= limit:
+                return tuple('%s%d' % (kind, i) for i in range(first, last + 1))
+        return ()
+
+    @staticmethod
+    def mentions(ops):
+        return {reg for op in ops for word in re.findall(r'[sv](?:\[\d+:\d+\]|\d+\b)', op)
+                for reg in ImageLoadProof.registers(word)}
+
+    def refuse(self, reason, access=False):
+        error = ImageAccessRefusal if access else Unsupported
+        raise error('s_setpc_b64: %s at +0x%x' % (reason, self.pc))
+
+    @classmethod
+    def constant(cls, op):
+        value = pc_word(op)
+        return value & cls.MASK if value is not None else None
+
+    def number(self, op):
+        value = self.constant(op)
+        if value is None:
+            return self.numbers.get(op, self.UNKNOWN)
+        return value, value, (value & -value) or (1 << 32)
+
+    def exact(self, op):
+        low, high, _ = self.number(op)
+        return low if low == high else None
+
+    def mask_pair(self, op):
+        if op in ('vcc', 'vcc_lo'):
+            return {'vcc', 'vcc_hi'}
+        regs = self.registers(op)
+        if len(regs) == 1 and op.startswith('s'):
+            n = int(op[1:])
+            if n < 105 and n % 2 == 0:
+                return {op, 's%d' % (n + 1)}
+        return set()
+
+    def numeric_result(self, name, ops, mods):
+        if mods:
+            return self.UNKNOWN
+        if name in self.MOVES and len(ops) == 2:
+            return self.number(ops[1])
+        if len(ops) == 3 and name in ('v_and_b32', 's_and_b32'):
+            a, b = map(self.number, ops[1:])
+            if a[0] == a[1] and b[0] == b[1]:
+                value = a[0] & b[0]
+                return value, value, (value & -value) or (1 << 32)
+            return 0, min(a[1], b[1]), max(a[2], b[2])
+        if len(ops) == 3 and name in ('v_lshlrev_b32', 's_lshl_b32'):
+            src, shift = ops[1:] if name == 's_lshl_b32' else ops[1:][::-1]
+            count = self.exact(shift)
+            if count is not None:
+                count &= 31
+                low, high, align = self.number(src)
+                if low == high:
+                    value = (low << count) & self.MASK
+                    return value, value, (value & -value) or (1 << 32)
+                return 0, min(high << count, self.MASK), min(align << count, 1 << 32)
+        return self.UNKNOWN
+
+    def replace(self, dst, facts):
+        for reg, fact in zip(dst, facts):
+            self.numbers.pop(reg, None)
+            self.carries.pop(reg, None)
+            self.words.pop(reg, None)
+            if fact is not None:
+                self.words[reg] = fact
+
+    def capture(self, token):
+        _, limit, align = self.number(token)
+        key = 'image_offset_%x' % self.pc
+        self.captures[self.pc] = key, token
+        self.scalar_reads.setdefault(self.pc, set()).update(scalar_tokens(token))
+        return key, limit, align
+
+    def pair(self, token, *, load=False):
+        regs = self.registers(token)
+        if len(regs) == 2 and (regs[0].startswith('v') or pc_pair(token) is not None):
+            low, high = (self.words.get(reg) for reg in regs)
+            if low and high and low[1] == 0 and high[:2] == (low[0], 1):
+                return low[0].advance(high[2])
+        if load:
+            self.refuse('incomplete program image address (missing matching high-word carry)', access=True)
+        self.refuse('unknown or incomplete calculated jump target from %s' % token)
+
+    def add(self, name, ops, mods):
+        vector = name.startswith('v_')
+        high = name in self.HIGH_ADDS
+        if mods or len(ops) != (4 + high if vector else 3):
+            return False
+        dst = self.registers(ops[0])
+        sources = ops[2:4] if vector else ops[1:]
+        if len(dst) != 1 or dst[0][0] != ('v' if vector else 's'):
+            return False
+        address_sources = [op for op in sources if op in self.words]
+        if len(address_sources) != 1:
+            return False
+        src = address_sources[0]
+        other = sources[1] if src == sources[0] else sources[0]
+        carry_out = self.mask_pair(ops[1]) if vector else {'scc'}
+        if not carry_out:
+            return False
+        address, part, *correction = self.words[src]
+        constant = self.exact(other)
+        if high:
+            carry_in = self.mask_pair(ops[4]) if vector else {'scc'}
+            pending = self.carries.get(next(iter(carry_in), None))
+            if (part != 1 or pending is None or constant is None
+                    or any(self.carries.get(reg) is not pending for reg in carry_in)
+                    or pending[0] is not address
+                    or not (constant == 0 or (constant == self.MASK and pending[2]))):
+                self.refuse('missing matching high-word carry for program image address', access=True)
+            # A pending low can have aliases. Only the high result completes the
+            # new address; the matching low result is still usable unchanged.
+            # In the relative sum the real machine carry cancels the low
+            # word's wrap. A high immediate of -1 subtracts 2**32.
+            self.replace(dst, [(pending[1], 1, correction[0] - ((1 << 32) if constant else 0))])
+            pending = None  # carry out of the absolute high word is opaque
+        else:
+            if part != 0 or other in self.carries or (constant is None and len(self.registers(other)) != 1):
+                return False
+            # Constants may use a signed displacement (+0xffffffff in the
+            # high word) or zero extension. The high instruction selects it.
+            if constant is None:
+                result = address.advance(0, self.capture(other))
+            else:
+                result = address.advance(constant)
+            pending = (address, result, constant is not None)
+            self.replace(dst, [(result, 0)])
+        self.erased[self.pc] = set(dst) | carry_out
+        for reg in carry_out:
+            self.words.pop(reg, None)
+            self.numbers.pop(reg, None)
+            self.carries[reg] = pending
+        self.lowered[self.pc] = None
+        return True
+
+    def memory(self, name, ops, mods, raw):
+        if name.startswith(('flat_store_', 'global_store_', 'flat_atomic_', 'global_atomic_')):
+            address = ops[:1] if '_store_' in name or 'glc' not in mods else ops[1:2]
+            if name.startswith('global_'):
+                address += ops[-1:]
+            if any(self.words.keys() & set(self.registers(op)) for op in address):
+                self.refuse('store to the program image', access=True)
+            return False
+        if name not in ('global_load_dword', 'flat_load_dword'):
+            return False
+        space = name.split('_', 1)[0]
+        if len(ops) != (3 if space == 'global' else 2):
+            return False
+        address_op = ops[2] if space == 'global' and ops[2] != 'off' else ops[1]
+        if not self.words.keys() & set(self.registers(address_op)):
+            return False
+        dst = self.registers(ops[0])
+        if len(dst) != 1 or not ops[0].startswith('v'):
+            return False
+        word0, word1 = struct.unpack('<2I', raw)
+        if word0 & ((1 << 25) | (1 << 13)) or word1 & 0x0080ff00:
+            return False
+        if space == 'flat' and (word1 >> 16) & 0x7f != 0x7d:
+            return False
+        addr = self.pair(address_op, load=True)
+        if space == 'global' and ops[2] != 'off':
+            if len(self.registers(ops[1])) != 1 or ops[1] in self.words or ops[1] in self.carries:
+                return False
+            addr = addr.advance(0, self.capture(ops[1]))
+        for mod in mods:
+            if mod.startswith('offset:'):
+                addr = addr.advance(int(mod[7:]))
+            elif mod not in ('glc', 'slc', 'dlc'):
+                return False
+        self.loads[self.pc] = int(dst[0][1:]), addr
+        self.replace(dst, [None])
+        return True
+
+    def step(self, name, asm, raw):
+        _, ops, mods = parse(asm)
+        base = re.sub(r'_e(32|64)$', '', name)
+        refs = self.mentions(ops)
+        scalar_reads, scalar_writes, scalar_may = scalar_effects(name, asm)
+        # Relative register addressing, lane exchanges and EXEC changes can
+        # observe words outside the explicit, full-lane def/use chain.
+        if (writes_exec(name, ops) or scalar_may & EXEC_KEYS or 'movrel' in name
+                or name.startswith(('v_readlane', 'v_writelane', 'v_readfirstlane'))):
+            self.refuse('unsupported lane or register access in program image proof')
+        if name == 's_getpc_b64' and not mods and len(ops) == 1 and pc_pair(ops[0]) is not None:
+            addr = ImageAddress(self.pc + len(raw))
+            self.replace(self.registers(ops[0]), [(addr, 0), (addr, 1, 0)])
+            self.erased[self.pc] = set(self.registers(ops[0]))
+            self.lowered[self.pc] = None
+        elif name == 's_setpc_b64' and not mods and len(ops) == 1 and pc_pair(ops[0]) is not None:
+            addr = self.pair(ops[0])
+            if addr.offsets:
+                self.refuse('nonconstant calculated jump target')
+            self.lowered[self.pc] = addr.base
+            return (addr.base,)
+        elif (base in self.MOVES and not mods and len(ops) == 2
+              and self.words.keys() & set(self.registers(ops[1]))):
+            dst, src = map(self.registers, ops)
+            if (len(dst) != (2 if base == 's_mov_b64' else 1) or len(dst) != len(src)
+                    or dst[0][0] != base[0] or (base[0] == 's' and src[0][0] != 's')
+                    or (base == 's_mov_b64' and any(pc_pair(op) is None for op in ops))
+                    or not all(reg in self.words for reg in src)):
+                self.refuse('calculated PC word escapes into %s' % name)
+            self.replace(dst, [self.words[reg] for reg in src])
+            self.erased[self.pc] = set(dst)
+            self.lowered[self.pc] = None
+        elif (base in self.LOW_ADDS | self.HIGH_ADDS and refs & self.words.keys()
+              and self.add(base, ops, mods)):
+            pass
+        elif refs & self.words.keys() and self.memory(name, ops, mods, raw):
+            pass
+        else:
+            # Only exclude a register from reads when the instruction
+            # definitely overwrites it without reading its old value.
+            vector_write = (ops and name.startswith(('v_', 'flat_load_', 'global_load_', 'buffer_load_',
+                                                     'tbuffer_load_', 'image_load_'))
+                            and not name.startswith(('v_cmp', 'v_mac', 'v_fmac', 'v_swap')))
+            dst = tuple(r for r in self.registers(ops[0]) if r.startswith('v')) if vector_write else ()
+            vector_reads = self.mentions(ops[1:] if dst else ops)
+            # Packed/partial writes may preserve old destination bits.
+            if name.startswith('v_') and (mods or re.search(r'16|sdwa|dpp', name)):
+                vector_reads.update(dst)
+            touched = (scalar_reads | vector_reads) & (self.words.keys() | self.carries.keys())
+            if touched:
+                self.refuse('calculated PC word escapes into %s' % name)
+            if name.startswith(('s_swappc', 's_call', 's_rfe', 's_setpc', 's_trap', 's_return')):
+                self.refuse('unsupported control transfer in program image proof')
+            bound = self.numeric_result(base, ops, mods)
+            if not name.startswith('s_'):
+                # Non-ALU instructions can also write vector data. Forget
+                # their operands' numeric bounds when the access is ambiguous.
+                for reg in refs:
+                    if reg.startswith('v'):
+                        self.numbers.pop(reg, None)
+            elif name.startswith(('s_mov_', 's_movk_')):
+                scalar_may.discard('scc')
+            self.scalar_reads[self.pc] = scalar_reads
+            self.replace(dst + tuple(scalar_writes), [None] * (len(dst) + len(scalar_writes)))
+            for reg in scalar_may:
+                if reg.startswith('s') and reg[1:].isdigit():
+                    self.definitions[reg] = self.pc
+            for reg in scalar_may - scalar_writes:
+                self.numbers.pop(reg, None)
+                if self.carries.get(reg) is not None:
+                    self.carries[reg] = None
+            if bound != self.UNKNOWN and ops:
+                regs = self.registers(ops[0])
+                if len(regs) == 1 and (regs[0] in dst or regs[0] in scalar_writes):
+                    self.numbers[regs[0]] = bound
+            if name == 's_branch':
+                return (int(ops[0].split('_')[1], 16),)
+            if name.startswith('s_cbranch_'):
+                if name not in ('s_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_vccz', 's_cbranch_vccnz',
+                                's_cbranch_execz', 's_cbranch_execnz'):
+                    self.refuse('unsupported conditional transfer in program image proof')
+                return (self.pc + len(raw), int(ops[0].split('_')[1], 16))
+        for reg in self.erased.get(self.pc, ()):
+            if reg.startswith('s') and reg[1:].isdigit():
+                self.definitions[reg] = None
+        return (self.pc + len(raw),)
+
+    def state(self):
+        return self.words.copy(), self.carries.copy(), self.numbers.copy(), self.definitions.copy()
+
+    def merge(self, target, states):
+        words, carries, numbers, definitions = states[0]
+        for ws, cs, ns, ds in states[1:]:
+            if words != ws or carries != cs:
+                self.refuse('ambiguous calculated PC words or carry at +0x%x' % target)
+            numbers = {reg: bound for reg, bound in numbers.items() if ns.get(reg) == bound}
+            definitions = {reg: definitions.get(reg, -1) if definitions.get(reg, -1) == ds.get(reg, -1) else None
+                           for reg in definitions.keys() | ds.keys()}
+        self.words, self.carries, self.numbers, self.definitions = words, carries, numbers, definitions
+
+    def prove(self):
+        pending, incoming, end = [0], {0: [self.state()]}, 0
+        next_boundary = 0
+        while pending:
+            off = self.pc = heapq.heappop(pending)
+            self.merge(off, incoming.pop(off))
+            self.reaching_definitions[off] = self.definitions.copy()
+            # Decode skipped bytes only up to the next target, to prevent a
+            # branch into a literal or the second word of an instruction.
+            while next_boundary < off:
+                next_boundary += D.decode_instruction(self.image, next_boundary)[0]
+            if next_boundary != off:
+                self.refuse('target in the interior of a program image instruction')
+            if off + 4 > len(self.image):
+                self.refuse('missing program image instruction')
+            size, name, asm, _ = D.decode_instruction(self.image, off)
+            if off + size > len(self.image):
+                self.refuse('truncated program image instruction')
+            asm = check_encoding(self.image, off, size, name, asm)
+            self.instructions.append((off, size, name, asm))
+            next_boundary = off + size
+            end = max(end, next_boundary)
+            if name == 's_endpgm':
+                continue
+            for target in self.step(name, asm, self.image[off:next_boundary]):
+                if not next_boundary <= target < len(self.image) or target % 4:
+                    self.refuse('invalid forward target in program image proof')
+                if target not in incoming:
+                    incoming[target] = []
+                    heapq.heappush(pending, target)
+                incoming[target].append(self.state())
+
+        # Stage's scalar resource/constant registry is also populated in
+        # listing order. An erased write must not hide a binding on a bypass.
+        erased_sgprs = {reg for erased in self.erased.values() for reg in erased
+                        if reg.startswith('s') and reg[1:].isdigit()}
+        linear = {}
+        for off, _, name, asm in self.instructions:
+            for reg in self.scalar_reads.get(off, set()) & erased_sgprs:
+                definition = self.reaching_definitions[off].get(reg, -1)
+                if definition is None or definition != linear.get(reg, -1):
+                    self.pc = off
+                    self.refuse('elided PC register %s has no matching ordinary definition' % reg)
+            if off in self.lowered:
+                linear.update(dict.fromkeys(self.erased.get(off, ())))
+            elif off not in self.loads:
+                linear.update((reg, off) for reg in scalar_effects(name, asm)[2] & erased_sgprs)
+
+        if not self.loads:
+            self.refuse('no load from the program image')
+        tables = {}
+        for pc, (_, address) in self.loads.items():
+            self.pc = pc
+            base, offsets = address.base, address.offsets
+            limit = sum(bound - bound % align for _, bound, align in offsets)
+            if any(bound == self.MASK for _, bound, _ in offsets):
+                self.refuse('load from the program image with an unbounded offset', access=True)
+            if base < end and base + limit + 4 > 0:
+                self.refuse('load from the program image overlaps executed code', access=True)
+            if base < 0 or limit > self.MASK or base + limit + 4 > len(self.image):
+                self.refuse('load from the program image outside the image', access=True)
+            if base % 4 or any(align < 4 for _, _, align in offsets):
+                self.refuse('unaligned load from the program image', access=True)
+            size = limit + 4
+            tables[pc] = tuple(v for v, in struct.iter_unpack('<I', self.image[base:base + size]))
+        return tables
+
+
 def _lds_single(tok):
     """Single hardware VGPR vN (v0..v255) for bounded LDS exchange validation."""
     m = re.fullmatch(r'v(\d+)', tok)
@@ -2432,10 +2820,15 @@ class Stage:
         self.pipe, self.kind = pipe, kind
         self.refusals = refusals
         self.raw_code = strip_header(code)
-        if refusals is None:
-            self.ins = decode(self.raw_code)
-        else:
-            self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
+        self.image_proof = None
+        self.image_tables = {}
+        if kind == 'cs' and decoded is None:
+            self.try_image_loads()
+        if self.image_proof is None:
+            if refusals is None:
+                self.ins = decode(self.raw_code)
+            else:
+                self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
@@ -3727,6 +4120,37 @@ class Stage:
         sites = getattr(self, 'entry_exec_proof', None)
         return self.exec_known if sites is None else self.pc in sites
 
+    def try_image_loads(self):
+        # The established translation wins even if the bytes also happen to
+        # admit an image interpretation. Only GETPC programs need this retry.
+        code = self.raw_code
+        aligned = code[:len(code) & ~3]
+        if not any(word & 0xff80ffff == 0xbe801f00 for word, in struct.iter_unpack('<I', aligned)):
+            return
+        if not any(word & 0xfc000000 == 0xdc000000 for word, in struct.iter_unpack('<I', aligned)):
+            return
+        try:
+            ins = decode(code)
+            calculated_pc_proof(ins, 'cs')
+            if any(name == 's_setpc_b64' for _, _, name, _ in ins):
+                return
+        except Unsupported:
+            pass
+        proof = ImageLoadProof(code, self.pipe.group[:self.pipe.entry[2]])
+        try:
+            tables = proof.prove()
+        except ImageAccessRefusal as reason:
+            if self.refusals is None:
+                raise
+            self.refusals.append((str(reason), self.kind))
+            return
+        except Unsupported:
+            return
+        # If the legacy proof refused a different effect, let normal lowering
+        # check it again with the reachable instruction list and image sites.
+        self.image_proof, self.image_tables = proof, tables
+        self.ins = proof.instructions
+
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
@@ -3739,7 +4163,8 @@ class Stage:
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
         try:
-            self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+            image = getattr(self, 'image_proof', None)
+            self.calculated_pc = image.lowered if image else calculated_pc_proof(self.ins, getattr(self, 'kind', None))
         except Unsupported as reason:
             if refusals is None:
                 raise
@@ -4558,6 +4983,9 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        image = getattr(self, 'image_proof', None)
+        if image and (self.pc in image.lowered or self.pc in image.loads):
+            return self.lower_image_instruction(image, name, asm, ops, mods)
         if (getattr(self, 'vcc_lost', False) or
                 (getattr(self, 'has_branches', False) and
                  ('vcc' in asm or name.startswith(IMPLICIT_VCC_READ)))):
@@ -4978,6 +5406,36 @@ class Stage:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
         return result
+
+    def lower_image_instruction(self, proof, name, asm, ops, mods):
+        pc = self.pc
+        if pc in proof.captures:
+            temp, operand = proof.captures[pc]
+            self.emit('%s = %s;' % (temp, self.u(operand)))
+        if pc in proof.loads:
+            dst, addr = proof.loads[pc]
+            index = ' + '.join(key for key, _, _ in addr.offsets)
+            subscript = '(%s) >> 2' % index if index else '0u'
+            self.set_v(dst, 'image_data_%x[%s]' % (pc, subscript))
+            return None
+        base = re.sub(r'_e(32|64)$', '', name)
+        self.current_asm = asm
+        self._uniform_written = set()
+        for reg in proof.erased.get(pc, ()):
+            if reg.startswith('v') and reg[1:].isdigit():
+                n = int(reg[1:])
+                self.align4_v.discard(n)
+                self.clear_low16(n)
+                getattr(self, 'uniform_expr', {}).pop(n, None)
+                getattr(self, 'uniform_v', set()).discard(n)
+            elif reg.startswith('s') and reg[1:].isdigit():
+                n = int(reg[1:])
+                self.sym.pop(n, None)
+                self.masks.discard(n)
+                self.mask_high.discard(n)
+                self.align4_s.discard(n)
+                self.varying_s.add(n)
+        return self._lower(base, asm, ops, mods)
 
     def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
@@ -11930,9 +12388,17 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
-        return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
+        image = getattr(s, 'image_proof', None)
+        tables = []
+        captures = []
+        if image:
+            for pc, values in s.image_tables.items():
+                tables.append('static const uint image_data_%x[%d] = {%s};' %
+                              (pc, len(values), ', '.join('0x%08xu' % value for value in values)))
+            captures = ['    uint %s = 0;' % key for key, _ in image.captures.values()]
+        return '\n'.join(self.common() + shared + tables + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + captures + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.

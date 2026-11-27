@@ -4,10 +4,12 @@
   binary <llvm-mc>                              reassemble every fixture source and compare machine words
   decode <libLLVM>                              disassemble GLOBAL test words with LLVM 15 and compare strings
   dispatch <dxc> <offscreen_check> <adapter>    translate, compile DXC cs_6_0, dispatch and verify GPU readback
+  image-dispatch <dxc> <offscreen_check> <adapter>  run the program-image readbacks and mutations
 
 All instruction bytes below are constructed from the RDNA 2 / tools/disasm_rdna2.py bit layouts (no game bytes).
 """
 from pathlib import Path
+import platform
 import struct
 import subprocess
 import sys
@@ -803,22 +805,162 @@ def dispatch(directory, compiler, renderer, adapter):
     return 0
 
 
+IMAGE_TABLE_BASE = 320
+IMAGE_JUMP_TARGET = 24
+IMAGE_MODEL_BASE = 0x12ffffff00
+# The final data dword deliberately matches the END encoding.
+IMAGE_TABLE = tuple(0x49a10203 ^ (index * 0x01050913) for index in range(15)) + (0xbf810000,)
+
+
+def image_program(mode='global', control=None):
+    """An original 32-lane kernel with a GETPC-relative table and a forward SETPC."""
+    from startup_gfx2hlsl_add_sub_co_ci_check import vop3b
+
+    def carry_op(*args):
+        return struct.pack('<II', *vop3b(*args))
+
+    jump_delta = IMAGE_JUMP_TARGET - 4
+    table_delta = IMAGE_TABLE_BASE - IMAGE_JUMP_TARGET
+    code = (
+        encode_sop1(0x1f, 34 if mode == 'flat' else 36, 0)
+        + (encode_sop1(0x04, 36, 34) if mode == 'flat' else encode_sopp(0))
+        + encode_sop2(0x00, 36, 36, 128 + jump_delta)
+        + encode_sop2(0x04, 37, 37, 128)
+        + encode_sop1(0x20, 0, 36)                           # s_setpc_b64 s[36:37]
+        + encode_sopp(0x01)                                 # unreachable early termination
+        + encode_vop2(0x1b, 12, 128 + (63 if control == 'outside' else 15), 0)
+        + (encode_vop1(0x01, 12, 9) if control == 'unbounded' else encode_vop2(0x1a, 12, 130, 12))
+    )
+    assert IMAGE_JUMP_TARGET == 24
+    if mode == 'saddr':
+        # Negative displacement tests sign-extension on the scalar high add.
+        delta = -4 if control == 'overlap' else table_delta + 4
+        code += encode_sop2(0x00, 38, 36, 255, lit=delta)
+        code += encode_sop2(0x04, 39, 37, 193 if delta < 0 else 128)
+        code += encode_global(GLOBAL_LOAD_DWORD, 15, 12, 38, offset=-4)
+    else:
+        code += (
+            (encode_sop1(0x03, 38, 37) if mode == 'flat' else encode_sopp(0))
+            + encode_sop1(0x04, 40, 128)                   # known zero for the dropped-carry mutant
+            + (encode_vop1(0x01, 21, 38) if mode == 'flat' else encode_sopp(0))
+            + carry_op(0x30f, 20, 106, 36, 255, 0) + struct.pack('<I', table_delta)
+            + (encode_vop2(0x28, 21, 128, 21) if mode == 'flat' else
+               carry_op(0x128, 21, 40, 37, 128, 40 if control == 'carry' else 106))
+            + carry_op(0x30f, 20, 42, 0x100 + 20, 0x100 + 12, 0)
+            + carry_op(0x128, 21, 44, 0x100 + 21, 128, 42)
+        )
+        seg, saddr = (0 if mode == 'flat' else 2), 0x7d
+        if control == 'store':
+            code += encode_global(GLOBAL_STORE_DWORD, 0, 20, saddr, seg=seg, data=12)
+        else:
+            code += encode_global(GLOBAL_LOAD_DWORD, 15, 20, saddr, seg=seg)
+    if control == 'early-exit':
+        code += encode_sopp(0x08, 9)                        # s_cbranch_execz to final s_endpgm
+    code += (
+        encode_sopp(0x0c, 0x3f70)                            # s_waitcnt vmcnt(0)
+        + encode_sop1(0x03, 10, 8)
+        + encode_sop1(0x03, 11, 128)
+        + encode_smem(0x02, 16, 10)
+        + encode_sopp(0x0c, 0xc07f)                          # s_waitcnt lgkmcnt(0)
+        + encode_vop2(0x1a, 13, 130, 0)
+        + encode_mubuf(0x1c, 15, 13, 16)
+        + encode_sopp(0x01)
+    )
+    assert len(code) <= IMAGE_TABLE_BASE, len(code)
+    return code.ljust(IMAGE_TABLE_BASE, b'\0') + struct.pack('<16I', *IMAGE_TABLE)
+
+
+def image_reference():
+    # The displacement from the jump target forces low-word overflow in
+    # the model. A high word that ignores carry points 4 GiB before the table.
+    pc = IMAGE_MODEL_BASE + IMAGE_JUMP_TARGET
+    lo = (pc & MASK) + IMAGE_TABLE_BASE - IMAGE_JUMP_TARGET
+    assert lo > MASK
+    table = (((pc >> 32) + (lo >> 32)) << 32) | (lo & MASK)
+    assert table == IMAGE_MODEL_BASE + IMAGE_TABLE_BASE
+    assert ((pc & ~MASK) | (lo & MASK)) == table - (1 << 32)
+    return [IMAGE_TABLE[lane & 15] for lane in range(32)] + [SENTINEL] * (WORDS - 32)
+
+
+def check_image_controls():
+    for mode in ('global', 'flat', 'saddr'):
+        pipe = cs_pipe(image_program(mode), group=(32, 1, 1))
+        assert pipe.cs.calculated_pc[16] == IMAGE_JUMP_TARGET
+        assert 'srv ' not in pipe.manifest()
+        assert tuple(pipe.cs.image_tables.values()) == (IMAGE_TABLE,)
+    for mode, control, reason in (
+            ('global', 'unbounded', 'load from the program image with an unbounded offset'),
+            ('flat', 'outside', 'load from the program image outside the image'),
+            ('saddr', 'overlap', 'load from the program image overlaps executed code'),
+            ('global', 'store', 'store to the program image'),
+            ('global', 'carry', 'missing matching high-word carry for program image address')):
+        refused(reason, lambda: cs_pipe(image_program(mode, control), group=(32, 1, 1)))
+    early = cs_pipe(image_program(control='early-exit'), group=(32, 1, 1))
+    assert tuple(early.cs.image_tables.values()) == (IMAGE_TABLE,)
+    image_reference()
+    print('program image controls: 3 load forms, early exit and 5 refusals')
+
+
+def check_image_binary(llvm_mc):
+    for mode in ('global', 'flat', 'saddr'):
+        program = image_program(mode)
+        end = cs_pipe(program, group=(32, 1, 1)).cs.ins[-1][0] + 4
+        assert assemble(llvm_mc, disassemble_words(program[:end])) == program[:end], mode
+    print('program image binary: all 3 assemblies exact')
+
+
+def dispatch_image(directory, compiler, renderer, adapter):
+    want = image_reference()
+    source = image_program()
+    src_words = [0] * WORDS
+    groups = (1, 1, 1)
+    for mode in ('global', 'flat', 'saddr'):
+        program = image_program(mode)
+        hlsl = cs_pipe(program, group=(32, 1, 1)).hlsl_cs()
+        result = run_case(directory, compiler, renderer, adapter, 'image_' + mode, hlsl,
+                          groups, want, 0, 0, src_words)
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (
+            mode, result.stdout, result.stderr)
+        assert 'debug_errors=0 debug_warnings=0' in result.stdout or 'debug_layer=unavailable' in result.stdout
+        print(f'program image {mode}, OS {platform.version()}')
+        print(result.stdout.strip())
+
+    hlsl = cs_pipe(source, group=(32, 1, 1)).hlsl_cs()
+    old = ', '.join('0x%08xu' % value for value in IMAGE_TABLE)
+    wrong = struct.unpack_from('<16I', source)
+    new = ', '.join('0x%08xu' % value for value in wrong)
+    assert hlsl.count(old) == 1 and wrong[0] != want[0]
+    result = run_case(directory, compiler, renderer, adapter, 'image_wrong_table', hlsl.replace(old, new),
+                      groups, want, 0, 0, src_words)
+    assert result.returncode == 1 and f'word=0 expected={want[0]:08x} actual={wrong[0]:08x}' in result.stderr, (
+        result.stdout, result.stderr)
+    refused('missing matching high-word carry for program image address',
+            lambda: cs_pipe(image_program(control='carry'), group=(32, 1, 1)))
+    print(f'program image {adapter}: 3 readbacks, wrong table and missing carry caught')
+    return 0
+
+
 def main(argv):
     if not argv or argv == ['controls']:
         check_controls()
+        check_image_controls()
         return 0
     if len(argv) == 2 and argv[0] in ('binary', '--llvm-mc'):
         check_controls()
         check_binary(argv[1])
+        check_image_binary(argv[1])
         return 0
     if len(argv) == 2 and argv[0] == 'decode':
         check_decode(argv[1])
         return 0
-    if len(argv) == 4 and argv[0] in ('dispatch', '--dispatch'):
+    if len(argv) == 4 and argv[0] in ('dispatch', '--dispatch', 'image-dispatch'):
         out = ROOT / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
-            return dispatch(Path(tmp), *argv[1:])
+            run = dispatch_image if argv[0] == 'image-dispatch' else dispatch
+            return run(Path(tmp), *argv[1:])
     raise SystemExit(__doc__)
 
 
