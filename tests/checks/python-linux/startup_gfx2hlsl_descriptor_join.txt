@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_descriptor_join_check.py

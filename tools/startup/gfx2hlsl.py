@@ -933,6 +933,16 @@ def desc_key(sym):
     return sym[1], None if sym[2] is None else sym[2] + 4 * (sym[3] & ~3)
 
 
+def fixed_table_word(sym):
+    """Identity of an unmodified table word, independent of the scalar load width."""
+    if not sym or sym[0] != 'desc' or sym[1][0] != 'table' or sym[2] is None:
+        return None
+    # A nonnegative tag identifies a load site, not a fixed pointer value.
+    if len(sym) != 4 and not (len(sym) == 5 and isinstance(sym[4], int) and sym[4] < 0):
+        return None
+    return sym[1], sym[2] + 4 * sym[3], sym[4:]
+
+
 def desc_word(sym, dword):
     return sym[:3] + (dword,) + sym[4:]
 
@@ -3110,6 +3120,21 @@ class Stage:
             if len(s) > 2 and s[2]:
                 raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
+        joined_words = getattr(self, 'joined_table_words', {})
+        if r and r[0] == 's' and r[2] < 106 and r[2] - r[1] in (3, 7) and r[1] % 4 == 0:
+            words = [joined_words.get(i) or fixed_table_word(self.sym.get(i))
+                     for i in range(r[1], r[2] + 1)]
+            if words[0] and r[1] in joined_words and not getattr(self, 'exec_keep', {}):
+                source, offset, tag = words[0]
+                if (offset % 16 == 0 and (source, offset) not in self.pipe.modified and
+                        all(word == (source, offset + 4 * i, tag) for i, word in enumerate(words))):
+                    return source, offset
+        if s is None:
+            raise Unsupported('descriptor operand %s has no proven resource binding for its first word' % tok)
+        if s[0] in ('const', 'ud'):
+            raise Unsupported('descriptor operand %s has scalar words without a proven resource binding' % tok)
+        if s[0] == 'fixed_buffer_word':
+            raise Unsupported('descriptor operand %s comes from buffer data without a proven resource binding' % tok)
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
     def heap_sampler(self, tok):
@@ -4060,6 +4085,7 @@ class Stage:
             tentative_kept = set()
             materialize = {}
             incoming = {}
+            self.joined_table_words = {}
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -4079,6 +4105,7 @@ class Stage:
                     self.align4_s.clear()
                     self.blocks.append((start, self.lines, None))
                     self.lines, start = [], off
+                    self.joined_table_words.clear()
                     self.descriptor_block_first = instruction_index
                 self.pc = off
                 if retry_wave:
@@ -4111,6 +4138,7 @@ class Stage:
                         if r not in self.varying_s and r not in self.masks
                     }
                     kept[off] = {}
+                    self.joined_table_words.clear()
                     here = joined.get(off, set())
                     arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
                         incoming.get(off, [])
@@ -4130,6 +4158,12 @@ class Stage:
                         if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
                             self.sym[reg] = kept[off][reg] = paths[0]
                             continue
+                        if (force is None and off not in back_targets and paths and len(paths) == len(arriving)
+                                and len(paths) > 1 and off not in execz_targets):
+                            word = fixed_table_word(paths[0])
+                            if word and all(fixed_table_word(p) == word for p in paths):
+                                # Keep this proof separately. Only an otherwise refused descriptor operand uses it.
+                                self.joined_table_words[reg] = word
                         if force == 'refuse' or any(p and not run_time_symbol(p) for p in paths):
                             self.sym[reg] = ('joined at a branch target',)
                             continue
@@ -4296,7 +4330,14 @@ class Stage:
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
-                    term = self.one(name, asm)
+                    try:
+                        term = self.one(name, asm)
+                    finally:
+                        if 'any' in dests:
+                            self.joined_table_words.clear()
+                        else:
+                            for reg in dests:
+                                self.joined_table_words.pop(reg, None)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
                     if off in mesh_votes:

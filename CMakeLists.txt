@@ -5381,6 +5381,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_join_symbols_folded_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "control OUTSIDE: 3 in all four channels")
     endforeach()
+    add_test(NAME startup_gfx2hlsl_descriptor_join_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_descriptor_join_check.py")
+    add_test(NAME startup_gfx2hlsl_descriptor_join_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_descriptor_join_check.py" "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_descriptor_join_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # Startup shader translator: s_load with a register offset holding a known constant reaches the heap descriptor (#1723).
     add_test(NAME startup_gfx2hlsl_sload_const_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_const_offset_check.py")
