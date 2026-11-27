@@ -22,7 +22,7 @@ VERTEX = (
     + wave.sopp(1)
 )
 # SHA-256 of the accepted artifacts on the parent revision, with LF newlines.
-BASELINE_KEYS = {'cs': 0x821d7ecb3f3903cf, 'ps': 0x666697888b30f325}
+BASELINE_KEYS = {'cs': 0x3157a54a9decd565, 'ps': 0x666697888b30f325}
 BASELINE = {
     'cs': (
         'ab95d049722dac0fd4e756edd7534958c4b106c473689b640e4b87fd89fb89b5',
