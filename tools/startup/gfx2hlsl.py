@@ -6,6 +6,7 @@ values (tables, vertex-buffer table, root buffers) turn into HLSL resources inst
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
 import bisect
+from collections import Counter
 from contextlib import suppress
 import functools
 import hashlib
@@ -2639,9 +2640,12 @@ class Stage:
         """uint expression for a 32-bit operand."""
         if tok == 'src_scc':
             # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
-            # Refuse unless a modeled writer set SCC on the reaching path in this block.
             if not getattr(self, 'scc_verified', False):
-                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'operand read'))
+                reason = self.scc_refusal('src_scc with unverified SCC', 'operand read')
+                pending = getattr(self, 'scc_data_reads', None)
+                if pending is None or self.kind != 'ps':
+                    raise Unsupported(reason)
+                pending[self.pc] = reason
             return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
             self.read_vcc()
@@ -2961,12 +2965,12 @@ class Stage:
     def set_vf(self, n, expr, mods=()):
         self.set_v(n, 'U(%s)' % self.f_mods(expr, mods))
 
-    def scalar_expr_uniform(self, expr):
+    def scalar_expr_uniform(self, expr, *, assume_scc=False):
         # These identifiers are runtime inputs in the scalar expressions emitted below.
         # In particular, a compare can carry a lane mask into an otherwise scalar select.
         for token in re.findall(r'\b(?:s\d+|v\d+|vcc|exec|m0|scc)\b', expr):
             if token == 'scc':
-                if not self.scc_uniform:
+                if not (assume_scc or self.scc_uniform):
                     return False
             elif not self.uniform_source(token):
                 return False
@@ -2978,7 +2982,9 @@ class Stage:
         self.scc_effect = 'emitted'
         self.scc_verified = True
         if self.tracks_uniformity():
-            self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
+            source = expr if proof is None else proof
+            self.scc_uniform = self.scalar_expr_uniform(source)
+            self.scc_from_uniform_input = not self.scc_uniform and self.scalar_expr_uniform(source, assume_scc=True)
         self.emit('scc = %s;' % expr)
 
     def record_scalar_uniformity(self, n, uniform):
@@ -3005,9 +3011,12 @@ class Stage:
 
         Any write ends n's life as a lane mask; a caller that writes a mask marks n again after this call.
         The uniformity of expr is judged first, while a source that is n itself still has its old mark."""
+        scc_dependency = False
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
+                if scc and not uniform:
+                    scc_dependency = self.scalar_expr_uniform(expr, assume_scc=True)
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'mask_high', set()).discard(n)
@@ -3029,6 +3038,8 @@ class Stage:
         self.emit('s%d = %s;' % (n, expr))
         if scc:
             self.set_scc(scc.replace('$', 's%d' % n))
+            if scc_dependency:
+                self.scc_from_uniform_input = True
 
     def descriptor(self, tok):
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
@@ -3919,6 +3930,8 @@ class Stage:
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
+            self.scc_data_reads = {}
+            uniform_scc_writes, scc_dependent_writes = set(), set()
             self.address_carry_reader = None
             uniform_vcc_compares = set()
             self.lines = []
@@ -4018,6 +4031,7 @@ class Stage:
                     self.exec_known = off in self.reduction_entry_exec
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
+                self.scc_from_uniform_input = False
                 if off in targets:
                     # Every path in carries the same uniform emitted write, which the lane and the wave both ran
                     # last, whichever path each took (a per-lane s_cbranch_execz edge included); the SCC writes on a
@@ -4250,6 +4264,11 @@ class Stage:
                     self.scc_effect = 'an SCC write that is not modelled'
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
+                    if self.scc_effect == 'emitted':
+                        if self.scc_uniform:
+                            uniform_scc_writes.add(off)
+                        elif self.scc_from_uniform_input:
+                            scc_dependent_writes.add(off)
                 if self.scc_effect or not self.scc_verified:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
@@ -4296,6 +4315,19 @@ class Stage:
                 raise error
             refusals.append((reason, self.kind))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
+        if self.scc_data_reads:
+            reads = dict(self.scc_data_reads)
+            for off, name in names.items():
+                if name.startswith(('s_cselect', 's_cmov')):
+                    reads.setdefault(off, 'unverified SCC data in ' + name)
+            for off, detail in self.unverified_scc_data_paths(
+                    dict(branches), scc_effects, uniform_scc_writes, scc_dependent_writes, reads):
+                reason = '%s at +0x%x: %s' % (reads[off], off, detail)
+                if refusals is None:
+                    error = Unsupported(reason)
+                    error.instruction = names[off]
+                    raise error
+                refusals.append((reason, self.kind))
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
                 reason = 'scc from %s in %s' % ('descriptor data' if kind == 'descriptor' else kind, name)
@@ -4325,6 +4357,61 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+
+    def unverified_scc_data_paths(self, branches, effects, uniform_writes, dependent_writes, reads):
+        """Check the paths to explicit reads that failed the legacy single-definition proof.
+
+        The emitted scc local already acts as the phi: each executed block leaves its boolean
+        in the same local. Keep that lowering and the existing uniformity proofs untouched.
+        """
+        instructions = {off: (size, name) for off, size, name, _ in self.ins}
+        offsets = {off: i for i, off in enumerate(instructions)}
+        unsafe = {}
+        incoming = Counter(branches.values())
+        for off, target in branches.items():
+            counted = (target < off and target in offsets and incoming[target] == 1
+                       and mesh_constant_trip(self.ins, offsets[target], offsets[off], offsets))
+            if off in self.calculated_pc or target not in offsets or (target <= off and not counted):
+                unsafe[off] = 'unsupported control-flow edge +0x%x -> +0x%x' % (off, target)
+            elif instructions[off][1] != 's_branch' and off not in self.uniform_branches:
+                unsafe[off] = 'branch at +0x%x is not proven wave-uniform for SCC data' % off
+
+        pending = [(0, None, 'entry path has no SCC producer', None)]
+        seen, reached_reads, failures = set(), set(), {}
+        while pending:
+            off, prev, missing, shape = pending.pop()
+            # The strings are witnesses for diagnostics. Only their presence affects propagation.
+            state = (off, missing is not None, shape is not None)
+            if state in seen or off not in instructions:
+                continue
+            seen.add(state)
+            size, name = instructions[off]
+            if off in reads:
+                reached_reads.add(off)
+                if missing or shape:
+                    edge = ' on edge +0x%x -> +0x%x' % (prev, off) if prev is not None else ''
+                    if missing or off not in failures:
+                        failures[off] = (missing or shape) + edge
+            if off in effects:
+                effect = effects[off]
+                if name in SCC_LEGACY_MIN_MAX:
+                    # The legacy expression chooses S0 on ties. The ISA uses strict comparisons.
+                    missing = 'SCC producer %s at +0x%x has unverified tie semantics' % (name, off)
+                elif off in uniform_writes:
+                    missing = None
+                elif off not in dependent_writes:
+                    kind = {'emitted': 'a non-uniform value', 'descriptor': 'descriptor data'}.get(effect, effect)
+                    missing = 'SCC producer %s at +0x%x yields %s' % (name, off, kind)
+            if off in branches:
+                shape = shape or unsafe.get(off)
+                if missing and name.startswith('s_cbranch_scc'):
+                    shape = shape or 'branch at +0x%x reads an unverified SCC predicate' % off
+                pending.append((branches[off], off, missing, shape))
+            if name not in ('s_branch', 's_setpc_b64', 's_endpgm'):
+                pending.append((off + size, off, missing, shape))
+        for off in reads:
+            if off in failures or (off in self.scc_data_reads and off not in reached_reads):
+                yield off, failures.get(off, 'no reachable SCC producer')
 
     def descriptor_scc_reads(self, branches, effects):
         """Find reads reachable with an elided SCC write, including through joins and back edges."""
@@ -11047,11 +11134,9 @@ VEC_U.update({
 
 VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
-# Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
-# no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
-# trusting it.
-SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
-                            's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+# These SCC rules use the inputs, so they cannot be expressed as a template over the result.
+SCC_LEGACY_MIN_MAX = frozenset(('s_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+SCC_UNMODELLED = SCC_LEGACY_MIN_MAX | {'s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32'}
 
 
 def add_sub_min_max_scc(base, a, b, result):

@@ -1,6 +1,8 @@
 """`src_scc` at a branch target in tools/startup/gfx2hlsl.py.
 
 usage: startup_gfx2hlsl_src_scc_join_check.py [dispatch <dxc> <offscreen_check> <adapter>]
+       startup_gfx2hlsl_src_scc_join_check.py draw <dxc> <offscreen_check>
+       startup_gfx2hlsl_src_scc_join_check.py binary <llvm-mc>
 
 `dispatch` also compiles the accepted if/else and skipped-block programs with DXC and compares a D3D12 UAV
 readback (WARP or hardware) with the compare each read must see.
@@ -14,9 +16,10 @@ enters it. Every path into the target then ran that one write last, both for the
 for the wave, whichever path each took (a per-lane `s_cbranch_execz` skip included). So the model's SCC is
 the hardware value.
 
-Negative controls keep the refusal: an SCC write in one arm, an SCC write in a block `s_cbranch_execz`
-skips, a back edge into the target, a lane-mask SCC (`s_and_b32` with `vcc_lo`), and an unmodelled
-writer (`s_add_u32`) on one path.
+The pixel draw covers compare and logic writers, both arms of a uniform join, and a counted loop.
+Negative controls cover a missing writer, an SCC write skipped by a lane-local EXEC branch, an
+unproved back edge, lane-mask SCC, and an unmodeled writer. One producer polarity mutation
+must fail D3D12 readback.
 
 The instruction words are built here from the field layout that `tools/disasm_rdna2.py` decodes:
 - SOP1 (`[31:23] == 0b101111101`, sdst in `w0[22:16]`, op in `w0[15:8]`, src0 in `w0[7:0]`)
@@ -36,6 +39,8 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
 sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from startup_flat_param_check import assemble  # noqa: E402
+from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, compile_hlsl, root_blob  # noqa: E402
 
 failures = []
 
@@ -48,8 +53,7 @@ def check(label, condition, detail=''):
             print('  ' + detail)
 
 
-SOP1_MOV_B32 = 0x03
-SOP2_ADD_U32 = 0x00
+SOP1_MOV_B32, SOP1_WQM_B64 = 0x03, 0x0A
 SOP2_AND_B32 = 0x0E
 SOPC_CMP_EQ_U32 = 0x06
 SOPC_BITCMP1_B32 = 0x0D
@@ -57,7 +61,7 @@ SOPP_NOP, SOPP_ENDPGM, SOPP_BRANCH, SOPP_CBRANCH_SCC0, SOPP_CBRANCH_EXECZ = 0x00
 
 S_SCC = 253
 S_THREE = 131      # inline integer 3
-VCC_LO = 106
+VCC_LO, EXEC_LO = 106, 126
 S4, S5, S6, S7, S10 = 4, 5, 6, 7, 10
 UNVERIFIED = 'src_scc with unverified SCC'
 
@@ -156,38 +160,32 @@ asm, blocks = translate_program(skip_execz)
 check('join after an execz-skipped block without SCC writes reads the compare',
       blocks == [['scc = s4 == s5;'], [], ['s10 = (scc ? 1u : 0u);']], repr(blocks))
 
-# Negative controls: each keeps `src_scc with unverified SCC`.
-# 4. An SCC write in the skipped arm: the two edges carry different writes.
-check('SCC write in one arm refuses the read at the join',
-      refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)                       # 0x00
-                     + branch(SOPP_CBRANCH_SCC0, 0x04, 0x0c)             # 0x04 -> 0x0c
-                     + sopc(SOPC_CMP_EQ_U32, S6, S7)                     # 0x08
-                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))          # 0x0c
-# 5. An SCC write inside a block s_cbranch_execz skips: the wave may run it while the lane skips it.
+# An SCC write inside a block s_cbranch_execz skips: the wave may run it while the lane skips it.
 check('SCC write in an execz-skipped block refuses the read at the join',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)
                      + branch(SOPP_CBRANCH_EXECZ, 0x04, 0x0c)
                      + sopc(SOPC_CMP_EQ_U32, S6, S7)
                      + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
-# 6. A back edge into the target: the loop body's SCC write is not known when the target is reached.
+# A back edge into the target: the loop body's SCC write is not known when the target is reached.
 check('back-edge target refuses the read',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)                       # 0x00
                      + READ                                              # 0x04 (loop head)
                      + sopc(SOPC_CMP_EQ_U32, S6, S7)                     # 0x08
                      + branch(SOPP_CBRANCH_SCC0, 0x0c, 0x04)             # 0x0c -> 0x04
                      + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
-# 7. A lane-mask SCC: s_and_b32 with vcc_lo sets SCC from every lane's bit, which one lane does not see.
+# A lane-mask SCC: s_and_b32 with vcc_lo sets SCC from every lane's bit, which one lane does not see.
 check('lane-mask SCC across a branch refuses the read',
       refused_reason(sop2(SOP2_AND_B32, S6, S4, VCC_LO)                  # 0x00
                      + branch(SOPP_CBRANCH_EXECZ, 0x04, 0x0c)            # 0x04 -> 0x0c
                      + sopp(SOPP_NOP)                                    # 0x08
                      + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))          # 0x0c
-# 8. An unmodelled SCC writer on one path: s_add_u32 sets the carry the model does not emit.
+# 8. An unmodeled writer on one path: s_wqm_b64 leaves the HLSL SCC unchanged.
 check('unmodelled writer on one path refuses the read',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)
                      + branch(SOPP_CBRANCH_SCC0, 0x04, 0x0c)
-                     + sop2(SOP2_ADD_U32, S6, S4, S5)
-                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
+                     + sop1(SOP1_WQM_B64, EXEC_LO, EXEC_LO)
+                     + READ + sopp(SOPP_ENDPGM)).endswith(
+                         'SCC producer s_wqm_b64 at +0x8 yields an SCC write that is not modelled on edge +0x8 -> +0xc'))
 
 
 MASK = 0xFFFFFFFF
@@ -248,11 +246,153 @@ def check_dispatch(dxc, runner, adapter):
         sys.exit(1)
 
 
+PIXEL_TAIL = """s_cselect_b32 s12, 1.0, 0.5
+v_cvt_f32_u32_e32 v3, v0
+v_add_f32_e32 v2, 1.0, v3
+v_cvt_f32_u32_e32 v4, s10
+v_mul_f32_e32 v2, v4, v2
+v_mov_b32_e32 v5, s12
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+"""
+PIXEL_TAIL_WORDS = 'f2f00c85000d067ef20604060a0c087e040504100c020a7e0f1800f802030405000081bf'
+PIXEL_COMPARE = """s_cmp_eq_u32 7, {value}
+s_mov_b32 s10, src_scc
+"""
+PIXEL_JOIN = """s_cmp_eq_u32 7, {value}
+s_cbranch_scc0 2
+s_cmp_eq_u32 3, 3
+s_branch 1
+s_xor_b32 s8, 13, 13
+s_mov_b32 s10, src_scc
+"""
+PIXEL_LOGIC = """s_and_b32 s8, 2, {value}
+s_mov_b32 s10, src_scc
+"""
+PIXEL_CARRY = """s_cmp_eq_u32 9, {value}
+s_cbranch_scc0 2
+s_bitcmp1_b32 4, 2
+s_branch 1
+s_lshr_b32 s8, 1, 1
+s_add_u32 s11, -1, src_scc
+s_mov_b32 s10, src_scc
+"""
+PIXEL_LOOP = """s_mov_b32 s10, 0
+s_cmp_eq_u32 0, 1
+s_mov_b32 s8, 0
+s_mov_b32 s9, src_scc
+s_add_u32 s10, s10, s9
+s_add_u32 s8, s8, 1
+s_cmp_lt_u32 s8, 3
+s_cbranch_scc1 -5
+"""
+PIXEL_MISSING = """v_cmp_eq_u32_e32 vcc_lo, 0, v0
+s_cbranch_vccz 1
+s_cmp_eq_u32 3, 3
+s_mov_b32 s10, src_scc
+"""
+
+# Each scalar branch is uniform. Separate draws exercise both arms, and each pixel
+# has a distinct colour input from its packed position.
+PIXEL_CASES = {
+    'compare_equal': (PIXEL_COMPARE.format(value=7), '878706bffd038abe', int(7 == 7)),
+    'compare_unequal': (PIXEL_COMPARE.format(value=8), '878806bffd038abe', int(7 == 8)),
+    'join_compare': (PIXEL_JOIN.format(value=7), '878706bf020084bf838306bf010082bf8d8d0889fd038abe', int(3 == 3)),
+    'join_logic': (PIXEL_JOIN.format(value=8), '878806bf020084bf838306bf010082bf8d8d0889fd038abe', int((13 ^ 13) != 0)),
+    'logic_nonzero': (PIXEL_LOGIC.format(value=3), '82830887fd038abe', int((2 & 3) != 0)),
+    'logic_zero': (PIXEL_LOGIC.format(value=1), '82810887fd038abe', int((2 & 1) != 0)),
+    'carry_set': (PIXEL_CARRY.format(value=9), '898906bf020084bf84820dbf010082bf81810890c1fd0b80fd038abe',
+                  (0xffffffff + ((4 >> 2) & 1)) >> 32),
+    'carry_clear': (PIXEL_CARRY.format(value=8), '898806bf020084bf84820dbf010082bf81810890c1fd0b80fd038abe',
+                    (0xffffffff + int((1 >> 1) != 0)) >> 32),
+    'counted_loop': (PIXEL_LOOP, '80038abe808106bf800388befd0389be0a090a800881088008830abffbff85bf',
+                     int(0 == 1) + sum(i < 3 for i in range(1, 3))),
+    'missing_writer': (PIXEL_MISSING, '8000847d010086bf838306bffd038abe', None),
+}
+
+
+def pixel_words(prefix):
+    return bytes.fromhex(prefix + PIXEL_TAIL_WORDS)
+
+
+def translate_pixel(words):
+    pipe = G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=(0x8000, 0x8000))
+    return pipe.hlsl_ps()
+
+
+def pixel_controls():
+    accepted = {}
+    for name, (_, prefix, scale) in PIXEL_CASES.items():
+        try:
+            hlsl = translate_pixel(pixel_words(prefix))
+        except G.Unsupported as error:
+            expected = ('src_scc with unverified SCC [operand read: s_mov_b32, destination sgpr] at +0xc: '
+                        'entry path has no SCC producer on edge +0x4 -> +0xc')
+            check(name, scale is None and str(error) == expected, str(error))
+        else:
+            check(name, scale is not None, 'translated a path without an SCC writer')
+            if scale is not None:
+                accepted[name] = hlsl
+    return accepted
+
+
+def pixel_reference(scale):
+    result = bytearray()
+    # The loop's final latch is false even though two earlier bits sum to 2.
+    alpha = 1.0 if scale == 1 else 0.5
+    for y in range(4):
+        for x in range(4):
+            packed = x | (y << 16)
+            result.extend(struct.pack('<4f', (packed + 1) * scale, packed, scale, alpha))
+    return result
+
+
+def check_pixel_draw(dxc, runner, shaders):
+    out = Path(here).parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'scc_vs', 'vs_6_0', directory)
+
+        def draw(name, hlsl, scale):
+            ps = compile_hlsl(dxc, 'dxc', hlsl, name, 'ps_6_0', directory)
+            expected = directory / (name + '.bin')
+            expected.write_bytes(pixel_reference(scale))
+            run = subprocess.run([runner, 'warp', '--startup-pixel-words', str(vs), str(ps),
+                                  '4', '4', str(expected)], capture_output=True, text=True)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                sys.exit(1 if failures else 77)
+            return run
+
+        for name, hlsl in shaders.items():
+            run = draw(name, hlsl, PIXEL_CASES[name][2])
+            check(name + ' WARP readback', run.returncode == 0 and 'all 16 pixels matched' in run.stdout,
+                  run.stdout + run.stderr)
+
+        hlsl = shaders['join_logic']
+        producer = 'scc = s8 != 0;'
+        if hlsl.count(producer) != 1:
+            raise AssertionError('expected one logic SCC producer in the join fixture')
+        mutant = hlsl.replace(producer, 'scc = s8 == 0;')
+        run = draw('mutant_polarity', mutant, PIXEL_CASES['join_logic'][2])
+        check('logic writer polarity mutation fails WARP readback',
+              run.returncode != 0 and 'pixel mismatch (' in run.stderr and '16 of 16 pixels differ' in run.stderr,
+              run.stdout + run.stderr)
+
+
 if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
     check_dispatch(*sys.argv[2:])
-    print('PASS')
-    sys.exit(0)
-elif len(sys.argv) != 1:
+elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
+    shaders = pixel_controls()
+    if not failures:
+        check_pixel_draw(*sys.argv[2:], shaders)
+elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
+    for name, (source, prefix, _) in PIXEL_CASES.items():
+        check(name + ' encoding', assemble(sys.argv[2], source + PIXEL_TAIL) == pixel_words(prefix))
+elif len(sys.argv) == 1:
+    pixel_controls()
+else:
     sys.exit(__doc__)
 
 if failures:
