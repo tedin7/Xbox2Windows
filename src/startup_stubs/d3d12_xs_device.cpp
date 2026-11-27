@@ -99,6 +99,7 @@
 #include "clear_value_format.h"
 #include "debug_drain_budget.h"
 #include "debug_level.h"
+#include "resource_map_counts.h"
 #include "descriptor_heap_rules.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
@@ -1226,9 +1227,23 @@ bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 }
 ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 bool retire_unmaterialized_lazy_texture(Wrapper* w);
+
+SRWLOCK resource_map_lock = SRWLOCK_INIT;
+x2w_startup::ResourceMapCounts<Wrapper*> resource_maps;
+
+void forget_resource_maps(Wrapper* w)
+{
+    AcquireSRWLockExclusive(&resource_map_lock);
+    resource_maps.forget(w);
+    ReleaseSRWLockExclusive(&resource_map_lock);
+}
+
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
+    // A resource may be released while mapped (persistent mapping): its map counts end with it, with no Unmap.
+    // Only the last release takes the lock, so the hot Release path stays lock-free.
+    if (!refs && self->own().kind == resource_kind) forget_resource_maps(self);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
@@ -5432,8 +5447,6 @@ void* __stdcall queue_get_desc(void* a, void* b)
 // Resource slot 8, desktop Map(subresource, readRange, data). On the console a resource's memory is
 // title-visible: for a resource placed at a title address or backed by a hook allocation, the mapped
 // pointer is that memory (subresource offsets inside it are not modeled). Others map on desktop.
-SRWLOCK resource_map_lock = SRWLOCK_INIT;
-std::unordered_map<Wrapper*, std::unordered_map<UINT, std::uint64_t>> resource_maps;
 HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANGE* range, void** data)
 {
     HRESULT hr = S_OK;
@@ -5448,7 +5461,7 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
              (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
         AcquireSRWLockExclusive(&resource_map_lock);
         hr = !real ? E_FAIL : cpu_hidden ? E_INVALIDARG : real->Map(subresource, range, &mapped);
-        if (SUCCEEDED(hr)) ++resource_maps[self][subresource];
+        if (SUCCEEDED(hr)) resource_maps.record_map(self, subresource);
         ReleaseSRWLockExclusive(&resource_map_lock);
     }
     if (data) *data = SUCCEEDED(hr) ? mapped : nullptr;
@@ -5462,15 +5475,8 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
 void __stdcall resource_unmap(Wrapper* self, UINT subresource, const D3D12_RANGE* range)
 {
     AcquireSRWLockExclusive(&resource_map_lock);
-    auto wrapper = resource_maps.find(self);
-    if (!self->own().title_memory && self->own().real && wrapper != resource_maps.end()) {
-        auto entry = wrapper->second.find(subresource);
-        if (entry != wrapper->second.end() && x2w_startup::consume_map_count(entry->second)) {
-            static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
-            if (!entry->second) wrapper->second.erase(entry);
-            if (wrapper->second.empty()) resource_maps.erase(wrapper);
-        }
-    }
+    if (!self->own().title_memory && self->own().real && resource_maps.consume_map(self, subresource))
+        static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
     ReleaseSRWLockExclusive(&resource_map_lock);
 }
 
@@ -6859,6 +6865,8 @@ void evict_lazy_texture(Wrapper* v, Wrapper* by, ID3D12Device* device)
         InterlockedIncrement64(&lazy_evict_kept);
         return;
     }
+    // Slot 133 textures map title memory even if the desktop backing is recreated.
+    forget_resource_maps(v);
     null_lazy_views(v, device);
     const LONG64 total = InterlockedIncrement64(&lazy_evicted);
     if (total <= 8 || total % 1000 == 0)
@@ -7376,6 +7384,7 @@ void drain_retired_resources()
         InterlockedIncrement64(&lazy_evict_freed);
     }
     for (const RetiredDrop& drop : dropped) {
+        forget_resource_maps(drop.wrapper);
         if (drop.wrapper->own().title_memory) {
             const u64 address = reinterpret_cast<u64>(drop.wrapper->own().title_memory);
             {
@@ -7715,6 +7724,14 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_lazy_texture_count()
 {
     std::lock_guard lock(lazy_texture_mutex);
     return static_cast<unsigned>(lazy_textures().size());
+}
+
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_resource_map_count()
+{
+    AcquireSRWLockShared(&resource_map_lock);
+    const auto count = resource_maps.size();
+    ReleaseSRWLockShared(&resource_map_lock);
+    return count;
 }
 
 // Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a

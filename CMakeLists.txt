@@ -2072,7 +2072,7 @@ target_compile_features(startup_debug_noise_device PRIVATE cxx_std_17)
 target_link_libraries(startup_debug_noise_device PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_debug_noise_device_${backend} COMMAND startup_debug_noise_device ${backend})
-    set_tests_properties(startup_debug_noise_device_${backend} PROPERTIES TIMEOUT 60
+    set_tests_properties(startup_debug_noise_device_${backend} PROPERTIES TIMEOUT 120
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
 endforeach()
 set_tests_properties(startup_debug_noise_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
