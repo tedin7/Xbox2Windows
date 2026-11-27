@@ -885,7 +885,11 @@ static int present_gray(void* device, const std::string& mode)
     const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     const D3D12_RECT left_half{0, 0, static_cast<LONG>(size / 2), static_cast<LONG>(size)};
     UINT64 fence_value = 0;
-    const auto submit = [&] {
+    // One recording that clears the target (flat gray, or black with its left half white), run to its fence.
+    const auto fill = [&](bool two_tone) {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator), 0)))) return 74;
+        invoke(list, 52, handle, word(two_tone ? black : gray));
+        if (two_tone) invoke(list, 52, handle, word(white), 1, word(&left_half));
         if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
         invoke(queue, 10, 1, word(&list));
         if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), ++fence_value)))) return 76;
@@ -894,12 +898,6 @@ static int present_gray(void* device, const std::string& mode)
             Sleep(1);
         }
         return 0;
-    };
-    const auto fill = [&](bool two_tone, const float* color) {
-        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator), 0)))) return 74;
-        invoke(list, 52, handle, word(two_tone ? black : color));
-        if (two_tone) invoke(list, 52, handle, word(white), 1, word(&left_half));
-        return submit();
     };
     // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
     static std::uint64_t resources[1];
@@ -915,55 +913,14 @@ static int present_gray(void* device, const std::string& mode)
         }
         return 0;
     };
-    if (mode == "present-recent-fps") {
-        if (const int rc = fill(false, black)) return rc;
-        if (const int rc = show(30, 0)) return rc;
-        const float final_color[4] = {37.0f / 255.0f, 109.0f / 255.0f, 223.0f / 255.0f, 1.0f};
-        if (const int rc = fill(false, final_color)) return rc;
-        for (UINT i = 0; i < 30; ++i) {
-            Sleep(250);
-            if (const int rc = show(1, 0)) return rc;
-        }
-
-        DWORD pid = 0;
-        HWND window = nullptr;
-        while ((window = FindWindowExW(nullptr, window, L"X2WOutputWindow", nullptr)) != nullptr) {
-            GetWindowThreadProcessId(window, &pid);
-            if (pid == GetCurrentProcessId()) break;
-        }
-        wchar_t caption[256];
-        if (!window || !GetWindowTextW(window, caption, 256)) return 82;
-        std::printf("caption: %ls\n", caption);
-
-        constexpr UINT pitch = size * 4, bytes = size * pitch;
-        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
-            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
-        void* const readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, buffer, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!readback || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator), 0)))) return 83;
-        const D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        D3D12_TEXTURE_COPY_LOCATION dest{static_cast<ID3D12Resource*>(readback), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        dest.PlacedFootprint = {0, {texture_desc.Format, size, size, 1, pitch}};
-        invoke(list, 16, word(&dest), 0, 0, 0, word(&source), 0);
-        if (const int rc = submit()) return rc;
-
-        char path[MAX_PATH];
-        const DWORD n = GetEnvironmentVariableA("X2W_TEST_PRESENT_OUT", path, MAX_PATH);
-        void* pixels = nullptr;
-        if (!n || n >= MAX_PATH || FAILED(static_cast<HRESULT>(invoke(readback, 8, 0, 0, word(&pixels)))) || !pixels) return 84;
-        std::ofstream output(path, std::ios::binary);
-        output.write(static_cast<const char*>(pixels), bytes);
-        output.close();
-        invoke(readback, 9, 0, 0);
-        return output ? 0 : 85;
-    }
     if (onset) {
         // Two-tone for 6 s, then a flat gray for 6 s: the picture turns flat once, about 6 s into the run.
-        if (const int rc = fill(true, gray)) return rc;
+        if (const int rc = fill(true)) return rc;
         if (const int rc = show(30, 200)) return rc;
-        if (const int rc = fill(false, gray)) return rc;
+        if (const int rc = fill(false)) return rc;
         return show(30, 200);
     }
-    if (const int rc = fill(split, gray)) return rc;
+    if (const int rc = fill(split)) return rc;
     return show(presents, 0);
 }
 

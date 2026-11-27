@@ -259,17 +259,6 @@ source tree the shim was built from, with `-dirty` for uncommitted changes to tr
 without git. The `D3D12XboxCreateDevice` log line ends with the same `build=<rev>`. The build refreshes
 the revision on every build (`cmake/x2w_build_rev.cmake`). `ctest --preset dev --no-tests=error -R
 '^startup_build_rev_' -V` checks the generator and the built `d3d12_xs.dll`.
-Set `X2W_PRESENT_RECENT_FPS=1` to show FPS for the latest 30-frame block first and run-average
-FPS second. The caption still updates every 30 frames when the window shows the frame. The first
-update uses the 29 intervals from frame 1 to frame 30. The switch defaults to off.
-The WARP fixture presents 30 unpaced frames followed by 30 frames paced at 250 ms each.
-It checks the frame 60 caption and compares the presented source surface with a CPU RGBA8 reference.
-With the switch off, the pixels must still match and the legacy caption must fail the two-rate check.
-
-```powershell
-ctest --preset release --no-tests=error -j 1 -R '^startup_present_recent_fps_warp$' -V
-```
-
 The presenter only samples non-empty single-sample 2D surfaces without
 `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
 (`src/startup_stubs/present_view_format.h`), and marks itself failed if
