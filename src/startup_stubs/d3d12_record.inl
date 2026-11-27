@@ -16,6 +16,8 @@
 
 namespace replay_record {
 
+thread_local u64 call_seq;
+
 constexpr int wide_slots = 256;   // device and command-list slots wrapped
 constexpr int narrow_slots = 64;  // slots wrapped for the other kinds
 constexpr std::size_t flush_bytes = 1u << 20;
@@ -593,6 +595,7 @@ thread_local HeapPlacement* active_placement = nullptr;
 
 void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy, const HeapPlacement& placement)
 {
+    const u64 view_id = take_view_id();
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
     if (!active.load(std::memory_order_relaxed)) {
@@ -603,6 +606,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
+    // Prefix creates can supply the view ids read through title memory in the window.
+    if (view_id) {
+        const struct { u64 seq; std::uint32_t id, pad; } header{seq, static_cast<std::uint32_t>(view_id), 0};
+        append_chunk(b.bytes, "VIDS", &header, sizeof(header), nullptr, 0);
+    }
     if (kind == device_kind && slot == 14 && SUCCEEDED(static_cast<HRESULT>(ret))) {
         // Copied, never dereferenced: the recorder must not fault on title memory.
         u64 created = 0, extra[2] = {};
@@ -671,7 +679,8 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     constexpr bool submit = K == queue_kind && N == 10;
     constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
                                     (K == device_kind && (N == 23 || N == 24)) || submit;
-    constexpr bool draw_page_slot = K == list_kind && (N == 12 || N == 13 || N == 14 || N == 61 || (N >= 41 && N <= 48));
+    constexpr bool draw_page_slot = K == list_kind &&
+        (N == 12 || N == 13 || N == 14 || N == 35 || N == 36 || N == 61 || (N >= 41 && N <= 48));
     u64 seq;
     if constexpr (consumes_pages || draw_page_slot) {
         const bool scan = consumes_pages && (extra_title_pages ||
@@ -690,7 +699,11 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
         previous = active_placement;
         active_placement = &placement;
     }
+    take_view_id();
+    const u64 previous_seq = call_seq;
+    call_seq = K == list_kind && window_open.load(std::memory_order_relaxed) ? seq : 0;
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    call_seq = previous_seq;
     if constexpr (K == device_kind && N == 133) active_placement = previous;
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
     record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);

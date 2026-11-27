@@ -204,6 +204,14 @@ void view_refs_leave_class(std::uint32_t slot, u64 resource, u64 counter, Retire
 }
 
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
+thread_local u64 last_view_id;
+
+u64 take_view_id()
+{
+    const u64 id = last_view_id;
+    last_view_id = 0;
+    return id;
+}
 
 bool title_backed(u64 title_handle, u64 bytes)
 {
@@ -517,6 +525,13 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
     note_lock_acquire(true);
     ++views_noted;
+    if (view_records().empty()) {
+        char shift[2]{};
+        if (GetEnvironmentVariableA("X2W_TEST_VIEW_ID_SHIFT", shift, sizeof(shift)) == 1 && shift[0] == '7') {
+            view_records().resize(7);
+            view_materialized().resize(7, 0);
+        }
+    }
     const auto found = view_ids().find(hash);
     if (found != view_ids().end()) {
         record.id = found->second;
@@ -555,6 +570,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
             view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
         }
     }
+    last_view_id = (1ull << 32) | record.id;
     if (slot == 18 && resource && materialized) {
         if (Wrapper* res_w = as_wrapper(reinterpret_cast<const void*>(resource)); res_w && res_w->own().kind == resource_kind)
             res_w->own().lazy_view_created = true;
