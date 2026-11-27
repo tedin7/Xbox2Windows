@@ -1,0 +1,1 @@
+tests/startup_vertex_image_address_check.py
