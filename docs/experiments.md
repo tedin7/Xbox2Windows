@@ -69,6 +69,13 @@ hop through resolved texture SRVs of translated draws to known present targets.
 Once discovered, up to 32 such textures are eligible for producer history and
 readback under the same format and operation limits.
 
+Use `X2W_RED_PRODUCER_ONSET=black` with `X2W_RED_PRODUCER_AUTO=<first>,<count>`
+to select black onset. A sample is flat black when every sampled RGB channel
+is at most 8 and each is within four levels of the corresponding center
+channel. The preceding completed sample must contain a channel above 8.
+This mode uses the same capture window, attachment rows and input tracking
+as color onset, with a fixed black threshold in place of the RGB target.
+
 The producer rows report one RGBA8 texel before and after a clear or supported
 graphics draw to a known present target. They include the submitting queue and
 operation order. Present samples use the same texel, and attachment rows identify
@@ -87,7 +94,11 @@ check red and magenta, ignore an early exact match and a later near match, and
 refuse an out-of-range RGB component. The default-cadence case omits the signature
 override. The onset case compares a near-red center in a nonuniform picture with
 a uniform near-red picture, then checks the producer readbacks with onset on and
-automatic capture with onset off. Run the WARP and hardware checks separately
+automatic capture with onset off. The black case starts with two black frames,
+then checks a white frame, fade levels and nonuniform frames before flat near-black
+at present 8. Its CPU reference expects capture on frames 10 and 11 after publication
+at present 9 and checks the GPU producer texels. The exact-black auto control arms
+on present 1 and must differ from that reference. Run the WARP and hardware checks separately
 when reporting adapter results.
 
 ```powershell

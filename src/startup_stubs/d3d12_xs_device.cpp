@@ -7562,15 +7562,17 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
         return created;
     }();
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
-    static auto* const sampler = new x2w_present_signature::Sampler(every, always, producer_enabled, onset);
+    static auto* const sampler = new x2w_present_signature::Sampler(
+        every, always, producer_enabled, onset, red_producers().black_onset());
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
     if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* rgba = sampler->last_rgba();
         const bool red = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0;
-        const bool matched = red_producers().matches(rgba, sampler->last_flat());
-        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, matched);
+        const bool nonblack = sampler->last_nonblack();
+        const bool matched = red_producers().matches(rgba, sampler->last_flat(), nonblack);
+        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, matched, nonblack);
         static bool was_matched;
         if (matched != was_matched || red_producers().interested()) {
             log("x2w-red sample present=%lld published_at=%ld target=%p rgba=%u,%u,%u,%u red=%u match=%u tick=%llu",

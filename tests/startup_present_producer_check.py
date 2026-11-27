@@ -9,13 +9,15 @@ RED, GREEN, BLUE, MAGENTA = "255,0,0,255", "0,255,0,255", "0,0,255,255", "255,0,
 BACKEND, EXECUTABLE, *OPTIONS = sys.argv[1:]
 
 
-def run(mode, rgb="", *, onset=False, default_cadence=False):
+def run(mode, rgb="", *, onset="", default_cadence=False):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_PRESENT_SIGNATURE_EVERY="1", X2W_RED_PRODUCER_FRAMES="", X2W_RED_PRODUCER_AUTO="",
-               X2W_RED_PRODUCER_RGB=rgb, X2W_RED_PRODUCER_ONSET="1" if onset else "")
+               X2W_RED_PRODUCER_RGB=rgb, X2W_RED_PRODUCER_ONSET=onset)
     if default_cadence:
         env.pop("X2W_PRESENT_SIGNATURE_EVERY")
-    if mode.startswith("auto"):
+    if mode == "auto-black":
+        env["X2W_RED_PRODUCER_AUTO"] = "1,2"
+    elif mode.startswith("auto"):
         env["X2W_RED_PRODUCER_AUTO"] = "4,2"
     else:
         env["X2W_RED_PRODUCER_FRAMES"] = "1,12"
@@ -65,7 +67,7 @@ def check_default_cadence():
 
 
 def check_onset():
-    logs, records, adapter = run("auto-onset", onset=True)
+    logs, records, adapter = run("auto-onset", onset="1")
     assert len(records) == 2, logs
     target = records[0][3]
     assert f"x2w-red flat onset previous_present=4 sampled_present=5 previous_rgba={NEAR_RED}" in logs, logs
@@ -76,6 +78,41 @@ def check_onset():
     logs, records, _ = run("auto-onset")
     assert "auto armed" not in logs and not records, logs
     print(f"flat near-red edge arms after the nonuniform frame, with an onset-off control ({adapter})")
+
+
+def black_capture(logs, records):
+    arms = re.findall(r"auto armed sampled_present=(\d+) published_at=(\d+) target=(\w+) capture=(\d+)\.\.(\d+) rgb=0,0,0", logs)
+    assert len(arms) == 1, logs
+    sampled, published, target, first, last = arms[0]
+    assert all(row[3] == target for row in records), logs
+    return (sampled, published, first, last), [row[:3] + row[4:] for row in records]
+
+
+def check_black_onset():
+    # CPU reference: present 8 replaces (9,0,0) with (8,0,0) everywhere.
+    # The next present publishes the sample. The two captured frames clear
+    # 8 -> 0 -> 8 and 8 -> 0 respectively, with alpha always 255.
+    black, dark = "0,0,0,255", "8,0,0,255"
+    expected = ("8", "9", "10", "11"), [
+        ("1", "1", "10", black, dark),
+        ("2", "2", "10", dark, black),
+        ("3", "3", "11", black, dark),
+    ]
+    logs, records, adapter = run("auto-black", onset="black", default_cadence=True)
+    assert black_capture(logs, records) == expected, logs
+    assert "black onset previous_present=7 sampled_present=8 previous_rgba=9,0,0,255" in logs, logs
+    assert "sample present=8 published_at=9" in logs and "x2w-red history record=7 " in logs, logs
+
+    # Exact RGB auto mode has no predecessor requirement. With an initial
+    # exact black clear it exercises the premature-arm control on the same GPU.
+    logs, records, _ = run("auto-black", "0,0,0")
+    control = black_capture(logs, records)
+    assert control[0] == ("1", "2", "3", "4") and control != expected, logs
+    assert control[1] == [
+        ("1", "1", "3", "255,255,255,255", black),
+        ("2", "2", "4", "9,0,0,255", "255,255,255,255"),
+    ], logs
+    print(f"flat black onset arms on present 8. Initial-black control arms early on present 1 ({adapter})")
 
 
 def check_barriers():
@@ -94,6 +131,7 @@ elif __name__ == "__main__":
     check_auto(magenta=True)
     check_default_cadence()
     check_onset()
+    check_black_onset()
     logs, records, adapter = run("auto-magenta", "255,0,256")
     assert "auto disabled: X2W_RED_PRODUCER_RGB" in logs and "auto armed" not in logs and not records, logs
     print(f"invalid RGB disables automatic arming ({adapter})")
