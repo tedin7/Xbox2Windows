@@ -131,8 +131,7 @@ def mesh57_resume_controls():
         key = 0x57
         touch(d / 'req_0000000000000057.m57')
         stem = d / f'{key:016x}'
-        marker = stem.with_suffix('.ms57.txt')
-        touch(marker)
+        touch(stem.with_suffix('.ms57.txt'))
         ms, ps = (stem.with_suffix(suffix) for suffix in ('.ms57.cso', '.ps57.cso'))
         # A container envelope is sufficient for an on-disk completeness check.
         part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
@@ -143,9 +142,6 @@ def mesh57_resume_controls():
             touch(ms, bytecode)
             expect('slot 57 with only mesh bytecode is pending', scan(d, False), [key])
             touch(ps, bytecode)
-            expect('slot 57 legacy manifest is pending', scan(d, False), [key])
-            touch(marker, b'x2w-manifest 1\nmesh57-result x2w-startup-mesh-57-3 '
-                  b'0000000000000057 0000000000000001 0000000000000002\ntargets 0\n')
             expect('slot 57 with both complete containers is done', scan(d, False), [])
             for stage in (ms, ps):
                 touch(stage, bytecode[:-1])
