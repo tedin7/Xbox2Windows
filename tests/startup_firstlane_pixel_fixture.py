@@ -57,3 +57,95 @@ def check_translation():
         assert (G.READFIRSTLANE_UNIFORM, 'ps') in collected, (name, collected)
         print(f'{name}: {G.READFIRSTLANE_UNIFORM}')
     return hlsl, accepted.uds
+
+
+def whole_quad_program(control=None):
+    """Build a pixel program with a masked colour write and a wave-wide join."""
+    def word(value):
+        return struct.pack('<I', value)
+
+    def scalar_move(dst, src, opcode=4):
+        return word(0xbe800000 | dst << 16 | opcode << 8 | src)
+
+    def vector_unary(opcode, dst, src):
+        return word(0x7e000000 | dst << 17 | opcode << 9 | src)
+
+    def branch(opcode, skipped):
+        return word(0xbf800000 | opcode << 16 | ((skipped // 4) & 0xffff))
+
+    exec_reg = 126
+    flag_compare = word(0xbf068009)  # s_cmp_eq_u32 s9, 0
+    # 0x3ffff < packed pixel position exactly when y >= 4 on this target.
+    narrow = word(0x7c000000 | 0xd1 << 17 | 255) + word(0x3ffff)
+    restore = scalar_move(exec_reg, 34)
+    overwrite = scalar_move(35, 128, opcode=3)
+    descriptor = word(0xf4080000 | 28 << 6 | 4) + word(0xfa000030)
+    load = word(0xe0000000 | 8) + word(0x80000000 | 7 << 16 | 13 << 8)
+    if control == 'indexed load':
+        load = word(0xe0000000 | 0x2000 | 8) + load[4:]
+    wait_descriptor = word(0xbf8cc07f)
+    wait_load = word(0xbf8c3f70)
+    read = vector_unary(2, 17, 256 + 13)
+    then = descriptor + wait_descriptor
+    if control == 'narrowed read':
+        then += narrow
+    then += load + wait_load
+    if control == 'EXEC write between load and read':
+        then += restore
+    if control == 'split load and read':
+        then += branch(2, 0)
+    if control == 'overwritten load':
+        then += vector_unary(1, 13, 256)
+    then += read
+    if control == 'narrowed read':
+        then += restore
+    if control == 'mask-changing loop':
+        then += narrow + flag_compare
+        then += branch(4, -len(then) - 4)
+    otherwise = scalar_move(17, 10, opcode=3)
+    if control == 'swapped arms':
+        then, otherwise = otherwise, then
+
+    code = scalar_move(32, exec_reg) + scalar_move(exec_reg, exec_reg, opcode=10)
+    code += scalar_move(34, exec_reg)
+    code += vector_unary(1, 5, 128) + narrow + vector_unary(1, 5, 242)  # blue = 0 or 1
+    if control == 'saved pair overwritten on one path':
+        code += flag_compare + branch(5, len(overwrite)) + overwrite
+    code += scalar_move(exec_reg, 36) if control == 'unknown restore' else restore
+    if control in ('AND on one path', 'AND-NOT on one path'):
+        opcode, rhs = (0x0f, 128) if control == 'AND on one path' else (0x15, 126)
+        code += flag_compare + branch(5, 4)
+        code += word(0x80000000 | opcode << 23 | exec_reg << 16 | rhs << 8 | exec_reg)
+    join = branch(2, len(otherwise))
+    code += flag_compare + branch(5, len(then + join)) + then + join + otherwise
+    code += vector_unary(6, 6, 256)  # green = float(packed position)
+    code += word(3 << 25 | 4 << 17 | 6 << 9 | 17)  # red = selected scalar + green
+    code += vector_unary(1, 7, 242)  # alpha = 1
+    return code + word(0xf800080f) + word(0x07050604) + word(0xbf810000)
+
+
+def check_whole_quad_translation():
+    accepted = pipeline(whole_quad_program())
+    hlsl = accepted.hlsl_ps()
+    collected = []
+    assert pipeline(whole_quad_program(), refusals=collected).hlsl_ps() == hlsl and not collected, collected
+    assert 's17 = v13;' in hlsl and 'Wave' not in hlsl
+    assert accepted.ps.firstlane_ps_exec == set()  # exact entry EXEC still excludes WQM
+    for control in ('narrowed read', 'saved pair overwritten on one path',
+                    'EXEC write between load and read', 'indexed load', 'unknown restore',
+                    'split load and read', 'overwritten load', 'mask-changing loop',
+                    'AND on one path', 'AND-NOT on one path'):
+        code = whole_quad_program(control)
+        try:
+            pipeline(code)
+        except G.Unsupported as reason:
+            assert str(reason) == G.READFIRSTLANE_UNIFORM, (control, str(reason))
+        else:
+            raise AssertionError(f'{control} translated')
+        collected = []
+        pipeline(code, refusals=collected)
+        assert (G.READFIRSTLANE_UNIFORM, 'ps') in collected, (control, collected)
+        print(f'{control}: {G.READFIRSTLANE_UNIFORM}')
+    swapped = pipeline(whole_quad_program('swapped arms'))
+    assert swapped.uds == accepted.uds
+    return hlsl, swapped.hlsl_ps(), accepted.uds
