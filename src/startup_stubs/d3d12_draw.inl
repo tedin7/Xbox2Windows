@@ -3510,7 +3510,7 @@ bool heap_texture_view(Wrapper* self, const std::uint32_t* words, D3D12_CPU_DESC
         // HLSL Dynamic Resources, "ResourceDescriptorHeap and SamplerDescriptorHeap": the view must
         // match the shader's resource type. Descriptors Overview, "Null descriptors": a matching null SRV reads zero.
         const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
-        device->CreateShaderResourceView(nullptr, &null_view, dest);
+        x2w_create_srv(device, nullptr, &null_view, dest, "heap-null", log);
         ++counts.nulls[reason];
         return true;
     };
@@ -3530,7 +3530,7 @@ bool heap_texture_view(Wrapper* self, const std::uint32_t* words, D3D12_CPU_DESC
         snapshot.resources.emplace_back(texture);
         if (!owner->own().tiled_address_srv) retire_hold(self, owner);
     }
-    device->CreateShaderResourceView(texture, &view, dest);
+    if (!x2w_create_srv(device, texture, &view, dest, "heap-texture", log)) return bind_null(HeapTextureCounts::incompatible);
     ++counts.mirrored;
     return true;
 }
