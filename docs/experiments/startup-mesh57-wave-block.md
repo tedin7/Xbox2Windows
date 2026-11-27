@@ -95,3 +95,25 @@ On a local capture, 407 slot 57 requests stop at the refusal above on main `96a7
   covered`.
 - No new complete translation results from either change.
 - The other 316 have a branch inside the block, `src_scc`, or the `v_cmpx_lt_u32 v, v` compare form.
+
+## Wave collective readback controls
+
+The slot 57 collective lowering extends the original wave-block proof above.
+The synthetic WARP cases in `startup_mesh57_skeleton_wave_collectives_warp`
+use the same indexed mesh draw and 32×32 CPU rasterizer. Each shader mutant
+must fail against the correct reference and pass against its own reference.
+
+- Force the inner VCC-zero branch to fall through on a zero load. The mixed
+  wave writes zero red instead of retaining the initial red.
+- Drop the EXEC predicate from the green write at the wave-load join. Only
+  threads 0–2 should write green there, before the count exchange.
+- Replace the first-active-lane broadcast with each thread's copy. The
+  uniformly defined active value is 1.0, while inactive provoking threads
+  still hold zero in the source VGPR.
+
+Host verification on Linux against base `e8015da7a` with the fixture changes
+applied: `python -B tests/startup_mesh57_skeleton_check.py` and
+`python -B tests/startup_mesh57_skeleton_check.py binary /usr/bin/llvm-mc-19`
+both reported `ok`. The latter checks the encoded synthetic programs against
+assembly. GPU verification is pending on Windows. Run
+`ctest --preset release --no-tests=error -R '^startup_mesh57_skeleton_wave_collectives_warp$' -V`.
