@@ -29,6 +29,7 @@
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
+#include "startup_stubs/viewport_check.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/integer_texture_srvs.h"
 #include "startup_stubs/pixel_uav_support.h"
@@ -4829,17 +4830,29 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
 {
     // Only a viewport that is forwarded counts as set; a call with no viewports leaves the state as it was.
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
-        list->RSSetViewports(count, viewports);
+        std::array<D3D12_VIEWPORT, 16> copy;
+        std::copy_n(viewports, count, copy.begin());
+        static LONG repairs = 0;
+        for (UINT i = 0; i < count; ++i)
+            if (x2w_startup::sanitize_viewport(copy[i]) && first_calls(repairs, 6))
+                log("x2w-d3d12 RSSetViewports: repaired invalid viewport");
+        list->RSSetViewports(count, copy.data());
         pass_of(self).viewport_set = true;
-        pass_of(self).viewport0 = viewports[0];
+        pass_of(self).viewport0 = copy[0];
     }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
-        list->RSSetScissorRects(count, rects);
+        std::array<D3D12_RECT, 16> copy;
+        std::copy_n(rects, count, copy.begin());
+        static LONG repairs = 0;
+        for (UINT i = 0; i < count; ++i)
+            if (x2w_startup::sanitize_scissor(copy[i]) && first_calls(repairs, 6))
+                log("x2w-d3d12 RSSetScissorRects: repaired invalid scissor");
+        list->RSSetScissorRects(count, copy.data());
         pass_of(self).scissor_set = true;
-        pass_of(self).scissor0 = rects[0];
+        pass_of(self).scissor0 = copy[0];
     }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
