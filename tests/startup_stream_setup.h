@@ -73,3 +73,7 @@ inline bool stream_mrt_format(DXGI_FORMAT format, StreamMrtFormat& out)
 using StreamWord = std::uint64_t;
 StreamWord invoke(void*, unsigned, StreamWord = 0, StreamWord = 0, StreamWord = 0, StreamWord = 0,
                   StreamWord = 0, StreamWord = 0, StreamWord = 0, StreamWord = 0);
+
+// Upload the synthetic five-texel input and write its guest SRV into the caller's heap.
+bool bind_identifier_fixture(void* device, void* list, StreamWord cpu, DXGI_FORMAT format, D3D12_SRV_DIMENSION dimension);
+D3D12_SRV_DIMENSION identifier_fixture_dimension();

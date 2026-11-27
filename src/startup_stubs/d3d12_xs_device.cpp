@@ -30,6 +30,7 @@
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
+#include "startup_stubs/integer_texture_srvs.h"
 #include "startup_stubs/pixel_uav_support.h"
 #include "startup_stubs/formatted_buffer.h"
 #include "startup_stubs/heap_indexed_root.h"
@@ -7863,12 +7864,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld, integer_view_filtered %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], null_causes[6], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],

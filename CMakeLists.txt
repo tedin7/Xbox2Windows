@@ -4141,8 +4141,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_image_1d_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_image_load_mip_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_load_mip_check.py" --draw "${DXC_EXECUTABLE}"
-            "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(startup_image_load_mip_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            "$<TARGET_FILE:offscreen_check>" ${adapter} --consumer "$<TARGET_FILE:startup_stream_consumer>")
+        set_tests_properties(startup_image_load_mip_${adapter} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl pixel-stage image_store (#1996 item F): translation controls and refusals, then a desktop draw
     # that reads every texel of the stored image back.
@@ -5042,7 +5042,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_entry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_entry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
-        set_tests_properties(startup_compute_dispatch_${adapter} startup_compute_dispatch_texture_${adapter}
+        set_tests_properties(startup_compute_dispatch_texture_${adapter} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_compute_dispatch_${adapter}
             startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
             startup_compute_live_retry_${adapter} startup_compute_dispatch_entry_${adapter}
             startup_compute_dispatch_input_${adapter}
