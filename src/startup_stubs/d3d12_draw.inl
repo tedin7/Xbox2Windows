@@ -9,12 +9,12 @@
 // buffers named by the hardware descriptors in its tables, textures behind view tokens) into an
 // upload ring / a private descriptor heap.
 
-// A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
-// for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
-// root table P. Only that form is read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// A pixel image write uses 'uav N tex2d|tex2da|tex2du table P O': a float store or uint atomic at u<N>,
+// with the descriptor at byte O of root table P.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
     bool array = false;
+    bool uint_atomic = false;
     bool load = false;  // manifest 'uavload N': the pixel program reads through this view
 };
 static_assert(x2w_startup::kSupport2UavTypedLoad == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, "typed load bit");
@@ -38,8 +38,9 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (w.size() < 2 || w[0] != "uav" || !number(w[1], out.index)) return "malformed view index";
     if (w.size() < 3) return "missing view kind";
     if (w[2] == "raw" || w[2] == "table") return "buffer view (raw uav) is not bound";
-    if (w[2] != "tex2d" && w[2] != "tex2da") return "only tex2d and tex2da views are bound";
+    if (w[2] != "tex2d" && w[2] != "tex2da" && w[2] != "tex2du") return "only tex2d, tex2da and tex2du views are bound";
     out.array = w[2] == "tex2da";
+    out.uint_atomic = w[2] == "tex2du";
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
     if (w.size() < 4 || w[3] != "table") return "view source is not a table";
     if (w.size() < 6) return "missing table parameter or offset";
@@ -96,9 +97,10 @@ bool srgb_uav_format(DXGI_FORMAT format)
 // the title's own view (nullptr when it passed none) with console format values already mapped, and array is true
 // for a manifest 'tex2da' view. Returns nullptr and fills out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array, D3D12_UNORDERED_ACCESS_VIEW_DESC& out,
-                           bool needs_load)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, const PixelUav& binding,
+                           D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
 {
+    const bool array = binding.array;
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
     if (!array && resource.DepthOrArraySize != 1) return "resource is a texture array";
     if (resource.SampleDesc.Count != 1) return "resource is multisampled";
@@ -120,15 +122,20 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
         if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
     }
-    if (integer_view_type(format)) return "integer format for a float view";
-    if (srgb_uav_format(format)) return "sRGB format";
-    if (!float_uav_format(format)) return "format is not a float colour format";
+    if (binding.uint_atomic) {
+        format = x2w_startup::pixel_uav_uint_format(resource.Format, title_view ? title_view->Format : DXGI_FORMAT_UNKNOWN);
+        if (format == DXGI_FORMAT_UNKNOWN) return "tex2du view needs R32_UINT";
+    } else {
+        if (integer_view_type(format)) return "integer format for a float view";
+        if (srgb_uav_format(format)) return "sRGB format";
+        if (!float_uav_format(format)) return "format is not a float colour format";
+    }
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
     unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
                             ? 0u : static_cast<unsigned>(support.Support2);
     static const bool test_no_typed_load = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_NO_TYPED_LOAD", nullptr, 0) != 0;
     if (test_no_typed_load) support2 &= ~x2w_startup::kSupport2UavTypedLoad;
-    if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, needs_load)) return unsupported;
+    if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, binding.load)) return unsupported;
     out = {};
     out.Format = format;
     if (array) {
@@ -697,7 +704,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             const bool well_formed = !digits.empty() && digits.size() <= 9 &&
                                      digits.find_first_not_of("0123456789") == std::string::npos;
             if (well_formed) index = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
-            if (!well_formed || index >= tr.uavs.size() || tr.uavs[index].load) {
+            if (!well_formed || index >= tr.uavs.size() || tr.uavs[index].load || tr.uavs[index].uint_atomic) {
                 log("x2w-draw pipeline %016llx uavload line refused: %s; translation not used", tr.key, line.c_str());
                 return;
             }
@@ -3337,8 +3344,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav.array, out[i].view,
-                                            uav.load);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav, out[i].view);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -4452,7 +4458,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + srv_count + j} * draw_heap_increment};
         auto* resource = uav_bindings[j].resource;
         require_state(self, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (tr->uavs[j].load) {
+        if (tr->uavs[j].load || tr->uavs[j].uint_atomic) {
             // Order earlier UAV writes before a draw that reads the current contents.
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

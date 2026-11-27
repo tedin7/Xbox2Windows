@@ -5,7 +5,18 @@
 // preserves channels. The draw requires UAV_TYPED_STORE and, when that line is present, UAV_TYPED_LOAD.
 #pragma once
 
+#include <dxgiformat.h>
+
 namespace x2w_startup {
+
+inline DXGI_FORMAT pixel_uav_uint_format(DXGI_FORMAT resource, DXGI_FORMAT view)
+{
+    if (view != DXGI_FORMAT_UNKNOWN)
+        return view == DXGI_FORMAT_R32_UINT ? view : DXGI_FORMAT_UNKNOWN;
+    if (resource == DXGI_FORMAT_R32_TYPELESS || resource == DXGI_FORMAT_R32_UINT)
+        return DXGI_FORMAT_R32_UINT;
+    return DXGI_FORMAT_UNKNOWN;
+}
 
 // Values of D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD and D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE (checked against the
 // D3D12 header where the runtime uses them).

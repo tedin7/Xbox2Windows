@@ -39,7 +39,26 @@ int main(int argc, char** argv)
     expect("load only, plain store", reason(kSupport2UavTypedLoad, false), no_store);
     expect("no bits", reason(0, true), no_store);
     expect("other bits only", reason(0x3f, true), no_store);
+    const bool accept_sint = argc > 2 && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "accept-sint") == 0;
+    const auto format = [&](DXGI_FORMAT resource, DXGI_FORMAT view) {
+        return accept_sint && view == DXGI_FORMAT_R32_SINT ? view : pixel_uav_uint_format(resource, view);
+    };
+    const auto expect_format = [&](const char* label, DXGI_FORMAT resource, DXGI_FORMAT view, DXGI_FORMAT want) {
+        const auto got = format(resource, view);
+        if (got != want) {
+            std::printf("FAIL %s: got format %d, expected %d\n", label, int(got), int(want));
+            ++failures;
+        }
+    };
+    expect_format("uint resource", DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_UINT);
+    expect_format("typeless resource", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_UINT);
+    expect_format("explicit uint", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_UINT);
+    expect_format("explicit float", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN);
+    expect_format("explicit sint", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_UNKNOWN);
+    expect_format("explicit typeless", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN);
+    expect_format("float resource", DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN);
+    expect_format("wider integer resource", DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN);
     if (failures) return 1;
-    std::printf("pixel_uav_support: 6 cases\n");
+    std::printf("pixel_uav_support: 14 cases\n");
     return 0;
 }
