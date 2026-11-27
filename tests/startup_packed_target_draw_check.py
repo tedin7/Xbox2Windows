@@ -43,8 +43,14 @@ def stored(texture_format):
     return tuple(out)
 
 
-def check_placeholder(work, consumer, dxc, vs, ps, root, image, env, key):
+def check_placeholder(work, consumer, dxc, vs, ps, root, image, env):
     cache = Path(env["X2W_SHADER_CACHE"])
+    # The plain (untextured) consumer run builds its own root signature, so its pipeline key differs from the
+    # textured one above: let it write its files, then name the cache entries after that key.
+    boot = subprocess.run([consumer, vs, ps, root, "warp", image], env=dict(env, X2W_TEST_TRUNCATED_ONLY="1"),
+                          capture_output=True, text=True)
+    assert boot.returncode == 0, boot.stderr[-1000:]
+    key = f"{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}"
     sources = {
         "vs": """float4 main(uint id : SV_VertexID) : SV_Position {
             float2 corner = float2(id == 1 ? 4 : -2, id == 2 ? -4 : 2);
@@ -168,7 +174,7 @@ def check(work, consumer, dxc, backend):
     print(f"startup_packed_target_draw: PASS on {backend} (packed targets drawn {' and '.join(sorted(paths))} on this adapter; "
           f"1 drawn control, 2 refused view pairs; unordered-access writes and CPU-written texels not covered)")
     if backend == "warp":
-        check_placeholder(work, consumer, dxc, vs, ps, root, image, env, key)
+        check_placeholder(work, consumer, dxc, vs, ps, root, image, env)
     return 0
 
 
