@@ -119,7 +119,18 @@ int create_scene(void* device, Scene& s)
     // arguments after the device, the output last), so a recording must carry more than seven argument words. The
     // word after them (the caller's stack, which the slot ignores) points at the output variable too, as a title's
     // stack can: the replay must take the new object from the output the call wrote, not from that copy.
-    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
+    // X2W_TEST_REPLAY_CREATE133=1: the target is placed at a title address by device slot 133 (CreatePlacedResourceX:
+    // address, desc, state, clear, IID, out) with no desktop heap placement, the way a title makes most of its
+    // resources. A window that opens after it must still carry its description, IID and output.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE133", nullptr, 0)) {
+        constexpr SIZE_T bytes = 64 * 1024;
+        static_assert(width * height * 4 <= bytes, "the title memory holds the target");
+        void* memory = VirtualAlloc(reinterpret_cast<void*>(0x21000000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!memory || FAILED(static_cast<HRESULT>(invoke(device, 133, arg(memory), arg(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                                          arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) ||
+            !s.target)
+            return 29;
+    } else if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
         using Create = HRESULT (*)(void*, const void*, UINT, const void*, UINT, const void*, void*, UINT, const void*, const GUID*, void**,
                                    void**);
         const auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[127]);
@@ -129,6 +140,17 @@ int create_scene(void* device, Scene& s)
     } else if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
                                                   arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
+    }
+    // X2W_TEST_REPLAY_ALLOC108=1: device slot 108 (GetResourceAllocationInfo1) in the title's form: the return buffer
+    // first, the device second, two descriptions and the per-resource array the slot writes, all on this stack.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_ALLOC108", nullptr, 0)) {
+        using Info1 = void* (*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+        const auto info1 = reinterpret_cast<Info1>((*static_cast<void***>(device))[108]);
+        const D3D12_RESOURCE_DESC descs[2] = {desc, desc};
+        D3D12_RESOURCE_ALLOCATION_INFO1 each[2]{};
+        D3D12_RESOURCE_ALLOCATION_INFO total{};
+        info1(&total, device, 0, 2, descs, each);
+        if (!total.SizeInBytes || total.SizeInBytes == ~0ull || !each[1].SizeInBytes) return 34;
     }
     const bool descriptor_window = GetEnvironmentVariableA("X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", nullptr, 0) != 0;
     const bool null_views = GetEnvironmentVariableA("X2W_TEST_REPLAY_NULL_VIEWS", nullptr, 0) != 0;

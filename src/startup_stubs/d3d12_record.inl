@@ -268,6 +268,7 @@ struct ArgumentCapture {
         return bytes ? memory(arg, address, bytes, depth) : std::vector<unsigned char>{};
     }
 
+    // A failed call records no output: the player does not play a creation recorded as a failure.
     void output(unsigned i)
     {
         if (FAILED(static_cast<HRESULT>(call.ret))) return;
@@ -472,6 +473,14 @@ void record_arguments(ArgumentCapture& capture)
         case 39: capture.arg(0, sizeof(D3D12_QUERY_HEAP_DESC)); capture.create(1); break;
         case 25:  // GetResourceAllocationInfo(mask, count, descs), returned by value: the descriptions
             if (static_cast<UINT>(a[2]) <= 64) capture.arg(3, static_cast<u64>(static_cast<UINT>(a[2])) * sizeof(D3D12_RESOURCE_DESC));
+            break;
+        case 108:  // GetResourceAllocationInfo1(mask, count, descs, info1), returned by value: the descriptions and the
+                   // per-resource array the stand-in writes (the title's stack otherwise)
+            if (static_cast<UINT>(a[2]) <= 64) {
+                const u64 count = static_cast<UINT>(a[2]);
+                capture.arg(3, count * sizeof(D3D12_RESOURCE_DESC));
+                if (a[4]) capture.arg(4, count * sizeof(D3D12_RESOURCE_ALLOCATION_INFO1));
+            }
             break;
         case 55:  // CreateDerivedPipelineStateX(base, patch count, patches, IID, out)
             if (static_cast<UINT>(a[1]) <= 64) capture.arg(2, static_cast<u64>(static_cast<UINT>(a[1])) * x2w_derived_blend::record_size);
@@ -1022,6 +1031,20 @@ void install()
 }
 
 }  // namespace replay_record
+
+// A device made outside the recorded slots (D3D12XboxCreateDevice wraps it after install): an XOBJ chunk (kind,
+// wrapper) names it, so a player binds it even when the first device call is a struct-return form.
+extern "C" void x2w_d3d12_replay_record_object(int kind, const void* wrapper)
+{
+    using namespace replay_record;
+    if (!active.load(std::memory_order_relaxed) || !wrapper) return;
+    std::vector<unsigned char> chunk;
+    const struct { std::uint32_t kind, pad; u64 object; } header{static_cast<std::uint32_t>(kind), 0, reinterpret_cast<u64>(wrapper)};
+    append_chunk(chunk, "XOBJ", &header, sizeof(header), nullptr, 0);
+    AcquireSRWLockExclusive(&file_lock);
+    write_raw(chunk.data(), chunk.size());
+    ReleaseSRWLockExclusive(&file_lock);
+}
 
 // Ends the recording now (a fixture at its end, or a recording window that is still open when the process exits:
 // DllMain, `at_exit` 1).

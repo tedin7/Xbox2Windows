@@ -281,6 +281,49 @@ def check_null_views(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
+    """The target placed by device slot 133 at a title address (no desktop heap) in frame 0, a window opened mid-run
+    (f6,6): the file carries the placement's description, IID and output, and presents 7-12 replay equal. The same
+    prefix asks device slot 108 for two descriptions' allocation info (returned by value, arrays on the title's stack):
+    the file carries both arrays, so the replay passes no recorded stack address."""
+    recorded_dir, recording = directory / "placed_recorded", directory / "placed.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir), X2W_TEST_REPLAY_CREATE133="1",
+                          X2W_TEST_REPLAY_ALLOC108="1"))
+    assert code == 0, text[-3000:]
+    data = recording.read_bytes()
+    placements, infos, memory, outputs, sizes = set(), set(), set(), set(), {}
+    for tag, header, _hb, _payload, _size in chunks(data):
+        if tag == b"CALL":
+            seq, _tid, kind, slot = struct.unpack_from("<QIHH", data, header)
+            if (kind, slot) == (0, 133):
+                placements.add(seq)
+            if (kind, slot) == (0, 108):
+                infos.add(seq)
+        elif tag in (b"ARGM", b"OUTP"):
+            seq, arg = struct.unpack_from("<QI", data, header)
+            (memory if tag == b"ARGM" else outputs).add((seq, arg))
+            if tag == b"ARGM":
+                sizes[(seq, arg)] = struct.unpack_from("<QIIQQ", data, header)[4]
+    assert len(infos) == 1, infos
+    [info] = infos
+    # Two D3D12_RESOURCE_DESC (56 bytes) and two D3D12_RESOURCE_ALLOCATION_INFO1 (24 bytes).
+    assert (sizes.get((info, 3)), sizes.get((info, 4))) == (112, 48), (info, sorted(memory))
+    assert len(placements) == 1, placements
+    [seq] = placements
+    assert {(seq, 1), (seq, 4)} <= memory and (seq, 5) in outputs, (seq, sorted(memory), sorted(outputs))
+    whole = pictures(recorded_dir)
+    _score, played = replay(player, recording, directory / "placed_replayed", backend, env, presents=6)
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "placed-target window replay differs at %s\n%s" % (
+        differ, explain(whole[differ[0]], played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
+                        directory / "placed_replayed" / "stderr.txt"))
+    print("replay: slot-133 target made before window f6,6 replays presents 7-12 equal")
+
+
 def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -392,6 +435,7 @@ def main(scene, player, backend, mode=None):
         assert not differ, "slot-127 replay differs at %s\n%s" % (differ, explain(
             wide_recorded[differ[0]], wide_played.get(differ[0], ((0, 0), b"")), directory / "wide_replayed" / "stderr.txt")
             if differ else "")
+        check_placed_window(scene, player, backend, env, directory, vs, ps, root)
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
               (PRESENTS, score))

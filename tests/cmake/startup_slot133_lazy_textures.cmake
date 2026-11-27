@@ -16,6 +16,9 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_slot133_lazy_textures_noretire_${backend} COMMAND startup_slot133_lazy_textures_check ${backend} no-retire)
     set_tests_properties(startup_slot133_lazy_textures_noretire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "${lazy_tex_base};X2W_D3D12_LAZY_TEXTURES=1")
+    add_test(NAME startup_slot133_lazy_textures_evict_${backend} COMMAND startup_slot133_lazy_textures_check ${backend} evict)
+    set_tests_properties(startup_slot133_lazy_textures_evict_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${lazy_tex_base};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_LAZY_TEXTURES=1;X2W_D3D12_LAZY_EVICT=1")
     add_test(NAME startup_slot133_lazy_textures_off_${backend} COMMAND startup_slot133_lazy_textures_check ${backend} off)
     set_tests_properties(startup_slot133_lazy_textures_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "${lazy_tex_base};X2W_D3D12_RELEASE_RETIRED=1")

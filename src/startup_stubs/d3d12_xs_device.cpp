@@ -1129,6 +1129,14 @@ bool lazy_textures_enabled()
     static const bool on = x2w_local::env_on("X2W_D3D12_LAZY_TEXTURES");
     return on;
 }
+// X2W_D3D12_LAZY_EVICT=1 (with X2W_D3D12_LAZY_TEXTURES=1 and X2W_D3D12_RELEASE_RETIRED=1, else off): a lazy slot-133
+// texture that materializes over at least half of another materialized one's title memory evicts it. On the console the
+// newer texture took that memory, so the older one's contents are gone there too; its next use materializes it again.
+bool lazy_evict_enabled()
+{
+    static const bool on = lazy_textures_enabled() && release_retired_enabled() && x2w_local::env_on("X2W_D3D12_LAZY_EVICT");
+    return on;
+}
 // X2W_D3D12_TEXTURE_DROP_MIPS=<levels> (1 to 4, default off), X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES (default 4 MiB).
 const x2w_startup::drop_mips::Config& drop_mips_config()
 {
@@ -1153,6 +1161,28 @@ std::unordered_map<const Wrapper*, LazyTextureRecord>& lazy_textures()
 {
     static std::unordered_map<const Wrapper*, LazyTextureRecord> m;
     return m;
+}
+// X2W_D3D12_LAZY_EVICT: materialized lazy textures by title address (lazy_texture_mutex). end: the address plus the
+// desktop allocation size of the recorded description.
+struct LazyRange {
+    u64 end;
+    Wrapper* texture;
+};
+std::multimap<u64, LazyRange>& lazy_ranges()
+{
+    static std::multimap<u64, LazyRange> m;
+    return m;
+}
+LONG64 lazy_evicted, lazy_evict_kept, lazy_evict_freed;
+void forget_lazy_range(const Wrapper* w)  // lazy_texture_mutex held
+{
+    auto& ranges = lazy_ranges();
+    for (auto [at, end] = ranges.equal_range(reinterpret_cast<u64>(w->own().title_memory)); at != end; ++at) {
+        if (at->second.texture == w) {
+            ranges.erase(at);
+            return;
+        }
+    }
 }
 bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 {
@@ -6452,6 +6482,115 @@ extern "C" __declspec(dllexport) void x2w_d3d12_set_lazy_refresh_hook(LazyRefres
 
 // Thread-safe, idempotent materialization for slot-133 read-only textures created under X2W_D3D12_LAZY_TEXTURES=1.
 // Lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock.
+// X2W_D3D12_LAZY_EVICT: a desktop object taken from an evicted texture, released once every queue passed `targets`.
+struct EvictedTexture {
+    ID3D12Resource* resource;
+    std::vector<UINT64> targets;  // per RetireQueue at the eviction
+};
+std::vector<EvictedTexture> evicted_textures;  // retire_lock
+
+// Registers `w` (just materialized) under its title range and returns the materialized lazy textures it overlaps by at
+// least half of the smaller range; they leave the registry. lazy_texture_mutex held.
+std::vector<Wrapper*> take_overlapped_lazy(Wrapper* w, ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
+{
+    std::vector<Wrapper*> victims;
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    const u64 bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    if (!base || !bytes || bytes == ~0ull) return victims;
+    const u64 end = base + bytes;
+    auto& ranges = lazy_ranges();
+    try {
+        for (auto at = ranges.begin(); at != ranges.end() && at->first < end;) {
+            const u64 other_base = at->first, other_end = at->second.end;
+            const u64 overlap = other_end > base ? (std::min)(other_end, end) - (std::max)(other_base, base) : 0;
+            const u64 smaller = (std::min)(other_end - other_base, bytes);
+            if (at->second.texture != w && other_end > base && overlap * 2 >= smaller) {
+                victims.push_back(at->second.texture);
+                at = ranges.erase(at);
+            } else {
+                ++at;
+            }
+        }
+        ranges.emplace(base, LazyRange{end, w});
+    } catch (const std::bad_alloc&) {
+    }
+    return victims;
+}
+
+// Every CBV_SRV_UAV slot whose recorded view is an SRV of `w` gets a NULL view of the same dimension: the GPU never reads
+// the evicted object through a descriptor written before the eviction. The records stay, so the next materialize
+// refreshes the same slots.
+void null_lazy_views(Wrapper* w, ID3D12Device* device)
+{
+    const u64 target = reinterpret_cast<u64>(w);
+    note_lock_acquire(false);
+    for (const HeapInfo& h : heap_infos()) {
+        if (!h.shadow || !h.desktop_cpu || h.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
+        for (std::uint32_t i = 0; i < h.count; ++i) {
+            const std::uint32_t id = h.shadow[i];
+            if (!id || id - 1 >= view_records().size() || !view_materialized()[id - 1]) continue;
+            const ViewRecord& vr = view_records()[id - 1];
+            if (vr.slot != 18 || vr.resource != target) continue;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            if (vr.desc_bytes >= sizeof(view)) std::memcpy(&view, vr.desc, sizeof(view));
+            if (view.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN || view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                view = {};
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Texture2D.MipLevels = 1;
+            }
+            view.Format = desktop_format(view.Format);
+            if (view.Format == DXGI_FORMAT_UNKNOWN) view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (!view.Shader4ComponentMapping) view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            device->CreateShaderResourceView(nullptr, &view,
+                                             D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)});
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+}
+
+// Takes the desktop object from `v` (a materialized lazy texture whose title memory a newer one took). Only a texture
+// the retire machinery tracks is evicted: every list use of it holds its own desktop reference (retire_hold), and every
+// queue gets a fence signalled now, behind the work that may still read its old descriptors.
+void evict_lazy_texture(Wrapper* v, Wrapper* by, ID3D12Device* device)
+{
+    EvictedTexture item{nullptr, {}};
+    AcquireSRWLockExclusive(&retire_lock);
+    bool ok = v->own().lazy_slot133_texture && v->own().real && v->own().retire_when_idle && !v->own().retire_hold_missed &&
+              InterlockedCompareExchange(&v->own().refs, 0, 0) > 0 && !retire_queues.empty();
+    for (const RetireQueue& q : retire_queues) ok = ok && q.fence;
+    try {
+        if (ok) {
+            item.targets.reserve(retire_queues.size());
+            evicted_textures.reserve(evicted_textures.size() + 1);
+        }
+    } catch (const std::bad_alloc&) {
+        ok = false;
+    }
+    for (std::size_t q = 0; ok && q < retire_queues.size(); ++q) {
+        RetireQueue& queue = retire_queues[q];
+        if (FAILED(queue.queue->Signal(queue.fence, queue.signaled + 1))) ok = false;
+        else item.targets.push_back(++queue.signaled);
+    }
+    if (ok) {
+        item.resource = static_cast<ID3D12Resource*>(v->own().real);
+        v->own().real = nullptr;
+        v->own().budget = nullptr;  // the ticket is the desktop object's private data and goes with it
+        v->own().drop_levels = 0;
+        evicted_textures.push_back(std::move(item));
+        InterlockedIncrement(&retire_pending);
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    if (!ok) {
+        InterlockedIncrement64(&lazy_evict_kept);
+        return;
+    }
+    null_lazy_views(v, device);
+    const LONG64 total = InterlockedIncrement64(&lazy_evicted);
+    if (total <= 8 || total % 1000 == 0)
+        log("x2w-d3d12 lazy evict %lld: texture %p at %p by %p", total, static_cast<void*>(v), v->own().title_memory,
+            static_cast<void*>(by));
+}
+
 ID3D12Resource* materialize_lazy_texture(Wrapper* w)
 {
     if (!w || w->own().kind != resource_kind) return nullptr;
@@ -6471,6 +6610,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     } publish;
     ID3D12Device* device = nullptr;
     ID3D12Resource* created = nullptr;
+    std::vector<Wrapper*> evicted;
     {
         std::lock_guard lock(lazy_texture_mutex);
         if (auto* existing = static_cast<ID3D12Resource*>(w->own().real)) return existing;
@@ -6548,7 +6688,9 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         if (ticket && InterlockedCompareExchange(&w->own().refs, 0, 0) <= 0) {
             ticket->end_use();
         }
+        if (lazy_evict_enabled()) evicted = take_overlapped_lazy(w, device, record.desc);
     }
+    for (Wrapper* v : evicted) evict_lazy_texture(v, w, device);
 
     struct PendingSrvRefresh {
         u64 heap_wrapper;
@@ -6930,7 +7072,33 @@ void drain_retired_resources()
         retire_flights.pop_back();
         InterlockedDecrement(&retire_pending);
     }
+    std::vector<ID3D12Resource*> evicted_done;
+    for (std::size_t i = 0; i < evicted_textures.size() && evicted_done.size() < batch;) {
+        EvictedTexture& item = evicted_textures[i];
+        bool reached = item.targets.size() <= retire_queues.size();
+        for (std::size_t q = 0; q < item.targets.size() && reached; ++q)
+            reached = retire_queues[q].fence->GetCompletedValue() >= item.targets[q];
+        if (!reached) {
+            ++i;
+            continue;
+        }
+        try {
+            evicted_done.push_back(item.resource);
+        } catch (const std::bad_alloc&) {
+            break;
+        }
+        if (i + 1 != evicted_textures.size()) item = std::move(evicted_textures.back());
+        evicted_textures.pop_back();
+        InterlockedDecrement(&retire_pending);
+    }
     ReleaseSRWLockExclusive(&retire_lock);
+    for (ID3D12Resource* resource : evicted_done) {
+        draw_lock_acquire_exclusive();
+        texture_uploads().erase(resource);
+        draw_lock_release_exclusive();
+        resource->Release();
+        InterlockedIncrement64(&lazy_evict_freed);
+    }
     for (const RetiredDrop& drop : dropped) {
         if (drop.wrapper->own().title_memory) {
             const u64 address = reinterpret_cast<u64>(drop.wrapper->own().title_memory);
@@ -6950,6 +7118,7 @@ void drain_retired_resources()
         if (drop.wrapper->own().lazy_slot133_texture) {
             std::lock_guard lock(lazy_texture_mutex);
             lazy_textures().erase(drop.wrapper);
+            forget_lazy_range(drop.wrapper);
         }
         if (drop.resource) {
             draw_lock_acquire_exclusive();
@@ -8098,6 +8267,16 @@ void report_budget(ID3D12CommandQueue* queue)
         }
     }
     sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
+    if (lazy_evict_enabled()) {
+        std::size_t ranges = 0;
+        {
+            std::lock_guard lock(lazy_texture_mutex);
+            ranges = lazy_ranges().size();
+        }
+        log("x2w-d3d12 lazy evict: evicted %lld, kept %lld, freed %lld, materialized ranges %zu",
+            InterlockedCompareExchange64(&lazy_evicted, 0, 0), InterlockedCompareExchange64(&lazy_evict_kept, 0, 0),
+            InterlockedCompareExchange64(&lazy_evict_freed, 0, 0), ranges);
+    }
     const auto counts = x2w_budget::snapshot();
     char text[640]{};
     std::size_t used = 0;
@@ -8834,6 +9013,7 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     }
     the_device = candidate;
     removal_device = device;
+    x2w_d3d12_replay_record_object(device_kind, candidate);
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
