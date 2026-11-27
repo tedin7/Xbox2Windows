@@ -3595,6 +3595,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
     add_test(NAME startup_compute_cube COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_cube_check.py")
+    add_test(NAME startup_gfx2hlsl_dynamic_heap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dynamic_heap_check.py")
+    add_test(NAME startup_compute_dynamic_heap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dynamic_heap_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
@@ -5002,6 +5006,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     # wrong-group control must mismatch.
     add_test(NAME startup_compute_translate_requests COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py")
+    add_test(NAME startup_gfx2hlsl_dynamic_heap_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dynamic_heap_check.py" "$<TARGET_FILE:offscreen_check>"
+        "${DXC_EXECUTABLE}")
+    add_test(NAME startup_compute_dynamic_heap_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dynamic_heap_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        "${DXC_EXECUTABLE}")
+    set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp
+        PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py" e2e "$<TARGET_FILE:startup_stream_consumer>"
