@@ -12,8 +12,9 @@ TEXTURE = 'Texture2D<float4> image : register(t%d); SamplerState sample_point : 
 INTERFACE = 'struct Vertex { float4 position : SV_Position; nointerpolation float4 color : COLOR0; };\n'
 SAMPLE = 'image.SampleLevel(sample_point, float2(0.75, 0.5), 0)'
 REFERENCE = bytes((201, 119, 57, 255)) * (8 * 4)
-# INVALID_SUBRESOURCE_STATE and GPU_BASED_VALIDATION_INCOMPATIBLE_RESOURCE_STATE.
-STATE_ERROR = re.compile(r'sev=[01] id=(?:538|942)\b')
+# INVALID_SUBRESOURCE_STATE, GPU_BASED_VALIDATION_INCOMPATIBLE_RESOURCE_STATE, and 1358, the same draw-time check on
+# a runtime that tracks texture layouts ("Incompatible texture barrier layout", seen on the Win2025 WARP).
+STATE_ERROR = re.compile(r'sev=[01] id=(?:538|942|1358)\b')
 
 
 def shaders(vertex_reads, pixel_reads, pixel_slot):
