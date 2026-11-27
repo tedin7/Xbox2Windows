@@ -10,7 +10,9 @@ view validation. `X2W_PLACED_SRV_1D=1` by itself still requires an existing reso
 The adapter's format support selects native 1D storage first. A format that
 supports 2D storage only can use a height-one texture if D3D12 accepts the
 dimensions. That view requires a shader with a matching 2D declaration.
-The address path accepts layout `UNKNOWN` with desktop-footprint rows.
+The address path accepts layout `UNKNOWN` with desktop-footprint rows. It also
+accepts console linear layout `0x100` with one mip and one slice. The single row
+starts at the base address. Linear mip and slice alignment remain unmapped.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_address_srv_warp$'

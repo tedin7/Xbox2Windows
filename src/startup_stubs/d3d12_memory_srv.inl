@@ -890,7 +890,15 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     const auto note_blocker = [&](const char* reason) {
         if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(reason, &title);
     };
-    if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+    constexpr auto console_linear = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+    if (title.Layout == console_linear) {
+        // A single linear row starts at the base address, as in the desktop footprint.
+        if (title.MipLevels != 1 || title.DepthOrArraySize != 1) {
+            note_blocker("texture_1d_linear_mips_or_slices");
+            detail = "unsupported 1D linear layout (linear mip and slice alignment not mapped)";
+            return nullptr;
+        }
+    } else if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
         note_blocker("texture_1d_layout_unmapped");
         detail = "unsupported 1D source layout (no console footprint mapping)";
         return nullptr;

@@ -130,20 +130,32 @@ int draw_unregistered_1d_address_srv(void* guest, void* list)
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 44;
     const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
-    const bool console_layout = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", nullptr, 0) != 0;
+    wchar_t console_case[2]{};
+    GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", console_case, 2);
+    const bool console_layout = console_case[0] != L'\0';
+    const bool multiple_mips = console_case[0] == L'm';
+    const bool array = console_case[0] == L'a';
     const bool srgb = console_layout || GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_SRGB", nullptr, 0) != 0;
-    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 7u, 1, 1, 1,
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, multiple_mips ? 8u : mutant ? 4u : 7u,
+        1, array ? UINT16{2} : UINT16{1}, multiple_mips ? UINT16{2} : UINT16{1},
         srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8_UNORM, {1, 0},
-        console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(0x100) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(console_case[0] == L'u' ? 0x105 : 0x100)
+                       : D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_NONE};
-    // The desktop footprint starts at offset zero. sRGB endpoints decode exactly.
-    static std::array<unsigned char, 8 * 4> memory;
+    // Leave backing for the desktop mip and array offsets so the refusal controls exercise the layout gate.
+    static std::array<unsigned char, 65536 + 8 * 4> memory{};
     ViewAt view{};
     view.address = ptr(memory.data());
     view.view.Format = desc.Format;
-    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
     view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.view.Texture1D.MipLevels = 1;
+    if (array) {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        view.view.Texture1DArray.MipLevels = desc.MipLevels;
+        view.view.Texture1DArray.ArraySize = desc.DepthOrArraySize;
+    } else {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.view.Texture1D.MipLevels = desc.MipLevels;
+    }
     invoke(guest, 18, 0, ptr(&view.view), cpu);
     const auto* slot = reinterpret_cast<const void*>(cpu);
     std::array<unsigned char, 32> previous;
