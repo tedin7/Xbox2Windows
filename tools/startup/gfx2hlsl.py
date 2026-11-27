@@ -4131,6 +4131,7 @@ class Stage:
                     scc_dependency = self.scalar_expr_uniform(expr, assume_scc=True)
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
+        getattr(self, 'uniform_cmp_masks', {}).pop(n, None)
         getattr(self, 'mask_high', set()).discard(n)
         getattr(self, 'float_const_s', {}).pop(n, None)
         if isinstance(self.align4_s, set):
@@ -5537,6 +5538,7 @@ class Stage:
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
+            self.uniform_cmp_masks = {}  # mask SGPR -> (compare pc, EXEC was the entry mask there), see uniform_compare_and
             self.mask_high = set()
             self.uses_mask_ballot = False
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
@@ -5725,6 +5727,7 @@ class Stage:
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
+                    self.uniform_cmp_masks.clear()
                     self.since_join = kept_u
                     # One branch enters this block and the code above does not fall into it: the block starts with the
                     # facts that held at that branch, not with what a sibling arm laid down in program order.
@@ -6193,6 +6196,61 @@ class Stage:
 
     def tracks_uniformity(self):
         return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
+
+    def uniform_compare_and(self, base, srcs):
+        """Whether `base srcs` ANDs a compare mask of uniform inputs with EXEC so that every thread reaching here holds
+        the same SCC, the guest's wave value.
+
+        The compare gives every active lane the same bit b, so the result is b ? EXEC : 0 when EXEC did not change
+        in between, and SCC is b when EXEC is not zero. Accepted when every thread here is an active lane: EXEC was
+        the entry mask at the compare and still is (exec_known), or the compare and the AND lie in one stretch past an
+        s_cbranch_execz that no instruction writes EXEC in and no branch enters from outside (exec_live_between): a
+        thread whose lane is idle took that branch. A compare under one EXEC and an AND under another stays refused:
+        a lane idle at the compare holds 0 while the others hold b. The 32-bit form needs a proven wave32 program: in
+        wave64, exec_lo can be zero while this thread's lane, in the high half, is active. Returns the compare's mark,
+        which the result inherits, or None."""
+        exec_name = {'s_and_b64': 'exec', 's_and_b32': 'exec_lo'}.get(base)
+        if exec_name is None or len(srcs) != 2 or exec_name not in srcs or not self.tracks_uniformity():
+            return None
+        if exec_name == 'exec_lo' and not (getattr(getattr(self, 'pipe', None), 'wave_size', None) == 32
+                                           or wave32_exec_proof(self.ins)):
+            return None
+        other = reg_range(srcs[1] if srcs[0] == exec_name else srcs[0])
+        mark = getattr(self, 'uniform_cmp_masks', {}).get(other[1]) if other and other[0] == 's' else None
+        if mark is None or other[1] not in self.masks:
+            return None
+        compare_pc, known_at_compare = mark
+        if (known_at_compare and self.exec_known) or self.exec_live_between(compare_pc, self.pc):
+            return mark
+        return None
+
+    def exec_live_between(self, first, last):
+        """Whether EXEC is the same nonzero mask, with this thread's lane active, at every instruction from `first`
+        to `last`: an s_cbranch_execz before `first` falls through into a stretch up to `last` that no instruction
+        writes EXEC in and that no branch enters from outside (so every path to `last` runs that fall-through). The
+        s_cbranch_execz must be the per-lane test `(exec & 1) == 0`: a branch voted over the quad or the host wave
+        lets a thread whose lane is idle fall through too."""
+        before = [entry for entry in self.ins if entry[0] < last]
+        start = None
+        for pc, _, name, asm in reversed(before):
+            if name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe')) or writes_exec(name, parse(asm)[1]):
+                return False
+            if name == 's_cbranch_execz' and pc < first:
+                start = pc
+                break
+        voted = ('uniform_branches', 'voted_branches', 'wave_voted_branches')
+        if start is None or any(start in getattr(self, name, ()) for name in voted):
+            return False
+        for pc, _, name, asm in self.ins:
+            if not name.startswith(('s_branch', 's_cbranch')):
+                continue
+            label = re.fullmatch(r'label_0x([0-9a-f]+)', (parse(asm)[1] or [''])[0])
+            if label is None:
+                return False
+            target = int(label[1], 16)
+            if start < target <= last and not start < pc < last:
+                return False
+        return True
 
     def vgpr_writer(self, reg, before, after=-1):
         """Index of the last instruction in self.ins[after + 1:before] that may write VGPR reg (the first operand,
@@ -8609,7 +8667,13 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
+        uniform_and = self.uniform_compare_and(base, srcs)
         self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        if uniform_and is not None:
+            # (uniform compare mask) AND EXEC with every thread here an active lane: each holds the same bit, so SCC,
+            # its nonzero test, is the one wave value the guest sees.
+            self.scc_uniform, self.scc_from_uniform_input = True, False
+            self.__dict__.setdefault('uniform_cmp_masks', {})[d] = uniform_and
         if deferred_scc is not None:
             self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
@@ -13259,6 +13323,11 @@ class Stage:
             d = reg[1]
             self.set_s(d, expr)
             self.masks.add(d)
+            if self.tracks_uniformity() and not sdwa and self.scalar_expr_uniform('%s %s' % (x, y)):
+                # Every active lane compares the same two values (judged on the lowered sources, so a src_scc operand
+                # counts only with a uniform SCC), so the mask is all active lanes or none; which EXEC that was is
+                # decided where the mask is read (uniform_compare_and).
+                self.__dict__.setdefault('uniform_cmp_masks', {})[d] = (self.pc, self.exec_known)
 
     def signed_pack_export(self, token):
         """Identify signed normalized words on all paths to this compressed export."""
