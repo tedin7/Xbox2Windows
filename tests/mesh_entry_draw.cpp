@@ -20,7 +20,8 @@ std::vector<char> read_bytes(const char* path)
 }
 
 void copy_mesh_texture(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer, ID3D12Resource* texture,
-                       const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint)
+                       const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+                       D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
 {
     D3D12_TEXTURE_COPY_LOCATION from{}, to{};
     from.pResource = buffer;
@@ -28,7 +29,7 @@ void copy_mesh_texture(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer, 
     from.PlacedFootprint = footprint;
     to.pResource = texture;
     list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-    transition(list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(list, texture, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
 }
 
 struct ProducedTexture {
@@ -130,7 +131,8 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
             throw std::runtime_error("Invalid multi-primitive draw fixture");
         trace_stride = static_cast<UINT>(input.size() - draw_bytes - image_bytes);
     }
-    const bool textured = mode == MeshDrawMode::textured;
+    const bool mesh_texture = mode == MeshDrawMode::mesh_texture_load;
+    const bool textured = mode == MeshDrawMode::textured || mesh_texture;
     const bool depth_pair = mode == MeshDrawMode::depth_pair;
     const auto depth_format = depth_pair ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;
     const UINT draw_count = depth_pair ? 2 : 1;
@@ -185,7 +187,8 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         auto& texture_param = params[texture_slot];
         texture_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         texture_param.DescriptorTable = {1, &texture_range};
-        texture_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        if (mesh_texture) texture_range.BaseShaderRegister = 1;
+        texture_param.ShaderVisibility = mesh_texture ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_PIXEL;
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         sampler.MaxAnisotropy = 1;
@@ -394,7 +397,9 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
                 std::memcpy(static_cast<char*>(mapped) + sampled_layout.Offset + y * sampled_layout.Footprint.RowPitch,
                             input.data() + reference_end + y * 8, 8);
             texture_upload->Unmap(0, nullptr);
-            copy_mesh_texture(list, texture_upload.Get(), sampled.Get(), sampled_layout);
+            copy_mesh_texture(list, texture_upload.Get(), sampled.Get(), sampled_layout,
+                              mesh_texture ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                           : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};

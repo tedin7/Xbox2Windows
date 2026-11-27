@@ -145,6 +145,23 @@ Acceptance: a differential set of programs where the current translator accepts 
 pass accepts the neighbours; a control that uses a varying SCC as a uniform branch must be refused,
 not miscompiled.
 
+#### Phase 2, first slice
+
+The slot 57 wave-load block uses shared helpers to classify wave64 mask pairs.
+The proof inspects decoded accesses, including overlapping SGPR words, and
+checks that a mask read has a definition on every incoming path. The existing
+one-lane representation carries the lane's EXEC bit through comparisons,
+Boolean operations, copies, and selects on verified uniform SCC. Compute and
+graphics still use their existing paths.
+
+The first shape has forward uniform branches, one inner AND-saveexec if/else
+and a complement. An EXEC vote gates its scalar then arm. VALU and read-only
+vector loads obey the lane predicate. The outer full reset closes the region.
+Numeric reads of masks, SCC produced by mask operations, non-uniform scalar
+inputs, undefined skip values, and scalar else arms without a vote are refused.
+Additional nested if/else regions and uses of the saved mask beyond the region
+remain refused.
+
 ### Phase 3: `v_readfirstlane` and waterfalls
 
 Trace the per-lane source of a first-lane read through `v_cndmask_b32`, an if/else whose arms set
