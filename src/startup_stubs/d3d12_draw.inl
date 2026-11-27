@@ -3194,8 +3194,8 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
                         ? "swizzle enabled" : formatted_buffer_word3(words, format, extended_buffer_formats(), nullptr);
                     if (!reason) pair[1] = words[3];
                     else {
-                        static LONG first_calls = 0;
-                        if (InterlockedIncrement(&first_calls) <= 8) log("x2w-draw dynamic heap format record %u: %s", i, reason);
+                        static LONG zeroed_records = 0;
+                        if (first_calls(zeroed_records, 8)) log("x2w-heap format record %u zeroed: %s", i, reason);
                     }
                 }
                 std::memcpy(info + std::size_t{i} * 8, pair, sizeof(pair));
