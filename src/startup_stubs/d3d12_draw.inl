@@ -4598,6 +4598,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 : bound->depth_stencil.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO ? debug_present::depth_test_only
                 : debug_present::depth_writes;
             debug_present::note_draw(pass.bound_targets, pass.target_count, pass.bound_depth, depth_class);
+            if (depth_state && bound->depth_from_registers && bound->depth_stencil.DepthEnable)
+                depth_clear_census().depth_draw(pass.bound_depth, static_cast<int>(bound->depth_stencil.DepthFunc));
         }
         if (tr->placeholder) note_placeholder_draw(tr->key, pass);
     }

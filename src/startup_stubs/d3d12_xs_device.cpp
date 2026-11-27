@@ -46,6 +46,7 @@
 #include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
 #include <optional>
+#include "startup_stubs/depth_clear_census.h"
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/resource_address_index.h"
@@ -4428,6 +4429,12 @@ bool format_has_stencil(DXGI_FORMAT format)
     return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
+// Every depth clear's value and fate, and what a decoded GREATER depth test meets (depth_clear_census.h).
+x2w_depth_census::DepthClearCensus& depth_clear_census()
+{
+    static x2w_depth_census::DepthClearCensus census([](const char* line) { log("%s", line); });
+    return census;
+}
 // List slot 51 (desktop 47 + 4), ClearDepthStencilView(view, flags, depth, stencil, rect count, rects). Desktop
 // resources rest in COMMON here, so the target is moved to DEPTH_WRITE around the clear. The view is
 // read from its shadow record, as OMSetRenderTargets does, so a descriptor the title copied clears the
@@ -4453,7 +4460,9 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     if (first_calls(logged, 4))
         log("x2w-render ClearDepthStencilView view=0x%llx target=%p flags=0x%x depth=%.3f stencil=%u rects=%u", handle,
             static_cast<void*>(target), static_cast<unsigned>(flags), depth, static_cast<unsigned>(stencil), rect_count);
+    depth_clear_census().requested(depth, static_cast<unsigned>(flags));
     if (!target) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::unresolved_view);
         InterlockedIncrement(&render_target_unresolved);
         static LONG refused;
         if (first_calls(refused, 6))
@@ -4463,18 +4472,21 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
         return;
     }
     if (!(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL))) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::zero_flags);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: zero clear flags 0x%x", static_cast<unsigned>(flags));
         return;
     }
     if ((flags & D3D12_CLEAR_FLAG_DEPTH) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH)) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::read_only_depth);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: depth clear requested on read-only depth view 0x%llx", handle);
         return;
     }
     if ((flags & D3D12_CLEAR_FLAG_STENCIL) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::read_only_stencil);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: stencil clear requested on read-only stencil view 0x%llx", handle);
@@ -4483,9 +4495,13 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     const DXGI_FORMAT format = view_format_of(desktop, target);
     if ((flags & D3D12_CLEAR_FLAG_STENCIL) && !format_has_stencil(format)) {
         flags = static_cast<D3D12_CLEAR_FLAGS>(flags & ~D3D12_CLEAR_FLAG_STENCIL);
-        if (!flags) return;
+        if (!flags) {
+            depth_clear_census().skipped(x2w_depth_census::Skip::stencil_without_stencil_format);
+            return;
+        }
     }
     if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::unreadable_rects);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: unreadable rects array (%u rects at %p)", rect_count, static_cast<const void*>(rects));
@@ -4494,6 +4510,7 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
+    depth_clear_census().executed(target, depth, static_cast<unsigned>(flags));
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
                                 rect_count, rect_count ? rects : nullptr);
     red_producers().after(self, red_sample);
