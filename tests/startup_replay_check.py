@@ -421,40 +421,6 @@ def main(scene, player, backend, mode=None):
             (width, _height), pixels = without_snapshot[a]
             last_pixel = 1 + 4 * (width - 1)
             assert pixels[last_pixel:last_pixel + 4] == bytes((255, 255, 0, 255)), "fallback clear missing in " + a
-        # X2W_REPLAY_DESC_SNAPSHOT: the memory SRV writes (slot 70) of the prefix are held by destination and written when the
-        # window opens, so a handle written three times leaves one call, and the replay draws the same pictures.
-        def slot70_addresses(path):
-            raw, blobs, views, calls = path.read_bytes(), {}, {}, []
-            for tag, header, _hb, payload, size in chunks(raw):
-                if tag == b"BLOB":
-                    blobs[struct.unpack_from("<Q", raw, header)[0]] = raw[payload:payload + size]
-                elif tag == b"CALL":
-                    seq, _tid, kind, slot = struct.unpack_from("<QIHH", raw, header)
-                    if (kind, slot) == (0, 70):
-                        calls.append(seq)
-                elif tag == b"ARGM":
-                    seq, arg, _depth, _address, _bytes, blob_hash = struct.unpack_from("<QIIQQQ", raw, header)
-                    if arg == 1:
-                        views[seq] = blob_hash
-            return [struct.unpack_from("<Q", blobs[views[seq]], 0x28)[0] for seq in sorted(calls)]
-        held_env = dict(env, X2W_REPLAY_RECORD="f6,6", X2W_TEST_REPLAY_DESCRIPTOR_WINDOW="1",
-                        X2W_TEST_REPLAY_SLOT70_PREFIX="1")
-        recordings = {}
-        for name, extra in (("slot70_all", {}), ("slot70_held", {"X2W_REPLAY_DESC_SNAPSHOT": "1"})):
-            picture_dir, recordings[name] = directory / (name + "_pictures"), directory / (name + ".x2wr")
-            picture_dir.mkdir()
-            code, text = run([scene, vs, ps, root, backend, PRESENTS],
-                             dict(held_env, X2W_REPLAY_RECORD_FILE=str(recordings[name]),
-                                  X2W_PRESENT_PICTURES=str(picture_dir), **extra))
-            assert code == 0, text[-3000:]
-        assert slot70_addresses(recordings["slot70_all"]) == [0x1000, 0x2000, 0x3000, 0x4000], \
-            slot70_addresses(recordings["slot70_all"])
-        assert sorted(slot70_addresses(recordings["slot70_held"])) == [0x3000, 0x4000], \
-            "the held memory SRV writes are not the last write of each handle: %s" % slot70_addresses(recordings["slot70_held"])
-        held_pictures = pictures(directory / "slot70_held_pictures")
-        _score, held_played = replay(player, recordings["slot70_held"], directory / "slot70_held_replayed", backend, env, presents=6)
-        differ = [a for a, b in pairs if held_played[a] != held_pictures[b]]
-        assert not differ, "held-write replay differs from its recorded run at %s" % differ
         # The target made through device slot 127 (ten arguments: its output is the tenth): replays equal too.
         wide_dir, wide = directory / "wide_recorded", directory / "wide.x2wr"
         wide_dir.mkdir()

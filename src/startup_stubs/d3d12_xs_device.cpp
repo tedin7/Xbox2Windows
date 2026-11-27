@@ -1109,7 +1109,6 @@ void retire_leave_class(const void* object, RetireLeft why);
 void retire_add_view_ref(const void* object);
 void retire_release_view_ref(const void* object);
 void retire_drop_heap_views(Wrapper* heap);
-void held_srv_drop_heap(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
@@ -1202,10 +1201,7 @@ ULONG __stdcall release(Wrapper* self)
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
-        if (self->own().kind == descriptor_heap_kind) {
-            held_srv_drop_heap(self);
-            retire_drop_heap_views(self);
-        }
+        if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
             // The last release ends the resource for existing_memory_buffer and address_resource_overlap (they skip
