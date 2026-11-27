@@ -1006,6 +1006,12 @@ OperationResult run_mesh_textured(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::textured));
 }
 
+OperationResult run_mesh_texture_load(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::mesh_texture_load));
+}
+
 OperationResult run_compute_mesh_texture(const OperationContext& ctx)
 {
     const MeshTextureProducers producers{ctx.argv[6], ctx.argc >= 8 ? ctx.argv[7] : nullptr, ctx.argc == 9};
@@ -1902,6 +1908,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
+    {"--mesh-texture-load", 6, 6, nullptr, kNoGate, run_mesh_texture_load},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
     {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
      kGateSm60MeshFallback, run_compute_mesh_texture_fallback},

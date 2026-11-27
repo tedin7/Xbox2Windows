@@ -145,6 +145,62 @@ Acceptance: a differential set of programs where the current translator accepts 
 pass accepts the neighbours; a control that uses a varying SCC as a uniform branch must be refused,
 not miscompiled.
 
+#### Phase 2, first slice
+
+The slot 57 wave-load block uses shared helpers to classify wave64 mask pairs.
+The proof inspects decoded accesses, including overlapping SGPR words, and
+checks that a mask read has a definition on every incoming path. The existing
+one-lane representation carries the lane's EXEC bit through comparisons,
+Boolean operations, copies, and selects on verified uniform SCC.
+
+The first shape has forward uniform branches, one inner AND-saveexec if/else
+and a complement. An EXEC vote gates its scalar then arm. VALU and read-only
+vector loads obey the lane predicate. The outer full reset closes the region.
+Numeric reads of masks, SCC produced by mask operations, non-uniform scalar
+inputs, undefined skip values, and scalar else arms without a vote are refused.
+Uses of the saved mask beyond its closure remain refused.
+
+#### Shared EXEC-zero join proof
+
+Compute, pixel and mesh use the same full-pair classifier and skipped-lane
+write rules. A compare or an EXEC-masked write requires zero on the skip path.
+A write that produces one for inactive lanes requires all ones. A preserving
+write may retain any proven lane mask. Once the region joins, a live mask can
+feed a lane select, a carry, or an operation that intersects it with EXEC.
+Either half used as numeric data, a whole-wave observation, an SCC read of
+a mask operation, or unexpected control flow keeps the prior refusal.
+The new proof covers straight forward blocks with stable EXEC. Existing
+compute and graphics programs get their original lowering first.
+
+#### Reaching mask values and multiple regions
+
+Purity follows reaching definitions of the two scalar words, including the
+VCC aliases. A numeric overwrite starts another lifetime. A numeric path into
+a mask read, or a numeric read reached by the mask definition, makes that
+web impure. The mesh walk can lower pure mask selects on verified uniform
+SCC even outside a saved-EXEC region.
+
+Sequential regions can restore the saved EXEC, re-narrow from it, or end at
+the enclosing reset. A nested region must stay within its parent's then arm
+and restore a known EXEC predicate before the parent complement. Each branch
+votes only when its guest wave reaches the site together. Scalar work in an
+else arm without its own vote remains refused.
+
+Habermaier and Knapp's SIMT simulation theorem (2012, Theorem 1) motivates the
+per-thread interpretation of vector state. The whole-wave scalar state still
+requires a vote. [SIMT execution model](https://doi.org/10.1007/978-3-642-28869-2_16)
+
+Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
+uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
+
+Phase 2 also exercises the path-sensitive guard proof in step 6. The mesh
+walk retains definitions covered by `thread < B` when every active path
+writes them. After the count exchange, the same thread can read them under
+`thread < V` when `V` comes from zero or the same stable group-uniform
+bound. The count clamp can only reduce the required lanes. The scalar arms
+remain real wave-voted branches, following the distinction between uniform
+branches and predicates in Moll and Hack (PLDI 2018). [Partial Control-Flow Linearization](https://compilers.cs.uni-saarland.de/papers/moll_parlin_pldi18.pdf)
+
 ### Phase 3: `v_readfirstlane` and waterfalls
 
 Trace the per-lane source of a first-lane read through `v_cndmask_b32`, an if/else whose arms set

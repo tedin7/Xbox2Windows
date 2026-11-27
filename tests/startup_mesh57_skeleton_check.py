@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py lanemask <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py wave_collectives <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
@@ -221,6 +222,164 @@ def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e2
     wait = MESH.index('bf8c3f70')
     return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + ['befe04c1']
             + MESH[before:wait + 1] + exports.split() + MESH[wait + 1:])
+
+
+# Assembled in binary() from the synthetic instructions below. Branch distances
+# are counted in dwords, including VOP3 and literal words.
+MASK_PREFIX = WAVE_LOAD_PREFIX.replace('8f298806', '8f298206').replace('beaa0386', 'beaa03ff 00000080')
+MASK_FRONT = 'bf068006'                       # s_cmp_eq_u32 s6, 0
+MASK_RIGHT = 'd4c6002e 00010100'              # v_cmp_ge_u32_e64 s[46:47], v0, 0
+MASK_LEFT = '7d860080 d4c6002e 00010d00 87ae2e6a'
+MASK_SAVE = 'beae082e beae242e'               # not and aliased and_saveexec
+MASK_LOAD = 'f4080c05 fa000000 bf8cc07f f4200a18 520001e0'  # table dwordx4, then scalar buffer load
+MASK_ELSE = '8afe7e2e 7e0e02ff 3e800000'      # complement, v_mov_b32 v7, 0.25
+
+
+def lane_mask_mesh(*, prefix=MASK_PREFIX, front=MASK_FRONT, left=MASK_LEFT, right=MASK_RIGHT,
+                   setup='', load=MASK_LOAD, value='7e0e0228', otherwise=MASK_ELSE, exports='7e280228 7e2a0307'):
+    left, right = left.split(), right.split()
+    then = (load + ' bf8cc07f ' + value).split()
+    body = (front.split() + [branch(0xbf84, 0, len(left) + 2)] + left
+            + [branch(0xbf82, 0, len(right) + 1)] + right + setup.split() + MASK_SAVE.split()
+            + [branch(0xbf88, 0, len(then) + 1)] + then + otherwise.split())
+    return wave_load_mesh(prefix, ' '.join(body), exports=exports)
+
+
+MASK_CASES = (
+    ('S1', lane_mask_mesh()),
+    ('S1b', lane_mask_mesh(front=MASK_FRONT + ' bf0681fd',
+                          left='beb4047e ' + MASK_LEFT + ' 87ae342e')),
+    ('S3', lane_mask_mesh(right='d4c1002e 00010100',
+                          setup='bf068006 85b4c180 88ae342e')),
+    ('S3 mask arms', lane_mask_mesh(setup='bf068006 85b480c1 85b62e34 87ae362e',
+                                    value='d5010007 00d9e480')),
+    ('S4 EXEC moves', lane_mask_mesh(left='beb4047e 7da80084 befe0434 87fe7e34 ' + MASK_LEFT
+                                    + ' 87b67e6a 88ea366a 87ae2e6a')),
+    ('S4 CMPX', lane_mask_mesh(setup='7da80088')),
+    ('S4 VCC vote', lane_mask_mesh(left=MASK_LEFT + ' 7d880081 87ea7e6a bf870002 '
+                                      'd4c6002e 00010100')),
+    ('S4 closure', lane_mask_mesh(otherwise=MASK_ELSE + ' 88fe2e7e')),
+)
+MASK_MEMORY = (
+    ('tbuffer', wave_load_mesh(body='f4200a08 520001e0 e8b001e8 80040700 bf8c007f')),
+    ('image', wave_load_mesh(body='f4200a08 520001e0 f40c0e05 fa000020 bf8cc07f '
+                            '7e640280 7e660280 f0000108 000e0732 bf8c0f70')),
+)
+
+# Post-count, scalar-load-free skips use the same proof as the compute phi.
+MASK_GENERIC = (
+    ('generic live', vertex_red('beae0480 7d880086 be94246a bf880002 d4c4002e 00020086 '
+                                'befe04c1 d5010007 00b9e480')),
+    ('generic dead', vertex_red('7e0e0280 7d880086 be94246a bf880003 d4c4002e 00020086 '
+                                '7e0e02f2 befe04c1')),
+)
+
+MASK_CONTROLS = (
+    ('c1 numeric read', lane_mask_mesh(setup='beb6102e'), 'a lane mask is also read as a number'),
+    ('c2 unproven base', lane_mask_mesh(load=MASK_LOAD.replace('f4080c05', 'f4080c1b')),
+     'a masked arm reads a scalar that is not wave-uniform'),
+    ('c3 undefined skip value', lane_mask_mesh(prefix=' '.join(MASK_PREFIX.split()[2:])),
+     'a scalar live after the arm is undefined or non-uniform on the skip path'),
+    ('c4 saved mask live', lane_mask_mesh(exports='beb6042e 7e280228 7e2a0307'),
+     'a saved EXEC mask is live after the if/else'),
+    ('c5 mask SCC', lane_mask_mesh(setup='87ae2e7e 85b4c180'),
+     'SCC of a mask operation is read'),
+    ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT),
+     'the voted branch is reached through unproven EXEC control flow'),
+    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'),
+     'the else arm has scalar work without a voted EXEC branch'),
+    ('undefined VALU on restored lanes',
+     lane_mask_mesh(left='beb4047e 7da80084 7e6402f2 befe0434 7e0e0332 ' + MASK_LEFT),
+     'a vector input is undefined on the active lanes'),
+)
+
+
+# This pair holds ordinary data before the compare and again after the saved
+# EXEC's last use. Both numeric reads have their own reaching definitions.
+WEB_REUSE = lane_mask_mesh(prefix=MASK_PREFIX + ' beae0484 7e66022e',
+                           exports='beae0488 7e66022f 7e280228 7e2a0307')
+WEB_NUMERIC_EDGE = lane_mask_mesh(right='beae0389')
+WEB_NUMERIC_READ = lane_mask_mesh(setup='7e66022f')
+STANDALONE_SELECT = 'bf068006 85ea80c1 d5010007 01a9e480'
+STANDALONE_MESH = vertex_red(STANDALONE_SELECT)
+STANDALONE_WAVE_MESH = wave_load_mesh(body=WAVE_LOAD_BODY + ' ' + STANDALONE_SELECT)
+
+
+def mask_region(head, then, tail):
+    """Encode an execz to the complement after the then-arm words."""
+    body = then.split()
+    return ' '.join(head.split() + [branch(0xbf88, 0, len(body) + 1)] + body + tail.split())
+
+
+def multiple_regions(nested, renarrow=False):
+    first_head = 'd4c40034 00020086 beb62434'
+    second = mask_region('d4c40038 00020083 beba2438', '7e0e02f2', '8afe7e3a 7e0e02ff 3e800000 88fe3a7e')
+    first_then = MASK_LOAD + ' bf8cc07f 7e0e02f2'
+    if nested:
+        first_then += ' ' + second
+    close = '87fe3c36' if renarrow else '88fe367e'  # from saved block EXEC, optionally narrowed by s[60:61]
+    first = mask_region(first_head, first_then, '8afe7e36 7e0e02ff 3e800000 ' + close)
+    if nested:
+        return wave_load_mesh(MASK_PREFIX, first)
+    before = 'd4c4003c 000200c0 ' if renarrow else ''  # s[60:61] = thread < 64
+    return wave_load_mesh(MASK_PREFIX, before + first + ' ' + second.rsplit(' ', 1)[0])
+
+
+ROUND2_ACCEPTED = (
+    ('reused numeric pair', WEB_REUSE),
+    ('standalone wave-load select', STANDALONE_WAVE_MESH),
+    ('sequential mask regions', multiple_regions(False)),
+    ('nested mask regions', multiple_regions(True)),
+    ('re-narrowed mask regions', multiple_regions(False, renarrow=True)),
+)
+ROUND2_DRAWS = ROUND2_ACCEPTED + (
+    ('standalone select', STANDALONE_MESH),
+    ('standalone carry select', vertex_red('bf068006 85ea80c1 7e660280 d5283c32 01aa66c1 d5010007 00f1e480')),
+)
+ROUND2_REFUSED = (
+    ('numeric definition reaches the joined mask', WEB_NUMERIC_EDGE, 'a lane mask is also read as a number'),
+    ('live mask high word read as data', WEB_NUMERIC_READ, 'a lane mask is also read as a number'),
+    ('standalone VCC read as a number', vertex_red(STANDALONE_SELECT + ' 7e66026b'),
+     's_cselect_b64 on a wave mask is not covered'),
+    ('standalone select with unverified SCC', vertex_red(STANDALONE_SELECT.split(' ', 1)[1]),
+     's_cselect_b64 on a wave mask is not covered'),
+)
+
+
+# Both arms load each lane's position, including the high lanes of the first
+# guest wave. These VGPRs have no definition outside the prefix guard.
+GUARDED_POSITION_SETUP = (
+    ('select', 'beaa0309 bf068008 850e2a80'),
+    ('same', 'be8e0309'),
+    ('unsigned export', 'beaa0309 bf068008 850e2a80'),
+    ('plus one', 'beaa0309 800e812a'),
+    ('different SGPR', 'beaa0308 be8e0309'),
+    ('rewritten bound', 'beaa0309 bf068008 850e2a80'),
+    ('one arm', 'beaa0309 bf068008 850e2a80'),
+    ('wave index', 'beaa0306 be8e032a'),
+)
+GUARDED_POSITION_LOAD = 'e0381000 80043204 bf8c3f70'
+
+
+def guarded_position_mesh(case, setup):
+    prefix = MASK_PREFIX.replace('beaa03ff 00000080', setup).replace(' beaa0380', '')
+    prefix = prefix.replace('befe04c1', 'befe04c1 3608008f 34080884')  # v4 = (thread & 15) * 16
+    if case == 'same':
+        prefix = prefix.replace('7da8002a', '7da8000e')
+    otherwise = MASK_ELSE if case == 'one arm' else MASK_ELSE + ' ' + GUARDED_POSITION_LOAD
+    mesh = lane_mask_mesh(prefix=prefix, value=GUARDED_POSITION_LOAD, otherwise=otherwise, exports='')
+    count_copy = mesh.index('be8e0309', mesh.index('be8d0308'))
+    mesh.pop(count_copy)
+    if case == 'rewritten bound':
+        mesh.insert(count_copy, 'beaa0384')  # s42 = 4
+    if case == 'unsigned export':
+        mesh = mutate('7d28000e', '7da8000e', mesh=mesh)
+    return mutate('13121110', '35343332', mesh=mesh)  # position uses v[50:53]
+
+
+GUARDED_POSITIONS = {case: guarded_position_mesh(case, setup) for case, setup in GUARDED_POSITION_SETUP}
+GUARDED_REFUSAL = ('unsupported: slot 57 mesh: v50 is read where it is not defined for every lane '
+                   '(an entry value, or left different per wave by an exchange)')
 
 
 WAVE_LOAD_MESH = wave_load_mesh()
@@ -709,6 +868,45 @@ def depth_only_controls():
             expect(what + ' (depth-only pair)', request(tmp, mesh, DEPTH_PIXEL)[1], 'unsupported: ' + reason)
 
 
+def lane_mask_controls(tmp):
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
+        key, result = request(tmp, mesh)
+        expect(label + ' translates', result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            for mutant, mutated in lane_mask_mutants(label, source):
+                expect(label + ' mutant changes HLSL', mutated != source, True)
+                expect(label + ' mutant changes a CPU image', any(
+                    lane_mask_reference(label, full, mutant)[-1] != lane_mask_reference(label, full)[-1]
+                    for full in (False, True)), True)
+    for label, mesh in GUARDED_POSITIONS.items():
+        key, result = request(tmp, mesh)
+        expect('guarded positions with ' + label, result, 'ok' if label in ('select', 'same', 'unsigned export') else GUARDED_REFUSAL)
+        if label == 'select' and result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('export count mutant changes its source', widen_position_count(source) != source, True)
+            _, good, bad = guarded_position_reference()
+            expect('export count mutant changes the CPU image', good != bad, True)
+    for label, mesh, reason in ROUND2_REFUSED:
+        expect(label, reason in request(tmp, mesh)[1], True)
+    for label, mesh, reason in MASK_CONTROLS:
+        expect(label, request(tmp, mesh)[1], f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
+
+    mesh = MASK_GENERIC[0][1]
+    bad = mutate('d5010007', '7e0e022f', mesh=mesh)  # v_mov_b32 v7, s47
+    bad.remove('00b9e480')
+    expect('generic skip reads the high half as a number', request(tmp, bad)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+
+    # m3 ignores a numeric use before running the purity proof. The classifier's
+    # c1 assertion would fail under this mutant, independently of the emitter.
+    def compare_web(mesh):
+        ins = G.decode(code(mesh))
+        i = next(i for i, item in enumerate(ins) if item[2] == 's_not_b64')
+        return 's[46:47]' in G.lane_mask_webs(ins).get(i, ())
+    expect('c1 checks pair purity', compare_web(MASK_CONTROLS[0][1]), False)
+    expect('m3 ignoring the whole-word read fails c1', compare_web(MASK_CASES[0][1]), True)
+
+
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
@@ -744,6 +942,7 @@ def controls():
                 expect(what + ' guards the position export', bool(re.search(
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
     with tempfile.TemporaryDirectory() as tmp:
+        lane_mask_controls(tmp)
         key, result = request(tmp, WAVE_LOAD_MESH)
         expect('pre-exchange wave load translates', result, 'ok')
         if result == 'ok':
@@ -884,7 +1083,67 @@ def assemble(mc, text):
     return ['%08x' % word for word in struct.unpack('<%dI' % (len(data) // 4), data)]
 
 
+def lane_mask_binary(mc):
+    """Verify the opcodes and independently assemble the mixed/empty S1 draw."""
+    expect('standalone select words', assemble(mc, """
+s_cmp_eq_u32 s6, 0
+s_cselect_b64 vcc, -1, 0
+v_cndmask_b32_e64 v7, 0, 1.0, vcc
+"""), STANDALONE_SELECT.split())
+    expect('re-narrowed EXEC words',
+           assemble(mc, 'v_cmp_gt_u32_e64 s[60:61], 64, v0\ns_and_b64 exec, s[54:55], s[60:61]'),
+           'd4c4003c 000200c0 87fe3c36'.split())
+    expect('guarded position load words', assemble(mc, """
+buffer_load_dwordx4 v[50:53], v4, s[16:19], 0 offen
+s_waitcnt vmcnt(0)
+"""), GUARDED_POSITION_LOAD.split())
+    expect('guarded position select words', assemble(mc, """
+s_mov_b32 s42, s9
+s_cmp_eq_u32 s8, 0
+s_cselect_b32 s14, 0, s42
+"""), dict(GUARDED_POSITION_SETUP)['select'].split())
+    source = """
+s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 2
+s_mov_b32 s42, 128
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cmp_eq_u32 s6, 0
+s_cbranch_scc0 5
+v_cmp_le_u32_e32 vcc, 0, v0
+v_cmp_ge_u32_e64 s[46:47], v0, 6
+s_and_b64 s[46:47], vcc, s[46:47]
+s_branch 2
+v_cmp_ge_u32_e64 s[46:47], v0, 0
+s_not_b64 s[46:47], s[46:47]
+s_and_saveexec_b64 s[46:47], s[46:47]
+s_cbranch_execz 7
+s_load_dwordx4 s[48:51], s[10:11], 0
+s_waitcnt lgkmcnt(0)
+s_buffer_load_dword s40, s[48:51], s41 offset:0x1e0
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v7, s40
+s_andn2_b64 exec, s[46:47], exec
+v_mov_b32 v7, 0.25
+"""
+    prefix, body = source.split('s_cmp_eq_u32', 1)
+    expect('S1 assembled words', wave_load_mesh(' '.join(assemble(mc, prefix)),
+           ' '.join(assemble(mc, 's_cmp_eq_u32' + body))), MASK_CASES[0][1])
+    for label, asm, expected in (
+            ('tbuffer', 'tbuffer_load_format_x v7, off, s[16:19], 0 format:[BUF_FMT_32_FLOAT] offset:488',
+             'e8b001e8 80040700'),
+            ('image', 'image_load v7, v[50:51], s[56:63] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+             'f0000108 000e0732'),
+            ('S1b SCC', 's_cmp_eq_u32 src_scc, 1', 'bf0681fd'),
+            ('S3 masks', 's_cselect_b64 s[54:55], s[52:53], s[46:47]', '85b62e34'),
+            ('S4 VCC branch', 's_and_b64 vcc, vcc, exec\ns_cbranch_vccnz 2', '87ea7e6a bf870002')):
+        expect(label + ' assembled words', assemble(mc, asm), expected.split())
+
+
 def binary(mc):
+    lane_mask_binary(mc)
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
@@ -970,6 +1229,214 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
+
+
+def lane_mask_reference(label, full, mutant=None):
+    """Simulate scalar state per guest wave and VALU under that lane's EXEC."""
+    points, colours, indices = geometry()
+    triangles = [tuple(slot + first for slot in tri) for tri, first in zip(indices, (32, 0, 64, 64))]
+    data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
+    loaded = (255, 192)
+    for i, red in enumerate(loaded):
+        struct.pack_into('<f', data, 480 + 4 * i, red / 255)
+    struct.pack_into('<f', data, 488, 1.0)
+
+    memory = label in ('tbuffer', 'image')
+    for first in (0, 64):
+        limit = 6 if memory else 128
+        if label == 'standalone wave-load select':
+            limit = 6
+        if label == 'S4 CMPX' and mutant != 'dropped CMPX':
+            limit = 8
+        outer = [tid < limit for tid in range(first, first + 64)]
+        then = [active and (lane < 6 if first == 0 else full)
+                for lane, active in enumerate(outer)]
+        if mutant == 'dropped EXEC restore' and first == 0:
+            outer = [lane < 4 for lane in range(64)]
+            then = outer
+        if mutant == 'wrong constant select' and first == 64:
+            then = outer
+        if mutant == 'wrong mask select' and first == 0:
+            then = outer
+        if mutant == 'per-lane VCC branch' and first == 0:
+            then = [active and lane == 0 for lane, active in enumerate(outer)]
+        for tri in triangles:
+            for tid in tri:
+                if tid & ~63 != first:
+                    continue
+                lane, slot = tid & 63, tid & 15
+                runs = then[lane] if mutant == 'per-lane EXEC branch' else any(then)
+                red = loaded[first // 64] if runs else 64
+                if label == 'standalone wave-load select':
+                    green = 255 if tid < 6 and mutant != 'opposite SCC select' else 0
+                    colours[slot] = (red, green, *colours[slot][2:])
+                    continue
+                if label.endswith('mask regions'):
+                    green = 255 if tid < 3 else 64
+                    colours[slot] = (red, green, *colours[slot][2:])
+                    continue
+                if label in ('standalone select', 'standalone carry select'):
+                    red = 255 if (tid < 64) != (mutant == 'opposite SCC select') else 0
+                    colours[slot] = (red, *colours[slot][1:])
+                    continue
+                if label.startswith('generic'):
+                    red = 255 if tid < 6 or mutant == 'wrong generic mask' else 0
+                    colours[slot] = (red, *colours[slot][1:])
+                    continue
+                if memory:
+                    green = 255 if then[lane] or (mutant == 'unpredicated memory' and any(outer)) else 0
+                else:
+                    otherwise = (then[lane] if mutant == 'wrong complement' else outer[lane] and not then[lane])
+                    green = 64 if otherwise else 0
+                    if then[lane] and not otherwise and mutant != 'wrong mask select':
+                        green = 255 if label == 'S3 mask arms' else loaded[first // 64]
+                colours[slot] = (red, green, *colours[slot][2:])
+    return data, rasterise(points, colours, triangles, 128, len(triangles))
+
+
+def lane_mask_mutants(label, source):
+    """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label.endswith('mask regions'):
+        expect(label + ' has two votes', source.count('mesh_vote == 0u'), 2)
+        return [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
+    if label.startswith('standalone'):
+        old, new = 'vcc = (scc ?', 'vcc = (!scc ?'
+        expect(label + ' mutant site is unique', source.count(old), 1)
+        return [('opposite SCC select', source.replace(old, new))]
+    if label.startswith('generic'):
+        old, new = (('s46 = 0x00000000u;', 's46 = 0xffffffffu;') if label == 'generic live' else
+                    ('if (exec & 1) v7 = 0x00000000u;', 'if (exec & 1) v7 = 0x3f800000u;'))
+        expect(label + ' mutant site is unique', source.count(old), 1)
+        return [('wrong generic mask', source.replace(old, new))]
+    if label in ('tbuffer', 'image'):
+        start = source.index('if (exec & 1) {', source.index('s40 = r0.Load('))
+        end = source.index('pc =', start)
+        return [('unpredicated memory', source[:start] + source[start:end].replace('if (exec & 1)', 'if (true)')
+                 + source[end:])]
+    edits = [('per-lane EXEC branch', 'mesh_vote == 0u', 'exec == 0u'),
+             ('wrong complement', 'exec = (s46 & ~exec) & 1;', 'exec = exec & 1;')]
+    if label == 'S3':
+        edits.append(('wrong constant select', 's52 = (scc ? 0x00000000u : 0xffffffffu) & 1;',
+                      's52 = 0u;'))
+    if label == 'S3 mask arms':
+        edits.append(('wrong mask select', 's54 = (scc ? s52 : s46) & 1;', 's54 = 0u;'))
+    if label == 'S4 EXEC moves':
+        edits.append(('dropped EXEC restore', 'exec = (s52) & 1;', 'exec = exec & 1;'))
+    if label == 'S4 CMPX':
+        edits.append(('dropped CMPX', 'exec = (exec & ((0x00000008u > v0) ? 1u : 0u));',
+                      'exec = exec & 1;'))
+    if label == 'S4 VCC vote':
+        edits.append(('per-lane VCC branch', 'mesh_vote != 0u', 'vcc != 0u'))
+    for _, old, _ in edits:
+        expect(label + ' mutant site is unique', source.count(old), 1)
+    return [(name, source.replace(old, new)) for name, old, new in edits]
+
+
+def draw_lane_masks(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
+        # A group has two guest waves. A second S1 draw changes wave 1 from
+        # empty to full so the reference exercises all three kinds of wave.
+        programs = [(False, mesh)]
+        if label == 'S1':
+            programs.append((True, lane_mask_mesh(right='d4c1002e 00010100')))
+        for full, program in programs:
+            with tempfile.TemporaryDirectory() as tmp:
+                status = draw_lane_mask_case(tmp, dxc, renderer, adapter, label, program, full)
+                if status:
+                    return status
+    with tempfile.TemporaryDirectory() as tmp:
+        return draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+
+
+def guarded_position_reference():
+    """Extra vertex 10 is inactive in the defining region and has zero clip position in the mutant."""
+    points, colours, _ = geometry()
+    triangles = [(7, 2, 10), (5, 0, 8), (3, 4, 1), (6, 9, 4)]
+    data = buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles])
+    correct = rasterise(points, colours, triangles, 10, 4)
+    # The guest clamps index 10 to 9. When 10 is exported as (0,0,0,0),
+    # all nonzero homogeneous combinations in its triangle project onto the other edge.
+    mutant = rasterise(points, colours, triangles[1:], 11, 3)
+    return data, correct, mutant
+
+
+def widen_position_count(source):
+    """Widen the export predicate and its allocation together by one vertex."""
+    old = 's14 = min(lds[1], 128u);'
+    assert source.count(old) == 1
+    return source.replace(old, 's14 = min(lds[1] + 1u, 128u);')
+
+
+def draw_guarded_positions(tmp, dxc, renderer, adapter):
+    mesh = GUARDED_POSITIONS['select']
+    key, result = request(tmp, mesh)
+    expect('guarded positions compile', result, 'ok')
+    if result != 'ok':
+        return 1
+    base = tmp / ('%016x' % key)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+    for slot, count in enumerate((4, 10)):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+    data, correct, wrong = guarded_position_reference()
+    count = sum(a != b for a, b in zip(correct, wrong))
+    expect('widened export changes the CPU reference', count > 0, True)
+    path = tmp / 'guarded.bin'
+    path.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, correct)))
+    mutant, mutant_text = tmp / 'wider.cso', tmp / 'wider.hlsl'
+    mutant_text.write_text(widen_position_count(base.with_suffix('.ms57.hlsl').read_text()), encoding='ascii')
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutant_text], check=True)
+    for name, shader in (('guarded positions', base.with_suffix('.ms57.cso')), ('widened export', mutant)):
+        run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), path],
+                             capture_output=True, text=True)
+        if run.returncode == 77:
+            return 77
+        matches = re.search(r'pixels=1024 mismatches=(\d+)', run.stdout)
+        got = int(matches[1]) if matches else None
+        if shader == mutant:
+            expect(name + ' differs from the guest image', run.returncode == 1 and got is not None and got > 0, True)
+        else:
+            expect(name + ' matches the guest image', (run.returncode, got), (0, 0))
+    return 0
+
+
+def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
+    key, result = request(tmp, mesh)
+    expect(label + ' compiles', result, 'ok')
+    if result != 'ok':
+        return 1
+    base = Path(tmp) / ('%016x' % key)
+    source = base.with_suffix('.ms57.hlsl').read_text()
+    data, correct = lane_mask_reference(label, full)
+    cases = [(label, base.with_suffix('.ms57.cso'), correct, 0)]
+    for i, (name, mutated) in enumerate(lane_mask_mutants(label, source)):
+        expect(name + ' changes HLSL', mutated != source, True)
+        _, wrong = lane_mask_reference(label, full, name)
+        differences = sum(a != b for a, b in zip(correct, wrong))
+        expect(name + ' differs from guest pixels', differences > 0, True)
+        hlsl, shader = Path(tmp, f'mutant{i}.hlsl'), Path(tmp, f'mutant{i}.cso')
+        hlsl.write_text(mutated)
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', shader, hlsl], check=True)
+        cases += [(name, shader, correct, differences), (name + ' reference', shader, wrong, 0)]
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+    for slot, count in enumerate((4, 128)):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+    path = Path(tmp, 'lane-mask.bin')
+    command = '--mesh-texture-load' if label == 'image' else '--mesh-indexed'
+    texture = bytes((255, 0, 0, 255)) * 4 if label == 'image' else b''
+    for name, shader, image, differences in cases:
+        path.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, image)) + texture)
+        run = subprocess.run([renderer, adapter, command, shader, base.with_suffix('.ps57.cso'), path],
+                             capture_output=True, text=True)
+        if run.returncode == 77:
+            print(run.stdout + run.stderr)
+            return 77
+        expect(name, (run.returncode, f'pixels=1024 mismatches={differences}' in run.stdout),
+               (int(differences != 0), True))
+    return 0
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
@@ -1585,6 +2052,8 @@ def main(argv):
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['lanemask'] and len(argv) == 5:
+        status = draw_lane_masks(*argv[2:])
     elif argv[1:2] == ['wave_collectives'] and len(argv) == 5:
         status = draw_wave_collectives(*argv[2:])
     elif argv[1:2] == ['depth'] and len(argv) == 5:
