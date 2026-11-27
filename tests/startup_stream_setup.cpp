@@ -164,6 +164,14 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         if (GetEnvironmentVariableA("X2W_TEST_ROOT_FLAGS", flags, sizeof(flags)))
             root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(std::strtoul(flags, nullptr, 0));
     }
+    D3D12_ROOT_PARAMETER entry_constant{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_ENTRY_WORD", nullptr, 0)) {
+        entry_constant.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        entry_constant.Constants = {0, 0, 1};
+        entry_constant.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        root_desc.NumParameters = 1;
+        root_desc.pParameters = &entry_constant;
+    }
     // A runtime or device that rejects the requested root signature flags is a capability skip.
     const int rejected = root_desc.Flags ? 77 : 0;
     ComPtr<ID3DBlob> blob;

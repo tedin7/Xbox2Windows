@@ -251,6 +251,23 @@ reads the TEXCOORD parameter, and they check each refusal. The draw is
 parameter 1. The pixel shader reads only TEXCOORD, as attribute 0. On an 8×4 target, red follows TEXCOORD column by
 column. The same pipeline translated with pairing by number reads COLOR and fails the check.
 
+## Bounded stream shader exits
+
+The slot-86 vertex and pixel readers decode the bounded instruction span before
+counting exits. They accept one through eight reachable exits and validate
+direct branch targets against instruction boundaries. In a multi-exit pixel shader with outputs, a
+path that ends without writing any output discards the pixel. A vertex
+exit without a position export is refused during lowering.
+
+Run `python -B tests/startup_stream_two_exit_check.py` for the synthetic
+translation and refusal checks. On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_stream_two_exit_(translate|warp)$' -V`
+with the stream consumer built. The WARP test compares all 32 pixels per draw
+with a CPU reference. One shader takes three exits across four root-constant
+inputs, another uses an end-program word as literal colour data, and a vertex
+shader takes two exits. The literal-counting mutant must refuse extraction.
+The fall-through mutant must change all 32 pixels from green to yellow.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
