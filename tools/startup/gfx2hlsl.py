@@ -5048,7 +5048,7 @@ class Stage:
             source, offset, word = args
             if fixed_only and node in getattr(self, 'advanced_descriptor_words', ()):
                 raise Unsupported('cannot materialize descriptor word %d from an advanced descriptor' % word)
-            if (getattr(self, 'kind', None) in ('ps', 'vs') and source[0] == 'table' and 0 <= source[1] < 16
+            if (getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and source[0] == 'table' and 0 <= source[1] < 16
                     and offset is not None and offset % 4 == 0 and 0 <= offset + 4 * word <= 0x7ffffffc):
                 return 'ud' if probe else 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
             if getattr(self, 'kind', None) == 'cs' and source[0] == 'table' and offset is not None and word % 4 == 3:
@@ -5065,7 +5065,7 @@ class Stage:
         reg = reg_range(token)
         symbol = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
         if symbol and symbol[0] == 'desc' and names_one_value(symbol):
-            if getattr(self, 'kind', None) in ('ps', 'vs'):
+            if getattr(self, 'kind', None) in ('ps', 'vs', 'ms'):
                 return self.descriptor_number(symbol[:4], fixed_only=True)
         if symbol and symbol[0] == 'descnum' and len(symbol) == 3:
             return self.descriptor_number(self.descriptor_number_node(symbol), fixed_only=True)
@@ -9953,7 +9953,7 @@ class Stage:
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
-            if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
+            if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
                 result = self.descriptor_alu(text, srcs, syms)
                 expr = self.descriptor_number(self.descriptor_number_node(result), fixed_only=True)
