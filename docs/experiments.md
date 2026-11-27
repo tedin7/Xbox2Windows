@@ -17296,15 +17296,31 @@ cmake --build --preset dev --target startup_resource_retire_title startup_resour
 ctest --preset dev --no-tests=error -R '^startup_resource_retire(_title)?_' -V
 ```
 
-## Single-wave `TG_SIZE_EN` wave-ID folding in the startup compute translator
+## Guest wave ID and wave count in the startup compute translator
 
-[The startup translator](../tools/startup/gfx2hlsl.py) accepts `COMPUTE_PGM_RSRC2.TG_SIZE_EN` (bit 10) in `ComputePipeline` when the thread-group size is at most 32 threads (`x * y * z <= 32`, one wave per workgroup). The `TG_SIZE` entry SGPR sits immediately after `USER_SGPR` and any enabled `TGID_X/Y/Z` SGPRs (`user + len(groups)`) and is tagged `('tg_size',)`. Only `s_and_b32 R, TG, 0xfc0` (or `0xfc0, TG`) into an SGPR `R <= 105` is accepted for an untouched `TG_SIZE` register: because a single-wave group has wave index `TG_SIZE[11:6] == 0`, it lowers to `R = 0u; scc = false;` with `R` tracked as `('const', 0)` (feeding `v_mbcnt_lo_u32_b32` as a known zero base). Every other read of an untouched `('tg_size',)` register (other masks, moves, arithmetic, vector instructions, or direct `v_mbcnt_lo_u32_b32`) is refused, while overwriting `TG` restores ordinary scalar behavior. Larger groups (`> 32` threads) with `TG_SIZE_EN` remain refused in `ComputePipeline`, and `tools/compute_store_aot.py` continues to refuse `TG_SIZE_EN` unconditionally.
+The startup translator places the `COMPUTE_PGM_RSRC2.TG_SIZE_EN` entry word
+after the user and enabled group-ID SGPRs. An `s_and_b32` into an ordinary
+SGPR can read the wave ID with mask `0xfc0` or the wave count with `0x3f`.
+For a known guest wave size, the ID is the x-major flat thread index divided
+by the guest wave size and shifted left by six. The count is the group size
+divided by the guest wave size, rounded up. The last wave can be partial.
+The existing per-thread EXEC model still applies and its unsupported lane
+operations still refuse. Without a wave-size proof, the translator only
+accepts the legacy wave-ID fold for groups of up to 32 threads. Other reads
+of the untouched word, including first-wave and ordered-append fields,
+remain unsupported.
+
+The WARP fixture compares both fields against a CPU reference for wave32
+groups of 33, 48, 64 and 96 threads and wave64 groups of 64 and 128 threads.
+It checks 320 words per dispatch, including sentinel words past the last
+thread. Three mutations exercise the readback: swapping the shift for each
+wave size and zeroing the wave-count result.
 
 [The `TG_SIZE_EN` check](../tests/startup_compute_tg_size_check.py) verifies SGPR placement, `s_and_b32` folding, `v_mbcnt_lo_u32_b32` lowering, overwrite/branch/refusal controls, and a two-group `4x2x2` WARP dispatch (`320` words compared, `0` mismatches on Microsoft Basic Render Driver `10.0.26100.9818`, with `dropped-base` rejected at word 5 and `swapped-mask` rejected at word 8).
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tests/startup_compute_tg_size_check.py
-ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_' -V
+ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_.*(controls|warp)$' -V
 ```
 
 ## Explicit-level 1D image sampling in the startup translator
