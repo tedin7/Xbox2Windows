@@ -43,6 +43,20 @@ def run(mesh, mode=None, pixel=(), *, artifacts=False):
             return result, output
 
 
+def check_exec_zero_edges():
+    # On the dead edge v0 and s20 retain their old storage. Only the active arm defines them.
+    prefix = SERIAL_MESH[:6]
+    writes = ['7e000280', 'be940380']  # v_mov_b32 v0, 0; s_mov_b32 s20, 0
+    suffix = ['7e020214', *SERIAL_MESH[8:]]  # v_mov_b32 v1, s20; export v0
+    for branch in (['bf880002', *writes], ['bf890001', 'bf820002', *writes]):
+        status, _ = run(prefix + branch + suffix, 'force')
+        assert status == 'ok', status
+    status, _ = run(prefix + ['bf880001', writes[1]] + suffix, 'force')
+    assert 'v0 may be read before it is written' in status, status
+    status, _ = run(prefix + ['bf880001', writes[0]] + suffix, 'force')
+    assert 's20 may be read before it is written' in status, status
+
+
 def main():
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
@@ -77,6 +91,7 @@ def main():
     undefined = [word for word in SERIAL_MESH if word != '7e000280']
     reason, _ = run(undefined)
     assert 'wave loop: v0 may be read before it is written' in reason, reason
+    check_exec_zero_edges()
     print('ok')
 
 

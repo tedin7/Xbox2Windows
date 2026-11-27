@@ -162,6 +162,28 @@ class ControlFlow:
             for successor in self.successors[start]:
                 self.predecessors[successor].append(start)
         self.effects = [effects(G, name, asm) for _, _, name, asm in instructions]
+        self.exec_zero_edges = {}
+        for start, end in self.blocks.items():
+            name = instructions[end - 1][2]
+            if name not in ('s_cbranch_execz', 's_cbranch_execnz') or len(self.successors[start]) != 2:
+                continue
+            empty, active = self.successors[start]
+            if name == 's_cbranch_execnz':
+                empty, active = active, empty
+            if empty == active:
+                continue
+            seen, todo, writes = {empty, start}, [active], set()
+            while todo:
+                block = todo.pop()
+                if block in seen:
+                    continue
+                seen.add(block)
+                for index in range(block, self.blocks[block]):
+                    writes.update(reg for reg in self.effects[index][1]
+                                  if re.fullmatch(r'[sv]\d+', reg))
+                todo.extend(self.successors[block])
+            self.exec_zero_edges[start, empty] = writes
+
 
     def definedness(self, entry, elided_scc=()):
         def transfer(state, index):
@@ -175,7 +197,8 @@ class ControlFlow:
         while True:
             changed = False
             for start, end in self.blocks.items():
-                incoming = [exits[p] for p in self.predecessors[start]]
+                incoming = [exits[p] | self.exec_zero_edges.get((p, start), set())
+                            for p in self.predecessors[start]]
                 if start == 0:
                     incoming.append(entry)
                 inputs[start] = set.intersection(*incoming)
@@ -196,12 +219,18 @@ class ControlFlow:
         return before
 
 
-def meet(states):
+def meet(states, exec_zero=()):
     keys = set().union(*(state.keys() for state in states))
     result = {}
     for key in keys:
         values = [state.get(key) for state in states]
         first = values[0]
+        active = [value for i, value in enumerate(values) if i not in exec_zero]
+        if (active and active[0] is not None and all(value == active[0] for value in active)
+                and all(value is None or value[0] != 'const' for value in values)
+                and (active[0] != JOINED)):
+            result[key] = active[0]
+            continue
         if first is not None and all(value == first for value in values):
             result[key] = first
         elif any(value is not None and (value[0] != 'const' or len(value) != 2) for value in values):
@@ -267,10 +296,12 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             raise G.Unsupported('wave loop: symbolic block entries did not stabilize')
 
         def block_symbols(self, start, exits):
-            states = [exits[p] for p in self.cfg.predecessors[start] if p in exits]
+            predecessors = [p for p in self.cfg.predecessors[start] if p in exits]
+            states = [exits[p] for p in predecessors]
+            exec_zero = {i for i, p in enumerate(predecessors) if (p, start) in self.cfg.exec_zero_edges}
             if start == 0:
                 states.append(self.entry_symbols)
-            return meet(states) if states else {}
+            return meet(states, exec_zero) if states else {}
 
         def op_x2w_serial_block(self, ops, mods):
             if self.current_block is not None:
