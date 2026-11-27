@@ -634,10 +634,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
-        if (std::strcmp(placeholder_mode, "clipped") == 0) {
-            // Keep the counted draw but exclude every target pixel.
-            const D3D12_RECT outside{8, 0, 9, 8};
-            invoke(list, 22, 1, arg(&outside));
+        if (placeholder_fixture) {
+            // The default scissor covers 4x2 pixels. A visible draw covers the whole target; a clipped one keeps
+            // the counted draw but excludes every target pixel.
+            const bool clipped = std::strcmp(placeholder_mode, "clipped") == 0;
+            const D3D12_RECT area{clipped ? 8 : 0, 0, clipped ? 9 : 8, 8};
+            invoke(list, 22, 1, arg(&area));
         }
         invoke(list, 12, 3, 1);
     }
