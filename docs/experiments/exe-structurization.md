@@ -188,7 +188,7 @@ else arm without its own vote remains refused.
 
 Habermaier and Knapp's SIMT simulation theorem (2012, Theorem 1) motivates the
 per-thread interpretation of vector state. The whole-wave scalar state still
-requires a vote. [SIMT execution model](https://opus.bibliothek.uni-augsburg.de/opus4/frontdoor/deliver/index/docId/1600/file/TR_2012_01.pdf)
+requires a vote. [SIMT execution model](https://doi.org/10.1007/978-3-642-28869-2_16)
 
 Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
 uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
