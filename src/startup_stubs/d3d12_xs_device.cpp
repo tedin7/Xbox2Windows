@@ -544,6 +544,10 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    // The guest checks device byte +0x18 before using its inline descriptor
+    // writers. Request vtable calls so the shim records the descriptor.
+    static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
+    if (kind == device_kind) w->console_fields[2] = 1;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
