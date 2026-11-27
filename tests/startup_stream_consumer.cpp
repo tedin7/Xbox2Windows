@@ -22,6 +22,8 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_compute_snapshots();
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_fixture_fill_upload_ring(void* list, UINT bytes);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
@@ -582,6 +584,151 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     return 0;
 }
 
+// Each dispatch copies the same placed input into a distinct output range. Readback is recorded on the
+// producing list so it also checks that separate recordings hold the shared upload slice for execution.
+static int dispatch_snapshot_reuse(void* device, const std::string& mode)
+{
+    static constexpr UINT rounds = 200;
+    const bool large = mode == "dispatch-snapshot-large";
+    const UINT bytes = large ? (1u << 20) + 4096 : 40u * 1024;
+    const UINT words = bytes / sizeof(UINT);
+    const bool threaded = mode == "dispatch-snapshot-threads";
+    const bool recycle = mode == "dispatch-snapshot-recycle";
+    const bool next_frame = mode == "dispatch-snapshot-frame";
+    const bool rewrite = mode == "dispatch-snapshot-rewrite";
+    const auto word = [](const void* p) { return reinterpret_cast<StreamWord>(p); };
+    const auto ok = [](StreamWord hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); };
+    const auto buffer = [](UINT size, D3D12_RESOURCE_FLAGS flags) {
+        return D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                  D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
+    };
+    const auto place = [&](UINT* memory, const D3D12_RESOURCE_DESC& desc, void** resource) {
+        return ok(invoke(device, 133, word(memory), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                         word(&__uuidof(ID3D12Resource)), word(resource)));
+    };
+    const auto descriptor = [words](UINT* memory, UINT* dest) {
+        const auto address = reinterpret_cast<UINT64>(memory);
+        dest[0] = static_cast<UINT>(address);
+        dest[1] = static_cast<UINT>(address >> 32) | 4u << 16;
+        dest[2] = words;
+        dest[3] = 0;
+    };
+    auto* allocation = static_cast<UINT*>(VirtualAlloc(nullptr, bytes + 0x4000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!allocation) return 90;
+    auto* input = allocation + 0x4000 / sizeof(UINT);  // Offset is incompatible with desktop placed-buffer alignment.
+    void* input_resource = nullptr;
+    if (!place(input, buffer(bytes, D3D12_RESOURCE_FLAG_NONE), &input_resource)) return 91;
+    for (UINT i = 0; i < words; ++i) input[i] = 0x23456789u + i * 0x12345u;
+
+    void *queue = nullptr, *fence = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    if (!ok(invoke(device, 8, word(&queue_desc), word(&__uuidof(ID3D12CommandQueue)), word(&queue))) ||
+        !ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence)))) return 92;
+
+    struct Recording {
+        void *heap = nullptr, *allocator = nullptr, *list = nullptr, *output = nullptr, *readback = nullptr;
+        UINT *memory = nullptr, *views = nullptr;
+        StreamWord gpu = 0;
+        UINT count = 0;
+    } recordings[2];
+    const UINT list_count = threaded || recycle ? 2 : 1;
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    for (UINT t = 0; t < list_count; ++t) {
+        auto& r = recordings[t];
+        r.count = recycle ? 1 : large ? 2 : threaded ? rounds / 2 : rounds + next_frame;
+        const UINT total = r.count * bytes;
+        r.memory = static_cast<UINT*>(VirtualAlloc(nullptr, (total + 0xffffu) & ~0xffffu,
+                                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!r.memory || !place(r.memory, buffer(total, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), &r.output))
+            return 93;
+        r.readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, buffer(total, D3D12_RESOURCE_FLAG_NONE),
+                                   D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!r.readback ||
+            !ok(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&r.heap))) ||
+            !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&r.allocator))) ||
+            !ok(invoke(device, 73, word(list_desc), word(r.allocator), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&r.list))) ||
+            !ok(invoke(r.list, 139, word(r.allocator)))) return 94;
+        r.views = reinterpret_cast<UINT*>(invoke(r.heap, 9));
+        r.gpu = invoke(r.heap, 10);
+        if (!r.views || !r.gpu) return 95;
+        descriptor(input, r.views);
+        invoke(r.list, 32, 1, word(&r.heap));
+        invoke(r.list, 25, word(slot67_pipeline));
+        invoke(r.list, 33, word(slot67_root));
+        const UINT constants[2]{};
+        invoke(r.list, 39, 0, 2, word(constants), 0);
+        invoke(r.list, 35, 1, r.gpu);
+    }
+
+    const auto dispatch_one = [&](Recording& r, UINT index) {
+        descriptor(r.memory + index * words, r.views + 4);
+        invoke(r.list, 14, words / 64, 1, 1);
+    };
+    const auto run = [&](Recording& r) {
+        for (UINT i = 0; i < r.count; ++i) {
+            if (rewrite && i == rounds / 2) input[words / 2] ^= 0x10203040u;
+            if (next_frame && i == rounds) invoke(queue, 32, 0, 0, 0);
+            dispatch_one(r, i);
+        }
+    };
+    UINT64 signal = 0;
+    const auto submit = [&](Recording& r) {
+        invoke(r.list, 15, word(r.readback), 0, word(r.output), 0, r.count * bytes);
+        if (!ok(invoke(r.list, 9))) return false;
+        invoke(queue, 10, 1, word(&r.list));
+        if (!ok(invoke(queue, 14, word(fence), ++signal))) return false;
+        for (const auto deadline = GetTickCount64() + 10000; invoke(fence, 8) < signal;) {
+            if (GetTickCount64() >= deadline) return false;
+            Sleep(1);
+        }
+        return true;
+    };
+
+    if (threaded) {
+        std::atomic<bool> start{false};
+        std::thread worker([&] {
+            while (!start.load()) std::this_thread::yield();
+            run(recordings[1]);
+        });
+        start.store(true);
+        run(recordings[0]);
+        worker.join();
+        if (!submit(recordings[0]) || !submit(recordings[1])) return 96;
+    } else if (recycle) {
+        auto& first = recordings[0];
+        dispatch_one(first, 0);
+        for (UINT i = 0; i < 3; ++i)
+            if (!x2w_d3d12_fixture_fill_upload_ring(first.list, bytes)) return 97;
+        if (!submit(first) || !ok(invoke(first.list, 139, word(first.allocator)))) return 96;
+        auto& second = recordings[1];
+        // Recycle and overwrite the old slice at offset zero before the second dispatch resolves its input.
+        if (!x2w_d3d12_fixture_fill_upload_ring(second.list, bytes)) return 97;
+        dispatch_one(second, 0);
+        if (!submit(second)) return 96;
+    } else {
+        run(recordings[0]);
+        if (!submit(recordings[0])) return 96;
+    }
+
+    char path[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return 2;
+    std::ofstream out(path, std::ios::binary);
+    for (UINT t = 0; t < list_count; ++t) {
+        auto& r = recordings[t];
+        void* mapped = nullptr;
+        if (!ok(invoke(r.readback, 8, 0, 0, word(&mapped))) || !mapped) return 98;
+        out.write(static_cast<const char*>(mapped), r.count * bytes);
+        invoke(r.readback, 9, 0, 0);
+    }
+    x2w_d3d12_fixture_compute_snapshots();
+    return out ? 0 : 2;
+}
+
 // The image store program of startup_compute_image_store_d16_check.py through the stand-in's own list: a committed
 // 32x8 RGBA16_FLOAT texture (device slot 127) filled with sentinel halves by CopyTextureRegion (list slot 16), an
 // unordered access view of it (device slot 19) whose token the stand-in writes into the title heap at table byte 64,
@@ -901,6 +1048,8 @@ int main(int argc, char** argv)
             }
         }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
+        if (std::strncmp(argv[8], "dispatch-snapshot-", 18) == 0)
+            return dispatch_snapshot_reuse(device, argv[8]);
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
         if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
             if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;

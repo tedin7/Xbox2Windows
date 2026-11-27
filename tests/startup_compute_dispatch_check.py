@@ -34,7 +34,7 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 
-def dispatch(directory, consumer, env, mode):
+def dispatch(directory, consumer, env, mode, *, word_count=C.WORDS):
     out = directory / 'out.bin'
     out.unlink(missing_ok=True)
     args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
@@ -44,7 +44,7 @@ def dispatch(directory, consumer, env, mode):
         print(result.stdout, end='')
         sys.exit(77)
     assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
-    return list(struct.unpack('<%dI' % C.WORDS, out.read_bytes())), result
+    return list(struct.unpack('<%dI' % word_count, out.read_bytes())), result
 
 
 def lines(result, text):

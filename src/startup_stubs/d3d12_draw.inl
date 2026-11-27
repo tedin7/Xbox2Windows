@@ -2772,6 +2772,7 @@ struct IndirectBufferView {
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
     bool null_token = false;
+    bool snapshot_reused = false;
 };
 
 bool unfilled_heap_slot(const std::uint32_t* words)
@@ -2785,6 +2786,106 @@ bool title_input_snapshot_enabled()
 {
     static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT");
     return enabled;
+}
+
+bool compute_snapshot_reuse_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_SNAPSHOT_REUSE");
+    return enabled;
+}
+
+bool compute_snapshot_cacheable(std::size_t bytes)
+{
+    if (!compute_snapshot_reuse_enabled()) return false;
+    if (bytes <= (1u << 20)) return true;
+    static const bool verify_large = x2w_local::env_on("X2W_COMPUTE_SNAPSHOT_VERIFY");
+    return verify_large;
+}
+
+struct ComputeSnapshot {
+    UploadReservation slice;
+    Wrapper* owner;  // Identity only. Invalidation removes its recording ID before reset or destruction.
+    u64 recording;
+    u64 hash;
+};
+
+SRWLOCK compute_snapshot_lock = SRWLOCK_INIT;
+volatile LONG compute_snapshot_frame;
+struct ComputeSnapshotCache {
+    std::map<std::pair<u64, std::size_t>, ComputeSnapshot> ranges;
+    std::unordered_map<Wrapper*, u64> recordings;
+    u64 next_recording = 0;
+    LONG frame = 0;
+};
+
+ComputeSnapshotCache& compute_snapshot_cache()
+{
+    static ComputeSnapshotCache cache;
+    return cache;
+}
+
+void forget_compute_snapshot_recording(Wrapper* list)
+{
+    if (!compute_snapshot_reuse_enabled()) return;
+    x2w_startup::ExclusiveNoteLock guard(compute_snapshot_lock);
+    compute_snapshot_cache().recordings.erase(list);
+}
+
+volatile LONG64 compute_snapshot_hits, compute_snapshot_replacements, compute_snapshot_saved;
+
+// Called with draw_lock released. The cache lock serializes first use, verification and publication.
+// The ring takes the consuming list's hold under allocator_lock while validating the slice generation.
+UploadReservation compute_snapshot(Wrapper* list, u64 address, std::size_t bytes, bool& reused)
+{
+    x2w_startup::ExclusiveNoteLock guard(compute_snapshot_lock);
+    auto& cache = compute_snapshot_cache();
+    // Present publishes the epoch. Clear lazily so Present never waits for a snapshot.
+    const LONG frame = InterlockedCompareExchange(&compute_snapshot_frame, 0, 0);
+    if (cache.frame != frame) {
+        cache.ranges.clear();
+        cache.recordings.clear();
+        cache.frame = frame;
+    }
+    const auto key = std::make_pair(address, bytes);
+    const auto* source = reinterpret_cast<const unsigned char*>(address);
+    const auto found = cache.ranges.find(key);
+    bool changed = false;
+    if (found != cache.ranges.end()) {
+        const auto& entry = found->second;
+        const auto owner = cache.recordings.find(entry.owner);
+        if (owner != cache.recordings.end() && owner->second == entry.recording) {
+            static const bool skip_hash = x2w_local::env_on("X2W_TEST_COMPUTE_SNAPSHOT_SKIP_HASH");
+            changed = !skip_hash && fnv_bytes(source, bytes) != entry.hash;
+            if (!changed && bind_upload_slice(list, entry.slice)) {
+                reused = true;
+                InterlockedIncrement64(&compute_snapshot_hits);
+                InterlockedAdd64(&compute_snapshot_saved, static_cast<LONG64>((bytes + 511) & ~std::size_t{511}));
+                return entry.slice;
+            }
+        }
+    }
+
+    const auto slice = reserve_upload_ring(list, bytes);
+    if (!slice.mapped) return {};
+    // Hash the actual copied bytes in cacheable CPU memory. The upload heap can be write-combined.
+    unsigned char block[4096];
+    u64 hash = fnv_bytes(nullptr, 0);
+    for (std::size_t offset = 0; offset < bytes; offset += sizeof(block)) {
+        const auto count = (std::min)(sizeof(block), bytes - offset);
+        std::memcpy(block, source + offset, count);
+        std::memcpy(slice.mapped + offset, block, count);
+        hash = fnv_bytes(block, count, hash);
+    }
+    if (changed) InterlockedIncrement64(&compute_snapshot_replacements);
+    try {
+        auto recording = cache.recordings.find(list);
+        if (recording == cache.recordings.end())
+            recording = cache.recordings.emplace(list, ++cache.next_recording).first;
+        cache.ranges.insert_or_assign(key, ComputeSnapshot{slice, list, recording->second, hash});
+    } catch (const std::bad_alloc&) {
+        // The new slice is still usable by this recording.
+    }
+    return slice;
 }
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
@@ -2907,6 +3008,17 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
                 u64 ring_offset = 0;
                 ID3D12Resource* ring = nullptr;
+                if (compute_snapshot_cacheable(static_cast<std::size_t>(bytes))) {
+                    bool reused = false;
+                    draw_lock_release_exclusive();
+                    const bool readable = readable_window(address, static_cast<std::size_t>(bytes)) >= bytes;
+                    const auto slice = readable ? compute_snapshot(self, address, static_cast<std::size_t>(bytes), reused)
+                                                : UploadReservation{};
+                    draw_lock_acquire_exclusive();
+                    if (!readable) return refuse("an input range in title memory is not readable");
+                    if (!slice.resource) return refuse("an input range could not be copied from title memory");
+                    return {slice.resource, slice.offset, bytes, stride, true, 2, false, reused};
+                }
                 if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
                     return refuse("an input range in title memory is not readable");
                 if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
