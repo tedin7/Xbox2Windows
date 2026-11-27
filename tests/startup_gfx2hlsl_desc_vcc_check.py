@@ -3,6 +3,7 @@
 usage: startup_gfx2hlsl_desc_vcc_check.py [draw <dxc> <offscreen_check> <warp|hardware> [fxc]]
 """
 import struct
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -70,9 +71,18 @@ MASK_MOVE = 'vcc = (s30) & 1;'
 MASK_REFUSAL = 'mask from descriptor data: vcc needs a pair of tracked descriptor words or constants'
 
 
+def xor64(dst, a, b):
+    return struct.pack('<I', 0x89800000 | dst << 16 | b << 8 | a)
+
+
+SWAP = xor64(106, 106, 30) + xor64(30, 106, 30) + xor64(106, 106, 30)
+
+
 def mask_controls():
     pipe = G.Pipeline(MASK_VS, None, TABLE_ROOT)
     source = pipe.hlsl_vs()
+    assert hashlib.sha256((source + '\0' + pipe.manifest()).encode()).hexdigest() == (
+        '4e4ea0bcf91f6a586e8c46e89798f5721a2febc7cf5253920e669ded3e907897')
     assert source.count(MASK_MOVE) == 1 and 'class32(F(v6)) & 0x00000100u' in source
     # Read vcc_hi as the select mask, or remove the 32-bit EXEC proof.
     high_select = bytes.fromhex('0a0001d580e4ad01')
@@ -80,7 +90,42 @@ def mask_controls():
     full_write = struct.pack('<I', mov64(106, 128))  # s_mov_b64 vcc, 0
     bypass = struct.pack('<I', 0xbf820001)  # s_branch to the high select
     branched = high_read[:44] + bypass + full_write + high_read[44:]
-    for wave, code in ((64, MASK_VS), (None, MASK_VS[4:]), (None, high_read), (None, branched)):
+    for wave in (None, 64):
+        pipe.wave_size = wave
+        lifted = G.Stage(pipe, 'vs', MASK_VS[4:])
+        assert any(MASK_MOVE in line for _, lines, _ in lifted.blocks for line in lines)
+    # A later descriptor-word write invalidates the compare's high-word tag.
+    write_high = struct.pack('<I', 0xbe9f031d)  # s_mov_b32 s31, s29
+    odd_move = struct.pack('<I', mov64(106, 31))
+    for code in (MASK_VS[4:40] + write_high + MASK_VS[40:],
+                 MASK_VS[4:40] + odd_move + MASK_VS[44:]):
+        pipe.wave_size = None
+        try:
+            G.Stage(pipe, 'vs', code)
+        except G.Unsupported as error:
+            assert str(error) == MASK_REFUSAL, error
+        else:
+            raise AssertionError(code.hex())
+    swap_code = MASK_VS[4:40] + SWAP * 2 + MASK_VS[40:]
+    assert len(G.Stage(pipe, 'vs', swap_code).blocks)
+    for a in (0, 1):
+        for b in (0, 1):
+            x, y = a, b
+            for _ in range(2):
+                x ^= y
+                y ^= x
+                x ^= y
+            assert (x, y) == (a, b)
+    # Model lane bits across both halves of a wave64 and two wave32s.
+    bits = [int((lane % 5) < 2) for lane in range(64)]
+    mask64 = sum(bit << lane for lane, bit in enumerate(bits))
+    for lane in range(64):
+        start = (lane // 32) * 32
+        low32 = sum(bits[start + i] << i for i in range(32))
+        assert (mask64 >> lane) & 1 == (low32 >> (lane % 32)) & 1 == bits[lane]
+    numeric_high = struct.pack('<I', 0xbe8a036b)  # s_mov_b32 s10, vcc_hi
+    numeric_read = MASK_VS[4:44] + numeric_high + MASK_VS[44:]
+    for wave, code in ((None, high_read), (None, branched), (None, numeric_read)):
         pipe.wave_size = wave
         try:
             G.Stage(pipe, 'vs', code)
@@ -102,7 +147,7 @@ def check_mask_draw(dxc, renderer, adapter):
     # Request a translated PS that copies param0 to the target.
     ps_code = bytes.fromhex(
         '0203fcbe 020052c8 020156c8 02025ac8 02035ec8 0f1800f814151617 000081bf')
-    pipe = G.Pipeline(MASK_VS, ps_code, TABLE_ROOT)
+    pipe = G.Pipeline(MASK_VS[4:], ps_code, TABLE_ROOT)
     source = pipe.hlsl_vs()
     assert source.count(MASK_MOVE) == 1
     out = Path(__file__).resolve().parent.parent / 'out'
@@ -112,12 +157,29 @@ def check_mask_draw(dxc, renderer, adapter):
         vs = compile_hlsl(dxc, 'dxc', source, 'vs', 'vs_6_0', directory)
         mutant = compile_hlsl(dxc, 'dxc', source.replace(MASK_MOVE, 'vcc = (~s30) & 1;'),
                               'inverse', 'vs_6_0', directory)
+        swapped_pipe = G.Pipeline(MASK_VS[4:40] + SWAP * 2 + MASK_VS[40:], ps_code, TABLE_ROOT)
+        swapped = compile_hlsl(dxc, 'dxc', swapped_pipe.hlsl_vs(), 'vs_swapped', 'vs_6_0', directory)
         ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), 'ps', 'ps_6_0', directory)
         expected = directory / 'expected.bin'
         # At the pixel centers, x_ndc+y_ndc = (x-y)/2. No center lies on the edge.
-        expected.write_bytes(b''.join(struct.pack('<4f', float(x > y), float(x <= y), 0.0, 1.0)
-                                      for y in range(4) for x in range(4)))
-        for shader, status in ((vs, 0), (mutant, 1)):
+        def reference(wave):
+            # Compare writes a lane bit in the appropriate word; in wave32
+            # the untouched descriptor high word is never read by a lane.
+            pixels = []
+            for y in range(4):
+                for x in range(4):
+                    lane = y * 4 + x
+                    bit = int(x > y)
+                    words = [0, 0xdeadbeef] if wave == 32 else [0, 0]
+                    words[lane // 32] |= bit << (lane % 32)
+                    selected = (words[lane // 32] >> (lane % 32)) & 1
+                    pixels.append((float(selected), float(1 - selected), 0.0, 1.0))
+            return pixels
+        pixels = reference(32)
+        assert pixels == reference(64)
+        assert pixels != [(1 - r, 1 - g, b, a) for r, g, b, a in pixels]
+        expected.write_bytes(b''.join(struct.pack('<4f', *pixel) for pixel in pixels))
+        for shader, status in ((vs, 0), (swapped, 0), (mutant, 1)):
             result = gpu_case_runner.run(renderer, adapter, (
                 '--raster-reference', shader, ps, 4, 4, expected, 'none', 'cw'))
             print(result.stdout, end='')

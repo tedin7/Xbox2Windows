@@ -1277,10 +1277,29 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
+bool needs_snorm_export_variant(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16_SNORM:
+        return true;
+    default: return false;
+    }
+}
+
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+    bool variant = std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
+    if (!variant && base->state != 1 &&
+        std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_snorm_export_variant)) {
+        wchar_t path[MAX_PATH];
+        std::string failure;
+        variant = cache_path(path, L"", base->key, L".fail") && read_text(path, failure) &&
+                  failure.compare(0, 35, "signed normalized compressed export") == 0;
+    }
+    if (!variant) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
         return base;
