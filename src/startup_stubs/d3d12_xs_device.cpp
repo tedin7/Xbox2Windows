@@ -4511,6 +4511,7 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
     depth_clear_census().executed(target, depth, static_cast<unsigned>(flags));
+    if (flags & D3D12_CLEAR_FLAG_DEPTH) debug_present::note_clear(target, depth, rect_count);
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
                                 rect_count, rect_count ? rects : nullptr);
     red_producers().after(self, red_sample);

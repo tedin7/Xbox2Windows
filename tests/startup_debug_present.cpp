@@ -23,6 +23,7 @@ using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) int x2w_d3d12_fixture_debug_present(ID3D12Device*, ID3D12CommandQueue*, const char*, ID3D12Resource*, int,
                                                                       ID3D12Resource*, int, ID3D12Resource*, unsigned, unsigned, ID3D12Resource*, char*, std::size_t,
                                                                       char*, std::size_t);
+extern "C" __declspec(dllimport) int x2w_d3d12_fixture_debug_present_life(ID3D12Resource*, unsigned, int, char*, std::size_t);
 
 namespace {
 
@@ -292,6 +293,12 @@ int main(int argc, char** argv)
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("rt:16x16:28", depth.Get()) != 1 || show("rt:32x32:10", depth.Get()) != 1 || show("", depth.Get()) != 1) return fail("a setting that matches nothing drew"), 36;
     if (!expect(s, surface.Get(), "no match", magenta_pixel)) return 37;
+    // the order of the depth-writing draws and the depth clears: a clear after the writes blanks the picture
+    char life[220];
+    x2w_d3d12_fixture_debug_present_life(depth.Get(), 12, 1, life, sizeof(life));
+    if (!std::strstr(life, "depth writes 12, clears 1 (last value 1, 0 partial), the last clear came after the last write: YES")) return fail(life), 44;
+    x2w_d3d12_fixture_debug_present_life(depth.Get(), 12, 0, life, sizeof(life));
+    if (!std::strstr(life, "depth writes 12, clears 1 (last value 1, 0 partial), the last clear came after the last write: no")) return fail(life), 45;
     std::puts("startup_debug_present: PASS (depth, reversed Z, largest-rt and rt:WxH:fmt pictures match the hand-computed pixels; no match leaves the surface)");
     return 0;
 }
