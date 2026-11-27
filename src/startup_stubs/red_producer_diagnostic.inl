@@ -1,11 +1,14 @@
 // Opt-in diagnostic for writes to the title-selected presentation texture.
 extern LONG frame_number;
+std::uint64_t process_ms();
 
 class RedProducers {
     using Resource = Microsoft::WRL::ComPtr<ID3D12Resource>;
     using Fence = Microsoft::WRL::ComPtr<ID3D12Fence>;
     static constexpr UINT64 after_offset = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     static constexpr std::size_t history_limit = 64;
+    static constexpr std::size_t readback_limit = 512;
+    static constexpr int onset_level_delta = 16;
     struct Entry {
         ID3D12GraphicsCommandList* list;
         Resource readback, surface;
@@ -32,14 +35,21 @@ class RedProducers {
     std::vector<Entry> entries_;
     LONG first_ = 0, last_ = 0;
     LONG auto_min_ = 0, auto_count_ = 0;
+    LONG capture_limit_ = 1;
+    volatile LONG captures_ = 0;
+    bool seconds_ = false, any_rgb_ = false;
+    volatile LONG first_eligible_present_ = 0;
     volatile LONG auto_first_ = 0, auto_last_ = 0;
     unsigned target_rgb_[3]{255, 0, 0};
+    bool previous_flat_ = false;
     bool auto_last_match_ = false, onset_ = false;
+    bool black_onset_ = false, previous_nonblack_ = false;
     LONG64 previous_sample_ = 0;
     unsigned char previous_rgba_[4]{};
     History history_[history_limit]{};
     std::size_t history_next_ = 0, history_count_ = 0;
     unsigned submit_order_ = 0;
+    std::size_t capture_entry_base_ = 0;
     bool full_logged_ = false;
 
 public:
@@ -49,48 +59,75 @@ public:
     RedProducers()
     {
         char value[48]{};
-        onset_ = GetEnvironmentVariableA("X2W_RED_PRODUCER_ONSET", value, sizeof(value)) == 1 && value[0] == '1';
+        const DWORD onset_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_ONSET", value, sizeof(value));
+        black_onset_ = onset_bytes == 5 && std::strcmp(value, "black") == 0;
+        onset_ = black_onset_ || (onset_bytes == 1 && value[0] == '1');
         if (GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", value, sizeof(value)) &&
             std::sscanf(value, "%ld,%ld", &first_, &last_) == 2 && first_ >= 1 && last_ >= first_) {
             log("x2w-red producer capture frames %ld..%ld; max 512 center texels from known present targets", first_, last_);
         } else {
             first_ = last_ = 0;
         }
-        if (GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value)) &&
-            std::sscanf(value, "%ld,%ld", &auto_min_, &auto_count_) == 2 && auto_min_ >= 1 &&
-            auto_count_ >= 1 && auto_count_ <= 120) {
-            const DWORD rgb_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_RGB", value, sizeof(value));
-            if (rgb_bytes) {
-                unsigned rgb[3]{};
-                char trailing;
+        const DWORD auto_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value));
+        if (!auto_bytes || auto_bytes >= sizeof(value)) return;
+        char trailing;
+        seconds_ = std::sscanf(value, "%lds,%ld%c", &auto_min_, &auto_count_, &trailing) == 2;
+        if ((!seconds_ && std::sscanf(value, "%ld,%ld", &auto_min_, &auto_count_) != 2) ||
+            auto_min_ < (seconds_ ? 0 : 1) || auto_count_ < 1 || auto_count_ > 120) {
+            auto_count_ = 0;
+            return;
+        }
+
+        const DWORD rgb_bytes = black_onset_ ? 0 : GetEnvironmentVariableA("X2W_RED_PRODUCER_RGB", value, sizeof(value));
+        if (rgb_bytes) {
+            unsigned rgb[3]{};
+            any_rgb_ = rgb_bytes == 3 && std::strcmp(value, "any") == 0;
+            if (any_rgb_ && !onset_) {
+                auto_count_ = 0;
+                log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB=any requires X2W_RED_PRODUCER_ONSET=1");
+                return;
+            }
+            if (!any_rgb_) {
                 if (rgb_bytes >= sizeof(value) || std::sscanf(value, "%3u,%3u,%3u%c", &rgb[0], &rgb[1], &rgb[2], &trailing) != 3 ||
                     rgb[0] > 255 || rgb[1] > 255 || rgb[2] > 255) {
-                    auto_min_ = auto_count_ = 0;
-                    log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB needs three decimal components from 0 to 255");
+                    auto_count_ = 0;
+                    log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB needs any or three decimal components from 0 to 255");
                     return;
                 }
                 std::copy_n(rgb, 3, target_rgb_);
             }
-            log("x2w-red producer waits for RGB %u,%u,%u at or after present %ld then captures %ld future frames",
-                target_rgb_[0], target_rgb_[1], target_rgb_[2], auto_min_, auto_count_);
-        } else {
-            auto_min_ = auto_count_ = 0;
         }
+        if (black_onset_) std::fill_n(target_rgb_, 3, 0);
+        const DWORD rearm_bytes = GetEnvironmentVariableA("X2W_RED_PRODUCER_REARM", value, sizeof(value));
+        LONG limit;
+        if (rearm_bytes && rearm_bytes < sizeof(value) && std::sscanf(value, "%ld%c", &limit, &trailing) == 1 && limit > 0)
+            capture_limit_ = (std::min)(limit, 4L);
+        log("x2w-red auto configured floor=%ld%s frames=%ld rearm=%ld", auto_min_, seconds_ ? "s" : "", auto_count_, capture_limit_);
     }
 
     bool enabled() const { return first_ || auto_count_; }
     bool onset() const { return enabled() && onset_; }
-    bool matches(const unsigned char* rgba, bool flat) const
+    bool any_rgb() const { return any_rgb_; }
+    bool black_onset() const { return enabled() && black_onset_; }
+    bool matches(const unsigned char* rgba, bool flat, bool nonblack) const
     {
+        if (black_onset_) return flat && !nonblack;
+        if (any_rgb_) return flat;
         if (onset_ && !flat) return false;
         const int tolerance = onset_ ? x2w_present_signature::onset_rgb_tolerance : 0;
         for (unsigned c = 0; c < 3; ++c)
             if (std::abs(int(rgba[c]) - int(target_rgb_[c])) > tolerance) return false;
         return true;
     }
+    bool seconds_floor_reached() const
+    {
+        return process_ms() >= static_cast<std::uint64_t>(auto_min_) * 1000;
+    }
     bool wants_history() const
     {
-        return auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_ - (onset_ ? 1 : 0);
+        return auto_count_ && captures_ < capture_limit_ &&
+            (seconds_ ? seconds_floor_reached() :
+                        frame_number + 1 >= auto_min_ - (onset_ ? 1 : 0));
     }
     bool interested() const
     {
@@ -102,27 +139,55 @@ public:
         return interested() || wants_history();
     }
 
-    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, const unsigned char* rgba, bool matched)
+    void note_present(LONG frame)
     {
-        if (!auto_count_ || auto_last_) return;
+        if (!auto_count_ || first_eligible_present_) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        if (first_eligible_present_) return;
+        if (seconds_ ? seconds_floor_reached() : frame >= auto_min_) {
+            InterlockedExchange(&first_eligible_present_, frame);
+            log("x2w-red auto floor reached present=%ld", frame);
+        } else {
+            log("x2w-red auto waiting present=%ld", frame);
+        }
+    }
+
+    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface,
+                 const unsigned char* rgba, bool flat, bool matched, bool nonblack)
+    {
+        if (!auto_count_ || captures_ >= capture_limit_) return;
         std::lock_guard<std::mutex> guard(lock_);
         const LONG64 previous = previous_sample_;
-        const bool became_matched = matched && !auto_last_match_ && (!onset_ || previous);
-        auto_last_match_ = matched;
-        if (auto_last_ || !became_matched || sampled_frame < auto_min_ || published_frame > LONG_MAX - auto_count_) {
-            if (onset_) {
-                previous_sample_ = sampled_frame;
-                std::copy_n(rgba, 4, previous_rgba_);
-            }
-            return;
+        unsigned char prior[4];
+        std::copy_n(previous_rgba_, 4, prior);
+        bool changed_level = false;
+        if (any_rgb_ && flat && previous_flat_) {
+            for (unsigned c = 0; c < 3; ++c)
+                changed_level |= std::abs(int(rgba[c]) - int(prior[c])) > onset_level_delta;
         }
+        const bool became_matched = matched && (black_onset_ ? previous_nonblack_ :
+            any_rgb_ ? previous && (!previous_flat_ || changed_level) : !auto_last_match_ && (!onset_ || previous));
+        auto_last_match_ = matched;
+        if (onset_) {
+            previous_sample_ = sampled_frame;
+            previous_flat_ = flat;
+            previous_nonblack_ = nonblack;
+            std::copy_n(rgba, 4, previous_rgba_);
+        }
+        if (captures_ >= capture_limit_ || !became_matched || sampled_frame <= auto_last_ ||
+            !first_eligible_present_ || sampled_frame < first_eligible_present_ || published_frame > LONG_MAX - auto_count_) return;
         InterlockedExchange(&auto_first_, published_frame + 1);
         InterlockedExchange(&auto_last_, published_frame + auto_count_);
-        log("x2w-red auto armed sampled_present=%lld published_at=%ld target=%p capture=%ld..%ld rgb=%u,%u,%u",
+        const LONG capture = InterlockedIncrement(&captures_);
+        if (capture > 1) {
+            capture_entry_base_ = entries_.size();
+            full_logged_ = false;
+        }
+        log("x2w-red auto armed sampled_present=%lld published_at=%ld target=%p capture=%ld..%ld rgb=%u,%u,%u ordinal=%ld",
             sampled_frame, published_frame, surface, static_cast<LONG>(auto_first_), static_cast<LONG>(auto_last_),
-            target_rgb_[0], target_rgb_[1], target_rgb_[2]);
-        if (onset_) log("x2w-red flat onset previous_present=%lld sampled_present=%lld previous_rgba=%u,%u,%u,%u",
-            previous, sampled_frame, previous_rgba_[0], previous_rgba_[1], previous_rgba_[2], previous_rgba_[3]);
+            rgba[0], rgba[1], rgba[2], capture);
+        if (onset_) log("x2w-red %s onset previous_present=%lld sampled_present=%lld previous_rgba=%u,%u,%u,%u",
+            black_onset_ ? "black" : "flat", previous, sampled_frame, prior[0], prior[1], prior[2], prior[3]);
         for (std::size_t i = 0; i < history_count_; ++i) {
             const auto& e = history_[(history_next_ + history_limit - history_count_ + i) % history_limit];
             log("x2w-red history record=%ld list=%p target=%p op=%s key=%016llx rt=%u",
@@ -175,7 +240,7 @@ public:
             if (history_count_ < history_limit) ++history_count_;
         }
         if (!interested()) return 0;
-        if (entries_.size() >= 512) {
+        if (entries_.size() - capture_entry_base_ >= readback_limit) {
             if (!full_logged_) log("x2w-red producer capture limit reached at frame %ld", frame_number + 1);
             full_logged_ = true;
             return 0;

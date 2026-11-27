@@ -118,8 +118,113 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_mirror_two_lists(directory, consumer, backend):
+    shader = """ByteAddressBuffer data : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint first = ((uint)p.y * 8 + (uint)p.x) * 8;
+    uint sum = 0;
+    for (uint i = 0; i < 8; ++i) {
+        uint block = first + i;
+        uint marker = data.Load(block * 65536 + 20);
+        if (marker != 5 * block + 13)
+            return float4(1, 0, 1, 1);
+        sum += marker;
+    }
+    return float4((sum & 255) / 255.0, 1, 0, 1);
+}
+"""
+    mib = 1 << 20
+    reference = bytes(channel for pixel in range(32)
+                      for channel in (sum(5 * block + 13 for block in range(pixel * 8, pixel * 8 + 8)) & 255,
+                                      255, 0, 255))
+    clear = BLUE * 32
+    cases = (
+        ("mirror_two_lists", "1", "0", "0", (reference, reference), (1, 1537, 3, 112 * mib), (4, 0, 0), []),
+        ("two_lists_mirror_off", "0", "0", "0", (reference, reference), (1, 1, 3, 16 * mib), (4, 0, 0), []),
+        ("two_lists_uncapped_mutant", "1", "1", "0", (reference, clear),
+         (3, 1536, 1, 96 * mib), (2, 2, 2), []),
+        ("two_lists_ring_full", "1", "0", str(64 << 10), (clear, clear),
+         (1, 0, 3, 0), (0, 4, 0), [65536, 16 * mib]),
+    )
+    for name, mirror, uncapped, ring_kib, wanted_pixels, wanted_bindings, wanted_draws, wanted_capacity in cases:
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        second = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-mirror-two", "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", "X2W_GPU_MIRROR": mirror,
+            "X2W_TEST_GPU_MIRROR_UNCAPPED": uncapped, "X2W_TEST_UPLOAD_RING_MAX_KIB": ring_kib,
+            "X2W_TEST_GPU_MIRROR_STALE": "0", "X2W_TEST_GPU_MIRROR_FULL_COPY": "0",
+        }, binding="srv 0 buf table 0 0")
+        if second is None:
+            return 77
+        actual = ((folder / "pixels.0").read_bytes(), second)
+        diagnostics = log.read_text(errors="replace")
+        bindings = re.findall(r"large bindings frame 1: (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes", diagnostics)
+        draws = re.findall(r"mirror fixture frame 1: (\d+) drawn, (\d+) refused, (\d+) oversize", diagnostics)
+        capacity = list(map(int, re.findall(r"no unused capacity \(asked (\d+) bytes", diagnostics)))
+        oversize_logs = len(re.findall(r"upload ring reservation refused: oversize", diagnostics))
+        if (actual != wanted_pixels or bindings != [tuple(map(str, wanted_bindings))]
+                or draws != [tuple(map(str, wanted_draws))] or capacity != wanted_capacity
+                or oversize_logs != wanted_draws[2]):
+            raise AssertionError(f"{name}: pixels {[pixels.hex() for pixels in actual]}, expected "
+                                 f"{[pixels.hex() for pixels in wanted_pixels]}; bindings {bindings}, "
+                                 f"expected {wanted_bindings}; draws {draws}, expected {wanted_draws}; "
+                                 f"capacity refusals {capacity}, expected {wanted_capacity}; oversize logs {oversize_logs}")
+        print(f"{backend} {name}: both targets match reference, binding counters {wanted_bindings}, draws {wanted_draws}")
+    return 0
+
+
+def check_mirror(directory, consumer, backend):
+    shader = """ByteAddressBuffer constants : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint first = ((uint)p.y * 8 + (uint)p.x) * 16;
+    for (uint block = first; block < first + 16; ++block) {
+        if (asfloat(constants.Load(block * 65536 + 4)) != float(block + 1))
+            return float4(1, 0, 1, 1);
+    }
+    return asfloat(uint4(constants.Load(0), constants.Load(11534336),
+                         constants.Load(33554424), constants.Load(33554428)));
+}
+"""
+    block = 64 << 10
+    size = 32 << 20
+    expected = [bytes(255 if channel <= frame or channel == 3 else 0
+                      for channel in range(4)) * 32 for frame in range(3)]
+    cases = (
+        ("mirror", "1", "0", (512, 1, 1), (size, block, block), expected),
+        ("mirror_off", "0", "0", (1, 1, 1), (size, size, size), expected),
+        ("stale_mutant", "1", "1", (512, 0, 0), (size, 0, 0), [expected[0]] * 3),
+    )
+    for name, enabled, stale, copies, uploaded, reference in cases:
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        last = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-mirror", "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+            "X2W_GPU_MIRROR": enabled, "X2W_TEST_GPU_MIRROR_STALE": stale,
+            "X2W_TEST_GPU_MIRROR_FULL_COPY": "1" if enabled == "0" else "0",
+        }, binding="srv 0 buf table 0 0")
+        if last is None:
+            return 77
+        actual = [(folder / f"pixels.{frame}").read_bytes() for frame in range(2)] + [last]
+        for frame, (pixels, wanted) in enumerate(zip(actual, reference), 1):
+            if pixels != wanted:
+                raise AssertionError(f"{name} frame {frame}: actual {pixels.hex()} expected {wanted.hex()}")
+        frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
+                            log.read_text(errors="replace"))
+        counters = [tuple(map(int, record)) for record in frames]
+        wanted = [(frame, 1, copies[frame - 1], 1, uploaded[frame - 1]) for frame in range(1, 4)]
+        if counters != wanted:
+            raise AssertionError(f"{name}: actual counters {counters}, expected {wanted}")
+        print(f"{backend} {name}: upload bytes {uploaded}, "
+              + ("stale pixels detected in frames 2 and 3" if stale == "1" else "all frames match CPU"))
+    return check_mirror_two_lists(directory, consumer, backend)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "mirror": check_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))

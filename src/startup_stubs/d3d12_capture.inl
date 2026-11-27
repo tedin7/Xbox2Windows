@@ -49,6 +49,8 @@ struct ResourceInfo {
     Placement placement{};
     const Wrapper* placement_device{};
     D3D12_RESOURCE_STATES initial_state{};
+    const Wrapper* texture_alias_device{};
+    u64 texture_alias_bytes{};
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
@@ -68,6 +70,7 @@ inline void note_lock_acquire(bool exclusive)
     QueryPerformanceCounter(&end);
     QueryPerformanceFrequency(&frequency);
     const LONG64 waited = end.QuadPart - start.QuadPart;
+    x2w_phase::LockWaitScope::note(waited);
     const int k = exclusive ? 1 : 0;
     InterlockedIncrement64(&note_lock_waits.calls[k]);
     InterlockedAdd64(&note_lock_waits.ticks[k], waited);
@@ -337,7 +340,8 @@ int resource_index_check_mode()
 }
 u64 resource_index_extent(const ResourceInfo& info)
 {
-    return (std::max)(info.bytes, info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0);
+    return (std::max)(info.texture_alias_bytes,
+        (std::max)(info.bytes, info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0));
 }
 // The index entry of a resource whose record is already published (publish_placement's hook); may throw.
 void index_resource(const Wrapper* w, const ResourceInfo& info)
@@ -347,12 +351,13 @@ void index_resource(const Wrapper* w, const ResourceInfo& info)
     resource_address_index().insert(base, resource_index_extent(info), w);
     x2w_startup::note_placement_change();
 }
-void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
+void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes,
+                   const Wrapper* texture_alias_device = nullptr, u64 texture_alias_bytes = 0)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
     x2w_startup::note_placement_change();
-    const ResourceInfo info{*console, bytes};
+    const ResourceInfo info{*console, bytes, Placement::none, nullptr, {}, texture_alias_device, texture_alias_bytes};
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
         resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);

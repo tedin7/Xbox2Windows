@@ -155,6 +155,76 @@ def array_reference(layer):
     return initial, expected
 
 
+# The EXEC mask leaves one row live, so each of the eight active lanes owns one texel across both groups.
+# Four distinct finite values and distinct initial channel words detect reordered or overwritten components.
+PARTIAL_CASES = {
+    '1d': (STORE_1D, HEAD, 'v8', TEXTURE_1D_FLAG, 'tex1d'),
+    '2d': (STORE, ARRAY_PROLOGUE, 'uint2(v8, v9)', 0, 'tex2d'),
+    'array': (ARRAY_STORE, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', ARRAY_FLAG, 'tex2da'),
+    '3d': (STORE_3D, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', VOLUME_FLAG, 'tex3d'),
+}
+UAV_LOAD_FLAG = 1 << 21  # tests/compute_check.cpp texture_uav_load_flag
+
+
+def partial_pipeline(shape, mask):
+    store, prologue, _, _, _ = PARTIAL_CASES[shape]
+    # The MIMG DMASK field occupies bits 8 through 11 of the first instruction word.
+    store = store[:1] + bytes([(store[1] & 0xf0) | mask]) + store[2:]
+    return G.ComputePipeline(prologue + ARRAY_DATA + MASK + store + END, root_blob(3), RSRC2, fixture.GROUP)
+
+
+def partial_reference(shape, mask):
+    if shape == '1d':
+        initial, _ = reference_1d()
+        first = 0
+    elif shape == '2d':
+        initial = [sentinel(mip, 0, y, x, c)
+                   for mip in range(3) for y in range(8 >> mip)
+                   for x in range(32 >> mip) for c in range(4)]
+        first = 0
+    elif shape == 'array':
+        initial, _ = array_reference(1)
+        first = 1344  # mip zero of array layer 1
+    else:
+        initial, _ = reference_3d(1)
+        first = 32 * 8 * 4  # slice 1 at mip zero
+    expected = initial.copy()
+    selected = [c for c in range(4) if mask & (1 << c)]
+    for word in range(first, first + 4 * 4 * fixture.GROUPS, 4):
+        for c, value in zip(selected, ARRAY_VALUES):
+            expected[word + c] = value
+    return initial, expected, first
+
+
+def partial_controls():
+    for shape, (_, _, index, _, kind) in PARTIAL_CASES.items():
+        for mask in range(1, 15):
+            pipe = partial_pipeline(shape, mask)
+            source = pipe.hlsl_cs()
+            assert f'if (exec & 1) {{ t = w0[{index}];' in source, (shape, mask)
+            assert f'w0[{index}] = t; }}' in source, (shape, mask)
+            selected = [c for c in range(4) if mask & (1 << c)]
+            for c in range(4):
+                assignment = f't.{"xyzw"[c]} = asfloat(v'
+                if c in selected:
+                    assert f'{assignment}{14 + selected.index(c)});' in source, (shape, mask)
+                else:
+                    assert assignment not in source, (shape, mask)
+            assert pipe.manifest().splitlines()[-2:] == [
+                f'uav 0 {kind} float table 1 64 channels 4', 'uavload 0',
+            ]
+            initial, expected, _ = partial_reference(shape, mask)
+            assert sum(before != after for before, after in zip(initial, expected)) == 4 * fixture.GROUPS * len(selected)
+    refused('no channel selected', lambda: partial_pipeline('2d', 0))
+    pipe = partial_pipeline('2d', 1)
+    for mask in ('0x10', '-1'):
+        refused('out of range', lambda: pipe.cs.op_image_store(
+            ['v14', 'v[8:9]', 's[24:31]'], ['dmask:' + mask, 'dim:SQ_RSRC_IMG_2D']))
+    refused('one VGPRs expected', lambda: pipe.cs.op_image_store(
+        ['v[14:15]', 'v[8:9]', 's[24:31]'], ['dmask:0x1', 'dim:SQ_RSRC_IMG_2D']))
+    print('Compute FP32 partial image_store checked for 14 masks on each of 4 shapes')
+
+
 def controls(llvm_mc):
     def encoded(line, hex_words):
         words = bytes.fromhex(hex_words)
@@ -243,8 +313,6 @@ def controls(llvm_mc):
             lambda: pipe.cs.op_image_store(['v[14:17]', 'v[8:9]', 's[28:35]'], mods))
 
     for asm, code, reason in (
-        (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
-         '080320f0080e0600', 'typed UAV store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
     ):
         instruction = encoded(asm, code)
@@ -277,6 +345,7 @@ def controls(llvm_mc):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
     print('Compute 32-bit float image_store, unorm, 1D, 2D array, 3D, EXEC, raw/texture binding order, alias and '
           'refusal checks passed')
+    partial_controls()
 
 
 def draw_cases(directory, compiler, renderer, adapter, payload, cases, selector=None, compared=1344):
@@ -298,6 +367,26 @@ def draw_cases(directory, compiler, renderer, adapter, payload, cases, selector=
             assert result.returncode == 0, name
         else:
             assert result.returncode == 1 and needle in result.stderr, name
+    return 0
+
+
+def dispatch_partial(directory, compiler, renderer, adapter, shape):
+    _, _, index, shape_flag, _ = PARTIAL_CASES[shape]
+    for mask in range(1, 15):
+        initial, expected, first = partial_reference(shape, mask)
+        source = partial_pipeline(shape, mask).hlsl_cs()
+        load = f't = w0[{index}];'
+        assert source.count(load) == 1
+        first_preserved = first + next(c for c in range(4) if not mask & (1 << c))
+        cases = (
+            (f'{shape} mask {mask:#x}', source, 0, None),
+            (f'{shape} mask {mask:#x}, clobber preserved channels', source.replace(load, 't = 0;'),
+             (4 - mask.bit_count()) * 4 * fixture.GROUPS,
+             f'mip=0 word={first_preserved} expected={initial[first_preserved]:08x} actual=00000000'),
+        )
+        if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                      selector=fixture.GROUPS | shape_flag | UAV_LOAD_FLAG, compared=len(initial)) == 77:
+            return 77
     return 0
 
 
@@ -392,10 +481,15 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--llvm-mc')
     mode.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
+    parser.add_argument('--partial-shape', choices=PARTIAL_CASES)
     args = parser.parse_args()
+    if args.partial_shape and not args.dispatch:
+        parser.error('--partial-shape requires --dispatch')
     if args.dispatch:
         out = Path(__file__).resolve().parents[1] / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
+            if args.partial_shape:
+                raise SystemExit(dispatch_partial(Path(tmp), *args.dispatch, args.partial_shape))
             raise SystemExit(dispatch(Path(tmp), *args.dispatch))
     controls(args.llvm_mc)

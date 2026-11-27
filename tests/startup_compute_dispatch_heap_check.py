@@ -14,10 +14,14 @@ scales it by 16 is refused instead of passing. Three runs share one cache:
    expectation of case A of startup_gfx2hlsl_compute_check.py (the program computes the same words);
 3. dispatch-heap-outside (the constant is 0x07ffffff, a record past the heap): refused with one
    logged reason, every word keeps the sentinel and the input is unchanged.
+A second program reads four typed elements from the heap. One cached translation is used for three desktop
+views and two native descriptor records. Unsupported desktop formats leave the output untouched. Mutated DXIL
+must dispatch successfully and produce a readback mismatch against the same CPU oracle.
 Exit 77 when the adapter is not available.
 """
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,6 +34,147 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 OUTSIDE = "a heap record is outside the list's view heap"
+
+
+FORMATTED_ASM = """\
+s_mov_b32 s11, 0
+s_mov_b32 s10, s7
+s_load_dwordx4 s[24:27], s[10:11], 0x10
+s_mov_b32 s9, 0
+s_lshl_b32 s15, s6, 5
+s_load_dwordx4 s[32:35], s[8:9], s15
+s_waitcnt lgkmcnt(0)
+buffer_load_format_xyzw v[12:15], v0, s[32:35], 0 idxen
+v_lshlrev_b32 v7, 4, v0
+s_waitcnt vmcnt(0)
+buffer_store_dwordx4 v[12:15], v7, s[24:27], 0 offen
+s_endpgm
+"""
+FORMATTED_CODE = bytes.fromhex(
+    '80038bbe 07038abe 050608f4100000fa 800389be 06850f8f 040808f40000001e 7fc08cbf '
+    '00200ce0000c0880 84000e34 703f8cbf 001078e0070c0680 000081bf'
+)
+FORMATTED_GROUP = (4, 1, 1)
+FORMATTED_RSRC2 = 9 << 1
+FORMATTED_BINDINGS = (
+    'udsrc 3 stride 0\nudsrc 4 descword3 0\nsrv 0 buf heap rootconst 0 2\nuav 0 table 1 16\n'
+)
+FORMATTED_INDEXED_ASM = FORMATTED_ASM.replace('s_lshl_b32 s15, s6, 5', """\
+s_load_dwordx4 s[40:43], s[10:11], 0x60
+s_waitcnt lgkmcnt(0)
+s_buffer_load_dword s19, s[40:43], 0x34
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s15, s19, 5""")
+FORMATTED_INDEXED_CODE = FORMATTED_CODE.replace(
+    bytes.fromhex('06850f8f'), bytes.fromhex('050a08f4600000fa 7fc08cbf d40420f4340000fa 7fc08cbf 13850f8f')
+)
+FORMATTED_INDEXED_BINDINGS = (
+    'udsrc 3 stride 1\nudsrc 4 descword3 1\nsrv 0 buf table 1 96\n'
+    'srv 1 buf heap word table 1 96 at 52\nuav 0 table 1 16\n'
+)
+INPUT = struct.pack('<16e', -1, 1.5, 2, -2.5, 3, -3.5, 4, -4.5, 0.125, 0.25, 128, 16, 21, 31, -41, 51)
+NO_FORMAT = 'a formatted input view has no buffer format code'
+
+
+def f32_word(value):
+    return struct.unpack('<I', struct.pack('<f', value))[0]
+
+
+def formatted_expected(kind):
+    if kind == 'half':
+        return [f32_word(value) for value in struct.unpack('<16e', INPUT)]
+    if kind == 'packed':
+        return [f32_word((word >> shift) % (1 << width) / ((1 << width) - 1))
+                for word in struct.unpack_from('<4I', INPUT)
+                for shift, width in ((0, 10), (10, 10), (20, 10), (30, 2))]
+    if kind == 'uint':
+        return [INPUT[4 * element + channel] for element in range(4) for channel in (2, 0, 3, 1)]
+    assert kind == 'unknown'
+    return [0] * 16
+
+
+def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False):
+    cache, env = prepare(directory)
+    env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
+    if adapter == 'hardware':
+        env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
+    root = directory / 'compute_root'
+    root.write_bytes(H.root_blob(table_range=True))
+    (directory / 'program').write_bytes(FORMATTED_INDEXED_CODE if indexed else FORMATTED_CODE)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(FORMATTED_GROUP, FORMATTED_RSRC2))
+    source = directory / 'input.bin'
+    source.write_bytes(INPUT.ljust(C.WORDS * 4, b'\0'))
+    env.update(X2W_TEST_COMPUTE_ROOT=str(root), X2W_TEST_DISPATCH_IN=str(source))
+    untouched = [C.SENTINEL] * C.WORDS
+
+    def run(kind, hardware_word=None):
+        binding = dict(env)
+        if hardware_word is not None:
+            fields = directory / 'fields.bin'
+            fields.write_bytes(struct.pack('<6I', 8, 4, hardware_word, 4, C.WORDS, 0))
+            binding['X2W_TEST_DISPATCH_FIELDS'] = str(fields)
+        mode = 'indexed' if indexed else 'plain' if hardware_word is not None else kind
+        return dispatch(directory, consumer, binding, 'dispatch-heap-format-' + mode)
+
+    def mismatches(kind, hardware_word=None):
+        got, result = run(kind, hardware_word)
+        assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
+        assert not lines(result, 'refused: '), result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors
+        assert got[16:] == untouched[16:], f'{kind}: wrote past the four output elements'
+        # DXC can lower division by a constant to reciprocal multiplication.
+        tolerance = 1 if kind == 'packed' else 0
+        return [(i, actual, expected) for i, (actual, expected) in enumerate(zip(got, formatted_expected(kind)))
+                if abs(actual - expected) > tolerance]
+
+    got, result = run('half')
+    assert got == untouched and len(lines(result, 'Dispatch(1, 1, 1) refused: no translation')) == 1, result.stderr[-3000:]
+    key = lines(result, 'x2w-draw compute request')[0].split()[3]
+    translated = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True,
+                                capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
+    assert f'{key}: ok' in translated, translated
+    manifest = (cache / f'{key}.txt').read_text()
+    assert manifest.endswith(FORMATTED_INDEXED_BINDINGS if indexed else FORMATTED_BINDINGS), manifest
+    if indexed:
+        wrong = mismatches('half')
+        assert not wrong, wrong
+        print(f'formatted heap on {adapter}: table-word index matched the half-float reference')
+        return
+
+    for kind in ('half', 'packed', 'uint'):
+        wrong = mismatches(kind)
+        assert not wrong, (kind, wrong)
+    got, result = run('unsupported')
+    assert got == untouched, 'the unsupported view wrote the output'
+    refused = lines(result, 'refused: ')
+    assert len(refused) == 1 and refused[0].endswith(NO_FORMAT), result.stderr[-3000:]
+
+    identity = 4 | 5 << 3 | 6 << 6 | 7 << 9
+    assert not mismatches('half', 71 << 12 | identity)
+    # An unknown native code reaches the HLSL default even with a forced-one selector.
+    assert not mismatches('unknown', 127 << 12 | (identity & ~7) | 1)
+
+    hlsl = (cache / f'{key}.cs.hlsl').read_text()
+    bytecode = cache / f'{key}.cs.cso'
+    mutant = directory / 'mutant.hlsl'
+    for old, new, cases in (
+        ('switch ((ud4 >> 12) & 127u)', 'switch (71u)', ('packed', 'uint')),
+        ('v0 * ud3', 'v0 * 4u', ('half',)),
+    ):
+        assert hlsl.count(old) == 1, old
+        mutant.write_text(hlsl.replace(old, new))
+        subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, mutant], check=True)
+        if cases == ('packed', 'uint'):
+            wrong = mismatches('half')
+            assert not wrong, ('frozen format failed on the original binding', wrong)
+        for kind in cases:
+            wrong = mismatches(kind)
+            assert wrong, (new, kind, 'mutant matched the CPU reference')
+            print(f'{kind}: mutant {new!r} differs at word {wrong[0][0]}')
+
+    print(f'formatted heap on {adapter}: three typed views, two native records and the named refusal passed')
 
 
 def main(consumer, dxc, adapter):
@@ -79,6 +224,8 @@ def main(consumer, dxc, adapter):
         assert len(census) == 3 and census[1].endswith(f'reason "{OUTSIDE}": 1 keys, 1 dispatches'), census
         print(f'startup_compute_dispatch_heap: PASS on {adapter} (all {C.WORDS} words match through heap record 2; '
               'untouched before translation and for a record outside the heap)')
+        check_formatted_dispatch(directory / 'formatted', consumer, dxc, adapter)
+        check_formatted_dispatch(directory / 'formatted-indexed', consumer, dxc, adapter, indexed=True)
 
 
 if __name__ == '__main__':

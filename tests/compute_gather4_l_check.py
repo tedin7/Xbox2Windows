@@ -251,15 +251,19 @@ def first_mismatch(expected, actual):
     return f"word={word} expected={expected[word]:08x} actual={actual[word]:08x}"
 
 
-def run_case(directory, compiler, renderer, backend, name, hlsl_source, expected, first):
+def run_case(directory, compiler, renderer, backend, name, hlsl_source, expected, first, *, manifest=None):
     hlsl, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
     payload = expected + texels()
     flags = FLOAT_TEXTURE_FLAG | (VIEW_MIP1_FLAG if first else 0)
     case.write_bytes(struct.pack(f"<I{len(payload)}I", GROUPS | flags, *payload))
     hlsl.write_text(hlsl_source, encoding="ascii")
     subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, hlsl], check=True)
-    result = subprocess.run([renderer, backend, "--compute-texture-case", cso, case],
-                            capture_output=True, text=True, timeout=30)
+    command = [renderer, backend, "--compute-texture-case", cso, case]
+    if manifest is not None:
+        path = directory / f"{name}.manifest"
+        path.write_text(manifest, encoding="ascii")
+        command.append(path)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
     print(f"{name}:\n{result.stdout}{result.stderr}", end="", flush=True)
     if "debug_layer=enabled" in result.stdout:
         assert "debug_errors=0 debug_warnings=0" in result.stdout, name

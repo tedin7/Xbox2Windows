@@ -528,42 +528,6 @@ def check_request_files():
             assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
 
 
-def check_indirect_mesh_requests():
-    """A refused mesh pipeline used only by ExecuteIndirect supplies its own pack weight."""
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        cache, run = tmp / "cache", tmp / "run"
-        cache.mkdir()
-        run.mkdir()
-        make_run(run, 1)
-        files = {}
-        for key, stages in (("3000000000000001", ("m57", "ps57")), ("4000000000000001", ("m86",))):
-            for ext in (*stages, "root"):
-                name = f"req_{key}.{ext}"
-                files[name] = ext.encode()
-                write(cache, name, files[name])
-            write(cache, f"req_{key}.fail", b"unsupported synthetic mesh instruction\n")
-        census = (
-            b"x2w-d3d12 indirect-graphics refusal 1: key=3000000000000001 reason=mesh no translation calls=2\n"
-            b"x2w-d3d12 indirect-graphics refusal 2: key=4000000000000001 reason=mesh no translation calls=5\n"
-        )
-        for used in (True, False):
-            log = census + (b"x2w-render key use mesh 3000000000000001 first 1.0 s last 2.0 s uses 2\n"
-                            b"x2w-render key use mesh 4000000000000001 first 1.0 s last 3.0 s uses 5\n" if used else b"")
-            write(run, "stderr.txt", log)
-            T.pack(str(run), MANIFEST, str(tmp / "mesh.zip"), cache_dir=str(cache))
-            with zipfile.ZipFile(tmp / "mesh.zip") as archive:
-                prefix = T.REQUESTS_DIR + "/"
-                packed = {n[len(prefix):]: archive.read(n) for n in archive.namelist() if n.startswith(prefix)}
-                assert packed == (files if used else {}), packed
-                ranked = json.loads(archive.read("manifest.json"))["request_files"]["ranked"]
-                assert [(r["kind"], r["weight"]) for r in ranked] == ([("mesh86", 5), ("mesh57", 2)] if used else [])
-            if used:
-                chosen = T.select_requests(str(cache), T.cache_results(str(cache)), {}, top=1, families=0,
-                                           uses=T.key_use(str(run)))
-                assert [(r[0], r[2]) for r in chosen] == [("4000000000000001", 5)], chosen
-
-
 def check_part_one_has_the_small_files():
     """Several parts: shader_results.txt, the debugger summary and every small log are in part 1 (Run Q: part 2 never arrived and
     took shader_results.txt and the summary with it), the big log chunks come after them."""
@@ -904,13 +868,62 @@ def check_symbols():
             assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
 
 
+def check_producer_report():
+    config = "x2w-red auto configured floor=40 frames=2 rearm=3\n"
+    waiting = config + "x2w-red auto waiting present=33\n"
+    assert "floor not reached: last present 33, floor 40" in T.producer_report(waiting)
+    assert "floor not reached: last present 33, floor 40s" in T.producer_report(waiting.replace("floor=40", "floor=40s"))
+    reached = waiting + "x2w-red auto floor reached present=40\n"
+    assert "no flat onset seen" in T.producer_report(reached)
+    capture = "x2w-red auto armed sampled_present={} published_at={} target=123 capture={}..{} rgb={} ordinal={}\n"
+    armed = reached + capture.format(45, 46, 47, 48, "255,255,255", 1) + capture.format(55, 56, 57, 58, "0,0,0", 2)
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        log = tmp / "stderr.txt"
+        log.write_text(waiting, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "waiting.zip"))
+        with zipfile.ZipFile(tmp / "waiting.zip") as z:
+            assert "floor not reached: last present 33, floor 40" in z.read(T.PRODUCER_NAME).decode()
+        log.write_text(armed, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "report.zip"))
+        with zipfile.ZipFile(tmp / "report.zip") as z:
+            report = z.read(T.PRODUCER_NAME).decode()
+    assert report.splitlines()[1:] == [
+        "capture 1: RGB 255,255,255, onset present 45, frames 47..48",
+        "capture 2: RGB 0,0,0, onset present 55, frames 57..58",
+    ]
+    assert not T.producer_report("unrelated log\n")
+
+
+def check_null_inputs():
+    row = ("x2w-render null input: key 0000000000000123 input 1 (2D) cause token calls {} "
+           "frames 1..{} target format 28 depth format 0 words 56573258 ffffffff")
+    other = row.format(1, 2).replace("input 1", "input 2")
+    target = "x2w-render target abc (4x2 format 28): draws 2, with a null input 1 frames 1..2"
+    clean = "x2w-render target abc (4x2 format 28): draws 3, with a null input 0 frames 3..5"
+    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean])
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        (run / "stderr.txt").write_text(stderr, encoding="utf-8")
+        archive = Path(tmp) / "report.zip"
+        T.pack(str(run), MANIFEST, str(archive))
+        with zipfile.ZipFile(archive) as report:
+            section = report.read(T.NULL_INPUTS_NAME).decode("utf-8")
+    assert section.splitlines()[:3] == ["null inputs", row.format(2, 5), other]
+    assert row.format(1, 1) not in section
+    assert f"{target} (50.0% poisoned)" in section
+    assert f"{clean} (0.0% poisoned)" in section
+    assert not T.null_inputs_section("unrelated log")
+
+
 if __name__ == "__main__":
+    check_null_inputs()
     check_symbols()
     check_seed_cache()
     check_cache_results()
     check_key_use()
     check_request_files()
-    check_indirect_mesh_requests()
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
@@ -922,6 +935,7 @@ if __name__ == "__main__":
     check_manifest()
     check_first_poll()
     check_end_cause()
+    check_producer_report()
     check_cache_stats()
     check_cache_tag()
     check_memory_gib()

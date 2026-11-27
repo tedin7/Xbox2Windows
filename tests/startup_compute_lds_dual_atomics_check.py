@@ -380,11 +380,48 @@ def make_case_r():
     return build_program(p)
 
 
+def make_case_wide():
+    p = list(PREAMBLE_LINES)
+    p += [
+        ('v_lshlrev_b32 v3, 4, v0', vop2(0x1a, 3, 0x84, 0)),
+        ('v_lshlrev_b32 v4, 3, v0', vop2(0x1a, 4, 0x83, 0)),
+        ('v_add_nc_u32 v4, 1024, v4', vop2(0x25, 4, 0xff, 4, 1024)),
+    ]
+    for reg, tag in enumerate((0x105b0000, 0xfa040000, 0x437e0000, 0xcb230000), 8):
+        p.append((f'v_xor_b32 v{reg}, 0x{tag:x}, v0', vop2(0x1d, reg, 0xff, 0, tag)))
+    p += [
+        # Initialize the ordinary second slot so the wrong-offset control reads defined data.
+        ('ds_write2_b64 v3, v[8:9], v[8:9] offset1:1', ds_dual(0x4e, 3, 8, 8, offset1=1)),
+        ('s_waitcnt lgkmcnt(0)', sopp(0x0c, 0xc07f)),
+        ('s_barrier', sopp(0x0a)),
+        ('ds_write2_b64 v3, v[8:9], v[10:11] offset1:1', ds_dual(0x4e, 3, 8, 10, offset1=1)),
+        ('ds_write2st64_b64 v4, v[10:11], v[8:9] offset1:1', ds_dual(0x4f, 4, 10, 8, offset1=1)),
+        ('s_waitcnt lgkmcnt(0)', sopp(0x0c, 0xc07f)),
+        ('s_barrier', sopp(0x0a)),
+        ('v_add_nc_u32 v5, 1, v0', vop2(0x25, 5, 0x81, 0)),
+        ('v_and_b32 v5, 31, v5', vop2(0x1b, 5, 0x9f, 5)),
+        ('v_lshlrev_b32 v6, 4, v5', vop2(0x1a, 6, 0x84, 5)),
+        # Destination aliases the incoming address in each form.
+        ('ds_read2_b64 v[6:9], v6 offset1:1', ds_dual(0x77, 6, vdst=6, offset1=1)),
+        ('s_waitcnt lgkmcnt(0)', sopp(0x0c, 0xc07f)),
+        ('buffer_store_dwordx4 v[6:9], v3, s[16:19], 0 offen', mubuf_store(0x1e, 6, 3)),
+        ('v_lshlrev_b32 v7, 3, v5', vop2(0x1a, 7, 0x83, 5)),
+        ('v_add_nc_u32 v7, 1024, v7', vop2(0x25, 7, 0xff, 7, 1024)),
+        ('ds_read2st64_b64 v[7:10], v7 offset1:1', ds_dual(0x78, 7, vdst=7, offset1=1)),
+        ('s_waitcnt lgkmcnt(0)', sopp(0x0c, 0xc07f)),
+        ('buffer_store_dwordx4 v[7:10], v3, s[16:19], 0 offen offset:512', mubuf_store(0x1e, 7, 3, offset=512)),
+        ('s_endpgm', sopp(0x01)),
+    ]
+    return build_program(p)
+
+
 SOURCE_D, WORDS_D = make_case_d()
 SOURCE_A, WORDS_A = make_case_a()
 SOURCE_R, WORDS_R = make_case_r()
+SOURCE_WIDE, WORDS_WIDE = make_case_wide()
 
 CASES = {
+    'wide': (SOURCE_WIDE, WORDS_WIDE, USER7 | (4 << 15), (32, 1, 1), (1, 1, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | (4 << 15), (64, 1, 1), (1, 1, 1)),
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     'R': (SOURCE_R, WORDS_R, USER7 | TGID_X | (2 << 15), (32, 1, 1), (1, 1, 1)),
@@ -411,7 +448,13 @@ VERIFIED_SNIPPETS = {
 
 def expected_words(name):
     out = [SENTINEL] * WORDS
-    if name == 'D':
+    if name == 'wide':
+        for lane in range(32):
+            peer = (lane + 1) % 32
+            words = [tag ^ peer for tag in (0x105b0000, 0xfa040000, 0x437e0000, 0xcb230000)]
+            out[4 * lane:4 * lane + 4] = words
+            out[128 + 4 * lane:128 + 4 * lane + 4] = words[2:] + words[:2]
+    elif name == 'D':
         for l in range(64):
             peer = l ^ 32
             bank2_peer = 0x22000000 ^ (peer << 8)
@@ -512,6 +555,17 @@ def check_controls():
         assert len(decoded) == len(lines), (name, len(decoded), len(lines))
         for src_line, (_, _, dec_op, _dec_asm) in zip(lines, decoded):
             assert dec_op.removesuffix('_e32').removesuffix('_e64') == src_line.split()[0], (name, src_line, dec_op)
+
+    hlsl_wide = translate_case('wide').hlsl_cs()
+    assert mutate(hlsl_wide, 'wide-offset-times-four') != hlsl_wide
+    for raw, diagnostic in (
+        (ds_dual(0x4e, 3, 8, 10, offset1=1, gds=1), 'ds_write2_b64 needs two ordinary 8-bit offsets'),
+        (ds_dual(0x77, 3, vdst=8), 'ds_read2_b64 needs two distinct offsets'),
+        (ds_dual(0x4f, 3, 8, 10, offset1=1, vdst=1), 'ds_write2st64_b64 unused operand field set'),
+    ):
+        refused(diagnostic, lambda: translate_case('wide', code=single_ds_code(raw)).hlsl_cs())
+    refused('ds_write2_b64 needs a nonzero LDS allocation',
+            lambda: translate_case('wide', rsrc2=USER7).hlsl_cs())
 
     # 2. Verify HLSL lowering for Case D (dual-offset & stride-64 ops, EXEC guard, alignment & bounds).
     hlsl_d = translate_case('D').hlsl_cs()
@@ -658,8 +712,7 @@ def check_controls():
 
     # 14. Out-of-scope DS ops stay refused by name.
     for op_code, op_name in ((0x05, 'ds_min_i32'), (0x06, 'ds_max_i32'), (0x0b, 'ds_xor_b32'),
-                             (0x15, 'ds_add_f32'), (0x2e, 'ds_wrxchg2_rtn_b32'), (0x4e, 'ds_write2_b64'),
-                             (0x78, 'ds_read2st64_b64')):
+                             (0x15, 'ds_add_f32'), (0x2e, 'ds_wrxchg2_rtn_b32')):
         raw = ds_dual(op_code, 1, 2, 4, vdst=8, offset0=1, offset1=2)
         refused(op_name, lambda r=raw: G.ComputePipeline(
             single_ds_code(r), root_blob(), USER7 | (4 << 15), (32, 1, 1)))
@@ -681,7 +734,7 @@ def check_controls():
         else:
             raise AssertionError('expected debug_layer rejection for %r' % (bad_out,))
 
-    print('dual-offset/st64 LDS and 32-bit LDS atomic controls (14 ops, encodings, bounds, aliasing, EXEC, debug_layer, refusals) pass')
+    print('dual-offset/st64 LDS and 32-bit LDS atomic controls (18 ops, encodings, bounds, aliasing, EXEC, debug_layer, refusals) pass')
 
 
 def assemble(llvm_mc, source):
@@ -702,6 +755,10 @@ def check_binary(llvm_mc):
 
 # Shader mutant controls: each must fail on WARP and hardware at the expected word with debug_errors=0.
 CONTROLS = {
+    'wide-offset-times-four': ('wide', 'lds[(a + 8u) >> 2] = v10;\n'
+                               '    if (((a & 3u) == 0u) && a < 2036u) lds[(a + 12u) >> 2] = v11;',
+                               'lds[(a + 4u) >> 2] = v10;\n'
+                               '    if (((a & 3u) == 0u) && a < 2036u) lds[(a + 8u) >> 2] = v11;'),
     'd-wrong-st64-stride': ('D', 'if (((a & 3u) == 0u) && a < 1536u) lds[(a + 512u) >> 2] = v6;\n',
                             'if (((a & 3u) == 0u) && a < 2040u) lds[(a + 8u) >> 2] = v6;\n'),
     'd-drop-oob-zero': ('D', '    w = 0u;\n    if ((exec & 1) && ((a & 3u) == 0u) && a < 256u) w = lds[(a + 1792u) >> 2];\n',
@@ -735,14 +792,17 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
     hlsl = translate_case(name).hlsl_cs()
     if control:
         hlsl = mutate(hlsl, control)
+    return run_shader(name, dxc, runner, adapter, directory, hlsl, expected_words(name), CASES[name][4])
+
+
+def run_shader(name, dxc, runner, adapter, directory, hlsl, expected, groups=(1, 1, 1)):
     src, cso, case = (directory / ('%s.%s' % (name, ext)) for ext in ('hlsl', 'cso', 'case'))
     src.write_text(hlsl, encoding='ascii')
     subprocess.run([dxc, '-Gis', '-WX', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-    groups = CASES[name][4]
     constants = [0] * 16
     case.write_bytes(
         struct.pack('<I', groups[0] | (groups[1] << 8) | (groups[2] << 16))
-        + struct.pack('<%dI' % WORDS, *expected_words(name))
+        + struct.pack('<%dI' % WORDS, *expected)
         + struct.pack('<16I', *constants)
     )
     return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
@@ -775,6 +835,8 @@ def check_dispatch(dxc, runner, adapter, control=None):
                 if run.returncode != 1 or not diagnostics or not re.fullmatch(
                         r'word=\d+ expected=[0-9a-f]{8} actual=[0-9a-f]{8}', diagnostics[0]):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (control, run.returncode, run.stderr))
+                if control == 'wide-offset-times-four':
+                    assert diagnostics[0] == 'word=1 expected=fa040001 actual=437e0001', diagnostics
                 print('control %s: rejected at %s' % (control, diagnostics[0]))
             elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))

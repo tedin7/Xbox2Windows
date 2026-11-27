@@ -31,6 +31,14 @@ struct Stream {
     Root root;
     Stage vs;
 };
+struct alignas(8) TargetFormats {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_RT_FORMAT_ARRAY formats;
+};
+struct TargetStream {
+    TargetFormats targets;
+    Stream stream;
+};
 struct alignas(8) Layout {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
     D3D12_INPUT_LAYOUT_DESC desc;
@@ -70,6 +78,13 @@ HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& 
     return D3D12SerializeVersionedRootSignature(&versioned, &blob, nullptr);
 }
 }
+UINT stream_joined_table_choices()
+{
+    wchar_t value[2]{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", value, 2) != 1) return 0;
+    return value[0] >= L'2' && value[0] <= L'4' ? static_cast<UINT>(value[0] - L'0') : 0u;
+}
+
 void* stream_root_signature() { return stream_root; }
 void* stream_alternate_root_signature() { return stream_alternate_root; }
 const std::vector<char>& stream_root_blob() { return stream_root_bytes; }
@@ -133,12 +148,16 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
     const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
-    D3D12_ROOT_PARAMETER textured_parameters[2]{};
+    const UINT choices = stream_joined_table_choices();
+    D3D12_DESCRIPTOR_RANGE choice_ranges[4]{};
+    D3D12_ROOT_PARAMETER textured_parameters[5]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+        table.ShaderVisibility = GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", nullptr, 0)
+            ? D3D12_SHADER_VISIBILITY_ALL
+            : vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = textured_parameters;
         if (joined_table || GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
@@ -147,6 +166,17 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             constant.Constants = {0, 0, 1};
             constant.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
             root_desc.NumParameters = 2;
+        }
+        if (choices) {
+            for (UINT i = 0; i < choices; ++i) {
+                const UINT parameter = i ? i + 1 : 0;
+                choice_ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 2 * i, 0, 0};
+                auto& choice = textured_parameters[parameter];
+                choice.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                choice.DescriptorTable = {1, &choice_ranges[i]};
+                choice.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            }
+            root_desc.NumParameters = choices + 1;
         }
     }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
@@ -197,8 +227,12 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
     const bool layout = GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", nullptr, 0) != 0;
-    void* first = layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
-    const SIZE_T whole = layout ? sizeof(with_layout) : sizeof(with_layout.stream);
+    const bool gbuffer = GetEnvironmentVariableW(L"X2W_TEST_GBUFFER_TARGETS", nullptr, 0) != 0;
+    TargetStream with_targets{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                               {{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT}, 2}}, with_layout.stream};
+    void* first = gbuffer ? static_cast<void*>(&with_targets) :
+                  layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
+    const SIZE_T whole = gbuffer ? sizeof(with_targets) : layout ? sizeof(with_layout) : sizeof(with_layout.stream);
     auto submit = [&](SIZE_T bytes) {
         D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, first};
         const auto hr = reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso);
@@ -279,7 +313,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const bool typed = stream_mrt_format(format, mrt);
     const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
-    // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
+    // A caller that wants a second target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
@@ -297,8 +331,10 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const float clear[] = {0, 0, 1, narrow ? 0.0f : 1.0f};
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
-        const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? mrt.typeless : view_format;
+        const auto view_format = i ? state.second_format : format;
+        StreamMrtFormat attachment{};
+        const bool typed_attachment = stream_mrt_format(view_format, attachment);
+        const auto resource_format = typed_attachment && attachment.integer ? attachment.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -307,7 +343,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (typed_attachment ? attachment.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 

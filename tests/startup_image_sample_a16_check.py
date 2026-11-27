@@ -308,10 +308,14 @@ def controls():
     expect_refused(lambda: translate(encode_mimg(IMG_SAMPLE, dim=DIM_1D, a16=1)),
                    '1D image', '1D a16 sample')
 
+    lz_d16_ps = translate(encode_mimg(IMG_SAMPLE_LZ, a16=1, d16=1)).hlsl_ps()
+    assert 'SampleLevel(q0, float2(f16tof32(v0), f16tof32(v0 >> 16)), 0)' in lz_d16_ps, lz_d16_ps
+    assert 'pack16_rne(t.x) | (pack16_rne(t.y) << 16)' in lz_d16_ps, lz_d16_ps
+
     # Unmodeled modifiers, empty dmask, 3D/array A16, fake NSA and reserved bits are refused for both ops.
     for prefix, op, op_name in (('sample', IMG_SAMPLE, 'image_sample'),
                                 ('lz', IMG_SAMPLE_LZ, 'image_sample_lz')):
-        for mod in ('unorm', 'tfe', 'lwe', 'd16', 'r128'):
+        for mod in ('unorm', 'tfe', 'lwe', 'r128') + (('d16',) if prefix == 'sample' else ()):
             expect_refused(lambda b=MIMG_LLVM_MC[f'{prefix}_{mod}'][1]: translate(b),
                            f'{op_name} modifier {mod}', f'{op_name} {mod}')
         expect_refused(lambda o=op: translate(encode_mimg(o, a16=1, nsa=1, extra_addrs=(1,))),

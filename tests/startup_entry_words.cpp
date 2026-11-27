@@ -32,7 +32,7 @@ std::vector<char> read_blob(const char* path)
 
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width, UINT height)
+                               UINT width, UINT height, bool dynamic_heap)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -42,6 +42,7 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     param.Constants = {0, 0, entry_count};
     param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
+    if (dynamic_heap) rs.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
     rs.NumParameters = 1;
     rs.pParameters = &param;
     ComPtr<ID3DBlob> signature, errors;
@@ -93,6 +94,32 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
+    ComPtr<ID3D12Resource> source;
+    ComPtr<ID3D12DescriptorHeap> views;
+    if (dynamic_heap) {
+        constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
+        constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
+        source = make_buffer(device, 3 * buffer_stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        const D3D12_RANGE none{0, 0};
+        check(source->Map(0, &none, &mapped), "Map heap fixture input");
+        for (UINT i = 0; i < 3; ++i)
+            std::memcpy(static_cast<unsigned char*>(mapped) + i * buffer_stride, values + i, sizeof(values[i]));
+        source->Unmap(0, nullptr);
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create raw fixture heap");
+        auto cpu = views->GetCPUDescriptorHandleForHeapStart();
+        const UINT increment = device->GetDescriptorHandleIncrementSize(desc.Type);
+        for (UINT i = 0; i < 3; ++i, cpu.ptr += increment) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            srv.Buffer = {i * (buffer_stride / 4), 1, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+            device->CreateShaderResourceView(source.Get(), &srv, cpu);
+        }
+        ID3D12DescriptorHeap* binding[]{views.Get()};
+        list->SetDescriptorHeaps(1, binding);
+    }
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRoot32BitConstants(0, entry_count, entry, 0);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};

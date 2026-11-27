@@ -1,0 +1,2 @@
+tests/startup_gfx2hlsl_dynamic_heap_check.py
+tests/startup_compute_dynamic_heap_check.py

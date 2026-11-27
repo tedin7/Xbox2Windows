@@ -1,6 +1,6 @@
 """Depth target binding for translated draws (#1999 item D).
 
-usage: startup_draw_depth_target_check.py <startup_draw_depth_target> <warp|hardware> [check|drop|debug]
+usage: startup_draw_depth_target_check.py <startup_draw_depth_target> <warp|hardware> [check|drop|debug|readonly|readonly-indirect|readonly-indirect-off]
 Exit codes: 0 pass, 1 unexpected result, 2 broken run, 77 no hardware adapter (and, for "debug" only,
 no D3D12 debug layer).
 
@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 
-from startup_stream_check import gfx2hlsl
+from startup_stream_check import container, gfx2hlsl
 from startup_stream_depth_check import vertex
 from startup_stream_draw_check import pixel
 
@@ -110,15 +110,112 @@ def describe(result):
     return f"colour {result['colour'][:16].hex()}..., depth row 0 {values[:8]}"
 
 
+
+# The guest IDs only select a cache entry. Compile an independent quad and depth-reading
+# pixel shader to exercise the translated draw path without an ISA dependency.
+READONLY_SHADER = """
+float4 vs(uint vertex : SV_VertexID) : SV_Position {
+    const float2 corners[6] = {
+        float2(-1, -1), float2(-1, 1), float2(1, -1),
+        float2(1, -1), float2(-1, 1), float2(1, 1)
+    };
+    return float4(corners[vertex], 0.25, 1.0);
+}
+Texture2D<float> sourceDepth : register(t0);
+float4 ps(float4 position : SV_Position) : SV_Target0 {
+    int2 pixel = int2(position.xy);
+    float depth = sourceDepth.Load(int3(pixel, 0));
+    float mirrored = sourceDepth.Load(int3(7 - pixel.x, pixel.y, 0));
+    return float4(float2(depth, mirrored) * (16.0 / 255.0), 0.0, 1.0);
+}
+"""
+
+
+def readonly_reference(off=False, writable=False):
+    gradient = [(x + 1) / 16 for x in range(8)]
+    passes = [not off and 0.25 < z for z in gradient]
+    color = b"".join(bytes((x + 1, 8 - x, 0, 255)) if drawn else CLEAR
+                     for x, drawn in enumerate(passes)) * 4
+    depth = struct.pack("<8f", *(0.25 if writable and drawn else z
+                                 for z, drawn in zip(gradient, passes))) * 4
+    return color, depth
+
+
+def readonly_check(directory, program, backend, mode):
+    cache = directory / "cache"
+    cache.mkdir()
+    vs, ps, root = (directory / name for name in ("vs", "ps", "root"))
+    # NOP followed by end, with different IDs for the two cache inputs.
+    vs.write_bytes(container(1, [0xbf800003, 0xbf810000]))
+    ps.write_bytes(container(0, [0xbf800007, 0xbf810000]))
+    args = [program]
+    if mode != "readonly":
+        args.append("readonly-depth")
+    args.extend(map(str, (vs, vs, ps, ps, root, backend)))
+    off = mode == "readonly-indirect-off"
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_D3D12_DEBUG="1", X2W_TRANSLATED_INDIRECT_DRAW="1", X2W_SHADER_CACHE=str(cache),
+               X2W_READONLY_DEPTH_DRAWS="0" if off else "1")
+    prefix = directory / "scene"
+    request = subprocess.run(args + ["readonly-request", str(prefix)], env=env, capture_output=True, text=True)
+    if request.returncode == 77:
+        return 77
+    requests = list(cache.glob("req_*.a"))
+    if request.returncode or len(requests) != 1:
+        raise Broken(f"expected one synthetic graphics request, got {len(requests)} ({request.returncode})\n{request.stderr}")
+    key = requests[0].stem.removeprefix("req_")
+    hlsl = directory / "readonly.hlsl"
+    hlsl.write_text(READONLY_SHADER, encoding="ascii")
+    fxc = gfx2hlsl.find_fxc()
+    if not fxc:
+        raise Broken("FXC is required to compile the synthetic depth shaders")
+    for stage in ("vs", "ps"):
+        subprocess.run([fxc, "/nologo", "/T", f"{stage}_5_1", "/E", stage, "/Fo",
+                        str(cache / f"{key}.{stage}.cso"), str(hlsl)], check=True, env=env)
+    (cache / f"{key}.txt").write_text(
+        "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n", encoding="ascii")
+    run = subprocess.run(args + ["readonly-off" if off else "readonly", str(prefix)], env=env,
+                         capture_output=True, text=True)
+    print(run.stdout, end="")
+    if run.returncode:
+        raise Broken(f"{mode} exited {run.returncode}\n{run.stderr}")
+    if re.search(r"x2w-d3d12-debug .*sev=[01]\b", run.stderr):
+        raise Broken(f"D3D12 debug layer reported an error\n{run.stderr}")
+    if "x2w-d3d12 debug layer: 0x00000000 enabled" not in run.stderr:
+        print("D3D12 debug layer unavailable (skip)")
+        return 77
+    refused = "translated draw writes depth or stencil to a read-only depth view" in run.stderr
+    if refused != off:
+        raise Broken(f"unexpected read-only refusal status for {mode}\n{run.stderr}")
+    before = Path(f"{prefix}.before.depth").read_bytes()
+    if before != readonly_reference(off=True)[1]:
+        raise Broken(f"pre-pass gradient differs, first row {before[:32].hex()}")
+    for case in (["readonly"] if off else ["readonly", "writable"]):
+        color = Path(f"{prefix}.{case}.rgba").read_bytes()
+        depth = Path(f"{prefix}.{case}.depth").read_bytes()
+        expected_color, expected_depth = readonly_reference(off=off, writable=case == "writable")
+        if color != expected_color or depth != expected_depth:
+            if case == "writable" and color == expected_color and depth == before:
+                print("FAIL writable: correct colour, depth remained at the pre-pass gradient")
+            print(f"FAIL {case}: colour row {color[:32].hex()} expected {expected_color[:32].hex()}, "
+                  f"depth row {depth[:32].hex()} expected {expected_depth[:32].hex()}\n{run.stderr}")
+            return 1
+    print(f"{mode}: all colour and depth bytes match the CPU reference, zero D3D12 debug errors")
+    return 0
+
+
 def main():
     program, backend = sys.argv[1], sys.argv[2]
     mode = sys.argv[3] if len(sys.argv) > 3 else "check"
-    if mode not in ("check", "drop", "debug"):
+    readonly_modes = ("readonly", "readonly-indirect", "readonly-indirect-off")
+    if mode not in ("check", "drop", "debug", *readonly_modes):
         print(__doc__)
         return 64
     try:
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
+            if mode in readonly_modes:
+                return readonly_check(directory, program, backend, mode)
             prepared = prepare(directory, program, backend)
             if prepared is None:
                 print("No D3D12 feature-level 12 hardware adapter")
