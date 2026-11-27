@@ -302,9 +302,95 @@ struct UnplacedBufferEntry {
 std::mutex unplaced_buffer_mutex;
 std::vector<UnplacedBufferEntry> unplaced_buffers;
 
+// Each distinct byte snapshot gets immutable backing. Copied descriptors and in-flight lists can
+// still reference older generations, so keep them until device teardown and refuse at the budget.
+struct MemoryBufferSnapshot {
+    Wrapper* device;
+    u64 address;
+    u64 charge;
+    std::vector<unsigned char> bytes;
+    x2w_startup::ComPtr<ID3D12Resource> resource;
+    Wrapper* wrapper;
+};
+
+std::vector<MemoryBufferSnapshot> memory_buffer_snapshots;
+u64 memory_buffer_snapshot_charge;
+
+Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& requested,
+                                const D3D12_SHADER_RESOURCE_VIEW_DESC& view, u64 bytes) try
+{
+    constexpr u64 max_view_bytes = 1ull << 20;
+    constexpr u64 budget = 128ull << 20;
+    if (view.Format != DXGI_FORMAT_UNKNOWN || view.Buffer.FirstElement != 0 ||
+        view.Buffer.NumElements != 1 || view.Buffer.StructureByteStride != requested.Width ||
+        !bytes || bytes > max_view_bytes || bytes > UINT64_MAX - address)
+        return nullptr;
+    const auto placed = placed_buffer_range(device, address, bytes);
+    if (placed.owner || placed.reject || address_resource_overlap(address, bytes)) return nullptr;
+
+    const auto* source = reinterpret_cast<const void*>(address);
+    if (!x2w_local::readable(source, static_cast<std::size_t>(bytes))) return nullptr;
+    std::lock_guard lock(unplaced_buffer_mutex);
+    std::vector<unsigned char> snapshot(static_cast<std::size_t>(bytes));
+    if (!x2w_local::guarded_memcpy(snapshot.data(), source, snapshot.size(), true)) return nullptr;
+
+    static const bool stale_mutant = x2w_local::env_on("X2W_TEST_SLOT70_MEMORY_BUFFER_STALE");
+    for (const auto& entry : memory_buffer_snapshots) {
+        if (entry.device == device && entry.address == address && entry.bytes.size() == snapshot.size() &&
+            (stale_mutant || entry.bytes == snapshot))
+            return entry.wrapper;
+    }
+
+    auto* desktop = device_of(device);
+    D3D12_RESOURCE_DESC desc = requested;
+    desc.Alignment = 0;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const auto allocation = desktop->GetResourceAllocationInfo(0, 1, &desc);
+    if (!allocation.SizeInBytes || allocation.SizeInBytes > budget - memory_buffer_snapshot_charge ||
+        bytes > budget - memory_buffer_snapshot_charge - allocation.SizeInBytes)
+        return nullptr;
+    const u64 charge = allocation.SizeInBytes + bytes;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                    D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    x2w_startup::ComPtr<ID3D12Resource> resource;
+    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource))))
+        return nullptr;
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{};
+    if (FAILED(resource->Map(0, &no_reads, &mapped))) return nullptr;
+    std::memcpy(mapped, snapshot.data(), snapshot.size());
+    const D3D12_RANGE written{0, snapshot.size()};
+    resource->Unmap(0, &written);
+
+    auto& entry = memory_buffer_snapshots.emplace_back(
+        MemoryBufferSnapshot{device, address, charge, std::move(snapshot), resource, nullptr});
+    entry.wrapper = wrap(resource.Get(), resource_kind);
+    if (!entry.wrapper) {
+        memory_buffer_snapshots.pop_back();
+        return nullptr;
+    }
+    memory_buffer_snapshot_charge += charge;
+    entry.wrapper->own().budget = x2w_budget::committed(desktop, resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
+    return entry.wrapper;
+} catch (const std::bad_alloc&) {
+    return nullptr;
+}
+
 void clear_unplaced_buffers(Wrapper* device)
 {
     std::lock_guard lock(unplaced_buffer_mutex);
+    for (auto it = memory_buffer_snapshots.begin(); it != memory_buffer_snapshots.end();) {
+        if (it->device != device) {
+            ++it;
+            continue;
+        }
+        if (it->wrapper->own().budget) it->wrapper->own().budget->end_use();
+        it->wrapper->own().real = nullptr;
+        InterlockedDecrement(&it->wrapper->own().refs);
+        memory_buffer_snapshot_charge -= it->charge;
+        it = memory_buffer_snapshots.erase(it);
+    }
     for (auto it = unplaced_buffers.begin(); it != unplaced_buffers.end();) {
         if (it->device == device) {
             if (it->wrapper) {
@@ -917,15 +1003,27 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
         const auto refusal_stamp = buffer_refusal_stamp(input->address);
-        if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted)) {
+        const bool cached_refusal = buffer_refusal_cache().hit(
+            refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted);
+        Wrapper* buffer = nullptr;
+        x2w_startup::SrvRefusalProof refusal_proof;
+        if (!cached_refusal) {
+            buffer = existing_memory_buffer(self, input->address, span_bytes);
+            if (!buffer)
+                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, &refusal_proof);
+        }
+        static const bool shadow_enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_BUFFER");
+        if (!buffer && shadow_enabled) {
+            if (auto* shadow = snapshot_memory_buffer(self, input->address, *resource, input->view, span_bytes)) {
+                view_slot<18, 2>(self, reinterpret_cast<u64>(shadow), reinterpret_cast<u64>(&input->view), destination, 0);
+                note_memory_srv_write(resource, input, destination);
+                return;
+            }
+        }
+        if (cached_refusal) {
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
-        }
-        Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
-        x2w_startup::SrvRefusalProof refusal_proof;
-        if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, &refusal_proof);
         }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
