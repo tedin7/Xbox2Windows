@@ -9,6 +9,39 @@ refusal is always waiting.
 This note separates the work that must happen before a first complete translation from the runtime
 work that consumes it. It is a plan, not a claim that a scene renders.
 
+## Entry ABI: user data and group index
+
+For this mesh entry, `s3` carries the wave index in bits 24–27. The platform user
+words occupy `s8..s15`; root user data begins at `s16` and follows the root layout.
+Entry `v5` is otherwise undefined in the translator. Only the recognized exchange
+reads lane 0 of wave 0, shifts `v5` right by seven and broadcasts the result as a
+wave-uniform linear mesh group index.
+
+The [RDNA 3 ISA reference, February 2023, §3.5.4, p. 31](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna3-shader-instruction-set-architecture-feb-2023_0.pdf)
+identifies `v5` as the ES base vertex index in GS(+ES) Fast Launch 1 combined mode,
+following the five GS registers; in ordinary ES-is-VS mode it is the vertex index.
+The [geometry-engine presentation](https://gpuopen.com/gdc-presentations/2024/GDC2024_Mesh_Shaders_in_AMD_RDNA_3_Architecture.pdf)
+describes mesh thread launch. With 128 thread slots per group, this model infers
+that the first wave's base vertex index is 128 times the linear group index; the
+exchange's shift recovers that index. The [D3D12 mesh specification](https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html)
+also limits a mesh group to 128 threads.
+
+The runtime contract for a slot 57 draw is `DispatchMesh(linear_group_count, 1, 1)`;
+under this contract the translated word is `SV_GroupID.x`. The runtime does not yet
+load slot 57 outputs. This contract does not define any other use of entry `v5`.
+
+The synthetic group fixture was checked on Linux x86-64, Python 3.14.8, with
+step-1 revision `90a5ef90a` plus this change. `python3 -B
+tests/startup_mesh57_skeleton_check.py` and `python3 -B
+tests/startup_mesh57_skeleton_check.py binary /usr/lib/llvm-19/bin/llvm-mc`
+both passed. Restoring the previous group symbol makes the new offline acceptance
+and group mode refuse numeric use of the index. The CPU references for the correct
+and zero-index images differ at 134 pixels. WARP readback and its shader mutant
+remain to be run on Windows; the offline result does not establish GPU behavior.
+The additional no-argument Linux CI checks ran with the system Python: 92 passed
+and 13 failed to start because `pefile` or `iced_x86` was absent. They require
+the development dependencies before the full CI list can pass.
+
 ## Dependency map
 
 ```

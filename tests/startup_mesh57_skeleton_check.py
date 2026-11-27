@@ -9,6 +9,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py group <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -55,6 +56,14 @@ MESH = (
     ' bf8cc07f 7e2c0503 befe04c1 7d280016 3608008f 34080884 e0381000 80021004 e03810c0 80021404'
     ' bf8c3f70 f80008cf 13121110 f800020f 17161514 befe04c1 7d280015 3608008f 34080882 e0301180'
     ' 80021804 bf8c3f70 f8000941 00000018 bf810000').split()
+# Select one pair of index words per mesh group; the exchange leaves the group index in s20.
+_group_at = MESH.index('e0301180')
+GROUP_MESH = MESH[:_group_at] + [
+    '8f1e8314',  # s_lshl_b32 s30, s20, 3
+    'd70f6a04', '0002081e',  # v_add_co_u32 v4, vcc, s30, v4
+] + MESH[_group_at:]
+GROUP_CONTROL = [word if word != '7e280505' else '7e280507' for word in GROUP_MESH]
+
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
@@ -1378,6 +1387,14 @@ def mesh_root_layout_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
+    with tempfile.TemporaryDirectory() as group_tmp:
+        key, group_result = request(group_tmp, GROUP_MESH)
+        expect('numeric group index translates', group_result, 'ok')
+        if group_result == 'ok':
+            group_source = (Path(group_tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('group index uses SV_GroupID', 'uint3 gid : SV_GroupID' in group_source and 'gid.x' in group_source, True)
+        expect('non-exchanged first lane refused', request(group_tmp, GROUP_CONTROL)[1],
+               'unsupported: slot 57 mesh: v7 is read where it is not defined for every lane (an entry value, or left different per wave by an exchange)')
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
@@ -1389,6 +1406,7 @@ def controls():
                [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
                ['params 1', 'targets 0'])
         text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        expect('unused group index has no SV_GroupID', 'SV_GroupID' in text, False)
         body = [line.strip() for line in text[text.index('void main('):].splitlines()]
         want = ['if (tid == 0u) { lds[0] = s21; lds[1] = s22; }', 'GroupMemoryBarrierWithGroupSync();',
                 's21 = min(lds[0], 128u);', 's22 = min(lds[1], 128u);', 'if (s22 == 0u) s21 = 0u;',
@@ -1623,6 +1641,9 @@ def binary(mc):
     lane_mask_binary(mc)
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
+    expect('group words match llvm-mc', assemble(mc, mesh.replace(
+        'buffer_load_dword v24, v4', 's_lshl_b32 s30, s20, 3\nv_add_co_u32 v4, vcc, s30, v4\nbuffer_load_dword v24, v4')),
+        GROUP_MESH)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
            FORMATTED_MESH)
     expect('rewritten descriptor words match llvm-mc',
@@ -2658,6 +2679,47 @@ def draw_shift(dxc, renderer, adapter):
     return 0
 
 
+def draw_group(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    correct = rasterise(points, colours, indices, len(points), len(indices))
+    zero = rasterise(points, colours, indices[:2], len(points), 2)
+    different = sum(a != b for a, b in zip(correct, zero))
+    assert different > 0
+    with tempfile.TemporaryDirectory() as tmp:
+        key, status = request(tmp, GROUP_MESH)
+        if status != 'ok':
+            raise AssertionError(status)
+        base = Path(tmp) / ('%016x' % key)
+        pipe = G.MeshPipeline(code(GROUP_MESH), code(PIXEL), root())
+        constants = bytearray(1024)
+        for slot, count in enumerate((2, len(points))):
+            struct.pack_into('<I', constants, 4 * pipe.uds.index(('rootconst', 0, slot)), count)
+        head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+        source = base.with_suffix('.ms57.hlsl').read_text()
+        assert source.count('gid.x') == 1
+        mutated = Path(tmp) / 'group-zero.hlsl'
+        mutated.write_text(source.replace('gid.x', '0u'))
+        mutant = Path(tmp) / 'group-zero.cso'
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True)
+        case = Path(tmp) / 'group.bin'
+        for shader, image, mismatch in ((base.with_suffix('.ms57.cso'), correct, 0),
+                                        (mutant, correct, different), (mutant, zero, 0)):
+            case.write_bytes(head + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed-groups', shader,
+                                  base.with_suffix('.ps57.cso'), case, '2'], capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(mismatch)) or
+                    not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatch}\b', run.stdout)):
+                raise AssertionError(run.stdout + run.stderr)
+            print(f'{shader.name}: {mismatch} pixels differ from the reference')
+    return 0
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
@@ -2674,6 +2736,8 @@ def main(argv):
         status = draw_kill_exit(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
+    elif argv[1:2] == ['group'] and len(argv) == 5:
+        status = draw_group(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:
         status = draw_shift(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:

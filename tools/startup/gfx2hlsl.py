@@ -4855,6 +4855,8 @@ class Stage:
                 return 's%d' % n
             if s[0] == 'descnum' and len(s) == 3:
                 return self.descriptor_number(self.descriptor_number_node(s))
+            if s[0] == 'mesh_group_value':
+                return 'gid.x'
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
@@ -7649,7 +7651,7 @@ class Stage:
                 return False  # written before the last join: program-order tracking is not exact there
             sym = self.sym.get(lo)
             if sym:
-                return sym[0] in ('const', 'ud', 'fixed_buffer_word')
+                return sym[0] in ('const', 'ud', 'fixed_buffer_word', 'mesh_group_value')
             return lo not in self.varying_s
         if tok == 'null' or tok in FLOATS:
             return True
@@ -12926,8 +12928,8 @@ class Stage:
         self.exec_known = self.exec_narrow_only = False
 
     def op_x2w_mesh_group(self, ops, mods):
-        # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
-        self.sym[reg_range(ops[0])[1]] = ('the mesh group index',)
+        # The recognized exchange broadcasts wave 0 lane 0 entry v5 >> 7, the linear group index.
+        self.sym[reg_range(ops[0])[1]] = ('mesh_group_value',)
 
     def op_x2w_mesh_firstlane(self, ops, mods):
         self.mesh_collect_reads[self.pc] = self.u(ops[1])
@@ -17043,8 +17045,9 @@ class MeshPipeline(Pipeline):
         return '\n'.join(
             self.common() + collectives + mask_collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
-                'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
-                % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
+                'void main(uint tid : SV_GroupIndex, %sout vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
+                % ('uint3 gid : SV_GroupID, ' if any('gid.x' in line for line in lines) else '',
+                   MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
             + s.declarations() + counts + ['    ' + line for line in s.entry] + lines
             + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
 

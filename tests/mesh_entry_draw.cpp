@@ -106,7 +106,7 @@ ComPtr<ID3D12RootSignature> create_draw_root(ID3D12Device* device, const D3D12_R
 
 bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
                      bool vertices, MeshConstantBinding binding, const char* fallback_vertex, MeshDrawMode mode,
-                     const MeshTextureProducers* producers, const char* amplification)
+                     const MeshTextureProducers* producers, const char* amplification, unsigned groups)
 {
     const bool fallback = fallback_vertex != nullptr;
     if (!fallback) {
@@ -469,7 +469,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     } else {
         ComPtr<ID3D12GraphicsCommandList6> mesh_list;
         check(commands.list.As(&mesh_list), "Query mesh dispatch list");
-        mesh_list->DispatchMesh(1, 1, 1);
+        mesh_list->DispatchMesh(groups, 1, 1);
         if (depth_pair) {
             const auto second_base = base + draw_bytes;
             list->SetGraphicsRootConstantBufferView(0, second_base);
@@ -536,10 +536,10 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
 
 bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* pixel, const char* fixture,
                            bool vertices, MeshConstantBinding binding, MeshDrawMode mode,
-                           const MeshTextureProducers* producers, const char* amplification)
+                           const MeshTextureProducers* producers, const char* amplification, unsigned groups)
 {
     return check_mesh_draw(device, mesh, pixel, fixture, vertices, binding, nullptr, mode, producers,
-                           amplification);
+                           amplification, groups);
 }
 
 bool check_mesh_amplified_draw(ID3D12Device* device, const char* amplification, const char* mesh,
@@ -554,5 +554,5 @@ void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const c
                               const MeshTextureProducers* producers)
 {
     check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers,
-                    nullptr);
+                    nullptr, 1);
 }

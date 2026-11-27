@@ -84,7 +84,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr,
-                           const char* amplification = nullptr);
+                           const char* amplification = nullptr, unsigned groups = 1);
 bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
                                const char* pixel, const char* fixture);
 bool check_mesh_shader_pipeline(ID3D12Device* device, bool force_fallback);
