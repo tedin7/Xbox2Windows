@@ -55,7 +55,7 @@ void lod_range(const char* name, const char* kind, float bias, float min_lod, fl
 }
 
 // min_lod and max_lod are the expected limits for table entries and smpl static samplers.
-// Ordinary static samplers have an unbounded MaxLOD when mipmapping is enabled.
+// Ordinary static samplers have an unbounded MaxLOD.
 void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v, unsigned w, unsigned filter,
              unsigned anisotropy, UINT reg = 0, float min_lod = 0.0f, float max_lod = 0.0f)
 {
@@ -73,8 +73,7 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "static ShaderRegister", s.ShaderRegister, reg);
     expect(name, "static RegisterSpace", s.RegisterSpace, 0);
     expect(name, "static ShaderVisibility", s.ShaderVisibility, 0);  // ALL
-    const bool mip_none = ((words[2] >> 26) & 3u) == 0;
-    lod_range(name, "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, mip_none ? 0.0f : FLT_MAX);
+    lod_range(name, "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, FLT_MAX);
     const D3D12_STATIC_SAMPLER_DESC limited = decode_sampler(words, reg, false, true);
     lod_range(name, "static smpl", limited.MipLODBias, limited.MinLOD, limited.MaxLOD, min_lod, max_lod);
 
@@ -222,8 +221,15 @@ int main(int argc, char** argv)
     decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0,
             0.5f, 3.0f);
 
-    // Nonzero word 1 limits must be ignored when mipmapping is disabled.
-    decoded("mip none", {0, 0x100u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1);
+    {
+        ++cases;
+        // The fixed static sampler keeps its full range even when MIP_FILTER is zero.
+        const SamplerWords words{0, 0x100u | 0x300u << 12, 0, 0};
+        const auto s = decode_sampler(words, 0);
+        lod_range("mip none", "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, D3D12_FLOAT32_MAX);
+        const auto d = dynamic_sampler(words);
+        lod_range("mip none", "dynamic", d.MipLODBias, d.MinLOD, d.MaxLOD, 0.0f, 0.0f);
+    }
 
     const struct {
         const char* name;

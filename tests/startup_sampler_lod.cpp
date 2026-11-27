@@ -50,7 +50,7 @@ constexpr x2w_startup::SamplerWords heap_words[]{
     {clamp_xy, full_lod, point_mip, 0},          // point mip control
 };
 constexpr UINT heap_count = sizeof(heap_words) / sizeof(heap_words[0]);
-// LESS (word 0 bits 14:12 = 1), mipmapping disabled.
+// LESS (word 0 bits 14:12 = 1), with MAX_LOD 1 encoded in word 1.
 constexpr const char* comparison_line = "smpc 0 0x1012 0x100000 0x0 0x0";
 
 struct Probe {

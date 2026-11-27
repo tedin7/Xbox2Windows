@@ -23,8 +23,8 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-// MIP_FILTER 0 uses only the view's base level. Otherwise, lod_limits carries the unsigned 4.8 MIN_LOD
-// (word 1 bits 11:0) and MAX_LOD (bits 23:12) for heap entries and smpl static samplers.
+// lod_limits carries the unsigned 4.8 MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12)
+// for heap entries and smpl static samplers.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
                                                 bool lod_limits = false)
 {
@@ -53,9 +53,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
                   : border_type == 1u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
                                       : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
-    if (mip == 0) {
-        s.MaxLOD = 0.0f;
-    } else if (lod_limits) {
+    if (lod_limits) {
         s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
         s.MaxLOD = static_cast<float>((words[1] >> 12) & 0xfffu) / 256.0f;
     }
@@ -212,7 +210,12 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
     // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
-    const auto s = decode_sampler(words, 0, false, true);
+    auto s = decode_sampler(words, 0, false, true);
+    // MIP_FILTER 0 selects the view's base level for title heap descriptors.
+    if (((words[2] >> 26) & 3u) == 0) {
+        s.MinLOD = 0.0f;
+        s.MaxLOD = 0.0f;
+    }
     const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
     const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
                          s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
