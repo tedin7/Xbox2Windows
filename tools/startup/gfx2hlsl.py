@@ -7661,15 +7661,6 @@ class Stage:
                 return None
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
-            if (shift_add and dname != 'm0' and syms[1] and syms[1][0] in ('desc', 'descnum')
-                    and (self.sym.get(dst[1]) or ('',))[0] not in ('desc', 'ptr', 'ptrhi')):
-                # The guest descriptor word is opaque. Its unsigned range is enough to prove carry if
-                # the shifted constant alone overflows, or if it is zero and the addend alone fits.
-                first = self.const_u32(srcs[0])
-                if first is not None and (first == 0 or (first << SHIFT_ADD[base]) > 0xffffffff):
-                    self.set_s(dst[1], None, ('descnum',))
-                    self.set_scc('true' if first else 'false')
-                    return None
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
                 self.scc_verified = False
@@ -12680,8 +12671,8 @@ class Stage:
     # WaveActiveBitOr / WaveActiveMin / WaveActiveMax of vX over the active lanes of the desktop wave, which leaves
     # helper lanes out. Accepted only in a straight-line pixel stage whose EXEC is the entry mask, not widened by
     # s_wqm (helper lanes would then be counted on the console). Every other shape that starts like a chain is refused
-    # with its reason: an unproved wave64 combine, another fill, a wrong identity, invalid steps, other or mixed
-    # operations, other lane selects, an unrestored EXEC, a misplaced readlane or
+    # with its reason: wave64, another fill, a wrong identity, missing or reordered steps, other or mixed operations,
+    # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
     # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
     WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
                    'v_max_u32': ('WaveActiveMax({0})', 0), 'v_and_b32': ('WaveActiveBitAnd({0})', 0xffffffff),
@@ -12789,12 +12780,11 @@ class Stage:
                                                                              'row_half_mirror' in mods)
                    for name, _ops, mods in steps[1:]):
             return False   # not a reduction: the instruction keeps its own handler
-        wave64 = base.endswith('_b64')
+        if base.endswith('_b64'):
+            raise Unsupported('wave reduction in the wave64 form (%s %s): only the wave32 chain is lowered'
+                              % (base, ', '.join(ops)))
         ss = reg_range(ops[0])
-        if wave64:
-            if not ss or ss[0] != 's' or ss[1] % 2 or ss[2] != ss[1] + 1 or ss[2] > 105:
-                raise Unsupported('wave reduction in the wave64 form: EXEC needs an even SGPR pair')
-        elif not ss or ss[0] != 's' or ss[1] != ss[2]:
+        if not ss or ss[0] != 's' or ss[1] != ss[2]:
             raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
         ss = ss[1]
         first = next((k for k, (name, _o, m) in enumerate(steps)
@@ -12810,13 +12800,13 @@ class Stage:
         stretch = [at(k, 'the first quad_perm step') for k in range(1, first)]
         pending = getattr(self, 'reduce_pending', {})
         taken = None   # the later readlane of the min chain just before, which this chain carries before its fill
-        if not wave64 and stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
+        if stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
             taken = pending[items[1][0]]
             stretch = stretch[1:]
         fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
         if fill is None:
-            raise Unsupported('wave reduction: the identity fill after %s %s, -1 (%s) is not a known '
-                              'form' % (base, ops[0], ' / '.join(t[3] for t in stretch) or 'no instruction'))
+            raise Unsupported('wave reduction: the identity fill after s_or_saveexec_b32 s%d, -1 (%s) is not a known '
+                              'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
         vt, source, identity = fill
         op = None
         seen = []
@@ -12860,8 +12850,6 @@ class Stage:
             mixed = b in self.WAVE_REDUCE and b != op
             raise Unsupported('wave reduction %s' % ('mixes %s and %s' % (op, b) if mixed else
                                                      ': %s in place of %s v%d, v%d, v%d' % (text, op, vt, vt, vp)))
-        if wave64:
-            return self.wave64_sum(index, first, at, op, vt, vp, ss, source)
         b, o, m, text = at(first + 6, 'EXEC is restored')
         if b != 's_mov_b32' or o != ['exec_lo', 's%d' % ss] or m:
             raise Unsupported('wave reduction: %s in place of s_mov_b32 exec_lo, s%d (EXEC restored before the readlane)'
@@ -12947,64 +12935,6 @@ class Stage:
         if later:
             self.reduce_pending = {**pending, items[read][0]: claim}
         plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
-        return True
-
-    def wave64_sum(self, index, first, at, op, vt, vp, ss, source):
-        """The DPP/permlane prefix produces two modulo-32-bit partial sums, one in each half."""
-        def refuse(reason):
-            raise Unsupported('wave reduction in the wave64 form: ' + reason)
-
-        if (self.kind != 'ps' or self.fetched or self.has_branches or self.blocks or self.calculated_pc
-                or not self.exec_known or self.wqm_exec):
-            refuse('requires a straight-line pixel stage with entry EXEC')
-        if op != 'v_add_nc_u32':
-            refuse('the two half-wave results must be sums')
-        b, o, m, _ = at(first + 6, 'the wave64 EXEC restore')
-        if (b, o, m) != ('s_mov_b64', ['exec', 's[%d:%d]' % (ss, ss + 1)], []):
-            refuse('requires restoration of both EXEC words before the readlanes')
-        halves = {}
-        for k in (first + 7, first + 8):
-            b, o, m, _ = at(k, 'a wave64 half-wave readlane')
-            if (b != 'v_readlane_b32' or m or len(o) != 3 or o[1] != 'v%d' % vt
-                    or o[2] not in ('31', '63') or not re.fullmatch(r's\d+', o[0])
-                    or int(o[0][1:]) > 105):
-                refuse('requires readlanes of lanes 31 and 63')
-            halves[o[2]] = o[0]
-        if len(halves) != 2 or len(set(halves.values())) != 2:
-            refuse('requires distinct readlanes of lanes 31 and 63 into distinct SGPRs')
-        end = first + 9
-        b, o, m, _ = at(end, 'the scalar sum of the wave64 halves')
-        if (b != 's_add_u32' or m or len(o) != 3 or set(o[1:]) != set(halves.values())
-                or not re.fullmatch(r's\d+', o[0]) or int(o[0][1:]) > 105):
-            refuse('requires s_add_u32 of the two half-wave sums')
-        dest = int(o[0][1:])
-        scalar_scratch = {'s%d' % ss, 's%d' % (ss + 1), *halves.values()} - {o[0]}
-        scc_live = True
-        for _, _, name, asm in self.ins[index + end + 1:]:
-            reads, _, _ = scalar_effects(name, asm)
-            if scc_live and 'scc' in reads:
-                refuse('the carry of the half-wave add is read after the chain')
-            # Use only explicit SCC writes that the translator can check. The half sums, the saved EXEC
-            # and the vector temporaries have no desktop equivalents in this lowering.
-            if name.startswith(('s_cmp', 's_bitcmp')):
-                scc_live = False
-            _, operands, _ = parse(asm)
-            if scalar_scratch & scalar_tokens(asm) or 'movrel' in name or any(
-                    r[0] == 'v' and any(r[1] <= v <= r[2] for v in (vt, vp))
-                    for operand in operands if (r := reg_range(operand.strip('-|')))):
-                refuse('a half-wave temporary is used after the chain')
-
-        plan = self.reduce_plan = getattr(self, 'reduce_plan', {})
-        for pc, _, _, _ in self.ins[index + 1:index + end + 1]:
-            plan[pc] = None
-
-        def lower():
-            self.needs_sm6 = True
-            self.set_s(dest, 'WaveActiveSum(%s)' % self.u(source), uniform=True)
-            self.scc_effect = 'the carry of the wave64 half-wave add'
-            self.scc_verified = False
-
-        plan[self.ins[index + end][0]] = lower
         return True
 
     @staticmethod
@@ -15688,8 +15618,6 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
-    ('descriptor-shift-add-scc', r'^scc from descriptor data \[shift-add, complement or absdiff: s_lshl[1-4]_add_u32,'),
-    ('wave64-reduction', r'^wave reduction in the wave64 form \(s_or_saveexec_b64 .*only the wave32 chain is lowered'),
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),
