@@ -168,6 +168,7 @@ struct Translation {
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     bool dynamic_heap = false;
+    bool helper_lane = false;
     std::string placeholder_ps;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
@@ -717,6 +718,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             tr.placeholder_ps = line.substr(15);
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
+        } else if (line == "helper_lane") {
+            tr.helper_lane = true;
         } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -788,6 +791,10 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
         }
+    }
+    if (tr.helper_lane && !x2w_startup::device_helper_lane_reliable(device_of(the_device), log)) {
+        log("x2w-draw pipeline %016llx refused: adapter IsHelperLane unreliable; translation not used", tr.key);
+        return;
     }
     if (matched_rtv != !rtv_request.empty()) {
         log("x2w-draw RTV manifest missing for %016llx", tr.key);

@@ -15985,6 +15985,8 @@ class Pipeline:
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+        if getattr(self.ps, 'uses_helper_lane', False):
+            lines.append('helper_lane')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())

@@ -29,6 +29,7 @@
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
+#include "startup_stubs/helper_lane_guard.h"
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/integer_texture_srvs.h"
