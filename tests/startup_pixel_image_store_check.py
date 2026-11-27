@@ -107,11 +107,13 @@ RW_ADD = bytes.fromhex('703f8cbf' '09404006' '0a424206' '0b444406' '0c464606')
 RW_EXPORT = bytes.fromhex('0f1800f820212223' '000081bf')
 
 
-def rw_program(*, array=False, stale=False):
+def rw_program(*, array=False, stale=False, stride=32):
     descriptors = RW_DESCRIPTOR
     load, store = RW_LOAD, RW_STORE
     if stale:
-        descriptors += bytes.fromhex('04090cf4200000fa')  # s[36:43], distinct table entry at byte 32
+        # s[36:43], a distinct table entry one descriptor stride in (32 bytes on the console, the adapter's
+        # increment on the desktop: 64 on WARP)
+        descriptors += bytes.fromhex('04090cf4') + struct.pack('<I', 0xfa000000 | stride)
         load = load[:6] + bytes.fromhex('0900')
     if array:
         load, store = b'\x28' + load[1:], b'\x28' + store[1:]
