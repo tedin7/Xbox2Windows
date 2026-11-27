@@ -34,6 +34,7 @@ does not kill must differ at exactly the killed pixels.
 The heap mode compares a root-selected raw heap buffer with the CPU image and a slot-zero shader mutant.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
+import inspect
 import os
 from pathlib import Path
 import re
@@ -325,8 +326,13 @@ def coherent_words(parts):
     return ' '.join(words)
 
 
+COHERENT_VCC_READ = 'd501003c 01a90280'  # v_cndmask_b32_e64 v60, 0, 1, vcc
+COHERENT_EXEC_WRITE = 'bf068006 857ec180'  # s_cmp_eq_u32 s6, 0; s_cselect_b32 exec_lo, 0, -1
+COHERENT_VCC_DRAW = 'S5 VCC read before compare'
+
+
 def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=False, live_mask=False,
-                  numeric_pair=False):
+                  numeric_pair=False, vcc_before_compare=False):
     # Wave 0 has six then lanes. Wave 1 has zero or 64. The enclosing prefix covers both waves.
     threshold = 'bf068006 ' + ('8532ff86 00000080' if full else '8532c086')  # s50 = SCC ? 6 : 128/64
     before = ['beb4047e bf8cc07f', 'head:', '7da80032']  # save EXEC, wait, CMPX s50 > v0
@@ -388,6 +394,13 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
                          'else restore:', 'befe043a']
         body = [*before, (0xbf88, 'else'), *then, 'else:', *at_else, *otherwise, 'join:', *join]
     prefix = MASK_PREFIX
+    if vcc_before_compare:
+        before_compare = COHERENT_VCC_READ
+        if control == 'EXEC write before compare':
+            before_compare += ' ' + COHERENT_EXEC_WRITE
+        if control == 'entry after reset':
+            prefix = prefix.replace('befe04c1 ', 'bf840001 befe04c1 ')  # s_cbranch_scc0 skips the reset
+        prefix = prefix.replace('befe04c1 ', 'befe04c1 ' + before_compare + ' ')
     if positions:
         prefix = prefix.replace('beaa03ff 00000080', 'be960311').replace(' beaa0380', '')
         prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da80016')
@@ -411,7 +424,8 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
     return mesh
 
 
-COHERENT_DRAWS = ('S5', 'S6')
+COHERENT_DRAWS = {'S5': ('S5', {}), 'S6': ('S6', {}),
+                  COHERENT_VCC_DRAW: ('S5', {'vcc_before_compare': True})}
 COHERENT_CONTROLS = (
     ('S5', 'backward', 'a backward branch inside the block'),
     ('S5', 'constant-trip', 'a backward branch inside the block'),
@@ -1329,20 +1343,25 @@ def coherent_controls(tmp):
             ('S7', 'S7', {}, (5, 0)), ('S7 nonzero votes', 'S7', {'nonzero': True}, (3, 2)),
             ('S8', 'S8', {}, (8, 0)), ('S5 position exports', 'S5', {'positions': True}, (2, 0)),
             ('S5 live mask', 'S5', {'live_mask': True}, (2, 0)),
+            (COHERENT_VCC_DRAW, 'S5', {'vcc_before_compare': True}, (3, 0)),
+            (COHERENT_VCC_DRAW + ' full', 'S5', {'vcc_before_compare': True, 'full': True}, (3, 0)),
             ('S5 numeric scalar pair', 'S5', {'numeric_pair': True}, (2, 0))):
         key, result = request(tmp, coherent_mesh(shape, **options))
         expect(label, result, 'ok')
         if result != 'ok':
             continue
+        if label == COHERENT_VCC_DRAW:
+            print(label + ': translated')
         source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
         expect(label + ' votes', (source.count('mesh_vote == 0u'), source.count('mesh_vote != 0u')), votes)
         if label.startswith('S7'):
             expect(label + ' counts VCC even under zero EXEC',
                    bool(re.search(r'mesh_first_active\(tid, pc == \d+ && \(vcc & 1u\) != 0u', source)), True)
-        if shape in COHERENT_DRAWS and options.keys() <= {'full'}:
+        draw_label = label.removesuffix(' full')
+        if draw_label in COHERENT_DRAWS:
             full = options.get('full', False)
             _, guest = coherent_reference(shape, full)
-            for mutant, changed in lane_mask_mutants(shape, source):
+            for mutant, changed in lane_mask_mutants(draw_label, source):
                 _, wrong = coherent_reference(shape, full, mutant)
                 expect(label + ' ' + mutant + ' changes source and pixels', (changed != source, wrong != guest),
                        (True, True))
@@ -1365,6 +1384,24 @@ def coherent_controls(tmp):
                f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
     expect('one missing position arm',
            request(tmp, coherent_mesh('S5', positions=True, control='missing position'))[1], GUARDED_REFUSAL)
+
+    reset_refusal = (
+        f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: an unsupported branch inside the block '
+        '(s_cbranch_execz forward in the block); a scalar instruction the wave block cannot run once per wave)')
+    exec_write = coherent_mesh('S5', vcc_before_compare=True, control='EXEC write before compare')
+    outside_entry = coherent_mesh('S5', vcc_before_compare=True, control='entry after reset')
+    expect('EXEC write before compare', request(tmp, exec_write)[1], reset_refusal)
+    expect('entry after reset', request(tmp, outside_entry)[1], reset_refusal)
+
+    # Disable the EXEC guard only in the reset walk, leaving the emitter and branch check intact.
+    mutant_source, edits = re.subn(r'(?m)^        if writes_exec[^\n]+:', '        if False:',
+                                   inspect.getsource(G.mesh_full_exec_reset))
+    expect('the mutant removes one EXEC guard', edits, 1)
+    mutant_scope = vars(G).copy()
+    exec(mutant_source, mutant_scope)
+    with patch.object(G, 'mesh_full_exec_reset', mutant_scope['mesh_full_exec_reset']):
+        expect('ignoring EXEC writes makes the refusal control translate', request(tmp, exec_write)[1], 'ok')
+        expect('the entry control still refuses', request(tmp, outside_entry)[1], reset_refusal)
 
     # m3 removes the numeric use from the proof's view of the program. The same
     # VCC purity assertion used by the block must change from refusal to acceptance.
@@ -1652,6 +1689,9 @@ def assemble(mc, text):
 
 def lane_mask_binary(mc):
     """Verify the opcodes and independently assemble the mixed/empty S1 draw."""
+    expect('VCC select and EXEC write words',
+           assemble(mc, 'v_cndmask_b32_e64 v60, 0, 1, vcc\ns_cmp_eq_u32 s6, 0\ns_cselect_b32 exec_lo, 0, -1'),
+           (COHERENT_VCC_READ + ' ' + COHERENT_EXEC_WRITE).split())
     expect('standalone select words', assemble(mc, """
 s_cmp_eq_u32 s6, 0
 s_cselect_b64 vcc, -1, 0
@@ -1824,7 +1864,7 @@ def rasterise(points, colours, indices, verts, prims):
 def lane_mask_reference(label, full, mutant=None):
     """Simulate scalar state per guest wave and VALU under that lane's EXEC."""
     if label in COHERENT_DRAWS:
-        return coherent_reference(label, full, mutant)
+        return coherent_reference(COHERENT_DRAWS[label][0], full, mutant)
     points, colours, indices = geometry()
     triangles = [tuple(slot + first for slot in tri) for tri, first in zip(indices, (32, 0, 64, 64))]
     data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
@@ -1927,9 +1967,11 @@ def coherent_reference(shape, full, mutant=None):
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
     if label in COHERENT_DRAWS:
-        expect(label + ' inner EXEC vote is present', 'mesh_vote == 0u' in source, True)
-        mutants = [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
-        if label == 'S5':
+        vote = 'mesh_vote == 0u'
+        start = source.find(vote) + len(vote) if label == COHERENT_VCC_DRAW else 0
+        expect(label + ' inner EXEC vote is present', vote in source[start:], True)
+        mutants = [('per-lane EXEC branch', source[:start] + source[start:].replace(vote, 'exec == 0u', 1))]
+        if COHERENT_DRAWS[label][0] == 'S5':
             complement = 'exec = (s52 & ~exec) & 1;'
             expect(label + ' complement is unique', source.count(complement), 1)
             mutants.append(('wrong complement', source.replace(complement, 'exec = exec & 1;')))
@@ -1984,10 +2026,11 @@ def draw_lane_masks(dxc, renderer, adapter):
                 status = draw_lane_mask_case(tmp, dxc, renderer, adapter, label, program, full)
                 if status:
                     return status
-    for shape in COHERENT_DRAWS:
+    for label, (shape, options) in COHERENT_DRAWS.items():
         for full in (False, True):
             with tempfile.TemporaryDirectory() as tmp:
-                status = draw_lane_mask_case(tmp, dxc, renderer, adapter, shape, coherent_mesh(shape, full=full), full)
+                status = draw_lane_mask_case(
+                    tmp, dxc, renderer, adapter, label, coherent_mesh(shape, full=full, **options), full)
                 if status:
                     return status
     with tempfile.TemporaryDirectory() as tmp:
