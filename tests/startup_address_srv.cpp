@@ -1166,3 +1166,67 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
 
     return 0;
 }
+
+// An R8 0x105 slice has a 4 KiB mip tail followed by one 4 KiB tile for mip 0.
+// The request names the first two mips in the tail of the first or second slice.
+int draw_slot70_texture_alias(void* guest, void* list)
+{
+    constexpr std::size_t slice_bytes = 8192;
+    static std::array<unsigned char, 2 * slice_bytes> backing{};
+    constexpr auto layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    const D3D12_RESOURCE_DESC owner{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 2, 4, DXGI_FORMAT_R8_UNORM,
+        {1, 0}, layout, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    const D3D12_RESOURCE_DESC alias{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 2, DXGI_FORMAT_R8_UNORM,
+        {1, 0}, layout, D3D12_RESOURCE_FLAG_NONE};
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&owner), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&texture))))) return 40;
+
+    Word srv = 0;
+    if (!bind_view_table(guest, list, srv)) return 41;
+    wchar_t mode[4]{};
+    GetEnvironmentVariableW(L"X2W_TEST_SLOT70_TEXTURE_ALIAS", mode, 4);
+    const Word offset = mode[0] == L'2' ? slice_bytes : mode[0] == L'3' ? 1 : 0;
+    ViewAt view{};
+    view.address = ptr(backing.data()) + offset;
+    view.view.Format = alias.Format;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Texture2DArray = {0, UINT_MAX, 0, 1, 0, 0};
+    auto null_view = view.view;
+    null_view.Texture2DArray.MipLevels = 2;
+    invoke(guest, 18, 0, ptr(&null_view), srv);
+    std::array<unsigned char, 32> previous{};
+    const auto* descriptor = reinterpret_cast<const void*>(srv);
+    std::memcpy(previous.data(), descriptor, previous.size());
+    invoke(guest, 70, ptr(&alias), ptr(&view), srv);
+    std::printf("slot70 alias descriptor changed=%d\n", std::memcmp(previous.data(), descriptor, previous.size()) != 0);
+
+    struct ExtendedHeap {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    };
+    const ExtendedHeap heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)),
+                                           ptr(&heap))))) return 42;
+    const Word rtv_start = invoke(heap, 9);
+    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    // Write after publishing the alias. Distinct colours identify incorrect slice and mip remapping.
+    for (UINT slice = 0; slice < 2; ++slice) {
+        for (UINT mip = 0; mip < owner.MipLevels; ++mip) {
+            D3D12_RENDER_TARGET_VIEW_DESC target{};
+            target.Format = owner.Format;
+            target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            target.Texture2DArray = {mip, slice, 1, 0};
+            const Word handle = rtv_start + (slice * owner.MipLevels + mip) * stride;
+            invoke(guest, 20, ptr(texture), ptr(&target), handle);
+            const float color[]{(17 + 100 * slice + 31 * mip) / 255.0f, 0, 0, 1};
+            invoke(list, 52, handle, ptr(color));
+        }
+    }
+    const D3D12_RECT full{0, 0, 8, 4};
+    invoke(list, 22, 1, ptr(&full));
+    invoke(list, 12, 3, 1);
+    return 0;
+}
