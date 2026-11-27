@@ -583,81 +583,119 @@ def vertex_reference():
                     for _ in range(4) for x in range(4))
 
 
-def nested_words(outer, inner):
-    # Both inputs are inline scalar constants; the branch offsets are hand-written.
-    return b''.join((
-        sopc(6, 145, 145 if outer else 146), branch(SOPP_CBRANCH_SCC0, 4, 32),
-        sopc(6, 145, 145 if inner else 146), branch(SOPP_CBRANCH_SCC0, 12, 24),
-        sop1(3, 20, S_SCC), branch(SOPP_BRANCH, 20, 28), sop1(3, 20, S_SCC),
-        branch(SOPP_BRANCH, 28, 36), sop1(3, 20, S_SCC),
-        sopc(1, 20, 128), branch(SOPP_CBRANCH_SCC0, 40, 52),
-        sop1(3, 22, 129), branch(SOPP_BRANCH, 48, 56), sop1(3, 22, 130),
-        sop1(3, 21, S_SCC)))
+# Hand-encoded scalar sequence: save two SCC values, traverse nested SCC
+# diamonds, compare the joined copy, then read SCC after a second diamond.
+# An earlier EXEC branch exercises restoration of a common reaching definition.
+def nested_words(mutation=None):
+    branch_to = lambda op, at, target: branch(op, at * 4, target * 4)
+    words = [
+        bytes.fromhex('8000847d'), branch_to(SOPP_CBRANCH_EXECZ, 1, 3), sopp(SOPP_NOP),
+        sopc(SOPC_BITCMP1_B32, 9, 157), sop1(3, 15, S_SCC),
+        sop2(SOP2_AND_B32, 16, 9, 129), sopc(6, S_SCC, 128), sop1(3, 18, S_SCC),
+        sopc(1, 15, 128), branch_to(SOPP_CBRANCH_SCC0, 9, 17),
+        sop1(3, 14, S_SCC), sopc(1, 18, 128), branch_to(SOPP_CBRANCH_SCC0, 12, 15),
+        sop1(3, 15, S_SCC), branch_to(SOPP_BRANCH, 14, 18), sop1(3, 15, S_SCC),
+        branch_to(SOPP_BRANCH, 16, 18), sop1(3, 15, S_SCC),
+        sopc(1, 15, 128), branch_to(SOPP_CBRANCH_SCC0, 19, 22),
+        sop1(3, 16, 129), branch_to(SOPP_BRANCH, 21, 23), sop1(3, 16, 130),
+        sop1(3, 19, S_SCC)]
+    # Fixed descriptor-table loads preserve SCC on both arms.
+    def load(offset):
+        return struct.pack('<II', 0xf4000000 | (2 << 18) | (20 << 6) | 4,
+                           (125 << 25) | offset)
+    insertions = {13: load(0x10), 15: load(0x30), 20: load(0x10), 22: load(0x30)}
+    offsets, cursor = {}, 0
+    for i, word in enumerate(words):
+        offsets[i] = cursor
+        cursor += len(insertions.get(i, b'')) + len(word)
+    branches = {1: (SOPP_CBRANCH_EXECZ, 3), 9: (SOPP_CBRANCH_SCC0, 17),
+                12: (SOPP_CBRANCH_SCC0, 15), 14: (SOPP_BRANCH, 18),
+                16: (SOPP_BRANCH, 18), 19: (SOPP_CBRANCH_SCC0, 22), 21: (SOPP_BRANCH, 23)}
+    for i, (op, target) in branches.items():
+        words[i] = branch(op, offsets[i], offsets[target])
+    if mutation:
+        i, word = mutation
+        words[i] = branch(SOPP_BRANCH, offsets[i], offsets[11]) if word == 'back' else word
+    return b''.join(insertions.get(i, b'') + word for i, word in enumerate(words))
 
 
-def nested_reference(outer, inner, wrong_scc=False):
-    saved = int(bool(inner) if outer else False)
-    scc = int(saved != 0) ^ int(wrong_scc)
-    return b''.join(struct.pack('<4f', saved if x < 2 else scc, saved, 0, 1)
-                    for _ in range(4) for x in range(4))
+NESTED_TAIL = bytes.fromhex(
+    'ff02067e00004040ff02147e000040c08100847df30602028200847df2140402'
+    'f202087e80020a7e0f020c7e060d0c7e13020e7e070d0e7e8002107ef202127e'
+    'cf0800f8010205040f0200f806070809000081bf')
+
+
+def nested_translate(code):
+    pipe = G.Pipeline(code + NESTED_TAIL, PS_WORDS, root_blob())
+    return pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest(), pipe.uds
+
+
+def nested_reference(value, wrong_scc=False):
+    outer = (value >> 29) & 1
+    inner = int((value & 1) == 0)
+    saved = inner if outer else 0
+    result = int(saved != 0) ^ int(wrong_scc)
+    return b''.join(struct.pack('<4f', float(saved), float(result), 0.0, 1.0) for _ in range(16))
 
 
 def nested_controls():
-    accepted = []
-    for outer, inner in ((0, 0), (1, 0), (1, 1)):
-        code = nested_words(outer, inner)
-        retry = G.Stage.retry_scc_edge_proof
-        G.Stage.retry_scc_edge_proof = lambda self, reason: False
+    code = nested_words()
+    retry = G.Stage.retry_scc_edge_proof
+    G.Stage.retry_scc_edge_proof = lambda self, reason: False
+    try:
         try:
-            try:
-                translate_vertex(code)
-            except G.Unsupported as error:
-                check('nested old refusal', 'src_scc with unverified SCC' in str(error), str(error))
-            else:
-                check('nested old refusal', False, 'previous proof accepted the fixture')
-            old = translate_vertex(SCALAR_WORDS)
-        finally:
-            G.Stage.retry_scc_edge_proof = retry
-        check('unchanged vertex output', old == translate_vertex(SCALAR_WORDS))
-        try:
-            shaders = translate_vertex(code)
+            nested_translate(code)
         except G.Unsupported as error:
-            check('nested SCC edge', False, str(error))
-            continue
-        check('nested SCC edge', True)
-        accepted.append((outer, inner, shaders))
+            check('nested base refusal', 'src_scc with unverified SCC' in str(error), str(error))
+        else:
+            check('nested base refusal', False, 'previous proof accepted the fixture')
+        old = translate_vertex(SCALAR_WORDS)
+    finally:
+        G.Stage.retry_scc_edge_proof = retry
+    check('unchanged vertex output', old == translate_vertex(SCALAR_WORDS))
+    try:
+        shaders = nested_translate(code)
+    except G.Unsupported as error:
+        check('nested SCC edge', False, str(error))
+        return None
+    check('nested SCC edge', True)
+    check('nested root binding', ('rootconst', 1, 0) in shaders[3], shaders[2])
     for index, word, diagnostic in (
-            (0, sop2(SOP2_AND_B32, 6, 4, VCC_LO), 's_and_b32 at +0x0 yields a non-uniform value'),
-            (13, sop2(SOP2_AND_B32, 6, 4, VCC_LO), 's_and_b32 at +0x34 yields a non-uniform value'),
-            (7, branch(SOPP_BRANCH, 28, 8), 's_cmp_lg_i32 at +0x24 yields a non-uniform value')):
-        code = bytearray(nested_words(1, 1))
-        code[index * 4:index * 4 + 4] = word
+            (3, sop2(SOP2_AND_B32, 6, 9, VCC_LO), 'non-uniform'),
+            (22, sop2(SOP2_AND_B32, 6, 9, VCC_LO), 'non-uniform'),
+            (16, 'back', 'non-uniform')):
+        mutant = nested_words((index, word))
         try:
-            translate_vertex(bytes(code))
+            nested_translate(mutant)
         except G.Unsupported as error:
             check('nested refusal ' + str(index), diagnostic in str(error), str(error))
         else:
             check('nested refusal ' + str(index), False, 'translated unsafe path')
-    check('mutant discriminated', nested_reference(1, 1) != nested_reference(1, 1, wrong_scc=True))
-    return accepted
+    for value, expected in ((0, (0.0, 0.0)), (1 << 29, (1.0, 1.0)), ((1 << 29) | 1, (0.0, 0.0))):
+        check('nested CPU path %x' % value, struct.unpack_from('<2f', nested_reference(value)) == expected)
+    check('mutant discriminated', nested_reference(1 << 29) != nested_reference(1 << 29, True))
+    return shaders
 
 
-def check_nested_draw(dxc, runner, cases):
+def check_nested_draw(dxc, runner, shaders):
+    vs, ps, manifest, bindings = shaders
     out = Path(here).parent / 'out'
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         directory = Path(tmp)
-        for outer, inner, (vs, ps) in cases:
-            name = f'nested_{outer}_{inner}'
-            vertex = compile_hlsl(dxc, 'dxc', vs, name, 'vs_6_0', directory)
-            pixel = compile_hlsl(dxc, 'dxc', ps, name + '_ps', 'ps_6_0', directory)
-            expected = directory / (name + '.bin')
-            expected.write_bytes(nested_reference(outer, inner))
-            run = subprocess.run([runner, 'warp', '--raster-reference', str(vertex), str(pixel),
-                                  '4', '4', str(expected), 'none', 'cw'], capture_output=True, text=True)
+        vertex = compile_hlsl(dxc, 'dxc', vs, 'nested_vs', 'vs_6_0', directory)
+        pixel = compile_hlsl(dxc, 'dxc', ps, 'nested_ps', 'ps_6_0', directory)
+        check('root binding', ('rootconst', 1, 0) in bindings, manifest)
+        for value in (0, 1 << 29, (1 << 29) | 1):
+            expected = directory / ('nested_%x.bin' % value)
+            expected.write_bytes(nested_reference(value))
+            constants = [value if source == ('rootconst', 1, 0) else 0 for source in bindings]
+            entry = ','.join('%08x' % word for word in constants)
+            run = subprocess.run([runner, 'warp', '--startup-pixel-buffer-words', str(vertex), str(pixel),
+                                  '4', '4', str(expected), entry, '00000000'], capture_output=True, text=True)
             if run.returncode == 77:
                 sys.exit(1 if failures else 77)
             report = run.stdout + run.stderr
-            check(name + ' WARP readback', run.returncode == 0 and 'all 16 pixels matched' in report, report)
+            check('nested WARP %x' % value, run.returncode == 0 and 'all 16 pixels matched' in report, report)
 
 
 def check_vertex_draw(dxc, runner, shaders):

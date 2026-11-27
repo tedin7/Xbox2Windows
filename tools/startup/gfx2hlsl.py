@@ -5762,6 +5762,7 @@ class Stage:
             self.exec_may_be_empty = False  # EXEC was narrowed and no s_cbranch_execz has shown a live lane since
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
+            verified_scc_branches = set()
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
             self.heap_index_was = {}  # the marks the current instruction's destinations held before it
@@ -5895,11 +5896,20 @@ class Stage:
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
                     self.uniform_cmp_masks.clear()
-                    if (getattr(self, 'retry_scc_edges', False) and self.uniform_cf
-                            and not back_targets):
+                    if getattr(self, 'retry_scc_edges', False) and not back_targets:
                         paths = ([pre_uniform] if falls else []) + edge_since.get(off, [])
                         if paths and all(path is not None for path in paths):
-                            common = set.intersection(*paths)
+                            common = set.intersection(*paths) - blocked
+                            # A divergent branch can choose different uniform values.
+                            # Reject a register if any of its writes lies in such a region.
+                            if not self.uniform_cf:
+                                _, block_of, _, regions = self.spill_cfg
+                                ins_index = {pc: i for i, (pc, _, _, _) in enumerate(self.ins)}
+                                common = {r for r in common if all(
+                                    branch in verified_scc_branches or not any(
+                                        pc < off and block_of[ins_index[pc]] in region
+                                        for pc in self.uniform_write_pcs.get(r, ()))
+                                    for branch, region in regions.items())}
                             kept_u |= common
                             self.varying_s.difference_update(common)
                     self.since_join = kept_u
@@ -5911,8 +5921,13 @@ class Stage:
                             and getattr(self, 'kind', None) == 'vs'):
                         self.since_join |= edge
                         self.varying_s.difference_update(edge)
+                    # A single reaching emitted uniform write is valid on every
+                    # incoming path, including after lane-local control flow.
+                    # AMD RDNA 2 ISA, section 3.8 SCC, p. 19: SCC is per wave.
+                    uniform_def = (getattr(self, 'retry_scc_edges', False) and self.kind == 'vs'
+                                   and self.scc_def is not None and not back_targets)
                     self.scc_uniform = ((self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
-                                         and self.scc_def is not None) or edge_scc_uniform)
+                                         and self.scc_def is not None) or uniform_def or edge_scc_uniform)
                     self.scc_verified = self.scc_def is not None or edge_scc_uniform
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
@@ -6042,6 +6057,8 @@ class Stage:
                         uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
+                        if cond in ('scc0', 'scc1') and self.scc_verified and self.scc_uniform:
+                            verified_scc_branches.add(off)
                         # A skipped wave retains its old scalar state. Prove that it supplies
                         # defined, wave-uniform values for the scalars read after the join.
                         live_on_skip = wave_loads[off][3] if off in wave_loads else wave_scalar_joins.get(off, ())
