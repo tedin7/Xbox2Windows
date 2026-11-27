@@ -2206,8 +2206,15 @@ def lds_retry_candidate(ins, has_branches):
 
 def lds_general_plan(ins, group, words, converged=None, refusal=None):
     """Plan LDS ordering on a forward-only CFG; convergence maps PCs to always-entered blocks."""
-    if not 0 < words <= 8192 or any(n < 1 for n in group):
+    def decline(reason):
+        if refusal is not None:
+            refusal.append(reason)
         return None
+
+    if not 0 < words <= 8192:
+        return decline('LDS general lowering: allocation is %d dwords (limit 1..8192)' % words)
+    if any(n < 1 for n in group):
+        return decline('LDS general lowering: invalid group shape %s' % (group,))
     decoded = [parse(asm) for _, _, _, asm in ins]
     offsets = {off: i for i, (off, _, _, _) in enumerate(ins)}
     edges = [[] for _ in ins]
@@ -2215,34 +2222,36 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
     for i, ((off, _, _, _), (name, ops, mods)) in enumerate(zip(ins, decoded)):
         base = name.removesuffix('_e32').removesuffix('_e64')
         if base.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap')):
-            return None
+            return decline('LDS general lowering: %s at +0x%x is not supported' % (base, off))
         if base.startswith(('s_branch', 's_cbranch')):
             if base not in ('s_branch', 's_cbranch_execz', 's_cbranch_scc0', 's_cbranch_scc1'):
-                return None
+                return decline('LDS general lowering: branch %s at +0x%x is not supported' % (base, off))
             try:
                 target = offsets[int(ops[0].split('_')[1], 16)]
             except (IndexError, KeyError, ValueError):
-                return None
+                return decline('LDS general lowering: invalid branch target %s at +0x%x' % (ops, off))
             if target <= i:
-                return None
+                return decline('LDS general lowering: backward branch at +0x%x to +0x%x' % (off, ins[target][0]))
             edges[i].append(target)
             branches = True
         if base == 's_endpgm' and i + 1 < len(ins):
-            return None
+            return decline('LDS general lowering: early s_endpgm at +0x%x' % off)
         if i + 1 < len(ins) and base not in ('s_branch', 's_endpgm'):
             edges[i].append(i + 1)
         if writes_exec(base, ops):
             if not branches and converged is None:
-                return None
+                return decline('LDS general lowering: EXEC write %s at +0x%x without convergence proof' % (base, off))
             # Only the save/narrow and restore forms recognized by entry_exec_sites.
             if base not in ('s_and_saveexec_b32', 's_and_saveexec_b64',
                             's_or_b32', 's_or_b64', 's_mov_b32', 's_mov_b64'):
-                return None
-        if base.startswith('ds_') and ('gds' in mods or
-                base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS):
-            return None
+                return decline('LDS general lowering: EXEC write %s at +0x%x is not supported' % (base, off))
+        if base.startswith('ds_'):
+            if 'gds' in mods:
+                return decline('LDS general lowering: GDS operation %s at +0x%x' % (base, off))
+            if base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS:
+                return decline('LDS general lowering: %s at +0x%x is not supported' % (base, off))
     if branches and (converged is None or not ins):
-        return None
+        return decline('LDS general lowering: no convergence proof for %d instructions' % len(ins))
     pending = [None] * len(ins)
     if pending:
         pending[0] = set()
@@ -2254,20 +2263,16 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
         base = name.removesuffix('_e32').removesuffix('_e64')
         if base == 's_barrier':
             if mods or ops not in ([], ['0'], ['0x0']):
-                return None
+                return decline('LDS general lowering: s_barrier at +0x%x has operands %s and modifiers %s' % (off, ops, mods))
             if converged is not None and off not in converged:
-                if refusal is not None:
-                    refusal.append('LDS barrier inside per-lane control flow')
-                return None
+                return decline('LDS barrier inside per-lane control flow at +0x%x' % off)
             state.clear()
         elif base.startswith('ds_'):
             kind = 'a' if base in LDS_ATOMIC_OPS else ('w' if LDS_GENERAL_OPS[base][0] else 'r')
             if ((kind == 'r' and state & {'w', 'a'}) or (kind == 'w' and state)
                     or (kind == 'a' and state & {'r', 'w'})):
                 if converged is not None and off not in converged:
-                    if refusal is not None:
-                        refusal.append('LDS ordering point inside per-lane control flow')
-                    return None
+                    return decline('LDS ordering point inside per-lane control flow at +0x%x' % off)
                 barriers.add(i)
                 state.clear()
             state.add(kind)
@@ -2277,9 +2282,7 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
             else:
                 pending[target].update(state)
     if branches and ins[-1][0] not in converged:
-        if refusal is not None:
-            refusal.append('LDS control flow lacks proven group convergence and entry EXEC')
-        return None
+        return decline('LDS control flow lacks proven group convergence and entry EXEC at +0x%x' % ins[-1][0])
     return barriers
 
 
