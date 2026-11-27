@@ -454,7 +454,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     const bool full_target = GetEnvironmentVariableW(L"X2W_TEST_FULL_TARGET", nullptr, 0) != 0;
-    const UINT scissor_width = legacy && !bc7 && !bc_chain && !full_target && !placeholder_fixture ? width / 2 : width;
+    const UINT scissor_width = legacy && !bc7 && !bc_chain && !full_target && !placeholder_fixture && !pixel_uav_rw ? width / 2 : width;
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           scissor_width, frame)) return rc;
     auto* list = frame.list;
