@@ -31,9 +31,9 @@ import gfx2hlsl as g  # noqa: E402
 
 REQUEST = re.compile(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57|m86)')
 # Request files of each kind; the ready marker is last.
-PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
+PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.vsout', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
          'm57': ('.ps57', '.root', '.m57')}
-OPTIONAL = {'.ia', '.psin'}  # a graphics request may have no input layout (.ia) and no stream description (.psin)
+OPTIONAL = {'.ia', '.psin', '.vsout'}
 
 
 class Incomplete(Exception):
@@ -63,12 +63,14 @@ def current_key(job):
     except OSError as error:
         return kind, key, None, 'unreadable %s: %s' % (os.path.basename(error.filename or ''), error.strerror)
     if kind == 'g':
-        # The pixel input masks of a stream description are part of the key; the description names its key.
+        # Both descriptions contribute to the key. The pixel input description also names it.
         try:
-            masks = g.read_ps_inputs(request_name(src, key, '.psin'), key)
+            description = request_name(src, key, '.psin')
+            masks = g.read_ps_inputs(description, key)
+            control = g.read_vs_output(description)
         except g.Unsupported as reason:
             return kind, key, None, str(reason)
-        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks), None
+        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks, control), None
     if kind == 'm57':
         return kind, key, g.mesh57_key(p['.m57'], p['.ps57'], p['.root']), None
     return kind, key, g.compute_key(p['.c67'], p['.data'], p['.root'], p['.desc'], p['.sa'], p['.sb']), None

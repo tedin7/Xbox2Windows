@@ -89,6 +89,14 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
                                                                                   __uuidof(ID3D12RootSignature), &root))) return false;
     alignas(8) static unsigned char desc[0x300];
     alignas(8) static unsigned char state_a[0x200];
+    static UINT context_packet[3]{0xc0016900u, 0x207u, 0};
+    const bool position_exports = std::strncmp(spec, "vsout=", 6) == 0;
+    if (position_exports) {
+        char* end = nullptr;
+        context_packet[2] = std::strtoul(spec + 6, &end, 16);
+        if (end == spec + 6 || *end) return false;
+        spec = end;
+    }
     for (const char* at = spec; *at;) {
         char* end = nullptr;
         const unsigned long offset = std::strtoul(at, &end, 16);
@@ -98,7 +106,9 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
         if (*end && *end != ',') return false;
         at = *end ? end + 1 : end;
     }
-    const UINT64 words[12] = {reinterpret_cast<UINT64>(root), reinterpret_cast<UINT64>(state_a), sizeof(state_a), 0, 0,
+    const UINT64 words[12] = {reinterpret_cast<UINT64>(root), reinterpret_cast<UINT64>(state_a), sizeof(state_a),
+                              position_exports ? reinterpret_cast<UINT64>(context_packet) : 0,
+                              position_exports ? sizeof(context_packet) : 0,
                               reinterpret_cast<UINT64>(vs.data()), vs.size(), 0, 0, reinterpret_cast<UINT64>(ps.data()), ps.size(), 0};
     std::memcpy(desc, words, sizeof(words));
     using Create = HRESULT (WINAPI*)(void*, const void*, REFIID, void**);
@@ -873,7 +883,8 @@ int main(int argc, char** argv)
         return bind_and_execute_indirect(device, pso, mode == "slot57-dispatch", calls) ? 0 : 11;
     }
     if (argc == 8 && std::strncmp(argv[6], "slot57", 6) == 0) {
-        // The same shaders and root through device slot 57, with the given words in state block A.
+        // The same shaders and root through device slot 57. The spec sets state block A words
+        // or supplies a vertex output control packet in block B.
         // "slot57-mrt" binds a second RGBA8 target.
         two_targets = std::strcmp(argv[6], "slot57-mrt") == 0;
         if (!two_targets && std::strcmp(argv[6], "slot57") != 0) return 2;

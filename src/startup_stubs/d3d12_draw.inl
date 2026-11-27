@@ -163,6 +163,7 @@ struct Translation {
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     x2w_startup::D16ImageSrvs d16_srvs;         // manifest 'd16srv': texture views that must match proven D16 formats (#2023)
+    bool vs_position_system_values = false;
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -559,6 +560,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     const bool previously_missing = tr.retry_manifest_at != 0;
     tr.retry_manifest_at = 0;
     bool matched_rtv = false;
+    bool vs_position_index = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
         if (end == std::string::npos) end = manifest.size();
@@ -573,6 +575,10 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
+        } else if (line == "vspossystem") {
+            tr.vs_position_system_values = true;
+        } else if (line == "vsposindex") {
+            vs_position_index = true;
         } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
             // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
             // so a translation whose stores would be silently skipped is never drawn (#1723).
@@ -642,6 +648,16 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
+    if (vs_position_index) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        auto* device = device_of(the_device);
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            !options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation) {
+            log("x2w-draw pipeline %016llx refused: vertex layer/viewport index requires "
+                "VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation", tr.key);
+            return;
+        }
+    }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
@@ -665,13 +681,15 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                                const std::vector<unsigned char>& root_blob, const std::string& layout = {})
+                                const std::vector<unsigned char>& root_blob, const std::string& layout = {},
+                                std::optional<UINT> vs_output = std::nullopt)
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
     const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
+    if (vs_output) key = fnv_bytes(&*vs_output, sizeof(*vs_output), fnv_bytes("vsout1", 6, key));
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
@@ -679,7 +697,8 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
         // A legacy cache hit still needs source blobs for late RTV specialization.
         if (publish_shader_request(key, L".b", b, b_bytes) &&
             publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
-            (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())))
+            (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())) &&
+            (!vs_output || publish_shader_request(key, L".vsout", &*vs_output, sizeof(*vs_output))))
             publish_shader_request(key, L".a", a, a_bytes);
         load_translation(*entry);
     }
@@ -1010,6 +1029,33 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     return result;
 }
 
+// Accept a state block explicitly encoded as SET_CONTEXT_REG packets. An opaque
+// state block requires an independently established layout before reading this word.
+std::optional<UINT> vertex_output_control(const std::vector<unsigned char>& block)
+{
+    constexpr UINT vs_output_register = (0x2881c - 0x28000) / 4;
+    if (block.size() % sizeof(UINT)) return std::nullopt;
+    const auto word = [&](std::size_t at) {
+        UINT value;
+        std::memcpy(&value, block.data() + at * sizeof(value), sizeof(value));
+        return value;
+    };
+    const std::size_t end = block.size() / sizeof(UINT);
+    std::optional<UINT> control;
+    for (std::size_t at = 0; at < end;) {
+        const UINT header = word(at++);
+        const UINT values = (header >> 16) & 0x3fff;
+        if ((header & 0xc000ffffu) != 0xc0006900u || !values || values >= end - at)
+            return std::nullopt;
+        const UINT first = word(at++);
+        if (first >= 0x400 || values > 0x400 - first) return std::nullopt;
+        if (first <= vs_output_register && vs_output_register - first < values)
+            control = word(at + vs_output_register - first);
+        at += values;
+    }
+    return control;
+}
+
 // draw_lock held.
 BoundPipeline* translation_for(Wrapper* pipeline)
 {
@@ -1119,7 +1165,11 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         const std::size_t a_bytes = static_cast<std::size_t>(words[6]), b_bytes = static_cast<std::size_t>(words[10]);
         if (!root_blob.empty() && a_bytes && b_bytes && a_bytes <= (1u << 20) && b_bytes <= (1u << 20) && x2w_local::readable(a, a_bytes) &&
             x2w_local::readable(b, b_bytes)) {
-            result = cached_translation(a, a_bytes, b, b_bytes, root_blob);
+            auto control = vertex_output_control(info->state_a);
+            const auto second = vertex_output_control(info->state_b);
+            if (!control) control = second;
+            else if (second && second != control) control.reset();
+            result = cached_translation(a, a_bytes, b, b_bytes, root_blob, {}, control);
         }
     }
     by_pipeline[pipeline] = bound;
@@ -1236,6 +1286,11 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
     if (indexed_rect) {
+        if (tr.vs_position_system_values) {
+            log("x2w-draw pipeline %016llx refused: indexed rectangle geometry cannot forward vertex position system values", tr.key);
+            bound.pipelines.emplace(key, nullptr);
+            return nullptr;
+        }
         if (!tr.indexed_rect_geometry_attempted) {
             tr.indexed_rect_geometry_attempted = true;
             x2w_startup::ComPtr<ID3DBlob> errors;

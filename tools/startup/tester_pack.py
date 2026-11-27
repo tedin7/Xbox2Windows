@@ -464,7 +464,7 @@ def format_results(rows, use=None):
 REQUESTS_DIR = "shader_requests"
 REQUESTS_TOP = 40                   # keys
 REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
-REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86", ".rtv")
+REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".vsout", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86", ".rtv")
 NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
 CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
 
@@ -493,7 +493,7 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys: compute keys ranked by dispatches
     without a translation, the other kinds by draws not drawn, `compute_share` of `top` for compute and the rest for the others
     (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
-    .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
+    .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin .vsout) goes in; whole keys only, all together within `cap` bytes. Keys
     without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing.
     `uses` ({key: (first s, last s, uses)}, key_use) adds a first pass per refusal family: the `families` refusal reasons
     (normal_reason, registers and numbers ignored) with the most refused keys each contribute their `family_keys` keys with the most

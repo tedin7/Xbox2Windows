@@ -10240,7 +10240,13 @@ class Stage:
             self.emit('o.depth = %s;' % self.f(vals[0]))
             return None
         name = {'pos0': 'pos'}.get(target, target)
-        if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
+        if self.kind == 'vs' and target in ('pos1', 'pos2', 'pos3'):
+            if self.pipe.vs_out_cntl is None:
+                raise Unsupported('export target %s: vertex output control not in the request' % target)
+            if 'compr' in flags:
+                raise Unsupported('compressed vertex position export %s' % target)
+            name = 'posx' + target[-1]
+        elif not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
         kind = self.pipe.mrt_kind(int(name[3:])) if name.startswith('mrt') else 'float'
         if len(vals) != 4:
@@ -10248,6 +10254,8 @@ class Stage:
         # The channels the export writes. An 'off' channel is not written, so a render target keeps
         # what it held there; the pipeline's write mask carries that (manifest 'wmask', #1674).
         mask = sum(1 << c for c, v in enumerate(vals) if v != 'off')
+        if name.startswith('posx'):
+            self.write_masks[name] = self.write_masks.get(name, 0xf) & mask
         if 'compr' in flags:
             if name.startswith('param'):
                 self.compr_params.add(int(name[5:]))
@@ -11099,6 +11107,7 @@ VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 class Pipeline:
     vertex_kind = 'vs'
+    vs_posx = ()
     uses_pack16_rne = False
     uses_gather_2d_lod = False
     uses_cube_dir = False
@@ -11153,7 +11162,8 @@ class Pipeline:
         self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
+                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), vs_out_cntl=None):
+        self.vs_out_cntl = vs_out_cntl
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
         self.rect = self.ud(('rect',))
@@ -11164,6 +11174,9 @@ class Pipeline:
             decoded = {} if decoded is None else decoded
             self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
             self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps')) if ps_code is not None else None
+        self.vs_posx = tuple(sorted(int(k[-1]) for k in self.vs.exports if k.startswith('posx')))
+        if self.vs_posx:
+            self.vs_system_values, self.vs_distance_slots, self.vs_point_size = self.position_outputs()
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
             if 'pos' not in self.vs.exports:
@@ -11676,9 +11689,74 @@ class Pipeline:
         fields.append('    float4 pos : SV_Position;')
         return fields
 
+    def position_outputs(self):
+        """Map the compact position export order to the enabled rasterizer fields."""
+        word = self.vs_out_cntl
+        misc = bool(word & (1 << 21))
+        # The misc side-bus flag (24) does not add a component to an export.
+        supported = 0xffff | (1 << 16) | (3 << 18) | (0xf << 21)
+        if word & ~supported:
+            raise Unsupported('vertex output control enables an unsupported output')
+        if word & 0x000d0000 and not misc:
+            raise Unsupported('vertex output control enables misc fields without a misc vector')
+
+        def require_slot(slot, channels):
+            if slot not in self.vs_posx:
+                raise Unsupported('vertex output control requires export target pos%d' % slot)
+            if channels & ~self.vs.write_masks['posx%d' % slot]:
+                raise Unsupported('vertex output control requires unwritten channels of export target pos%d' % slot)
+
+        fields = []
+        point_size = bool(word & (1 << 16))
+        if misc and word & 0x000d0000:
+            # The two integer indices share the raw z word on this export layout.
+            channels = int(point_size) | (4 if word & (3 << 18) else 0)
+            require_slot(1, channels)
+            for bit, name, semantic, suffix in (
+                (18, 'layer', 'SV_RenderTargetArrayIndex', ' & 0x7ffu'),
+                (19, 'viewport', 'SV_ViewportArrayIndex', ' >> 16 & 0xfu'),
+            ):
+                if word & (1 << bit):
+                    fields.append(('uint', name, semantic, 'asuint(raw.posx1.z)' + suffix))
+
+        distances = {'Clip': [], 'Cull': []}
+        distance_slots = set()
+        slot = 1 + misc
+        for vector in range(2):
+            enabled = word & (1 << (22 + vector))
+            for kind, shift in (('Clip', 0), ('Cull', 8)):
+                mask = (word >> (shift + 4 * vector)) & 0xf
+                if mask and not enabled:
+                    raise Unsupported('vertex output control enables distances without a distance vector')
+                if mask:
+                    require_slot(slot, mask)
+                    distance_slots.add(slot)
+                    distances[kind].extend('raw.posx%d.%s' % (slot, axis)
+                                           for c, axis in enumerate('xyzw') if mask & (1 << c))
+            if enabled:
+                slot += 1
+        # D3D12 packs up to eight clip and cull components into two signature registers.
+        if sum(map(len, distances.values())) > 8:
+            raise Unsupported('vertex output control exceeds D3D12 clip/cull distance component limit')
+        for kind, values in distances.items():
+            for index, at in enumerate(range(0, len(values), 4)):
+                group = values[at:at + 4]
+                typename = 'float%d' % len(group) if len(group) > 1 else 'float'
+                expr = '%s(%s)' % (typename, ', '.join(group)) if len(group) > 1 else group[0]
+                fields.append((typename, '%s%d' % (kind.lower(), index), 'SV_%sDistance%d' % (kind, index), expr))
+        return fields, distance_slots, point_size
+
     def hlsl_vs(self):
         s = self.vs
-        out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
+        interface = self.interface(False)
+        raw_type = 'VSRaw' if self.vs_posx else 'VSOut'
+        out = self.common() + ['struct VSOut {'] + interface
+        if self.vs_posx:
+            out += ['    %s %s : %s;' % (kind, name, semantic)
+                    for kind, name, semantic, _ in self.vs_system_values]
+            out += ['};', 'struct VSRaw {'] + interface
+            out += ['    float4 posx%d;' % slot for slot in self.vs_posx]
+        out += ['};', '%s body(uint vid) {' % raw_type, '    %s o = (%s)0;' % (raw_type, raw_type)]
         s.used_v.add(0)
         flat = re.compile(r'\s*o\.fparam(\d+) = ')
         half = re.compile(r'\s*o\.hparam(\d+)_(?:lo|hi) = ')
@@ -11700,22 +11778,38 @@ class Pipeline:
                                           'before the first branch defines' % min(unwritten))
                     if target and index == 0 and start == 0:
                         written.add(int(target.group(1)))
-        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
+        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}']
+        if self.vs_posx:
+            out += ['VSOut finish_position(VSRaw raw) {', '    VSOut o = (VSOut)0;']
+            for field in interface:
+                name = field.split(' : ')[0].split()[-1]
+                out.append('    o.%s = raw.%s;' % (name, name))
+            out += ['    o.%s = %s;' % (name, expr) for _, name, _, expr in self.vs_system_values]
+            if self.vs_point_size:
+                out.append('    // Point size is ignored: D3D12 has no point size system value.')
+            out += ['    return o;', '}']
+
+        first, last = ('finish_position(', ')') if self.vs_posx else ('', '')
+        out += [
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
-            '    if (ud%d == 0) return body(vid);' % self.rect,
+            '    if (ud%d == 0) return %sbody(vid)%s;' % (self.rect, first, last),
             '    uint first = (vid / 6) * 3, corner = vid % 6;',
-            '    if (corner < 3) return body(first + corner);',
-            '    if (corner == 3) return body(first);',
-            '    if (corner == 4) return body(first + 2);',
-            '    VSOut p = body(first), q = body(first + 1), r = body(first + 2), o;']
+            '    if (corner < 3) return %sbody(first + corner)%s;' % (first, last),
+            '    if (corner == 3) return %sbody(first)%s;' % (first, last),
+            '    if (corner == 4) return %sbody(first + 2)%s;' % (first, last),
+            '    %s p = body(first), q = body(first + 1), r = body(first + 2), o;' % raw_type]
         for p in range(max(self.params) + 1 if self.params else 0):
             out.append('    o.param%d = p.param%d + r.param%d - q.param%d;' % (p, p, p, p))
         out += ['    o.fparam%d = p.fparam%d;' % (p, p) for p in self.flat]
         for p in self.f16_plain:
             out += ['    o.hparam%d_%s = p.hparam%d_%s + r.hparam%d_%s - q.hparam%d_%s;' % (p, h, p, h, p, h, p, h)
                     for h in ('lo', 'hi')]
-        out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
+        for slot in self.vs_posx:
+            name = 'posx%d' % slot
+            expr = 'p.%s + r.%s - q.%s' % (name, name, name) if slot in self.vs_distance_slots else 'p.' + name
+            out.append('    o.%s = %s;' % (name, expr))
+        out += ['    o.pos = p.pos + r.pos - q.pos;', '    return %so%s;' % (first, last), '}']
         return '\n'.join(out) + '\n'
 
     def ps_profile(self):
@@ -11768,6 +11862,12 @@ class Pipeline:
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
+        if self.vs_posx:
+            lines.append('vsposx ' + ' '.join(map(str, self.vs_posx)))
+            if self.vs_system_values:
+                lines.append('vspossystem')
+            if any(kind == 'uint' for kind, *_ in self.vs_system_values):
+                lines.append('vsposindex')
         if self.ps is None:
             lines.append('ps none')
             return '\n'.join(lines) + '\n'
@@ -12059,16 +12159,19 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
-def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
+def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None, vs_out_cntl=None):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout.
 
     A pipeline with a stream description (req_<key>.psin) also hashes its pixel input masks: b'psin1' and then
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
-    description the key is unchanged."""
+    description the key is unchanged. When a vertex output word is available, append the tag b'vsout1'
+    and the little-endian control word to the hash input."""
     key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-28'))))
     key = fnv(layout, key) if layout else key
-    return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
+    if ps_inputs is not None:
+        key = fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
+    return key if vs_out_cntl is None else fnv(b'vsout1' + struct.pack('<I', vs_out_cntl), key)
 
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
@@ -12258,7 +12361,7 @@ def has_complete_mesh57_bytecode(path):
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
-                 ps_attr_map=None, ps_hw_inputs=None):
+                 ps_attr_map=None, ps_hw_inputs=None, vs_out_cntl=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
@@ -12266,7 +12369,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     name = os.path.join(out_dir, '%016x' % key)
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
-                        ps_hw_inputs=ps_hw_inputs)
+                        ps_hw_inputs=ps_hw_inputs, vs_out_cntl=vs_out_cntl)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -12362,13 +12465,15 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if request or validate_base_key:
-        # The masks of a stream description are part of the key (pipeline_key).
-        masks = read_ps_inputs(description, base)
-        if pipeline_key(a, b, root, layout, masks) != base:
-            raise Unsupported('RTV variant source key mismatch' if request else
-                              'pixel input description names another pipeline' if masks is not None else
-                              'shader request source key mismatch')
+    masks = read_ps_inputs(description, base)
+    control = read_vs_output(description)
+    # Legacy requests without state can still be inspected by the refusal report.
+    if (request or validate_base_key or masks is not None or control is not None) and (
+            pipeline_key(a, b, root, layout, masks, control) != base):
+        raise Unsupported('vertex output control names another pipeline' if control is not None else
+                          'RTV variant source key mismatch' if request else
+                          'pixel input description names another pipeline' if masks is not None else
+                          'shader request source key mismatch')
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -12392,15 +12497,15 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         kinds = {'vs': a, 'ps': b}
     else:
         kinds = {classify_stage(a): a, classify_stage(b): b}
-    return kinds, root, formats, request, fetch, decoded, attr_map
+    return kinds, root, formats, request, fetch, decoded, attr_map, masks, control
 
 
 def request_source(out_dir, key):
     """The source of a graphics request: (rtv1 line or '', source key, RTV formats, stream description path).
 
     A base request is its own source. An RTV variant (req_<key>.rtv) names its source pipeline and is translated
-    from that pipeline's blobs and stream description, req_<source>.psin. This is the one place that names the
-    description a request depends on: the translation reads its masks from that path, and pending_keys checks
+    from that pipeline's blobs and state descriptions, req_<source>.psin and req_<source>.vsout. This is the one place that names the
+    base description path: the translation resolves both inputs from it, and pending_keys checks
     the same path to withdraw a published result or retry a failure after the description changes or, for a
     result recorded as translated with it (dependency_record), is removed. The path is returned whether or not the
     file exists. An invalid variant line is refused by name."""
@@ -12419,25 +12524,20 @@ def request_source(out_dir, key):
     return request, base, formats, os.path.join(out_dir, 'req_%016x.psin' % base)
 
 
-def request_ps_inputs(out_dir, key):
-    """The pixel input masks (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR) of one graphics request, or None.
+def vs_output_path(description):
+    return os.path.splitext(description)[0] + '.vsout'
 
-    They come from the stream description request_source() names: req_<key>.psin, the separately captured
-    description of exactly that pipeline (see read_ps_inputs), or for an RTV variant its source pipeline's. The
-    masks are part of the request's identity: the key must equal pipeline_key() of the stage blobs, root
-    signature, input layout and these masks, so a description copied from another pipeline, left stale after a
-    stage change or rewritten with another mask pair is refused, never applied. No file means no captured
-    description: the translation keeps its model without hardware inputs."""
-    _, base, _, description = request_source(out_dir, key)
-    masks = read_ps_inputs(description, base)
-    if masks is None:
+
+def read_vs_output(description):
+    """Read the little-endian vertex output control word adjacent to the stream description."""
+    try:
+        with open(vs_output_path(description), 'rb') as file:
+            control = file.read(5)
+    except FileNotFoundError:
         return None
-    name = os.path.join(out_dir, 'req_%016x' % base)
-    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
-    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if pipeline_key(a, b, root, layout, masks) != base:
-        raise Unsupported('pixel input description names another pipeline')
-    return masks
+    if len(control) != 4:
+        raise Unsupported('invalid vertex output control description')
+    return struct.unpack('<I', control)[0]
 
 
 def dependency_record(out_dir, key):
@@ -12597,11 +12697,16 @@ def translate_request(out_dir, key):
             _, base, _, description = request_source(out_dir, key)
             if os.path.isfile(dependency_record(out_dir, key)) and not os.path.isfile(description):
                 raise Unsupported('pixel input description missing for a request translated with one')
-            kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
-            ps_inputs = request_ps_inputs(out_dir, key)
+            vs_dependency = os.path.join(out_dir, '%016x.vsdep' % key)
+            if os.path.isfile(vs_dependency) and not os.path.isfile(vs_output_path(description)):
+                raise Unsupported('vertex output control description missing for a request translated with one')
+            kinds, root, formats, request, fetch, _, attr_map, ps_inputs, control = load_request(
+                out_dir, key, validate_base_key=True)
+            if control is not None:
+                atomic_retry_text(vs_dependency, '%08x\n' % control)
             if ps_inputs is not None:
                 record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
-        except Unsupported:
+        except (Unsupported, OSError, UnicodeError):
             # A result published earlier was translated from sources or masks this request no longer confirms.
             with suppress(FileNotFoundError):
                 os.remove(os.path.join(out_dir, '%016x.txt' % key))
@@ -12613,8 +12718,8 @@ def translate_request(out_dir, key):
         write_failure(os.path.join(out_dir, '%016x.fail' % key), 'stages %s' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
-                          vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
-    if ps_inputs is not None and result == 'ok':
+                          vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs, vs_out_cntl=control)
+    if (ps_inputs is not None or control is not None) and result == 'ok':
         # An unchanged manifest is not rewritten; mark it as checked against this description (pending_keys).
         with suppress(FileNotFoundError):
             os.utime(os.path.join(out_dir, '%016x.txt' % key))
@@ -12669,8 +12774,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
-        ps_inputs = request_ps_inputs(out_dir, key)
+        kinds, root, formats, request, fetch, decoded, attr_map, ps_inputs, control = load_request(
+            out_dir, key, refusals, pair_info)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
@@ -12690,7 +12795,8 @@ def request_refusals(out_dir, key, pair_info=None):
         if set(kinds) != {'vs', 'ps'}:
             raise Unsupported('stages %s' % sorted(kinds))
         pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
-                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
+                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs,
+                        vs_out_cntl=control)
         op = 'hlsl_vs'
         pipe.hlsl_vs()
         op = 'hlsl_ps'
@@ -13496,11 +13602,18 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         described = None
         lost = False
         if m.group(2) in ('a', 'rtv'):
+            control_stamp = None
             with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
-                described = os.path.getmtime(request_source(out_dir, key)[3])
+                description = request_source(out_dir, key)[3]
+                with suppress(OSError):
+                    control_stamp = os.path.getmtime(vs_output_path(description))
+                described = os.path.getmtime(description)
             # A result translated with a description recorded it (dependency_record). With that description gone,
             # the result is checked again and withdrawn; a legacy request without a record is not read again.
-            lost = described is None and os.path.isfile(result + '.psdep')
+            lost = ((described is None and os.path.isfile(result + '.psdep')) or
+                    (control_stamp is None and os.path.isfile(result + '.vsdep')))
+            if control_stamp is not None:
+                described = control_stamp if described is None else max(described, control_stamp)
         if os.path.isfile(manifest) and not lost and not (
                 described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):

@@ -439,10 +439,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc7 && bc7->dropmips) {
         if (!bind_dropmips(desktop.Get(), guest, binding)) return 36;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
+    const bool quad = GetEnvironmentVariableW(L"X2W_TEST_POSITION_EXPORTS", nullptr, 0) != 0;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain && !quad ? width / 2 : width, frame,
+                                          quad ? 2 : 1)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -594,7 +596,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
-        invoke(list, 12, 3, 1);
+        invoke(list, 12, quad ? 6 : 3, 1);
     }
     if (console_view) {
         extern int draw_console_address_srv(void*, void*);

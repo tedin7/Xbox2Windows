@@ -19,7 +19,6 @@ const std::vector<char>& stream_root_blob();
 
 struct StreamAttachment {
     Microsoft::WRL::ComPtr<ID3D12Resource> texture, readback;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT row_bytes = 0;
 };
 
@@ -34,7 +33,7 @@ struct StreamTarget {
 };
 int read_stream_target(ID3D12Device* desktop, StreamTarget& state, const char* pixels);
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
-                       DXGI_FORMAT format, UINT scissor_width, StreamTarget& state);
+                       DXGI_FORMAT format, UINT scissor_width, StreamTarget& state, UINT16 layers = 1);
 // Typed render-target formats the translated colour export covers (#1999 F). Integer targets are created
 // typeless and drawn with a second RGBA8 target; float targets are drawn alone.
 struct StreamMrtFormat {

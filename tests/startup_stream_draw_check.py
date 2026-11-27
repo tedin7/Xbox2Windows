@@ -90,6 +90,89 @@ def check(directory, consumer, backend):
     return 0
 
 
+def check_position_exports(directory, consumer, backend):
+    from startup_image_3d_check import compile_hlsl
+    from startup_packed_position_check import CLIP, CLIP_BOTH, CULL, LAYER, MISC, VIEWPORT, vertex_position_words
+
+    cache = directory / "cache"
+    cache.mkdir()
+    vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
+    vs.write_bytes(container(1, vertex_position_words()))
+    ps.write_bytes(pixel(False))
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_SHADER_CACHE=str(cache), X2W_TEST_POSITION_EXPORTS="1")
+    args = [consumer, vs, ps, root, backend, output, "slot57"]
+    fxc = gfx2hlsl.find_fxc()
+    assert fxc, "FXC is required for the WARP position-export check"
+
+    red, clear = bytes((255, 0, 0, 255)), bytes((0, 0, 255, 255))
+
+    def reference(layer, coverage):
+        centers = [(2 * (x + 0.5) / 8) - 1 for x in range(8)]
+        return b"".join(red if z == layer and coverage(x) else clear
+                        for z in range(2) for y in range(4) for x in centers)
+
+    full = reference(0, lambda x: True)
+    half = reference(0, lambda x: x >= 0)
+    layer_one = reference(1, lambda x: True)
+    empty = reference(0, lambda x: False)
+
+    clip_bytecode = None
+    for label, control, expected, mutation in (
+        ("point size", MISC | (1 << 16), full, None),
+        ("clip", CLIP, half, ("raw.posx2.x", "raw.posx1.x", full)),
+        ("clip in both vectors", CLIP_BOTH, empty, ("raw.posx3.x", "raw.posx1.x", half)),
+        ("cull", CULL, empty, ("raw.posx3.x", "raw.posx1.x", full)),
+        ("layer", LAYER, layer_one, ("SV_RenderTargetArrayIndex", "SV_ViewportArrayIndex", half)),
+        ("viewport", VIEWPORT, half, ("SV_ViewportArrayIndex", "SV_RenderTargetArrayIndex", layer_one)),
+        ("disabled", 0, full, None),
+    ):
+        command = args + [f"vsout={control:x}"]
+        warm = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+        assert warm.returncode == 0, warm.stderr
+        key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes(), vs_out_cntl=control)
+        assert (cache / f"req_{key:016x}.vsout").read_bytes() == control.to_bytes(4, "little")
+        result = subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env,
+                                check=True, capture_output=True, text=True, timeout=25)
+        manifest = cache / f"{key:016x}.txt"
+        assert manifest.is_file(), (result.stdout, result.stderr)
+        assert "vsposx 1 2 3" in manifest.read_text().splitlines()
+
+        def draw():
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0 and "-> drawn;" in result.stderr, result.stderr
+            return output.read_bytes()
+
+        actual = draw()
+        assert actual == expected, f"{label}: {actual.hex()} != {expected.hex()}"
+        bytecode = cache / f"{key:016x}.vs.cso"
+        original = bytecode.read_bytes()
+        if control == CLIP:
+            clip_bytecode = original
+        if mutation:
+            old, new, bad_reference = mutation
+            source = (cache / f"{key:016x}.vs.hlsl").read_text()
+            assert source.count(old) == 1, (label, old)
+            mutated = compile_hlsl(fxc, "fxc", source.replace(old, new), "mutant", "vs_5_1", directory)
+            mutant = mutated.read_bytes()
+        elif control == 0:
+            mutant, bad_reference = clip_bytecode, half
+        else:
+            mutant = None
+        if mutant is not None:
+            bytecode.write_bytes(mutant)
+            try:
+                actual = draw()
+            finally:
+                bytecode.write_bytes(original)
+            assert actual == bad_reference and actual != expected, f"{label} mutant: {actual.hex()}"
+        print(f"{backend} {label}: 64 RGBA texels matched the CPU reference"
+              + (", mutant rejected by the same reference" if mutant is not None else ""))
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp:
+        if len(sys.argv) == 4 and sys.argv[3] == "positions":
+            sys.exit(check_position_exports(Path(temp), *sys.argv[1:3]))
         sys.exit(check(Path(temp), *sys.argv[1:]))

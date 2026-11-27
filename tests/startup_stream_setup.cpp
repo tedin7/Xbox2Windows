@@ -227,19 +227,26 @@ int read_stream_target(ID3D12Device* desktop, StreamTarget& state, const char* p
         FAILED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&complete)))) return 26;
 
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    std::array<std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, 2> footprints;
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
         UINT64 total = 0;
         const auto desc = target.texture->GetDesc();
-        desktop->GetCopyableFootprints(&desc, 0, 1, 0, &target.footprint, nullptr, nullptr, &total);
+        auto& layouts = footprints[i];
+        layouts.resize(desc.DepthOrArraySize);
+        desktop->GetCopyableFootprints(&desc, 0, static_cast<UINT>(layouts.size()), 0,
+                                       layouts.data(), nullptr, nullptr, &total);
         const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1,
                                    DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&target.readback)))) return 27;
         D3D12_TEXTURE_COPY_LOCATION destination{target.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        destination.PlacedFootprint = target.footprint;
         D3D12_TEXTURE_COPY_LOCATION source{target.texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        copy->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        for (UINT layer = 0; layer < layouts.size(); ++layer) {
+            destination.PlacedFootprint = layouts[layer];
+            source.SubresourceIndex = layer;
+            copy->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
     }
     if (FAILED(copy->Close())) return 28;
     ID3D12CommandList* submit[] = {copy.Get()};
@@ -256,8 +263,10 @@ int read_stream_target(ID3D12Device* desktop, StreamTarget& state, const char* p
         auto& target = targets[i];
         void* memory = nullptr;
         if (FAILED(target.readback->Map(0, nullptr, &memory))) return 32;
-        for (UINT y = 0; y < height; ++y)
-            out.write(static_cast<const char*>(memory) + y * target.footprint.Footprint.RowPitch, target.row_bytes);
+        for (const auto& layout : footprints[i])
+            for (UINT y = 0; y < height; ++y)
+                out.write(static_cast<const char*>(memory) + layout.Offset + y * layout.Footprint.RowPitch,
+                          target.row_bytes);
         target.readback->Unmap(0, nullptr);
     }
     return out ? 0 : 33;
@@ -273,7 +282,7 @@ Word invoke(void* object, unsigned index, Word a, Word b, Word c, Word d,
 }
 
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
-                       DXGI_FORMAT format, UINT scissor_width, StreamTarget& state)
+                       DXGI_FORMAT format, UINT scissor_width, StreamTarget& state, UINT16 layers)
 {
     StreamMrtFormat mrt{};
     const bool typed = stream_mrt_format(format, mrt);
@@ -299,12 +308,16 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         auto& target = targets[i];
         const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
         const auto resource_format = !i && integer ? mrt.typeless : view_format;
-        D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+        D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, layers, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
         if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_COMMON, &optimized_clear, IID_PPV_ARGS(&target.texture)))) return 21;
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+        if (layers > 1) {
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 0, layers, 0};
+        }
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
         target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
@@ -334,7 +347,13 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const bool inset = std::wcscmp(mode, L"rect") == 0 || std::wcscmp(mode, L"reset") == 0;
     const D3D12_VIEWPORT inner{2, 1, 4, 2, 0, 1};
     const D3D12_RECT inner_rect{2, 1, 6, 3};
-    if (!none) {
+    if (layers > 1) {
+        const D3D12_VIEWPORT viewports[] = {viewport, {
+            static_cast<float>(width) / 2, 0, static_cast<float>(width) / 2, static_cast<float>(height), 0, 1}};
+        const D3D12_RECT scissors[] = {rect, rect};
+        invoke(list, 21, 2, arg(viewports));
+        invoke(list, 22, 2, arg(scissors));
+    } else if (!none) {
         invoke(list, 21, 1, inset ? arg(&inner) : arg(&viewport));
         invoke(list, 22, 1, inset ? arg(&inner_rect) : arg(&rect));
     }
