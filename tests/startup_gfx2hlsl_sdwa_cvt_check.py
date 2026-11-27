@@ -269,7 +269,7 @@ def controls():
     # 4. A uint-result conversion takes the uint path and is not wrapped as a float.
     asm, emitted = translate(encode_vop1_sdwa(VOP1_CVT_F16_F32, 0, 1, src0_sel='WORD_0'))
     check('uint-result conversion stays on the uint path',
-          emitted == 'v0 = f16rn(F(((v1 >> 0u) & 0xffffu)));', emitted)
+          emitted == 'v0 = f32tof16(F(((v1 >> 0u) & 0xffffu)));', emitted)
 
     # 5. Output modifiers (clamp, mul:2, mul:4, div:2) on VEC_U_TO_F SDWA conversions (#2023 item E).
     asm, emitted = translate(encode_vop1_sdwa(VOP1_CVT_F32_U32, 0, 1, src0_sel='WORD_0', omod='mul:2'))

@@ -1,1 +1,0 @@
-tests/startup_gfx2hlsl_cvt_f16_round_check.py
