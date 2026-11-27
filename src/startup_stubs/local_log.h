@@ -145,6 +145,15 @@ inline void forget_mapped_spans(std::uintptr_t start, std::size_t bytes) noexcep
     if (const auto* cache = read_cache()) cache->erase(reinterpret_cast<const void*>(start), bytes);
     else mapped_cache = MappedCache{};
 }
+// Forgets everything: this thread's scratch spans and, with the read cache on, the whole shared table.
+inline void forget_mapped_spans() noexcept
+{
+    mapped_cache = MappedCache{};
+    if (const auto* cache = read_cache()) {
+        constexpr std::uintptr_t first = 0x1000;
+        cache->erase(reinterpret_cast<const void*>(first), UINTPTR_MAX - 0x2000);
+    }
+}
 
 inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes, bool* committed = nullptr) noexcept
 {
