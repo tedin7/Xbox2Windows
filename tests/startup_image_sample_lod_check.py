@@ -190,28 +190,28 @@ def vcc_sampler_controls():
     assert 106 not in pipe.ps.sym and 107 not in pipe.ps.sym
     # Save a compare mask before the sampler and restore it before a mask select.
     compare = struct.pack('<I', 0x7c000000 | 0xc2 << 17 | 256)
-    saved = struct.pack('<I', 0xbe800000 | 46 << 16 | 4 << 8 | 106)
-    restore = struct.pack('<I', 0xbe800000 | 106 << 16 | 4 << 8 | 46)
+    saved = struct.pack('<I', 0xbe800000 | 40 << 16 | 4 << 8 | 106)
+    restore = struct.pack('<I', 0xbe800000 | 106 << 16 | 4 << 8 | 40)
     select = struct.pack('<I', 0x02000000 | 1 << 9 | 256)
     code = vcc_sampler_program().replace(struct.pack('<I', 0xbeb0046a), compare + saved)
     end_sample = code.index(bytes.fromhex('080f9cf0')) + 8
     restored = code[:end_sample] + restore + select + code[end_sample:]
     asm = [text for _, _, _, text in G.decode(restored)]
-    assert 's_mov_b64 s[46:47], vcc' in asm and 's_mov_b64 vcc, s[46:47]' in asm
+    assert 's_mov_b64 s[40:41], vcc' in asm and 's_mov_b64 vcc, s[40:41]' in asm
     assert 'v_cndmask_b32_e32 v0, v0, v1, vcc_lo' in asm
     pipe = G.Pipeline(VS_WORDS, restored, root_blob())
     text = pipe.hlsl_ps()
-    assert text.index('vcc = ((v0 == v0) ? 1u : 0u);') < text.index('s46 = (vcc) & 1;')
-    assert text.index('s46 = (vcc) & 1;') < text.index('vcc = (0x18500000u) & 1;')
-    assert text.index('.SampleLevel(') < text.index('vcc = (s46) & 1;') < text.index('v0 = (vcc & 1) ? v1 : v0;')
+    assert text.index('vcc = ((v0 == v0) ? 1u : 0u);') < text.index('s40 = (vcc) & 1;')
+    assert text.index('s40 = (vcc) & 1;') < text.index('vcc = (0x18500000u) & 1;')
+    assert text.index('.SampleLevel(') < text.index('vcc = (s40) & 1;') < text.index('v0 = (vcc & 1) ? v1 : v0;')
     assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18500000 0x0'
     # A full wave of zeros or ones is already an exact per-lane VCC mask.
     for inline, expression in ((128, '0x00000000u'), (193, '0xffffffffu')):
         uniform = restored.replace(compare, struct.pack('<I', 0xbeea0400 | inline), 1)
         pipe = G.Pipeline(VS_WORDS, uniform, root_blob())
         text = pipe.hlsl_ps()
-        assert text.index('vcc = (%s) & 1;' % expression) < text.index('s46 = (vcc) & 1;')
-        assert 'vcc = (s46) & 1;' in text and 'v0 = (vcc & 1) ? v1 : v0;' in text
+        assert text.index('vcc = (%s) & 1;' % expression) < text.index('s40 = (vcc) & 1;')
+        assert 'vcc = (s40) & 1;' in text and 'v0 = (vcc & 1) ? v1 : v0;' in text
         assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18500000 0x0'
     partial_mask = restored.replace(compare, struct.pack('<I', 0xbeea0481), 1)
     try:
