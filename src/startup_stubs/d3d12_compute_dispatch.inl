@@ -76,79 +76,6 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
-bool compute_texture_srv_range_fits(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& resource)
-{
-    const auto mips_fit = [&](UINT first, UINT count) {
-        return first < resource.MipLevels && count && (count == UINT_MAX || count <= resource.MipLevels - first);
-    };
-    if (resource.SampleDesc.Count != 1) return false;
-    switch (view.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D:
-        return resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && resource.DepthOrArraySize == 1 &&
-            mips_fit(view.Texture1D.MostDetailedMip, view.Texture1D.MipLevels);
-    case D3D12_SRV_DIMENSION_TEXTURE2D:
-        return resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && resource.DepthOrArraySize == 1 &&
-            mips_fit(view.Texture2D.MostDetailedMip, view.Texture2D.MipLevels);
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: {
-        const auto& array = view.Texture2DArray;
-        return resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            mips_fit(array.MostDetailedMip, array.MipLevels) && array.FirstArraySlice < resource.DepthOrArraySize &&
-            array.ArraySize && array.ArraySize <= resource.DepthOrArraySize - array.FirstArraySlice;
-    }
-    case D3D12_SRV_DIMENSION_TEXTURE3D:
-        return resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
-            mips_fit(view.Texture3D.MostDetailedMip, view.Texture3D.MipLevels);
-    case D3D12_SRV_DIMENSION_TEXTURECUBE:
-        return resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && resource.DepthOrArraySize == 6 &&
-            mips_fit(view.TextureCube.MostDetailedMip, view.TextureCube.MipLevels);
-    default:
-        return false;
-    }
-}
-
-const char* compute_raw_uav_token(Wrapper* self, const std::uint32_t* words, Wrapper*& wrapper,
-                                  ID3D12Resource*& resource, u64& offset, u64& bytes)
-{
-    ViewRecord record{};
-    bool materialized = false;
-    if (!read_view_token(words, record, &materialized))
-        return "an output view token has an unknown kind and record";
-    if (record.slot == 18) return "an output shader resource view token cannot supply unordered access";
-    if (record.slot != 19) return "an output view token is not an unordered access view";
-    if (!materialized || record.desc_bytes < sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))
-        return "an output unordered access view token has no materialized description";
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-    std::memcpy(&desc, record.desc, sizeof(desc));
-    if (desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
-        return "an output unordered access view token describes a texture, but the shader needs a buffer";
-    if (desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.Buffer.Flags != D3D12_BUFFER_UAV_FLAG_RAW ||
-        desc.Buffer.StructureByteStride || record.counter || desc.Buffer.CounterOffsetInBytes)
-        return "an output unordered access view token is not a raw buffer view without a counter";
-
-    wrapper = as_wrapper(reinterpret_cast<const void*>(record.resource));
-    if (!wrapper || wrapper->own().kind != resource_kind || !wrapper->own().real)
-        return "an output unordered access view token has no desktop resource";
-    resource = static_cast<ID3D12Resource*>(wrapper->own().real);
-    const auto native = resource->GetDesc();
-    x2w_startup::ComPtr<ID3D12Device> native_device;
-    const auto* info = resource_info(wrapper);
-    if (native.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !(native.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        !info || info->initial_state != D3D12_RESOURCE_STATE_COMMON ||
-        FAILED(resource->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) ||
-        native_device.Get() != device_of(self->own().list_device))
-        return "an output unordered access view token needs a desktop UAV buffer created in common state on this device";
-
-    constexpr u64 element = 4;
-    if (desc.Buffer.FirstElement > native.Width / element)
-        return "an output unordered access view token starts outside its desktop buffer";
-    offset = desc.Buffer.FirstElement * element;
-    bytes = u64{desc.Buffer.NumElements} * element;
-    if (!bytes || bytes > (16u << 20) || bytes > native.Width - offset || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
-        return "an output unordered access view token has an invalid raw buffer range";
-    return nullptr;
-}
-
 LONG compute_inputs_plain;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
@@ -488,8 +415,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
             // a null view would read zeros or drop the program's stores without a trace.
             ViewRecord record{};
-            bool created = false;
-            const bool known = read_view_token(words, record, &created);
+            bool known = false, created = false;
+            if (words[0] == view_token_magic) {
+                note_lock_acquire(false);
+                known = words[1] < view_records().size();
+                if (known) {
+                    record = view_records()[words[1]];
+                    created = view_materialized()[words[1]] != 0;
+                }
+                ReleaseSRWLockShared(&note_lock);
+            }
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr
                 : output ? static_cast<ID3D12Resource*>(wrapper->own().real) : sampled_address_texture(wrapper);
@@ -525,9 +460,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                          (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                           (described ? desc.ViewDimension != slot.srv_dimension : resource.DepthOrArraySize <= 1)))
                     reason = "an input texture view is not a 2D array";
-                else if (compute_view_tokens_enabled() && described &&
-                         !compute_texture_srv_range_fits(desc, resource))
-                    reason = "an input texture shader resource view token has a range outside its desktop resource";
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
                 views[i] = {texture, 0, 0, true, true, described};
@@ -628,15 +560,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        if (words[0] == view_token_magic && compute_view_tokens_enabled()) {
-            auto& view = views[i];
-            reason = compute_raw_uav_token(self, words, view.wrapper, view.resource, view.offset, view.bytes);
-            for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].resource == view.resource)
-                    reason = "an output unordered access view token names a buffer that is also an input";
-            continue;
-        }
-        // Native buffer descriptors must cover a placement that aliases title memory.
+        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
+        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
@@ -673,10 +598,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
         const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
-        if (ud.source >= ComputeTranslation::output_word3 && view.wrapper) {
-            reason = "an output unordered access view token has no native buffer descriptor words";
-            break;
-        }
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
         case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;
@@ -783,7 +704,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
         }
-        if (view.wrapper) retire_hold(self, view.wrapper);
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;

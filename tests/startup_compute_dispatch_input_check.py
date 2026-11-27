@@ -20,7 +20,6 @@ memory no buffer is placed over, 16 bytes in, and writes the input words there a
 words match. The stand-in places that buffer in the consumer's own heap, outside its placement index.
 The title-input switch cases use a second program and a D3D12 readback heap. The CPU sum covers three records,
 including one in the final 16 bytes. A first-chunk-only copy must fail the same comparison.
-The view-token case reads a selected texture mip and writes a selected raw UAV range.
 Exit 77 when the adapter is not available.
 """
 from math import prod
@@ -137,70 +136,11 @@ def check_title_inputs(directory, cache, consumer, dxc, env, untouched):
     print('title inputs: five CPU matches, three switch-off refusals, protected page and ring-full refusals, mutant caught')
 
 
-def check_view_tokens(directory, cache, consumer, dxc, env, untouched):
-    mode = 'dispatch-input-view-tokens'
-    # The title program identifies the synthetic request. The fixture supplies its desktop translation directly.
-    (directory / 'program').write_bytes(bytes.fromhex('000081bf'))  # s_endpgm
-    (directory / 'state').write_bytes(state_a((1, 1, 1), C.USER7))
-    got, result = dispatch(directory, consumer, env, mode)
-    assert got == untouched and len(lines(result, 'refused: no translation')) == 1, result.stderr[-3000:]
-    key, = [line.split()[3] for line in lines(result, 'x2w-draw compute request') if ' published ' in line]
-    shader = directory / 'view_tokens.hlsl'
-    shader.write_text("""\
-Texture2D<float4> source : register(t0);
-RWByteAddressBuffer target : register(u0);
-[numthreads(1, 1, 1)]
-void main() {
-    uint4 rgba = uint4(round(source.Load(int3(0, 0, 0)) * 255.0));
-    target.Store2(0, uint2(rgba.x + 257 * rgba.y, rgba.z + 257 * rgba.w));
-}
-""")
-    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', shader], check=True)
-    (cache / f'{key}.txt').write_text(
-        'x2w-manifest 2\nstage cs\nud 0\nsrv 0 tex2d table 1 64\nuav 0 table 1 32\n')
-
-    def run(suffix='', *, enabled=True, refusal=None):
-        settings = dict(env, X2W_COMPUTE_VIEW_TOKENS='1') if enabled else env
-        readback, log = dispatch(directory, consumer, settings, mode + suffix)
-        assert not [line for line in lines(log, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line], log.stderr[-3000:]
-        refused = lines(log, 'Dispatch(1, 1, 1) refused: ')
-        if refusal:
-            assert readback == untouched and len(refused) == 1 and refused[0].endswith(refusal), log.stderr[-3000:]
-        else:
-            assert not refused and len(lines(log, 'Dispatch(1, 1, 1) translated')) == 1, log.stderr[-3000:]
-        return readback
-
-    run(enabled=False, refusal='an output is a view token, not a buffer descriptor')
-    run('-wrong-kind', refusal='an output shader resource view token cannot supply unordered access')
-    rgba = (17, 93, 201, 45)
-    value = [rgba[0] + 257 * rgba[1], rgba[2] + 257 * rgba[3]]
-
-    def expected_at(index):
-        expected = untouched.copy()
-        expected[index:index + len(value)] = value
-        return expected
-
-    def compare(readback):
-        expected = expected_at(8)
-        for i, (actual, reference) in enumerate(zip(readback, expected, strict=True)):
-            assert actual == reference, f'dword {i}: read {actual:#x}, expected {reference:#x}'
-
-    compare(run())
-    shifted = run('-shifted')
-    assert shifted == expected_at(12), 'the shifted UAV must write the same values at its own offset'
-    try:
-        compare(shifted)
-    except AssertionError as mismatch:
-        print(f'view tokens: CPU readback matches and wrong-offset control fails at {mismatch}')
-    else:
-        raise AssertionError('wrong-offset UAV unexpectedly passed the CPU comparison')
-
-
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
-        for variable in ('X2W_COMPUTE_VIEW_TOKENS', 'X2W_NULL_TOKEN_ZERO', 'X2W_COMPUTE_TITLE_INPUTS', 'X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY',
+        for variable in ('X2W_NULL_TOKEN_ZERO', 'X2W_COMPUTE_TITLE_INPUTS', 'X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY',
                          'X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT', 'X2W_TEST_UPLOAD_RING_MAX_KIB',
                          'X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS', 'X2W_TRANSLATED_INDIRECT_COPY_RANGES',
                          'X2W_D3D12_LINEAR_BUFFERS', 'X2W_TEST_DISPATCH_HARDWARE'):
@@ -255,11 +195,6 @@ def main(consumer, dxc, adapter):
         assert got == untouched and not lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
         assert lines(result, 'unfilled heap slot ') == [f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}'], result.stderr[-3000:]
 
-        got, result = dispatch(directory, consumer, dict(env, X2W_COMPUTE_VIEW_TOKENS='1'), 'dispatch-input-token')
-        refusal, = lines(result, 'refused: ')
-        assert got == untouched and refusal.endswith(
-            'an input shader resource view token describes a texture, but the shader needs a buffer'), result.stderr[-3000:]
-
         got, result = dispatch(directory, consumer, null_env, 'dispatch-input-null-token')
         written = prod(group) * prod(groups)
         zero_expected = [(C.KEY + i * C.STRIDE) & C.MASK for i in range(written)]
@@ -306,10 +241,9 @@ def main(consumer, dxc, adapter):
         assert got == untouched and len(rejected) == 1 and ' rejected (a resource that is not a raw table buffer' in rejected[0] \
             and rejected[0].endswith(': ' + first[:120]), result.stderr[-3000:]
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
-        print(f'startup_compute_dispatch_input: baseline PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
+        print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
         check_title_inputs(directory, cache, consumer, dxc, env, untouched)
-        check_view_tokens(directory, cache, consumer, dxc, env, untouched)
 
 
 if __name__ == '__main__':
