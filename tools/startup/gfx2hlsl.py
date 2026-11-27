@@ -16963,7 +16963,13 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
                     else:
                         return 'ps'
                 raise
-        ins = decode(strip_header(blob), refusals, embedded_vertex=True, embedded_pixel=True)
+        code = strip_header(blob)
+        plan = vertex_image_plan(code)
+        if plan is not None:
+            kind = classify_decoded(plan['ins'])
+            decoded[kind] = plan['ins']
+            return kind
+        ins = decode(code, refusals, embedded_vertex=True, embedded_pixel=True)
         kind = classify_decoded(ins)
         decoded[kind] = ins
         return kind

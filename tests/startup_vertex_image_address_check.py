@@ -149,9 +149,29 @@ def translator_controls():
             assert status == 'ok', status
             multi_image = multi_graphics_program()
             multi_words = list(struct.unpack('<%dI' % (len(multi_image) // 4), multi_image))
-            status, _ = stream_interface.translate(path / 'multi', streams.vertex(multi_words),
-                                                   stream_interface.pixel(), root_with_one_constant())
+            multi_vs, multi_ps, root = streams.vertex(multi_words), stream_interface.pixel(), root_with_one_constant()
+            status, _ = stream_interface.translate(path / 'multi', multi_vs, multi_ps, root)
             assert status == 'ok', status
+            key = G.pipeline_key(multi_vs, multi_ps, root)
+            assert G.request_refusals(str(path / 'multi'), key) == []
+            # Data words can resemble an invalid GLOBAL encoding; they are not instructions.
+            opaque = bytearray(multi_image)
+            struct.pack_into('<II', opaque, len(opaque) - 765 * 4,
+                             0xdc000000 | (1 << 25) | (0x0c << 18) | (2 << 14), 0x007d0000)
+            opaque_words = list(struct.unpack('<%dI' % (len(opaque) // 4), opaque))
+            opaque_vs = streams.vertex(opaque_words)
+            status, _ = stream_interface.translate(path / 'opaque', opaque_vs, multi_ps, root)
+            assert status == 'ok', status
+            opaque_key = G.pipeline_key(opaque_vs, multi_ps, root)
+            assert G.request_refusals(str(path / 'opaque'), opaque_key) == []
+            bad_image = graphics_program(nwords=762)
+            bad_words = list(struct.unpack('<%dI' % (len(bad_image) // 4), bad_image))
+            bad_vs = streams.vertex(bad_words)
+            status, _ = stream_interface.translate(path / 'bad', bad_vs, multi_ps, root)
+            assert 'program image load index not proven in range' in status, status
+            bad_key = G.pipeline_key(bad_vs, multi_ps, root)
+            refusals = G.request_refusals(str(path / 'bad'), bad_key)
+            assert any('program image load index not proven in range' in reason for reason, _ in refusals), refusals
             status, _ = stream_interface.translate(path / 'old', stream_interface.vertex(), stream_interface.pixel())
             assert status == 'ok', status
             want = {
