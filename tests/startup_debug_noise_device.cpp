@@ -6,12 +6,14 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_resource_map_count();
 
 namespace {
 using Word = std::uint64_t;
@@ -34,12 +36,67 @@ struct Probe {
     ComPtr<ID3D12Device> desktop;
     DWORD cookie = 0;
     ComPtr<ID3D12InfoQueue1> queue1;
+    bool watching = false;
     bool watch()
     {
-        return SUCCEEDED(desktop.As(&queue1)) &&
-               SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
+        watching = SUCCEEDED(desktop.As(&queue1)) &&
+            SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
+        return watching;
     }
+    ~Probe() { if (watching) queue1->UnregisterMessageCallback(cookie); }
 };
+
+bool check_resource_maps(void* device)
+{
+    constexpr unsigned buffer_count = 64;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_RANGE empty{0, 0};
+    const auto create_buffer = [&](ComPtr<ID3D12Resource>& buffer) {
+        return ok(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+                         D3D12_RESOURCE_STATE_GENERIC_READ, 0, arg(&__uuidof(ID3D12Resource)),
+                         arg(buffer.GetAddressOf()))) && buffer.Get();
+    };
+    const auto map = [&](ID3D12Resource* buffer) {
+        void* data = nullptr;
+        return SUCCEEDED(buffer->Map(0, &empty, &data)) && data;
+    };
+
+    const auto before = x2w_d3d12_resource_map_count();
+    for (unsigned i = 0; i < buffer_count; ++i) {
+        ComPtr<ID3D12Resource> buffer;
+        if (!create_buffer(buffer) || !map(buffer.Get())) {
+            std::printf("persistent upload buffer %u: create or Map failed\n", i);
+            return false;
+        }
+        if (i == 0) {
+            auto extra_ref = buffer;
+            extra_ref.Reset();
+            if (x2w_d3d12_resource_map_count() != before + 1) {
+                std::printf("live upload buffer missing from map census after non-final Release\n");
+                return false;
+            }
+        }
+        // Release while still mapped.
+    }
+    const auto after = x2w_d3d12_resource_map_count();
+    std::printf("map census after %u persistent releases: %zu -> %zu\n", buffer_count, before, after);
+    if (after != before) return false;
+
+    ComPtr<ID3D12Resource> buffer;
+    if (!create_buffer(buffer)) return false;
+    buffer->Unmap(0, &empty);
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!map(buffer.Get())) return false;
+        buffer->Unmap(0, &empty);
+        if (x2w_d3d12_resource_map_count() != before) {
+            std::printf("paired upload Map/Unmap %u left a census entry\n", i);
+            return false;
+        }
+    }
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -76,6 +133,7 @@ int main(int argc, char** argv)
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
 
     if (!probe.watch()) { std::printf("no debug layer\n"); return 5; }
+    const bool resource_maps_ok = check_resource_maps(device);
 
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC texture{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 1,
@@ -110,5 +168,5 @@ int main(int argc, char** argv)
     if (!ok(invoke(device, 14, arg(&request.desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&rtv)))) return 12;
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     std::printf("device removed: 0x%08lx errors: %llu\n", static_cast<unsigned long>(removed), debug_error_count.load());
-    return removed == S_OK && debug_error_count.load() == 0 ? 0 : 70;
+    return resource_maps_ok && removed == S_OK && debug_error_count.load() == 0 ? 0 : 70;
 }

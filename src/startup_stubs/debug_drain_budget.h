@@ -3,7 +3,6 @@
 #include <unordered_map>
 
 namespace x2w_startup {
-inline bool consume_map_count(std::uint64_t& count) { if (!count) return false; --count; return true; }
 class DebugDrainBudget {
     std::unordered_map<unsigned, std::uint64_t> counts_;
     unsigned errors_ = 0, other_ = 0;
