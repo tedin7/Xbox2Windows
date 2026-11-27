@@ -654,6 +654,10 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    // The guest checks device byte +0x18 before using its inline descriptor
+    // writers. Request vtable calls so the shim records the descriptor.
+    static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
+    if (kind == device_kind) w->console_fields[2] = 1;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
@@ -5580,6 +5584,7 @@ bool slot70_desktop_arrays_enabled()
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
@@ -7179,7 +7184,6 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
-#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
 // member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue

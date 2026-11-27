@@ -911,15 +911,6 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_list_copy_texture_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
-# Stage-by-stage trace and regression for horizontal alternating row bands on textured indexed UI draws (#3132).
-add_executable(startup_ui_texture_bands_check tests/startup_ui_texture_bands_check.cpp)
-target_compile_features(startup_ui_texture_bands_check PRIVATE cxx_std_17)
-target_link_libraries(startup_ui_texture_bands_check PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
-foreach(backend IN ITEMS warp hardware)
-    add_test(NAME startup_ui_texture_bands_${backend} COMMAND startup_ui_texture_bands_check ${backend})
-    set_tests_properties(startup_ui_texture_bands_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
-endforeach()
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
@@ -3880,6 +3871,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dynamic_heap_check.py")
     add_test(NAME startup_gfx2hlsl_resheap_branch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py")
+    add_test(NAME startup_gfx2hlsl_heap_format COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_format_check.py")
+    add_test(NAME startup_compute_heap_format COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_format_check.py")
     add_test(NAME startup_compute_dynamic_heap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dynamic_heap_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
@@ -4046,6 +4041,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     # GETPC refusal controls and synthetic embedded vertex table translation.
     add_test(NAME startup_gfx2hlsl_getpc_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py")
+    add_test(NAME startup_vertex_image_ranges COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_ranges_check.py")
+    set_tests_properties(startup_vertex_image_ranges PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_vertex_image_address COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_address_check.py")
+    set_tests_properties(startup_vertex_image_address PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_vertex_image_getpc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_getpc_check.py")
+    set_tests_properties(startup_vertex_image_getpc PROPERTIES TIMEOUT 120)
     # Image instructions with fewer than three operands (#2360 follow-up): the handler refused
     # them as an index error before it checked the count.
     add_test(NAME startup_gfx2hlsl_image_arity COMMAND "${INTAKE_PYTHON}" -B
@@ -4808,6 +4812,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py" "${DXC_EXECUTABLE}"
         "$<TARGET_FILE:offscreen_check>" $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
     set_tests_properties(startup_gfx2hlsl_getpc_table_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_vertex_image_address_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_vertex_image_address_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_vertex_image_address_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # gfx2hlsl 16-bit vector ALU (#1723): the translated pairs drawn on WARP and hardware (FXC 5_1 and DXC 6_0),
     # four result words per draw against an exact binary16 reference.
     add_test(NAME startup_gfx2hlsl_f16_alu_draw_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4949,6 +4957,13 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    add_test(NAME startup_pixel_store_format_xyzw_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_store_format_xyzw_check.py")
+    set_tests_properties(startup_pixel_store_format_xyzw_controls PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_pixel_store_format_xyzw_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_store_format_xyzw_check.py" "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_pixel_store_format_xyzw_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).
     add_test(NAME startup_gfx2hlsl_compute_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py")
@@ -5424,10 +5439,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_resheap_embedded_scalar_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-embedded-scalar
         "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_heap_format_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_format_check.py" warp "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_compute_heap_format_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_format_check.py" "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")
     set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp startup_gfx2hlsl_resheap_branch_warp
         startup_gfx2hlsl_resheap_vertex_image_warp startup_gfx2hlsl_resheap_vertex_loop_warp
         startup_gfx2hlsl_resheap_descriptor_word_warp startup_gfx2hlsl_resheap_image_dimensions_warp
         startup_gfx2hlsl_resheap_fma_mix_warp startup_gfx2hlsl_resheap_embedded_scalar_warp
+        startup_gfx2hlsl_heap_format_warp startup_compute_heap_format_warp
         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B

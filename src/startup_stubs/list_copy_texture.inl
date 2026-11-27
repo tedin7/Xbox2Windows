@@ -1,4 +1,4 @@
-// Included by d3d12_xs_device.cpp after list_copy.inl. Command list slot 16, CopyTextureRegion (#870).
+// Included by d3d12_xs_device.cpp after d3d12_draw.inl. Command list slot 16, CopyTextureRegion (#870).
 // Each location's resource is mapped to its desktop resource, the call is checked by
 // list_copy_texture.h, the two resources move to COPY_SOURCE / COPY_DEST for the call (the list's Close
 // puts them back to COMMON), and a call the desktop would reject is counted and logged, not forwarded.

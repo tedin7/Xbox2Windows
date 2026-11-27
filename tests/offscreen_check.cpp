@@ -1481,6 +1481,13 @@ OperationResult run_startup_image_atomic(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_startup_pixel_formatted_store(const OperationContext& ctx)
+{
+    if (check_startup_pixel_formatted_store(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]))
+        return {OutcomeKind::fail, "pixel formatted store readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
 
 OperationResult run_startup_sharedexp_target(const OperationContext& ctx)
@@ -1591,13 +1598,17 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, colors.data(), ctx.argv[8],
                                false, 3, false, true, 0, 3, false, UINT(width), UINT(height));
         std::memcpy(pixels.data(), colors.data(), pixels.size() * sizeof(std::uint32_t));
-    } else if (operation == "--startup-pixel-buffer-words") {
+    } else if (operation == "--startup-pixel-buffer-words" ||
+               operation == "--startup-instanced-vertex-buffer-words") {
         const auto entry = parse_hex_words(ctx.argv[8]);
         const auto buffer = parse_hex_words(ctx.argv[9]);
         if (entry.empty() || entry.size() > 32 || buffer.empty())
             return {OutcomeKind::fail, "expected 1..32 entry constants and a nonempty buffer"};
+        const bool vertex_buffer = operation == "--startup-instanced-vertex-buffer-words";
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
-                                D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer);
+                                D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer,
+                                vertex_buffer ? UINT(width) : 1, DXGI_FORMAT_R32G32B32A32_FLOAT, false, nullptr,
+                                vertex_buffer);
     } else {
         const UINT instances = operation == "--startup-instanced-pixel-words" ? UINT(width) : 1;
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
@@ -1707,7 +1718,8 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 // target must hold, compared bit for bit.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
-    const bool dynamic_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    const bool record_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap-records";
+    const bool dynamic_heap = record_heap || std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
     if (dynamic_heap) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
@@ -1720,8 +1732,22 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
     if (expected.size() != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::vector<std::vector<std::uint32_t>> records;
+    if (record_heap) {
+        std::string_view input(ctx.argv[7]);
+        while (!input.empty()) {
+            const auto separator = input.find(';');
+            auto record = parse_hex_words(input.substr(0, separator));
+            if (record.empty() || record.size() > 64) return {OutcomeKind::fail, "invalid heap record"};
+            records.push_back(record);
+            if (separator == std::string_view::npos) break;
+            input.remove_prefix(separator + 1);
+            if (input.empty()) return {OutcomeKind::fail, "empty heap record"};
+        }
+        if (records.empty() || entry.back() >= records.size()) return {OutcomeKind::fail, "missing heap format info"};
+    }
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap, records);
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1856,6 +1882,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-atomic", 7, 7, nullptr, kNoGate, run_startup_image_atomic},
+    {"--startup-pixel-formatted-store", 7, 7, nullptr, kNoGate, run_startup_pixel_formatted_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},
@@ -1865,10 +1892,12 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
+    {"--startup-dynamic-heap-records", 8, 8, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-image-words", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-instanced-vertex-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-r16-unorm", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},

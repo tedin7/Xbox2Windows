@@ -6,6 +6,7 @@
 // reads every texel back. The caller names the one texel it expects the store to change and its value;
 // every other texel must still hold -1.0.
 #include "desktop_gpu.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 
 #include <array>
 #include <cstdint>
@@ -218,4 +219,175 @@ int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, co
         {DXGI_FORMAT_R32_UINT, 1, fixture[1], fixture[3]},
     };
     return draw_and_check(device, vertex_path, pixel_path, images, 2, side);
+}
+
+// The fixture holds the manifest's entry words, R32_FLOAT texels, initial and expected
+// raw buffer words, and the expected uniform RGBA32_FLOAT target word.
+int check_startup_pixel_formatted_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                        const char* sampler_line, const char* fixture_path)
+{
+    struct Fixture {
+        std::uint32_t entry_count, entries[32];
+        std::uint32_t image[4], ramp[4], initial[12], expected[12], color;
+    } input{};
+    static_assert(sizeof(Fixture) == 264, "Pixel formatted store fixture layout");
+    std::ifstream fixture(fixture_path, std::ios::binary);
+    if (!fixture.read(reinterpret_cast<char*>(&input), sizeof(input)) || fixture.peek() != EOF ||
+        !input.entry_count || input.entry_count > 32)
+        throw std::runtime_error("Invalid pixel formatted store fixture");
+
+    const auto vs = read_shader(vertex_path);
+    const auto ps = read_shader(pixel_path);
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+        throw std::runtime_error("Expected one static sampler for the pixel formatted store");
+    ComPtr<ID3D12RootSignature> root;
+    check(x2w_startup::create_translated_root(device, input.entry_count, 2, samplers, &root, 1),
+          "Create pixel formatted store root");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = root.Get();
+    pd.VS = {vs.data(), vs.size()};
+    pd.PS = {ps.data(), ps.size()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create pixel formatted store PSO");
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    ComPtr<ID3D12DescriptorHeap> views, rtvs;
+    check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create formatted store view heap");
+    hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+    check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create formatted store RTV heap");
+    const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+    auto view = views->GetCPUDescriptorHandleForHeapStart();
+    const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto* list = commands.list.Get();
+    ComPtr<ID3D12Resource> textures[2], uploads[2];
+    const D3D12_RANGE none{0, 0};
+    for (UINT i = 0; i < 2; ++i) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = i ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = i ? 4 : 2;
+        desc.Height = i ? 1 : 2;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R32_FLOAT;
+        desc.SampleDesc.Count = 1;
+        textures[i] = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
+        uploads[i] = make_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        check(uploads[i]->Map(0, &none, &mapped), "Map formatted store texture upload");
+        const auto* texels = i ? input.ramp : input.image;
+        const auto width = static_cast<std::size_t>(desc.Width);
+        for (UINT y = 0; y < desc.Height; ++y)
+            std::memcpy(static_cast<char*>(mapped) + fp.Offset + y * fp.Footprint.RowPitch, texels + y * width,
+                        width * sizeof(*texels));
+        uploads[i]->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION src{uploads[i].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        src.PlacedFootprint = fp;
+        const D3D12_TEXTURE_COPY_LOCATION dst{textures[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        transition(list, textures[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        device->CreateShaderResourceView(textures[i].Get(), nullptr, view);
+        view.ptr += increment;
+    }
+
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = sizeof(input.initial);
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto buffer = resource(device, bd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto upload = make_buffer(device, bd.Width, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto buffer_readback = make_buffer(device, bd.Width, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    void* mapped = nullptr;
+    check(upload->Map(0, &none, &mapped), "Map formatted store buffer upload");
+    std::memcpy(mapped, input.initial, sizeof(input.initial));
+    upload->Unmap(0, nullptr);
+    list->CopyBufferRegion(buffer.Get(), 0, upload.Get(), 0, bd.Width);
+    transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    raw.Buffer.NumElements = sizeof(input.initial) / sizeof(input.initial[0]);
+    raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device->CreateUnorderedAccessView(buffer.Get(), nullptr, &raw, view);
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rd.Height = side;
+    rd.DepthOrArraySize = rd.MipLevels = rd.SampleDesc.Count = 1;
+    rd.Format = pd.RTVFormats[0];
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+    const float clear[4]{-1, -1, -1, -1};
+    list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    list->SetGraphicsRootSignature(root.Get());
+    ID3D12DescriptorHeap* heaps[]{views.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRoot32BitConstants(0, input.entry_count, input.entries, 0);
+    list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
+    const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
+    const D3D12_RECT scissor{0, 0, side, side};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+
+    transition(list, buffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(buffer_readback.Get(), 0, buffer.Get(), 0, bd.Width);
+    transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT64 target_bytes = 0;
+    device->GetCopyableFootprints(&rd, 0, 1, 0, &fp, nullptr, nullptr, &target_bytes);
+    const auto target_readback = make_buffer(device, target_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_TEXTURE_COPY_LOCATION src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION dst{target_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint = fp;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    commands.submit_and_wait(device);
+
+    const D3D12_RANGE buffer_range{0, sizeof(input.expected)};
+    check(buffer_readback->Map(0, &buffer_range, &mapped), "Map formatted store buffer readback");
+    bool mismatch = false;
+    const auto* buffer_words = static_cast<const std::uint32_t*>(mapped);
+    for (UINT i = 0; i < sizeof(input.expected) / sizeof(input.expected[0]); ++i) {
+        if (buffer_words[i] == input.expected[i]) continue;
+        std::fprintf(stderr, "record_mismatch record=%u word=%u expected=%08x actual=%08x\n",
+                     i / 2, i % 2, input.expected[i], buffer_words[i]);
+        mismatch = true;
+    }
+    buffer_readback->Unmap(0, &none);
+    const D3D12_RANGE target_range{0, static_cast<SIZE_T>(target_bytes)};
+    check(target_readback->Map(0, &target_range, &mapped), "Map formatted store target readback");
+    for (UINT y = 0; y < side; ++y) {
+        const auto* row = reinterpret_cast<const std::uint32_t*>(
+            static_cast<const char*>(mapped) + fp.Offset + y * fp.Footprint.RowPitch);
+        for (UINT x = 0; x < side; ++x) {
+            for (UINT c = 0; c < 4; ++c) {
+                if (row[4 * x + c] == input.color) continue;
+                std::fprintf(stderr, "pixel_mismatch x=%u y=%u channel=%u expected=%08x actual=%08x\n",
+                             x, y, c, input.color, row[4 * x + c]);
+                mismatch = true;
+            }
+        }
+    }
+    target_readback->Unmap(0, &none);
+    return mismatch ? 1 : 0;
 }

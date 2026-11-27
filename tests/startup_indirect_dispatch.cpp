@@ -378,6 +378,10 @@ int main(int argc, char** argv) try
     const std::array<unsigned char, 64> parameters{};
     ComPtr<ID3D12Device> guest;
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
+    if (!reinterpret_cast<const unsigned char*>(guest.Get())[0x18]) {
+        std::fputs("guest device permits inline descriptor creation\n", stderr);
+        return 1;
+    }
     DXGI_ADAPTER_DESC1 adapter_desc{};
     check(adapter->GetDesc1(&adapter_desc), "get adapter description");
     std::printf("adapter: %ls, debug layer %s\n", adapter_desc.Description, debug ? "enabled" : "unavailable");

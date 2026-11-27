@@ -71,20 +71,6 @@ struct Computer {
 constexpr std::size_t layout_header = 0x18, plane_bytes = 0x6c8, mip_base = 0x38, mip_bytes = 0x70;
 constexpr int max_mips = 15;
 
-// Desktop D3D12 resolves MipLevels == 0 to the full mip chain for the resource's largest extent.
-unsigned full_mips(const D3D12_RESOURCE_DESC& desc)
-{
-    UINT64 extent = desc.Width ? desc.Width : 1;
-    if (desc.Dimension >= D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Height > extent) extent = desc.Height;
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc.DepthOrArraySize > extent) extent = desc.DepthOrArraySize;
-    unsigned mips = 0;
-    while (extent) {
-        ++mips;
-        extent >>= 1;
-    }
-    return mips ? (std::min)(mips, static_cast<unsigned>(max_mips)) : 1u;
-}
-
 bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
 {
     return x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT") &&
@@ -238,7 +224,7 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     const unsigned slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
-    unsigned mips = desc.MipLevels ? desc.MipLevels : full_mips(desc);
+    unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
     const x2w_startup::SliceFootprints plan(device, desc, mips);
     const auto& footprints = plan.placed;
@@ -389,7 +375,7 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     const unsigned slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
-    unsigned mips = desc.MipLevels ? desc.MipLevels : full_mips(desc);
+    unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
     const unsigned mip = subresource % mips, slice = subresource / mips;
     const x2w_startup::SliceFootprints plan(device, desc, mips);

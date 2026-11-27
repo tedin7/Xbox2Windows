@@ -1930,6 +1930,467 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+
+
+def vertex_image_getpc_proof(code, ins):
+    """Prove a single GETPC table base and its direct vector carry uses.
+
+    The returned vector pairs still require a separate offset and load proof.
+    No values are elided by this function.
+    """
+    def refuse(reason):
+        raise Unsupported('vertex program image: ' + reason)
+
+    if not ins or len(code) % 4:
+        refuse('invalid image extent')
+    ends = [pc + size for pc, size, _, _ in ins]
+    if ins[0][0] != 0 or any(a != b[0] for a, b in zip(ends, ins[1:])):
+        refuse('instruction boundaries are incomplete')
+    reads = [i for i, (_, _, name, _) in enumerate(ins) if name == 's_getpc_b64']
+    if len(reads) != 1:
+        refuse('expected exactly one GETPC')
+    i = reads[0]
+    pc, size, _, asm = ins[i]
+    _, ops, mods = parse(asm)
+    low = pc_pair(ops[0]) if len(ops) == 1 and not mods and size == 4 else None
+    if low is None or i + 2 >= len(ins):
+        refuse('invalid GETPC pair')
+    add_pc, add_size, add_name, add_asm = ins[i + 1]
+    hi_pc, hi_size, hi_name, hi_asm = ins[i + 2]
+    _, add_ops, add_mods = parse(add_asm)
+    _, hi_ops, hi_mods = parse(hi_asm)
+    offset = pc_word(add_ops[2]) if len(add_ops) == 3 else None
+    if (add_pc != pc + 4 or add_size != 8 or add_name != 's_add_u32'
+            or add_mods or add_ops[:2] != ['s%d' % low] * 2 or offset is None
+            or offset < 0 or code[add_pc + 1] != 0xff
+            or hi_pc != add_pc + 8 or hi_size != 4 or hi_name != 's_addc_u32'
+            or hi_mods or hi_ops != ['s%d' % (low + 1), 's%d' % (low + 1), '0']):
+        refuse('GETPC requires literal low add and zero high carry')
+    start = pc + size + offset
+    if start % 4 or start < ends[-1] or start >= len(code):
+        refuse('table start is outside the data tail')
+    table = tuple(word for word, in struct.iter_unpack('<I', code[start:]))
+    pair = {'s%d' % low, 's%d' % (low + 1)}
+    low_reg, high_reg = 's%d' % low, 's%d' % (low + 1)
+    vector_pairs = {}
+    pcs = {row[0]: row for row in ins}
+    # Only the matching low and high add may read either address word.
+    for j, (off, n, name, line) in enumerate(ins):
+        if off <= hi_pc:
+            continue
+        if 'movrel' in name or 'swaprel' in name:
+            refuse('indirect register access after GETPC')
+        _, args, flags = parse(line)
+        reads_s, _, may_s = scalar_effects(name, line)
+        if pair & may_s:
+            refuse('GETPC pair is overwritten')
+        if not pair & reads_s:
+            continue
+        base = re.sub(r'_e(32|64)$', '', name)
+        if (base != 'v_add_co_u32' or flags or len(args) != 4 or args[1] not in ('vcc', 'vcc_lo')
+                or args[2:].count(low_reg) != 1 or high_reg in args[2:] or j + 1 >= len(ins)):
+            # The second half is checked with its preceding low half below.
+            if off in vector_pairs.values():
+                continue
+            refuse('GETPC pair escapes the vector carry chain')
+        next_pc, next_size, next_name, next_line = ins[j + 1]
+        _, next_ops, next_mods = parse(next_line)
+        next_base = re.sub(r'_e(32|64)$', '', next_name)
+        if (next_base != 'v_add_co_ci_u32' or next_mods or len(next_ops) != 5
+                or next_ops[1] != args[1] or next_ops[4] != args[1]
+                or next_ops[2:4].count(high_reg) != 1 or low_reg in next_ops[2:4]):
+            refuse('GETPC vector carry is incomplete')
+        # RDNA 2 ISA guide, VOP3B, pp. 55-56: reject unmodelled
+        # source and output modifiers on the carry instructions we elide.
+        if n != 8 or next_size != 8:
+            refuse('GETPC vector carry has an unsupported encoding length')
+        low_word, low_sources = struct.unpack_from('<2I', code, off)
+        high_word, high_sources = struct.unpack_from('<2I', code, next_pc)
+        if (low_word & (1 << 15) or high_word & (1 << 15)
+                or low_sources & 0xf8000000 or high_sources & 0xf8000000
+                or (low_sources >> 18) & 0x1ff):
+            refuse('GETPC vector carry has unsupported encoding bits')
+        vector_pairs[off] = next_pc
+    if not vector_pairs:
+        refuse('GETPC pair has no vector carry chain')
+
+    # Track setup dominance and the SCC produced by the erased scalar adds.
+    # A second path into the high add or a read of an unmaterialized SCC is unsafe.
+    pending, seen = [(0, 0, False)], set()
+    while pending:
+        off, phase, stale_scc = pending.pop()
+        if (off, phase, stale_scc) in seen:
+            continue
+        seen.add((off, phase, stale_scc))
+        if off not in pcs:
+            refuse('branch target is outside executable instructions')
+        _, n, name, line = pcs[off]
+        _, args, _ = parse(line)
+        if off == pc:
+            if phase:
+                refuse('GETPC executes more than once')
+            phase = 1
+        elif off == add_pc:
+            if phase != 1:
+                refuse('GETPC low add is not dominated by GETPC')
+            phase, stale_scc = 2, True
+        elif off == hi_pc:
+            if phase != 2:
+                refuse('GETPC high add is not dominated by low add')
+            phase, stale_scc = 3, True
+        elif off in vector_pairs or off in vector_pairs.values():
+            if phase != 3:
+                refuse('GETPC use is not dominated by setup')
+        else:
+            reads_s, writes_s, _ = scalar_effects(name, line)
+            if stale_scc and 'scc' in reads_s:
+                refuse('GETPC carry SCC escapes')
+            if 'scc' in writes_s:
+                stale_scc = False
+        successors = []
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            target = re.fullmatch(r'label_0x([0-9a-f]+)', args[0]) if len(args) == 1 else None
+            if not target:
+                refuse('unsupported branch')
+            successors.append(int(target.group(1), 16))
+        elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap', 's_endpgm_')):
+            refuse('unsupported control transfer')
+        if name not in ('s_branch', 's_endpgm'):
+            successors.append(off + n)
+        pending.extend((target, phase, stale_scc) for target in successors)
+    return start, table, (pc, add_pc, hi_pc), vector_pairs
+
+
+
+def vertex_image_address_proof(ins, getpc):
+    """Match indexed 64-bit GLOBAL addresses to a proven GETPC table base.
+
+    This proves address shape and range only; a lowering must additionally
+    prove the elided address words and carry masks cannot escape.
+    """
+    _, table, _, pairs = getpc
+    facts = vertex_image_range_facts(ins)
+    if not facts:
+        raise Unsupported('program image load index not proven in range')
+    targets = set()
+    for pc, _, name, asm in ins:
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            _, operands, _ = parse(asm)
+            match = re.fullmatch(r'label_0x([0-9a-f]+)', operands[0]) if len(operands) == 1 else None
+            if match:
+                targets.add(int(match.group(1), 16))
+    if targets & set(pairs.values()):
+        raise Unsupported('program image vector carry high half is a branch target')
+    signs, shifts, addresses, versions, loads = {}, {}, {}, {}, {}
+    used_pairs = set()
+    last_low = None
+    for pc, size, name, asm in ins:
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        if pc in targets or writes_exec(name, ops) or 'movrel' in name or 'swaprel' in name:
+            signs.clear()
+            shifts.clear()
+            addresses.clear()
+        if last_low is not None and pc != last_low[0]:
+            raise Unsupported('program image vector carry is not adjacent')
+        derived_sign = derived_shift = derived_address = None
+        if (base == 'v_ashrrev_i32' and len(ops) == 3 and not mods and pc_word(ops[1]) == 31
+                and re.fullmatch(r'v\d+', ops[0]) and re.fullmatch(r'v\d+', ops[2])
+                and int(ops[0][1:]) == int(ops[2][1:]) + 1):
+            derived_sign = ops[0], ops[2], versions.get(ops[2], 0)
+        elif base == 'v_lshlrev_b64' and len(ops) == 3 and not mods and pc_word(ops[1]) == 2:
+            dst, src = reg_range(ops[0]), reg_range(ops[2])
+            if dst and dst == src and dst[0] == 'v' and dst[2] == dst[1] + 1:
+                lo, hi = 'v%d' % dst[1], 'v%d' % dst[2]
+                sign = signs.get(hi)
+                bound = facts.get(pc, {}).get(lo)
+                if sign and sign == (lo, versions.get(lo, 0), versions.get(hi, 0)):
+                    if not bound or bound[0] != 'uint' or bound[1] < 0 or bound[2] >= len(table) or bound[2] > 0x3fffffff:
+                        raise Unsupported('program image load index not proven in range')
+                    derived_shift = lo, hi, pc, bound[2]
+        if pc in pairs:
+            next_pc = pairs[pc]
+            lo_sources = [op for op in ops[2:] if re.fullmatch(r'v\d+', op)]
+            shifted = shifts.get(lo_sources[0]) if len(lo_sources) == 1 else None
+            if not shifted or shifted[4:] != (versions.get(shifted[0], 0), versions.get(shifted[1], 0)):
+                raise Unsupported('program image address is not a proven index shifted by two')
+            last_low = next_pc, ops[0], shifted, pc
+        elif last_low is not None:
+            _, low_dst, shifted, low_pc = last_low
+            high_sources = [op for op in ops[2:4] if re.fullmatch(r'v\d+', op)]
+            if (len(high_sources) != 1 or high_sources[0] != shifted[1]
+                    or not re.fullmatch(r'v\d+', low_dst) or not re.fullmatch(r'v\d+', ops[0])
+                    or low_dst == shifted[1]
+                    or int(ops[0][1:]) != int(low_dst[1:]) + 1):
+                raise Unsupported('program image address high word does not match the shifted pair')
+            derived_address = low_dst, ops[0], shifted[2], shifted[3], low_pc
+            last_low = None
+        elif name == 'global_load_dword':
+            if len(ops) != 3 or ops[2] != 'off' or any(m not in ('glc', 'slc', 'dlc') for m in mods):
+                raise Unsupported('program image global load requires an unmodified VADDR pair')
+            address = reg_range(ops[1])
+            if not address or address[0] != 'v' or address[2] != address[1] + 1:
+                raise Unsupported('program image global load requires a VADDR pair')
+            lo, hi = 'v%d' % address[1], 'v%d' % address[2]
+            fact = addresses.get(lo)
+            if not fact or fact[0] != hi or fact[3:5] != (versions.get(lo, 0), versions.get(hi, 0)):
+                raise Unsupported('program image global load address is not proven')
+            destination = reg_range(ops[0])
+            if not destination or destination[0] != 'v' or destination[1] != destination[2]:
+                raise Unsupported('program image global load destination is not a VGPR')
+            used_pairs.add(fact[5])
+            loads[pc] = (ops[0], fact[1], fact[2])
+        written = set()
+        dests = destinations(base, ops)
+        if base == 'v_swap_b32' and len(ops) >= 2:
+            dests = ops[:2]
+        for op in dests:
+            reg = reg_range(op)
+            if reg and reg[0] == 'v':
+                written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
+        if base.startswith('v_cmp'):
+            written.clear()
+        for reg in written:
+            versions[reg] = versions.get(reg, 0) + 1
+        if derived_sign:
+            hi, lo, lo_version = derived_sign
+            signs[hi] = (lo, lo_version, versions.get(hi, 0))
+        if derived_shift:
+            lo, hi, origin, maximum = derived_shift
+            shifts[lo] = (lo, hi, origin, maximum, versions.get(lo, 0), versions.get(hi, 0))
+        if derived_address:
+            lo, hi, origin, maximum, low_pc = derived_address
+            addresses[lo] = (hi, origin, maximum, versions.get(lo, 0), versions.get(hi, 0), low_pc)
+    if not loads:
+        raise Unsupported('program image has no matching global loads')
+    if used_pairs != set(pairs):
+        raise Unsupported('program image vector address has no matching load')
+    return loads
+
+
+
+def vertex_image_elision_proof(ins, getpc, loads):
+    """Reject uses of the address words and VCC values erased by lowering."""
+    _, _, _, pairs = getpc
+    high_pairs = set(pairs.values())
+    by_pc = {row[0]: row for row in ins}
+    # May-taint catches escapes; must-taint proves every load path has its address.
+    incoming = {0: ({}, frozenset(), False)}
+    pending = [0]
+    full_vector = {'v_mov_b32', 'v_add_nc_u32', 'v_sub_nc_u32', 'v_mul_u32_u24',
+                   'v_add_f32', 'v_mul_f32', 'v_fma_f32', 'v_lshl_add_u32',
+                   'v_lshlrev_b32', 'v_lshlrev_b64', 'v_ashrrev_i32', 'v_cvt_u32_f32'}
+
+    def regs(tokens):
+        return {reg for reg in ImageLoadProof.mentions(tokens) if reg.startswith('v')}
+
+    while pending:
+        pc = pending.pop()
+        tainted, must_taint, stale_vcc = incoming[pc]
+        tainted, must_taint = tainted.copy(), set(must_taint)
+        if pc not in by_pc:
+            raise Unsupported('program image control flow leaves executable code')
+        _, size, name, asm = by_pc[pc]
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        reads_s, writes_s, may_s = scalar_effects(name, asm)
+        if pc in pairs or pc in high_pairs:
+            # The high half is the only permitted consumer of the erased carry.
+            if pc in pairs and regs(ops[2:]) & tainted.keys():
+                raise Unsupported('program image address uses an elided vector word')
+            if pc in high_pairs and regs(ops[2:4]) & tainted.keys():
+                raise Unsupported('program image address high word escapes')
+            dst = ops[0]
+            tainted[dst] = tainted.get(dst, False)
+            must_taint.add(dst)
+            stale_vcc = True
+        else:
+            if stale_vcc and reads_s & {'vcc', 'vcc_hi', 's106', 's107'}:
+                raise Unsupported('program image vector carry escapes')
+            if 'vcc' in writes_s and 'vcc_hi' in may_s:
+                stale_vcc = False
+            if writes_exec(name, ops):
+                tainted = dict.fromkeys(tainted, True)
+            if ('movrel' in name or 'swaprel' in name) and tainted:
+                raise Unsupported('program image address meets indirect register access')
+            can_write = (not mods and (base in full_vector or base.startswith((
+                'global_load_', 'flat_load_', 'buffer_load_', 'tbuffer_load_', 'image_load_')))
+                         and 'd16' not in base)
+            if pc in loads:
+                addr = reg_range(ops[1])
+                required = {'v%d' % addr[1], 'v%d' % addr[2]}
+                if not required <= must_taint:
+                    raise Unsupported('program image load is not dominated by its address')
+                read_regs = set()
+                can_write = True
+            elif can_write:
+                read_regs = regs(ops[1:])
+            else:
+                read_regs = regs(ops)
+            if read_regs & tainted.keys():
+                raise Unsupported('program image address word escapes')
+            if can_write:
+                for reg in regs(destinations(base, ops)):
+                    if not tainted.get(reg, True):
+                        tainted.pop(reg, None)
+                        must_taint.discard(reg)
+        successors = []
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            target = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
+            if not target:
+                raise Unsupported('program image unsupported branch')
+            successors.append(int(target.group(1), 16))
+        if name not in ('s_branch', 's_endpgm'):
+            successors.append(pc + size)
+        for target in successors:
+            previous = incoming.get(target)
+            if previous is None:
+                merged = (tainted.copy(), frozenset(must_taint), stale_vcc)
+            else:
+                old, old_must, old_vcc = previous
+                merged = ({reg: old.get(reg, False) or tainted.get(reg, False)
+                           for reg in old.keys() | tainted.keys()},
+                          old_must & must_taint, old_vcc or stale_vcc)
+            if previous != merged:
+                incoming[target] = merged
+                pending.append(target)
+
+
+
+def vertex_image_plan(code):
+    """Return an image plan only for a validated vertex tail with GLOBAL loads."""
+    from pixel_aot import _vertex_getpc_tail
+    aligned = code[:len(code) & ~3]
+    words = tuple(word for word, in struct.iter_unpack('<I', aligned))
+    if (not any(word & 0xff80ffff == 0xbe801f00 for word in words)
+            or not any(word & 0xfc000000 == 0xdc000000 for word in words)):
+        return None
+    boundary = _vertex_getpc_tail(code, native_instructions,
+                                  vertex_fetch=struct.pack('<I', FETCH_CALL), mesh_layout=True)
+    if not boundary:
+        return None
+    end, start = boundary
+    ins = decode(code[:end])
+    if not any(name == 'global_load_dword' for _, _, name, _ in ins):
+        return None
+    getpc = vertex_image_getpc_proof(code, ins)
+    if getpc[0] != start:
+        raise Unsupported('vertex program image: inconsistent table start')
+    loads = vertex_image_address_proof(ins, getpc)
+    vertex_image_elision_proof(ins, getpc, loads)
+    capture = {}
+    by_pc = {pc: asm for pc, _, _, asm in ins}
+    for _, shift_pc, _ in loads.values():
+        _, ops, _ = parse(by_pc[shift_pc])
+        reg = reg_range(ops[0])
+        capture[shift_pc] = 'v%d' % reg[1]
+    skipped = set(getpc[2]) | set(getpc[3]) | set(getpc[3].values())
+    return {'ins': ins, 'words': getpc[1], 'loads': loads, 'capture': capture, 'skip': skipped}
+
+
+def vertex_image_range_facts(ins):
+    """Bounds immediately before decoded instructions; discard unmodelled joins.
+
+    This is a forward-only dataflow building block, not an address proof. Callers
+    must still validate every use and overwrite of the GETPC-derived words.
+    """
+    from vertex_image_ranges import VertexImageRanges
+
+    targets = set()
+    last_load = max((pc for pc, _, name, _ in ins if name == 'global_load_dword'), default=-1)
+    for pc, size, name, asm in ins:
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            _, ops, _ = parse(asm)
+            match = len(ops) == 1 and re.fullmatch(r'label_0x([0-9a-f]+)', ops[0])
+            if not match:
+                return {}
+            target = int(match.group(1), 16)
+            if target <= pc and target <= last_load:
+                return {}  # A loop reaching a load needs an invariant.
+            targets.add(target)
+        elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap', 's_endpgm_')):
+            return {}
+
+    facts = VertexImageRanges()
+    result = {}
+
+    def float_constant(token):
+        try:
+            if token.startswith('0x'):
+                return struct.unpack('<f', struct.pack('<I', int(token, 16)))[0]
+            if token in ('0.5', '1.0', '2.0', '4.0'):
+                return FLOATS[token]
+        except (ValueError, OverflowError, struct.error):
+            pass
+        return None
+
+    clear_next = False
+    for pc, size, name, asm in ins:
+        if pc in targets or clear_next:
+            facts.exec_changed()
+        clear_next = name in ('s_branch', 's_endpgm')
+        result[pc] = facts.facts.copy()
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        if base == 'v_cmpx_ne_u32' and len(ops) == 2 and not mods:
+            constant = pc_word(ops[0])
+            if constant is not None and re.fullmatch(r'v\d+', ops[1]):
+                facts.cmpx_ne(ops[1], constant & 0xffffffff)
+                continue
+        if writes_exec(name, ops) or 'movrel' in name or 'swaprel' in name:
+            facts.exec_changed()
+        if not ops:
+            continue
+        written = set()
+        dests = destinations(base, ops)
+        if base == 'v_swap_b32' and len(ops) >= 2:
+            dests = ops[:2]
+        for op in dests:
+            reg = reg_range(op)
+            if reg and reg[0] == 'v':
+                written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
+        if base.startswith('v_cmp'):
+            written.clear()
+        before = facts.facts.copy()
+        facts.forget(*written)
+        # Model only full-register, unmodified instructions.
+        if base.startswith('tbuffer_load_format_') and len(ops) == 4:
+            formats = [m for m in mods if m.startswith('format:')]
+            if (len(formats) == 1 and re.fullmatch(r'format:\[BUF_FMT_(?:8(?:_8){0,3}|16(?:_16){0,3})_UNORM\]', formats[0])
+                    and all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith(('format:', 'offset:'))
+                            for m in mods) and written):
+                facts.unorm(*written)
+        elif not mods and base == 'v_cvt_u32_f32' and len(ops) == 2 and ops[1] in before:
+            facts.facts[ops[1]] = before[ops[1]]
+            facts.cvt_u32(ops[0], ops[1])
+        elif not mods and base == 'v_fma_f32' and len(ops) == 4:
+            for source, multiplier in ((ops[1], ops[2]), (ops[2], ops[1])):
+                mul, add = float_constant(multiplier), float_constant(ops[3])
+                # With a [0, 1] input the maximal product is exactly the
+                # binary32 multiplier, even if the compiler separates the FMA.
+                if before.get(source) == ('float', 0, 1) and mul is not None and add is not None:
+                    facts.facts[source] = before[source]
+                    facts.fma(ops[0], source, mul, add)
+                    break
+        elif not mods and base in ('v_lshl_add_u32', 'v_add_nc_u32', 'v_mul_u32_u24'):
+            # Capture sources before invalidating a destination that aliases one.
+            def old(token):
+                value = pc_word(token)
+                return ('uint', value & 0xffffffff, value & 0xffffffff) if value is not None else before.get(token)
+            a = old(ops[1]) if len(ops) > 1 else None
+            b = old(ops[2]) if len(ops) > 2 else None
+            c = old(ops[3]) if len(ops) > 3 else None
+            if base == 'v_lshl_add_u32' and len(ops) == 4 and a and b and c and b[1] == b[2] and b[2] < 32:
+                if a[0] == b[0] == c[0] == 'uint':
+                    facts.integer(ops[0], (a[1] << b[1]) + c[1], (a[2] << b[1]) + c[2])
+            elif base == 'v_add_nc_u32' and len(ops) == 3 and a and b and a[0] == b[0] == 'uint':
+                facts.integer(ops[0], a[1] + b[1], a[2] + b[2])
+            elif base == 'v_mul_u32_u24' and len(ops) == 3 and a and b and a[0] == b[0] == 'uint':
+                if a[2] < 1 << 24 and b[2] < 1 << 24:
+                    facts.integer(ops[0], a[1] * b[1], a[2] * b[2])
+    return result
+
+
 class ImageAccessRefusal(Unsupported):
     """A proved program-image use that cannot be lowered."""
 
@@ -4949,9 +5410,12 @@ class Stage:
         self.raw_code = strip_header(code)
         self.image_proof = None
         self.image_tables = {}
+        self.vertex_image = vertex_image_plan(self.raw_code) if kind == 'vs' else None
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
-        if self.image_proof is None:
+        if self.vertex_image is not None:
+            self.ins = self.vertex_image['ins']
+        elif self.image_proof is None:
             self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs',
                                embedded_pixel=kind == 'ps')
                         if refusals is None or decoded is None else decoded)
@@ -7536,7 +8000,10 @@ class Stage:
         vcc_compares = set().union(*vcc_branches.values())
         try:
             image = getattr(self, 'image_proof', None)
-            self.calculated_pc = image.lowered if image else calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+            vertex_image = getattr(self, 'vertex_image', None)
+            self.calculated_pc = (image.lowered if image else
+                                  dict.fromkeys(vertex_image['skip']) if vertex_image else
+                                  calculated_pc_proof(self.ins, getattr(self, 'kind', None)))
         except Unsupported as reason:
             if refusals is None:
                 raise
@@ -7742,6 +8209,7 @@ class Stage:
             self.fetched = False
             self.uniform_v = set()
             self.firstlane_v = set()
+            self.firstlane_masks = set()
             self.firstlane_ps_load_v = set()
             firstlane_edges = {}
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
@@ -9108,13 +9576,30 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        masks = getattr(self, 'firstlane_masks', None)
+        cfg = getattr(self, 'spill_cfg', None)
+        ins = getattr(self, 'ins', ())
+        if masks and cfg and any(lo < len(ins) and ins[lo][0] == getattr(self, 'pc', None) for lo, _ in cfg[0]):
+            masks.clear()
         if writes_exec(name, ops, mods):
             self.exec_generation += 1
+        vertex_image = getattr(self, 'vertex_image', None)
+        if vertex_image:
+            if self.pc in vertex_image['capture']:
+                self.emit('x2w_image_index_%x = %s;' % (self.pc, self.u(vertex_image['capture'][self.pc])))
+            if self.pc in vertex_image['loads']:
+                dst, shift_pc, _ = vertex_image['loads'][self.pc]
+                self.set_v(int(dst[1:]), 'x2w_image_table[x2w_image_index_%x]' % shift_pc)
+                return None
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
+            if masks is not None:
+                masks.clear()
             return self.lower_image_instruction(image, name, asm, ops, mods)
         pixel_table = getattr(self, 'pixel_table', None)
         if pixel_table and self.pc == pixel_table[1]:
+            if masks is not None:
+                masks.clear()
             _, _, first, words = pixel_table
             for reg, word in enumerate(words, first):
                 self.set_s(reg, '0x%08xu' % word, ('const', word))
@@ -9205,10 +9690,39 @@ class Stage:
         extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
         extra_regs = ()
         ps_load_regs = ()
+        # AMD RDNA 2 ISA guide, 3.9 VCC, p.19: compares produce a lane mask. Equal inputs give equal active bits.
+        # Keep these facts within one basic block, and invalidate them on any overlapping scalar write.
+        masks = getattr(self, 'firstlane_masks', None)
+        mask_enabled = (masks is not None and getattr(self, 'kind', None) == 'ps'
+                        and getattr(self, 'firstlane_cfg', False)
+                        and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ())))
+        def mask_key(token):
+            if token in ('vcc', 'vcc_lo'):
+                return 'vcc'
+            reg = reg_range(token)
+            if reg and reg[0] == 's' and reg[2] - reg[1] in (0, 1):
+                return 's%d' % reg[1]
+            return None
+        next_mask = None
         entry_proof = (extra_proof and self.uniform_entry_exec()
                        and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec))
         pixel_full = extra_proof and self.pc in getattr(self, 'firstlane_ps_full_exec', ())
+        if mask_enabled and entry_proof:
+            if (base.startswith('v_cmp_') and not mods and len(ops) == 3
+                    and mask_key(ops[0]) is not None
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
+            elif (base == 's_or_b64' and not mods and len(ops) == 3
+                  and mask_key(ops[0]) is not None
+                  and all(mask_key(tok) in masks for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
         if entry_proof or pixel_full:
+            if (entry_proof and mask_enabled and base == 'v_cndmask_b32' and not mods
+                    and len(ops) in (3, 4) and mask_key(ops[3] if len(ops) == 4 else 'vcc') in masks
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:3])):
+                dest = reg_range(ops[0])
+                if dest and dest[0] == 'v' and dest[1] == dest[2]:
+                    extra_regs = (dest[1],)
             # Table-driven VALU operations use only their explicit operands and, for the
             # accumulator forms, the old destination. No lane selectors or mask operands.
             if entry_proof and (base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU):
@@ -9254,12 +9768,30 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if mask_enabled:
+            _, _, written_masks = scalar_effects(name, asm)
+            if writes_exec(name, ops) or 'any' in scalar_destinations(name, asm):
+                masks.clear()
+            else:
+                for key in tuple(masks):
+                    if key == 'vcc':
+                        overlaps = bool({'vcc', 'vcc_hi'} & written_masks)
+                    else:
+                        reg = int(key[1:])
+                        overlaps = bool({'s%d' % reg, 's%d' % (reg + 1)} & written_masks)
+                    if overlaps:
+                        masks.discard(key)
+            if next_mask is not None:
+                masks.add(next_mask)
         if extra_proof:
             for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
+            if (entry_proof and loaded_regs and getattr(self, 'kind', None) == 'ps'
+                    and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in getattr(self, 'ins', ()))):
+                self.firstlane_v.update(loaded_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods)):
@@ -12259,7 +12791,7 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods, *, dynamic=False):
+    def buffer_address(self, ops, mods, *, dynamic=False, heap_format=False):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -12277,10 +12809,13 @@ class Stage:
             key, buf = None, 'embedded_vs_load'
         else:
             key = self.descriptor(ops[2])
-            buf = None if key is None or (dynamic and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
+            buf = None if key is None or ((dynamic or heap_format) and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
         soffset = None
+        immediate_offset = offset
+        literal_soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            offset += int(ops[3], 0)
+            literal_soffset = int(ops[3], 0)
+            offset += literal_soffset
         else:
             sreg = reg_range(ops[3])
             if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
@@ -12288,7 +12823,8 @@ class Stage:
             soffset = self.S(sreg[1])
         idxen, offen = 'idxen' in mods, 'offen' in mods
         terms = []
-        if idxen and buf is None and key is not None:
+        index_term = None
+        if idxen and buf is None and key is not None and not (heap_format and key[0][0] == 'dynamic_heap'):
             raise Unsupported('indexed load through a dynamic resource heap descriptor')
         if idxen and offen:
             if key in self.pipe.modified:
@@ -12296,8 +12832,9 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
-            terms.append('%s * %s' % (self.u('v%d' % r[1]), stride))
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
+            index_term = self.u('v%d' % r[1])
+            terms.append('%s * %s' % (index_term, stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
             if key in self.pipe.modified:
@@ -12305,8 +12842,9 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
-            terms.append('%s * %s' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
+            index_term = getattr(self, 'uniform_vaddr', None) or self.u(ops[1])
+            terms.append('%s * %s' % (index_term, stride))
         elif offen:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
@@ -12321,7 +12859,14 @@ class Stage:
             # a large byte offset back into the table.
             return buf, '%s, %s, %du' % (terms[0] if offen else '0u', soffset or '0u', offset)
         terms.append('%d' % offset)
-        return buf if buf is not None else key, ' + '.join(terms)
+        result = (buf if buf is not None else key, ' + '.join(terms))
+        if heap_format:
+            addends = terms[1:-1] if idxen else terms[:-1]
+            if literal_soffset is not None:
+                addends.append('%du' % literal_soffset)
+            addends.append('%du' % immediate_offset)
+            return (*result, index_term, addends)
+        return result
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         # ops[0] is read before buffer_address() can refuse a short operand list, so an instruction with no
@@ -12926,7 +13471,7 @@ class Stage:
         Compute also accepts proven heap records. A view token needs a decoded format before dispatch, while
         an unknown format in a native heap record returns zero in every destination.
         """
-        buf, address = self.buffer_address(ops, mods)
+        buf, address, address_index, address_addends = self.buffer_address(ops, mods, heap_format=True)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
@@ -12938,17 +13483,42 @@ class Stage:
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
         source = first[1][0] if first and first[0] in ('desc', 'ptr') else None
+        dynamic = source == 'dynamic_heap'
         heap = source == 'resheap' and getattr(self, 'kind', None) == 'cs'
-        if source not in (None, 'table') and not heap:
+        if source not in (None, 'table') and not heap and not dynamic:
             raise Unsupported('formatted buffer load requires a hardware table descriptor (source: %s)' % source)
         if (not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc'
                 or not names_one_value(first) or any(
                     self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
-        if not heap and self.past_entry and not self.formatted_descriptor_from_block(r, first):
+        if dynamic and (len(first[1]) != 2 or first[2] != 0 or (first[1], first[2]) in self.pipe.modified or (first[1], first[2]) in self.pipe.other_modified):
+            raise Unsupported('dynamic resource heap views require a raw buffer load')
+        if not heap and not dynamic and self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
-        self.emit('a = %s;' % address)
+        if dynamic:
+            # RDNA 2 ISA, sections 8.1.2 and 8.1.8: MUBUF obtains FORMAT and
+            # DST_SEL from the resource descriptor. Section 8.1.5 defines the
+            # indexed address using its stride.
+            self.pipe.uses_dynamic_heap = True
+            self.pipe.uses_dynamic_heap_formats = True
+            index = first[1][1]
+            self.emit('{ uint2 info = x2w_heap_info(%s);' % index)
+            self.emit('ByteAddressBuffer hb = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];' % (index, index))
+            buf, word3 = 'hb', 'format_word'
+            self.emit('uint format_word = info.y;')
+            if address_index is not None:
+                self.emit('bool address_overflow = info.x != 0u && %s > 0xffffffffu / info.x;' % address_index)
+                self.emit('a = %s * info.x;' % address_index)
+            else:
+                self.emit('bool address_overflow = false;')
+                self.emit('a = 0u;')
+            for term in address_addends:
+                self.emit('{ uint previous = a; a += %s; address_overflow = address_overflow || a < previous; }' % term)
+            self.emit('if (address_overflow) format_word = 0u;')
+        else:
+            word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
+        if not dynamic:
+            self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
         extended = extended_buffer_formats()
@@ -12963,7 +13533,7 @@ class Stage:
             if fmt in DESC_ONE_INTEGER:
                 body.append('one = 1u;')
             self.emit('case %du: %s break;' % (code, ' '.join(body)))
-        if heap:
+        if heap or dynamic:
             self.emit('default: one = 0u; break; }')
         else:
             self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
@@ -12972,6 +13542,8 @@ class Stage:
             self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
                        % (sel, sel, sel, sel, sel))
         self.emit('}')
+        if dynamic:
+            self.emit('}')
 
     def op_buffer_load_format_x(self, ops, mods):
         self.mubuf_format(ops, mods, 1)
@@ -13081,16 +13653,55 @@ class Stage:
             uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
+    def pixel_store_constant_index(self, position):
+        """Prove the last index write within this store's basic block."""
+        name = 'buffer_store_format_xyzw'
+        ins = getattr(self, 'ins', ())
+        cfg = getattr(self, 'spill_cfg', None)
+        if not cfg or not 0 <= position < len(ins) or position not in cfg[1]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        args = parse(ins[position][3])[1]
+        index = reg_range(args[1]) if len(args) > 1 else None
+        if not index or index[0] != 'v' or index[1] != index[2]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        bounds, block_of, _, _ = cfg
+        lo, _ = bounds[block_of[position]]
+        for _, _, op, asm in reversed(ins[lo:position]):
+            _, operands, mods = parse(asm)
+            if writes_exec(op, operands) or op.startswith(('v_movrel', 'v_accvgpr_write')):
+                break
+            if op.startswith(INTERP_STORE_PREFIXES) or op.startswith(('v_cmp', 'exp')):
+                continue
+            dest = operands[:2] if op.startswith('v_swap_b32') else destinations(op, operands)
+            for token in dest:
+                reg = reg_range(token)
+                if not reg or reg[0] != 'v':
+                    continue
+                hi = reg[2]
+                if reg[1] == hi and re.search(r'(?:b|i|u|f)64(?:_|$)', op):
+                    hi += 1
+                if reg[1] <= index[1] <= hi:
+                    if (re.sub(r'_e(32|64)$', '', op) == 'v_mov_b32' and not mods
+                            and len(operands) == 2 and operands[0] == args[1]):
+                        literal = operands[1]
+                        if re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', literal):
+                            return int(literal, 0) & 0xffffffff
+                        if literal in FLOATS:
+                            return fbits(FLOATS[literal])
+                    raise Unsupported(name + ' index not proven constant in the same basic block')
+        raise Unsupported(name + ' index not proven constant in the same basic block')
+
     def op_buffer_store_format_xyzw(self, ops, mods):
-        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+        """Lower MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
 
         FORMAT, stride and num_records are read at dispatch from the same entry constants as
         buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
         name = 'buffer_store_format_xyzw'
-        if self.kind != 'cs':
-            raise Unsupported(name)  # the unknown-op refusal
+        if getattr(self, 'kind', None) != 'cs' and not (
+                getattr(self, 'kind', None) == 'ps' and getattr(getattr(self, 'pipe', None), 'pixel_formatted_stores', False)):
+            raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
         if raw and pc is not None and pc + 8 <= len(raw):
@@ -13132,9 +13743,23 @@ class Stage:
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        if getattr(self, 'kind', None) == 'ps':
+            if int(ops[3], 0) or (imm_offset or 0):
+                raise Unsupported(name + ' pixel store requires zero offsets')
+            stores = [i for i, item in enumerate(getattr(self, 'ins', ())) if item[2] == name]
+            indices = [self.pixel_store_constant_index(pos) for pos in stores]
+            if len(indices) != len(set(indices)):
+                raise Unsupported(name + ' pixel stores have overlapping indices')
+            if (not getattr(self, 'firstlane_cfg', False) or not getattr(self, 'uniform_cf', False) or not self.uniform_entry_exec()
+                    or not all(n in getattr(self, 'firstlane_v', ()) for n in range(src[1], src[2] + 1))):
+                raise Unsupported(name + ' data not proven wave-uniform')
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        if getattr(self, 'kind', None) == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
+            raise Unsupported('%s shares a vertex UAV' % name)
         uav = self.pipe.uav(key, 'raw')
+        if getattr(self, 'kind', None) == 'ps':
+            self.pipe.uavs[key]['pixel_format'] = True
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
@@ -13142,7 +13767,8 @@ class Stage:
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
             uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
-        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+        # D3D pixel helper invocations have no UAV side effects. Also honor the guest's per-lane EXEC bit.
+        self.emit(call if getattr(self, 'kind', None) == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -18018,12 +18644,14 @@ class PixelImageConflict(Unsupported):
 class Pipeline:
     vertex_kind = 'vs'
     uses_dynamic_heap = False
+    uses_dynamic_heap_formats = False
     uses_pack16_rne = False
     uses_gather_2d_lod = False
     uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
+    pixel_formatted_stores = False
     srv_formats = ()
     integer_texture_srvs = False
     typed_srvs = False  # a Texture2DArray input (compute gather) needs the runtime's typed-SRV binding
@@ -18082,10 +18710,11 @@ class Pipeline:
         try:
             stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
         except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
+            if str(reason) not in (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform'):
                 raise
         else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+            retry_reasons = (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform')
+            if refusals is None or not any((reason, 'ps') in refusals[before:] for reason in retry_reasons):
                 return stage
         self.__dict__.clear()
         self.__dict__.update(state)
@@ -18118,6 +18747,7 @@ class Pipeline:
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), *, pixel_refusal=None):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
+        self.pixel_formatted_stores = self.vertex_kind == 'vs'
         self.rect = self.ud(('rect',))
         if self.vertex_kind == 'ms':
             self.mesh_pixel_writes = ps_code is not None and mesh_pixel_memory_writes(
@@ -18416,6 +19046,12 @@ class Pipeline:
                     '    if (index >= heap_count) return 0u;',
                     '    ByteAddressBuffer buffer = ResourceDescriptorHeap[NonUniformResourceIndex(index)];',
                     '    return buffer.Load(address);',
+                    '}']
+        if self.uses_dynamic_heap_formats:
+            out += ['uint2 x2w_heap_info(uint index) {',
+                    '    if (index >= heap_count) return uint2(0u, 0u);',
+                    '    ByteAddressBuffer info = ResourceDescriptorHeap[heap_count];',
+                    '    return info.Load2(index * 8u);',
                     '}']
         for r, reg, entry in twins:
             kind = {'tex1d': 'Texture1D', 'tex2d': 'Texture2D', 'tex2da': 'Texture2DArray', 'tex3d': 'Texture3D'}[r['kind']]
@@ -18792,6 +19428,10 @@ class Pipeline:
                 '    return embedded_vs_scalar[a >> 2u];',
                 '}',
             ]
+        image = getattr(self.vs, 'vertex_image', None) if embedded_vertex else None
+        if image:
+            out.append('static const uint x2w_image_table[%d] = { %s };' %
+                       (len(image['words']), ', '.join('0x%08xu' % word for word in image['words'])))
         return out
 
     def interface(self, for_pixel):
@@ -18831,7 +19471,9 @@ class Pipeline:
                                           'before the first branch defines' % min(unwritten))
                     if target and index == 0 and start == 0:
                         written.add(int(target.group(1)))
-        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
+        captures = (['    uint x2w_image_index_%x = 0u;' % pc for pc in s.vertex_image['capture']]
+                    if s.vertex_image else [])
+        out += s.declarations() + captures + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
             '    if (ud%d == 0) return body(vid);' % self.rect,
@@ -18886,6 +19528,8 @@ class Pipeline:
             lines.append('dynamic_heap')
             if any(getattr(stage, 'uses_dynamic_heap_images', False) for stage in (getattr(self, 'vs', None), self.ps)):
                 lines.append('dynamic_heap_images')
+        if self.uses_dynamic_heap_formats:
+            lines.append('dynamic_heap_formats')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())
@@ -19148,6 +19792,8 @@ class ComputePipeline(Pipeline):
         lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+        if self.uses_dynamic_heap_formats:
+            lines.append('dynamic_heap_formats')
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
         lines.extend(self.integer_srv_manifest())
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
@@ -19643,7 +20289,14 @@ def classify_decoded(ins):
 
 
 def classify(blob):
-    return classify_decoded(decode(strip_header(blob), embedded_vertex=True, embedded_pixel=True))
+    code = strip_header(blob)
+    try:
+        return classify_decoded(decode(code, embedded_vertex=True, embedded_pixel=True))
+    except Unsupported:
+        plan = vertex_image_plan(code)
+        if plan is None:
+            raise
+        return classify_decoded(plan['ins'])
 
 
 def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
@@ -19663,7 +20316,13 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
                     else:
                         return 'ps'
                 raise
-        ins = decode(strip_header(blob), refusals, embedded_vertex=True, embedded_pixel=True)
+        code = strip_header(blob)
+        plan = vertex_image_plan(code)
+        if plan is not None:
+            kind = classify_decoded(plan['ins'])
+            decoded[kind] = plan['ins']
+            return kind
+        ins = decode(code, refusals, embedded_vertex=True, embedded_pixel=True)
         kind = classify_decoded(ins)
         decoded[kind] = ins
         return kind
@@ -20279,6 +20938,7 @@ LIFTED_REASONS = (
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),
+    ('pixel-formatted-store', r'^buffer_store_format_xyzw$'),
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),
