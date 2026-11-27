@@ -3104,7 +3104,8 @@ class Stage:
         if (len(jumps) != 2 or pipe is None or getattr(pipe, 'wave_size', None) == 64
                 or not wave32_exec_proof(self.ins)):
             return None
-        lanes = math.prod(pipe.group)
+        group = getattr(pipe, 'group', None)
+        lanes = math.prod(group) if group else 0
         # Reserve room for the vote and a possible DPP exchange in the 32 KiB shared-memory budget.
         if not 0 < lanes <= 32 or getattr(pipe, 'lds_words', 0) + 2 * lanes > 8192:
             return None
