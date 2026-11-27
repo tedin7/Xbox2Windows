@@ -18,19 +18,26 @@ Controls, each of which must stay refused:
 The words are encoded from the SOP1 / SOP2 / SOPC / SOPP, SMEM and MUBUF field layouts that
 `tools/disasm_rdna2.py` decodes. The first test below checks them against the decoded text.
 """
+import hashlib
 import re
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from startup_gfx2hlsl_dynamic_heap_check import G, root_blob, compile_shader
+from startup_gfx2hlsl_heap_record_check import root_blob as table_root_blob
 from startup_flat_param_check import PS_WORDS, VS_WORDS
 
 
 def sop1(op, dst, src):
     return struct.pack('<I', 0xBE800000 | (dst << 16) | (op << 8) | src)
+
+
+def sop2(op, dst, a, b):
+    return struct.pack('<I', 0x80000000 | (op << 23) | (dst << 16) | (b << 8) | a)
 
 
 def sopc(op, a, b):
@@ -41,8 +48,8 @@ def sopp(op, imm=0):
     return struct.pack('<I', 0xBF800000 | (op << 16) | (imm & 0xFFFF))
 
 
-def smem(op, sdata, sbase, soffset):
-    return struct.pack('<II', 0xF4000000 | (op << 18) | (sdata << 6) | (sbase >> 1), soffset << 25)
+def smem(op, sdata, sbase, soffset, imm=0):
+    return struct.pack('<II', 0xF4000000 | (op << 18) | (sdata << 6) | (sbase >> 1), (soffset << 25) | imm)
 
 
 def mubuf(op, vdata, vaddr, srsrc):
@@ -139,6 +146,25 @@ def vertex_image(record=IMAGE_RECORD, read=IMAGE_READ):
     return vertex_copy([record, sopp(S_WAITCNT, LGKM0), COND_ONE, 'join', IMAGE_COORDS, read, sopp(S_WAITCNT, VM0)])
 
 
+def vertex_image_loop(back=4, next_counter=b''):
+    # Load a fixed root-table descriptor, then narrow EXEC using the vertex ID. The tested triangle's IDs all pass.
+    setup = (sop1(S_MOV_B32, 14, 11) + sop1(S_MOV_B32, 15, ZERO) + smem(0x02, 24, 14, 125)
+             + sopp(S_WAITCNT, LGKM0) + sop1(S_MOV_B32, 13, ZERO) + sop1(S_MOV_B32, 45, ZERO)
+             + IMAGE_COORDS + bytes.fromhex('8002107e7e039ebe8000267d'))  # sum=0, save EXEC, v_cmpx_le_i32 0, v0
+    body = (sop2(0x1e, 51, 45, 130) + smem(0x08, 23, 24, 51) + sopp(S_WAITCNT, LGKM0)
+            + sop2(0x1e, 23, 23, 133) + smem(0x03, 16, 12, 23) + sopp(S_WAITCNT, LGKM0)
+            + bytes.fromhex('080100f00c0e0400') + sopp(S_WAITCNT, VM0)  # image_load v14
+            + struct.pack('<I', (0x03 << 25) | (8 << 17) | (8 << 9) | (256 + 14))
+            + sop2(0x00, 45, 45, ONE) + sopc(S_CMP_EQ_U32, 45, 9) + next_counter)
+    return (HEAD + setup + sopp(8, len(body) // 4 + 1) + body + sopp(back, -(len(body) // 4 + 1))
+            + sop1(S_MOV_B32, 126, 30) + COPY_V8 + EXPORTS)
+
+
+def translate_image_loop(words):
+    pipe = G.Pipeline(words, PS_WORDS, table_root_blob(True))
+    return pipe, pipe.hlsl_vs(), pipe.hlsl_ps()
+
+
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
 # picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
 # index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
@@ -184,6 +210,7 @@ def expect(label, condition, detail=''):
 
 def main(dxc=None):
     vertex_image_control()
+    vertex_image_loop_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
     tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
@@ -299,6 +326,50 @@ def warp_image(offscreen, dxc):
         draw(offscreen, wrong, ps, 96, 0x3fa00000, count, negative=True, heap_count=5)
 
 
+def vertex_image_loop_control():
+    words = vertex_image_loop()
+    pipe, vs, ps = translate_image_loop(words)
+    assert pipe.vs.loop_uniform is not None
+    assert 'dynamic_heap\n' in pipe.manifest() and 'srv 0' in pipe.manifest()
+    assert '[loop] for' in vs and '.Load(' in vs and re.search(r'\(s23 \+ 0u\) >> 5;', vs)
+    with patch.object(G.Stage, 'retry_loop_uniform', return_value=False):
+        try:
+            translate_image_loop(words)
+        except G.Unsupported as reason:
+            assert 'register offset through' in str(reason), str(reason)
+        else:
+            raise AssertionError('the loop translated without the retry')
+    for bad in (vertex_image_loop(back=6), vertex_image_loop(back=8),
+                vertex_image_loop(next_counter=sop1(S_MOV_B32, 45, VCC_LO))):
+        try:
+            translate_image_loop(bad)
+        except G.Unsupported as reason:
+            assert 'register offset through' in str(reason), str(reason)
+        else:
+            raise AssertionError('the loop with an unproved edge translated')
+    old, old_vs, old_ps = translate(LOOP_VS)
+    assert old.vs.loop_uniform is None
+    assert [hashlib.sha256(x.encode()).hexdigest() for x in (old_vs, old_ps, old.manifest())] == [
+        'b6729f75ee319bec8177de1d2f3e68496bfc3b9548bbc483dcef8c684e4297cd',
+        '834e3ce1d54b3ffbaae9da19647ae684f64a31b20e2fff7a12c4634664fc16f9',
+        'b9eb3cb0811ceb855942b96467c0dea4a9b5c6e040da2fdc2d2de49a738d7b25',
+    ]
+    return pipe, vs, ps
+
+
+def warp_image_loop(offscreen, dxc):
+    pipe, source, ps_source = vertex_image_loop_control()
+    count = len(pipe.uds)
+    expected, = struct.unpack('<I', struct.pack('<f', sum((1.25, 16.0))))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        draw(offscreen, vs, ps, 0, expected, count, heap_count=8)
+        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, '(s23 + 0u) >> 5;', '(s23 + 0u) >> 6;'))
+        draw(offscreen, wrong, ps, 0, expected, count, negative=True, heap_count=8)
+
+
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
@@ -323,5 +394,7 @@ if __name__ == '__main__':
         warp(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-image']:
         warp_image(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-image-loop']:
+        warp_image_loop(*sys.argv[2:4])
     else:
         main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())

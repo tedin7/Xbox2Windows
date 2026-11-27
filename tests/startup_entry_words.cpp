@@ -37,14 +37,17 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
 
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.Constants = {0, 0, entry_count};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, entry_count};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor = {0, 0};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     if (dynamic_heap) rs.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
-    rs.NumParameters = 1;
-    rs.pParameters = &param;
+    rs.NumParameters = dynamic_heap ? 2 : 1;
+    rs.pParameters = params;
     ComPtr<ID3DBlob> signature, errors;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)))
         throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer())
@@ -97,18 +100,22 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     ComPtr<ID3D12Resource> source;
     ComPtr<ID3D12DescriptorHeap> views, image_rtvs;
     ComPtr<ID3D12Resource> images[2];
+    constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
+    constexpr UINT index_table_offset = 3 * buffer_stride;
     if (dynamic_heap) {
         constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
-        constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
-        source = make_buffer(device, 3 * buffer_stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        constexpr std::uint32_t image_indices[]{6, 7};
+        source = make_buffer(device, index_table_offset + sizeof(image_indices), D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
         const D3D12_RANGE none{0, 0};
         check(source->Map(0, &none, &mapped), "Map heap fixture input");
         for (UINT i = 0; i < 3; ++i)
             std::memcpy(static_cast<unsigned char*>(mapped) + i * buffer_stride, values + i, sizeof(values[i]));
+        std::memcpy(static_cast<unsigned char*>(mapped) + index_table_offset, image_indices, sizeof(image_indices));
         source->Unmap(0, nullptr);
-        // Slots 0..2 are raw buffers; slots 3 and 4 are 1x1 float textures holding one distinct texel each.
-        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
+        // Slots 0..2 are raw buffers. Slots 3 and 4 are textures, repeated at 6 and 7 for the shift control.
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create raw fixture heap");
         auto cpu = views->GetCPUDescriptorHandleForHeapStart();
@@ -145,12 +152,16 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
                                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
             view.Texture2D = {0, 1, 0, 0.0f};
             device->CreateShaderResourceView(images[i].Get(), &view, cpu);
+            auto alias = cpu;
+            alias.ptr += 3 * increment;
+            device->CreateShaderResourceView(images[i].Get(), &view, alias);
         }
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);
     }
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRoot32BitConstants(0, entry_count, entry, 0);
+    if (dynamic_heap) list->SetGraphicsRootShaderResourceView(1, source->GetGPUVirtualAddress() + index_table_offset);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);

@@ -3555,6 +3555,7 @@ class Stage:
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
+        self.loop_uniform = None  # None until a heap load refuses; then loop header -> assumed uniform SGPRs
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -3584,12 +3585,13 @@ class Stage:
             try:
                 self.translate()
             except Unsupported as reason:
-                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))):
+                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
+                        or self.retry_loop_uniform(str(reason))):
                     raise
                 continue
-            if refusals is not None and any(
-                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason))
-                    for reason, stage in refusals[first_refusal:]):
+            reasons = [reason for reason, stage in refusals[first_refusal:] if stage == kind] if refusals is not None else []
+            if (any(self.retry_reduction_exec(reason) or self.retry_join(reason) for reason in reasons)
+                    or any(self.retry_loop_uniform(reason) for reason in reasons)):
                 del refusals[first_refusal:]
                 continue
             if self.retry_join_phi and self.phi_new != self.phi_regs:
@@ -3604,12 +3606,20 @@ class Stage:
                 for reg, kind in regs.items():
                     if have.get(reg) not in (kind, 'refuse'):
                         have[reg], grown = kind, True
-            if not grown:
+            if not grown and not (self.loop_uniform is not None and self.loop_uniform_shrank):
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
+
+    def retry_loop_uniform(self, reason):
+        if (self.loop_uniform is not None or self.kind not in ('vs', 'ps') or not getattr(self, 'loop_headers', ())
+                or reason not in ("s_load with a register offset through ('resheap',)",
+                                  "s_load_dwordx8 with a register offset through ('resheap',)")):
+            return False
+        self.loop_uniform = {}
+        return True
 
     def retry_join(self, reason):
         if self.retry_join_phi or not self.JOINED_NUMERIC.fullmatch(reason):
@@ -5552,6 +5562,8 @@ class Stage:
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
+        self.loop_headers = back_targets
+        loop_uniform = getattr(self, 'loop_uniform', None)
         self.mesh_allocation_block = None
         splits = targets | mesh_reads | mesh_selects
         if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads or mesh_selects):
@@ -5766,6 +5778,7 @@ class Stage:
             materialize = {}
             incoming = {}
             edge_since = {}   # forward branch target -> since_join at each branch to it (None: not tracked)
+            loop_heads, loop_ends, loop_branches = {}, {}, set()
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -5880,6 +5893,17 @@ class Stage:
                         r for r in pre_uniform
                         if r not in clobber or (r not in fwd_clobber and r not in blocked)
                     }
+                    if loop_uniform is not None and off in back_targets:
+                        edges = edge_since.get(off, [])
+                        entries = ([pre_uniform] if falls else []) + [edge or set() for edge in edges]
+                        candidates = set.intersection(*entries) if entries else set()
+                        # Distinct forward paths can each bring a uniform but different value.
+                        if len(entries) > 1:
+                            candidates -= forward_splits.get(off, set())
+                        head = candidates & loop_uniform.get(off, candidates)
+                        loop_heads[off] = head
+                        kept_u = (kept_u - clobber) | head
+                        self.varying_s.difference_update(head)
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
@@ -5919,7 +5943,7 @@ class Stage:
                         paths = firstlane_edges.get(off, [])
                         if falls:
                             paths = paths + [(self.firstlane_v, pre_uniform)]
-                        if paths:
+                        if paths and not (loop_uniform is not None and off in back_targets):
                             self.firstlane_v = set.intersection(*(v for v, _ in paths))
                             scalar_phi = set.intersection(*(u for _, u in paths))
                             if self.kind == 'ps':
@@ -5952,9 +5976,11 @@ class Stage:
                             self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
                         # Only what is proven here: a register can be marked varying without leaving since_join.
+                        edge_facts = self.since_join
+                        if loop_uniform is not None and b_target in back_targets and edge_facts is None:
+                            edge_facts = self.defined_uniform_s
                         edge_since.setdefault(b_target, []).append(
-                            None if getattr(self, 'since_join', None) is None
-                            else self.since_join - self.varying_s - self.masks)
+                            None if edge_facts is None else edge_facts - self.varying_s - self.masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                         if self.firstlane_cfg and self.uniform_cf:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
@@ -5968,6 +5994,11 @@ class Stage:
                             elif sym is not None and back != sym:
                                 self.back_force.setdefault(b_target, {}).setdefault(
                                     reg, 'run' if run_time_symbol(sym) else 'refuse')
+                    if loop_uniform is not None:
+                        if name == 's_branch' or (name in ('s_cbranch_scc0', 's_cbranch_scc1') and self.scc_uniform):
+                            loop_branches.add(off)
+                        if b_target <= off:
+                            loop_ends[off] = self.since_join - self.varying_s - self.masks
                 falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
                 dests = scalar_destinations(name, asm)
                 written |= every_sgpr if 'any' in dests else dests
@@ -6155,6 +6186,21 @@ class Stage:
                 refusals.append((str(self.wave_unsound), self.kind))
             if raised_unsupported is not None:
                 raise raised_unsupported
+            if loop_uniform is not None:
+                # Start with the forward-entry facts and remove any assumption a back edge fails to establish.
+                # Equal scalars at entry and uniform branches preserve equal scalars on each subsequent iteration.
+                # The assumptions only shrink, so the retry terminates, without preserving loop-carried symbols.
+                next_uniform = {head: regs.copy() for head, regs in loop_heads.items()}
+                for end, head in branches:
+                    if head > end:
+                        continue
+                    if (any(head <= branch <= end and branch not in loop_branches for branch, _ in branches)
+                            or any(not head <= branch <= end and head < target <= end for branch, target in branches)):
+                        next_uniform[head].clear()
+                    else:
+                        next_uniform[head].intersection_update(loop_ends[end])
+                self.loop_uniform_shrank = next_uniform != loop_heads
+                self.loop_uniform = next_uniform
             break
         else:
             reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
