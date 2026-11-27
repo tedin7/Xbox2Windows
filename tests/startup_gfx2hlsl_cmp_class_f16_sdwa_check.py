@@ -258,9 +258,14 @@ def controls():
             ('v_cmp_class_f16_sdwa null, v2, v1 src0_sel:WORD_0 src1_sel:DWORD', 'into null'),
             ('v_cmp_class_f16_sdwa vcc_lo, v2 src0_sel:WORD_0 src1_sel:DWORD', 'with 2 operands'),
             ('v_cmpx_class_f16_sdwa vcc_lo, v2, v1 src0_sel:WORD_0 src1_sel:DWORD', 'with 3 operands'),
-            ('v_cmp_lt_f16_sdwa vcc_lo, v2, v1 src0_sel:WORD_0 src1_sel:WORD_0', 'v_cmp_lt_f16_sdwa')):
+            ('v_cmp_lt_f16_sdwa vcc_lo, v2, v1 src0_sel:BYTE_0 src1_sel:WORD_0',
+             'f16 SDWA requires WORD_0 or WORD_1')):
         got = refusal_of(asm.split()[0], asm)
         check('refused: %s (%s)' % (asm, got), got is not None and message in got)
+    code = vopc_sdwa(0xc9, source('v', 2), source('v', 1), None, 'WORD_0', 'WORD_0')
+    asm, stage = translate(code)
+    check('binary16 lt with WORD selectors lowers as a relational compare',
+          'f16tof32' in stage.lines[0] and 'class16(' not in stage.lines[0], asm)
 
     # 4. The reference separates the controls. Each mutated helper, over the whole 16-bit space with upper halves
     # that differ from the low half, must disagree with it; the shipped helper agrees everywhere.
