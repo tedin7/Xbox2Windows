@@ -39,6 +39,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
 sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+import startup_firstlane_pixel_fixture as firstlane_pixel  # noqa: E402
 from startup_flat_param_check import assemble  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, compile_hlsl, root_blob  # noqa: E402
 
@@ -381,12 +382,68 @@ def check_pixel_draw(dxc, runner, shaders):
               run.stdout + run.stderr)
 
 
+def check_firstlane_draw(dxc, runner, hlsl, bindings):
+    def float_word(value):
+        return struct.unpack('<I', struct.pack('<f', value))[0]
+
+    def hex_words(words):
+        return ','.join(f'{word:08x}' for word in words)
+
+    # Include enough backing for the widest format case in the generated switch.
+    values = (97.0, 19.25, 33.0, 41.0, 59.0)
+    fallback = 5.5
+    buffer = hex_words(float_word(value) for value in values)
+    word3 = (G.DESC_FORMAT_CODES['BUF_FMT_32_FLOAT'] << G.DESC_FORMAT_SHIFT) | 4
+    out = Path(here).parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'firstlane_vs', 'vs_6_0', directory)
+
+        def draw(name, shader, flag, mismatch=False):
+            picked = values[1] if flag else fallback
+            scale = 2.0 if flag else 4.0
+            select = scale if flag else 0.5
+            expected = directory / (name + '.bin')
+            expected.write_bytes(b''.join(
+                struct.pack('<4f', (x | (y << 16)) + picked, x | (y << 16), scale, select)
+                for y in range(8) for x in range(8)))
+            constants = {('rootconst', 1, 0): flag, ('rootconst', 1, 1): float_word(fallback),
+                         ('descword3', 0): word3}
+            entry = hex_words(constants.get(key, 0) for key in bindings)
+            ps = compile_hlsl(dxc, 'dxc', shader, name, 'ps_6_0', directory)
+            run = subprocess.run([runner, 'warp', '--startup-pixel-buffer-words', str(vs), str(ps),
+                                  '8', '8', str(expected), entry, buffer], capture_output=True, text=True)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                sys.exit(1 if failures else 77)
+            if mismatch:
+                expected_result = run.returncode != 0 and '64 of 64 pixels differ' in run.stderr
+            else:
+                expected_result = run.returncode == 0 and 'all 64 pixels matched' in run.stdout
+            expected_count = '64 differing pixels' if mismatch else '64 matching pixels'
+            check(f'{name} WARP readback ({expected_count})', expected_result, run.stdout + run.stderr)
+
+        for flag in (0, 1):
+            draw(f'firstlane_flag_{flag}', hlsl, flag)
+
+        for name, original, mutant in (
+            ('mutant_join_scc', 's14 = scc ?', 's14 = !scc ?'),
+            ('mutant_join_value', 's16 = s11;', 's16 = ud2;'),
+            ('mutant_load_offset', '        a = 4;', '        a = 0;'),
+        ):
+            assert hlsl.count(original) == 1, (name, original)
+            draw(name, hlsl.replace(original, mutant), 1, mismatch=True)
+
+
 if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
     check_dispatch(*sys.argv[2:])
 elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
     shaders = pixel_controls()
+    firstlane_hlsl, bindings = firstlane_pixel.check_translation()
     if not failures:
         check_pixel_draw(*sys.argv[2:], shaders)
+        check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings)
 elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     for name, (source, prefix, _) in PIXEL_CASES.items():
         check(name + ' encoding', assemble(sys.argv[2], source + PIXEL_TAIL) == pixel_words(prefix))
