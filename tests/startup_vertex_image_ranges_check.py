@@ -71,6 +71,10 @@ def controls():
     assert 'v18' not in G.vertex_image_range_facts(signed)[40]
     unbounded = G.decode(mtbuf + fma + encode_vop1(7, 15, 270) + cmpx + triple + end)
     assert 'v18' not in G.vertex_image_range_facts(unbounded)[40]
+    # V_SWAP writes both operands; the second loses its previously bounded value.
+    swap = encode_vop1(0x65, 0, 271)
+    swapped = G.decode(mtbuf + fma + cvt + cmpx + swap + triple + end)
+    assert 'v18' not in G.vertex_image_range_facts(swapped)[44]
     print('vertex image range controls: passed')
 
 

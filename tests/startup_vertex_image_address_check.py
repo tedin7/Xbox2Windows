@@ -213,6 +213,8 @@ def main():
                   after_shift=encode_vop1(1, 18, 128))
     check_refusal('program image address is not a proven index shifted by two',
                   after_shift=words(0xbeff037e))
+    check_refusal('program image address is not a proven index shifted by two',
+                  after_shift=encode_vop1(0x65, 0, 274))
     for extra, reason in (
             (encode_vop1(1, 0, 276), 'address word escapes'),
             (words(0xbf860000), 'vector carry escapes'),

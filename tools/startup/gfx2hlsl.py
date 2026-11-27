@@ -1922,7 +1922,10 @@ def vertex_image_address_proof(ins, getpc):
             used_pairs.add(fact[5])
             loads[pc] = (ops[0], fact[1], fact[2])
         written = set()
-        for op in destinations(base, ops):
+        dests = destinations(base, ops)
+        if base == 'v_swap_b32' and len(ops) >= 2:
+            dests = ops[:2]
+        for op in dests:
             reg = reg_range(op)
             if reg and reg[0] == 'v':
                 written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
@@ -2120,7 +2123,10 @@ def vertex_image_range_facts(ins):
         if not ops:
             continue
         written = set()
-        for op in destinations(base, ops):
+        dests = destinations(base, ops)
+        if base == 'v_swap_b32' and len(ops) >= 2:
+            dests = ops[:2]
+        for op in dests:
             reg = reg_range(op)
             if reg and reg[0] == 'v':
                 written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
