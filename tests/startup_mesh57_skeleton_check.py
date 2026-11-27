@@ -347,7 +347,6 @@ WAVE_LOAD_OTHER_REFUSALS += (
 )
 WAVE_BLOCK_REFUSALS = (
     ('VCC live at the join', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY, exports='7e280228 022a0e80')),
-    ('src_scc in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beaf03fd')),
     ('EXEC copied in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beb0047e')),
     ('VCC branch inside the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY.replace('bf8cc07f', 'bf860000', 1))),
     ('branch from outside between the reset and the compare', wave_load_mesh('bf840006 ' + WAVE_BLOCK_PREFIX,
@@ -429,6 +428,54 @@ def joined_vertex_masks():
         'bf850001',  # s_cbranch_scc1 .pos (first incoming mask is the vertex count)
         'befe04c1',  # s_mov_b64 exec, -1 (fallthrough reaches .pos with all lanes)
     ] + MESH[pos:]
+
+
+# Fixture body encodings are gfx1013 wave64. The existing synthetic shell supplies the two exchanges
+# and the count-guarded exports. Every variant adds a loaded displacement to the exported X coordinate.
+def scalar_position_mesh(shape, control=None):
+    body = ['f4240b88', 'fa0001e0',  # s_buffer_load_dwordx2 s[46:47], s[16:19], 0x1e0
+            'bf8cc07f']             # s_waitcnt lgkmcnt(0)
+    step = ['bf07802e',             # s_cmp_lg_u32 s46, 0
+            '8f30fd2e',             # s_lshl_b32 s48, s46, src_scc
+            '7e0e0230']             # v_mov_b32 v7, s48
+    if control == 'nonuniform input':
+        step[0:1] = ['bf800000']     # SCC of saveexec is a lane bit in the model
+    if control == 'undefined scalar input':
+        step[0] = 'bf078036'        # s_cmp_lg_u32 s54, 0 (s54 has no definition)
+    if control == 'mask select':
+        step.insert(1, '8531806a')   # s_cselect_b32 s49, vcc_lo, 0
+    if control == 'unguarded export':
+        step.extend(('f80008cf', '13121110'))
+    if control == 'unguarded store':
+        step.extend(('e0701000', '80040700'))
+    if shape == 2:
+        # Compare only the narrowed lanes against the second loaded dword.
+        step[0:0] = ['7d84002f', 'bf86%04x' % len(step)]
+    if shape:
+        skip = {'backward': -2, 'outside': len(step) + 2, 'exchange': len(step) + 5}
+        body += ['7d880088', 'beb4246a',  # v_cmp_gt_u32 vcc, 8, v0; s_and_saveexec_b64 s[52:53], vcc
+                 'bf88%04x' % (skip.get(control, len(step)) & 0xffff), *step,
+                 '88fe347e']             # s_or_b64 exec, exec, s[52:53]
+    else:
+        body += step
+    prefix = ['7e0e0280', 'beb20393', 'befe04c1', '7da80032']  # v7 = 0; full EXEC; thread < 19
+    if control == 'enters block':
+        prefix.insert(0, 'bf840005')  # jumps past the outer branch from outside
+    prologue = MESH[:COUNT]
+    suffix = MESH[COUNT:]
+    pos = suffix.index('f80008cf')
+    suffix[pos:pos] = ['06202107']  # v_add_f32 v16, v7, v16
+    finish = ['befe04c1']
+    if control == 'undefined result':
+        finish += ['7e0e0230']
+    if control in ('undefined inner result', 'defined inner result'):
+        body += ['7e0e0230']  # every lane can read s48 after the inner restore
+    if control == 'defined inner result':
+        prefix.insert(0, 'beb00380')  # s_mov_b32 s48, 0 is the skipped arm's definition
+    return prologue[:-2] + prefix + ['bf88%04x' % len(body)] + body + finish + prologue[-2:] + suffix
+
+
+SCALAR_POSITION_SHAPES = ('scalar-only', 'inner EXEC skip', 'inner VCC and EXEC skips')
 
 
 def request(directory, mesh, pixel=PIXEL):
@@ -723,6 +770,35 @@ def controls():
             expect(what + ' translates', request(tmp, mesh)[1], 'ok')
         for what, mesh, reason in WAVE_LOAD_OTHER_REFUSALS + (NEST_LOOP, NEST_MASK):
             expect(what, request(tmp, mesh)[1], 'unsupported: ' + reason)
+        expect('wave-uniform explicit SCC in the block',
+               request(tmp, wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beaf03fd'))[1], 'ok')
+        for shape, label in enumerate(SCALAR_POSITION_SHAPES):
+            key, result = request(tmp, scalar_position_mesh(shape))
+            expect(label + ' translates', result, 'ok')
+            if result == 'ok':
+                source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+                expect(label + ' has a mutant', scalar_position_mutant(shape, source) is not None, True)
+                _, correct, wrong = scalar_position_images(shape, 10 if shape == 2 else 5)
+                expect(label + ' mutant changes CPU coverage', correct != wrong, True)
+        expect('scalar defined on both paths to an inner join translates',
+               request(tmp, scalar_position_mesh(1, 'defined inner result'))[1], 'ok')
+        for control, expected in (
+            ('backward', 'a loop outside the group-memory exchanges is not covered'),
+            ('outside', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('exchange', 'a branch enters or crosses a group-memory exchange'),
+            ('enters block', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('nonuniform input', 'SCC of the count exchange is read'),
+            ('undefined scalar input', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('undefined result', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('undefined inner result', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('unguarded export', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('unguarded store', 's_cbranch_execz skips code with effects outside active lanes'),
+            ('mask select', 's_cbranch_execz skips code with effects outside active lanes'),
+        ):
+            result = request(tmp, scalar_position_mesh(1, control))[1]
+            expect(control, result.startswith('unsupported: slot 57 mesh: ' + expected), True)
+            if not result.startswith('unsupported: slot 57 mesh: ' + expected):
+                print(result)
         key, result = request(tmp, WAVE_BLOCK_MESH)
         expect('pre-exchange wave block translates', result, 'ok')
         if result == 'ok':
@@ -1012,6 +1088,88 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     return 0
 
 
+def scalar_position_images(shape, probe):
+    points, colours, indices = geometry()
+    # The first two triangles use mixed/active lanes of wave 0. The other two
+    # use wave 1, which takes the outer skip.
+    triangles = [tuple(slot + wave for slot in tri) for tri, wave in zip(indices, (0, 0, 64, 64))]
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    data = bytearray(buffer(points, colours, words))
+    struct.pack_into('<II', data, 480, 0x1f000000, probe)  # shifting the first word gives float 1/8, or two pixels
+
+    def image(limit):
+        displaced = points.copy()
+        for tri in triangles:
+            for tid in tri:
+                if tid < limit:
+                    x, y = points[tid]
+                    displaced[tid] = (x + 2, y)
+        return rasterise(displaced, colours, triangles, 128, len(triangles))
+
+    limit = 19 if shape == 0 else 8
+    correct = image(limit if shape < 2 or probe < 8 else 0)
+    wrong = image(0 if shape == 0 else 19 if shape == 1 else 8)
+    return data, correct, wrong
+
+
+def scalar_position_mutant(shape, source):
+    if shape < 2:
+        original, replacement = (('v7 = s48;', 'v7 = 0u;') if shape == 0 else
+                                 ('exec = (exec & vcc) & 1;', 'exec = exec & 1;'))
+        count = source.count(original)
+        expect('one position mutation site', count, 1)
+        return source.replace(original, replacement) if count == 1 else None
+    # The EXEC vote comes first. Force the VCC branch to fall through even
+    # when the compare mask is empty.
+    votes = list(re.finditer(r'pc = \(mesh_vote == 0u\) \? \d+ : (\d+);', source))
+    expect('two inner votes', len(votes), 2)
+    if len(votes) != 2:
+        return None
+    vcc_vote = votes[1]
+    return source[:vcc_vote.start()] + 'pc = %s;' % vcc_vote[1] + source[vcc_vote.end():]
+
+
+def draw_scalar_positions(directory, dxc, renderer, adapter):
+    for shape, probe in ((0, 5), (1, 5), (2, 5), (2, 10)):
+        label = '%s (compare index %d)' % (SCALAR_POSITION_SHAPES[shape], probe)
+        mesh = scalar_position_mesh(shape)
+        key, result = request(directory, mesh)
+        expect(label + ' compiles', result, 'ok')
+        if result != 'ok':
+            return 1
+        base = Path(directory) / ('%016x' % key)
+        data, correct, wrong = scalar_position_images(shape, probe)
+        cases = [(base.with_suffix('.ms57.cso'), correct, 0, 0)]
+        if shape < 2 or probe == 10:
+            source = base.with_suffix('.ms57.hlsl').read_text()
+            mutated = scalar_position_mutant(shape, source)
+            if mutated is None:
+                return 1
+            different = sum(a != b for a, b in zip(correct, wrong))
+            expect(label + ' mutant changes covered pixels', different > 0, True)
+            mutant_hlsl = base.with_suffix('.mutant.hlsl')
+            mutant_hlsl.write_text(mutated)
+            mutant_cso = base.with_suffix('.mutant.cso')
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant_cso, mutant_hlsl],
+                           check=True, capture_output=True)
+            cases += [(mutant_cso, correct, 1, different), (mutant_cso, wrong, 0, 0)]
+        constants = bytearray(1024)
+        uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+        for slot, count in enumerate((4, 128)):
+            struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+        fixture = base.with_suffix('.bin')
+        for shader, image, status, mismatches in cases:
+            fixture.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'),
+                                  fixture], capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            expect(label + ' ' + shader.suffix + ' readback',
+                   (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
+    return 0
+
+
 def draw_wave_collectives(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
@@ -1173,7 +1331,7 @@ def draw(dxc, renderer, adapter, publisher=None):
                                     nest_mutant=('exec = (exec & vcc) & 1;', 'exec = exec & 1;', lambda tid: 255 if tid < 6 else 0))
             if status:
                 return status
-            return 0
+            return draw_scalar_positions(tmp, dxc, renderer, adapter)
     return 0
 
 
