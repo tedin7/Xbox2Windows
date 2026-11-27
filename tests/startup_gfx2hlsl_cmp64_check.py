@@ -51,12 +51,20 @@ def controls():
                                                     signed(b) if typ == 'i64' else b)
                             assert evaluate(expr, env) == want, (asm, a, b, expr)
                     if cmpx and encoding == 'e64':
-                        assert stage.lines[-1] == 'exec = s4;', stage.lines
+                        assert len(stage.lines) == 1 and stage.lines[0].startswith('exec = '), stage.lines
+                        assert 4 not in stage.masks and 4 not in stage.used_s, stage.lines
+    for dst in (0, 4, S.VCC_LO):
+        code = S.e64(OPS[True, 'ne', 'i64'], dst, S.V(2), S.V(4))
+        name, asm = S.decode_one(code)
+        stage = S.Probe()
+        stage.one(name, asm)
+        assert len(stage.lines) == 1 and stage.lines[0].startswith('exec = '), stage.lines
+        assert not stage.masks and not stage.used_s, stage.lines
     for typ in ('i64', 'u64'):
-        for constant in (-1, 0, 1, 64):
+        for constant in (-16, -1, 0, 1, 64):
             code = S.e32(OPS[False, 'lt', typ], S.inline(constant), 4)
             _, _, expr = S.translate(code)
-            a = constant & ((1 << 64) - 1 if typ == 'i64' else S.MASK)
+            a = constant & ((1 << 64) - 1)
             for b in VALUES:
                 env = {'v4': b & S.MASK, 'v5': b >> 32}
                 assert evaluate(expr, env) == ((signed(a) < signed(b)) if typ == 'i64' else (a < b))
@@ -71,6 +79,17 @@ def controls():
     code = S.e32(OPS[True, 'ne', 'i64'], S.V(2), 4)
     _, _, expr = S.translate(code, exec_known=False)
     assert expr.startswith('(exec & '), expr
+    for typ in ('i64', 'u64'):
+        for token in ('0x80000000', '2147483648', '0xffffffff', '4294967295'):
+            reason = S.refusal(name='v_cmp_ne_%s_e32' % typ,
+                               asm='v_cmp_ne_%s_e32 vcc_lo, %s, v[4:5]' % (typ, token))
+            assert reason == 'v_cmp_ne_%s source %s: ambiguous 64-bit literal' % (typ, token), reason
+        for token in ('0x7fffffff', '2147483647'):
+            stage = S.Probe()
+            stage.one('v_cmp_eq_%s_e32' % typ, 'v_cmp_eq_%s_e32 vcc_lo, %s, v[4:5]' % (typ, token))
+            expr = stage.lines[0].split(' = ', 1)[1][:-1]
+            assert evaluate(expr, {'v4': 0x7fffffff, 'v5': 0}) == 1
+            assert evaluate(expr, {'v4': 0x7fffffff, 'v5': 0xffffffff}) == 0
     for token in ('0x80000000', 'v2', 'vcc', 'neg(v[2:3])'):
         reason = S.refusal(name='v_cmp_ne_i64_e32', asm='v_cmp_ne_i64_e32 vcc_lo, %s, v[4:5]' % token)
         assert reason and ('source' in reason or 'operand' in reason), (token, reason)

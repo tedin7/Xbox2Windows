@@ -13421,8 +13421,8 @@ class Stage:
             raise Unsupported('%s source %s' % (base, tok))
         return 'f16tof32(0x%04xu)' % int(tok, 0)
 
-    def _compare64_source(self, base, token, signed):
-        # AMD RDNA 2 ISA, section 6.2.1: integer literals expand to 64 bits.
+    def _compare64_source(self, base, token):
+        # AMD RDNA 2 ISA, section 6.2.1: inline integers are sign-extended to 64 bits.
         reg = reg_range(token)
         if reg:
             if reg[0] not in ('s', 'v') or reg[2] != reg[1] + 1:
@@ -13434,9 +13434,10 @@ class Stage:
             value = int(token, 0)
         except ValueError:
             raise Unsupported('%s source %s' % (base, token))
-        if not -16 <= value <= 0xffffffff or (token.startswith('0x') and value & 0x80000000):
+        inline = re.fullmatch(r'-?[0-9]+', token) and -16 <= value <= 64
+        if not inline and (value < 0 or value > 0x7fffffff):
             raise Unsupported('%s source %s: ambiguous 64-bit literal' % (base, token))
-        hi = 0xffffffff if signed and value < 0 else 0
+        hi = 0xffffffff if inline and value < 0 else 0
         return ('0x%08xu' % (value & 0xffffffff), '0x%08xu' % hi)
 
     def compare(self, base, ops, mods=()):
@@ -13563,8 +13564,8 @@ class Stage:
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
         if typ in ('i64', 'u64'):
-            al, ah = self._compare64_source(base, a, typ == 'i64')
-            bl, bh = self._compare64_source(base, b, typ == 'i64')
+            al, ah = self._compare64_source(base, a)
+            bl, bh = self._compare64_source(base, b)
             hi_a, hi_b = (('asint(%s)' % ah, 'asint(%s)' % bh) if typ == 'i64' else (ah, bh))
             eq = '(%s == %s && %s == %s)' % (ah, bh, al, bl)
             lt = '(%s < %s || (%s == %s && %s < %s))' % (hi_a, hi_b, ah, bh, al, bl)
@@ -13597,17 +13598,6 @@ class Stage:
         expr = '((%s) ? 1u : 0u)' % (predicate64 if typ in ('i64', 'u64') else table[cond].format(x, y, ordered))
         if not self.exec_known:
             expr = '(exec & %s)' % expr
-        if writes_exec and typ in ('i64', 'u64') and len(ops) == 3 and dst not in ('exec', 'exec_lo'):
-            if dst in ('vcc', 'vcc_lo'):
-                self.emit('vcc = %s;' % expr)
-                expr = 'vcc'
-            else:
-                reg = reg_range(dst)
-                if not reg or reg[0] != 's' or reg[1] != reg[2]:
-                    raise Unsupported('%s into %s' % (base, dst))
-                self.set_s(reg[1], expr)
-                self.masks.add(reg[1])
-                expr = self.S(reg[1])
         if writes_exec or dst in ('exec', 'exec_lo'):
             self.exec_known = False
             self.emit('exec = %s;' % expr)
