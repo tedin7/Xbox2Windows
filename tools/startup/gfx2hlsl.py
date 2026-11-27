@@ -2161,6 +2161,24 @@ LDS_EXCHANGE_OPS = {
 }
 
 
+def lds_unbarriered_b64_pair(ins):
+    """Conservative first general case: one ordered b64 store/load in straight-line entry EXEC."""
+    ds = []
+    for i, (_, _, _, asm) in enumerate(ins):
+        name, ops, mods = parse(asm)
+        base = name.removesuffix('_e32').removesuffix('_e64')
+        if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_rfe', 's_trap'))
+                or writes_exec(base, ops) or base == 's_barrier'
+                or base == 's_endpgm' and i + 1 < len(ins)):
+            return False
+        if base.startswith('ds_'):
+            ds.append((i, base))
+    if [op for _, op in ds] != ['ds_write_b64', 'ds_read_b64']:
+        return False
+    return all(i + 1 < len(ins) and parse(ins[i + 1][3]) == ('s_waitcnt', ['lgkmcnt(0)'], [])
+               for i, _ in ds)
+
+
 def lds_vgpr_writes(base, ops):
     """VGPR may-writes, including register spans and both destinations of a swap."""
     if base.startswith(INTERP_STORE_PREFIXES + ('s_', 'v_cmp', 'v_readlane', 'v_readfirstlane')):
@@ -7694,8 +7712,14 @@ class Stage:
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
+                    if (getattr(self, 'pipe', None) is not None and
+                            lds_unbarriered_b64_pair(self.ins)):
+                        self.lds_error = None
+                        self.lds_b64_pair = True
             if self.lds_error is not None:
                 raise Unsupported(self.lds_error)
+            if getattr(self, 'lds_b64_pair', False):
+                return self.lds_b64_general(base, ops, mods)
             if base == 's_barrier':
                 self.emit('GroupMemoryBarrierWithGroupSync();')
             else:
@@ -10079,6 +10103,42 @@ class Stage:
         self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
         if glc:
             self.set_v(data[1], 'asuint(ai)' if signed else 'ao')
+
+    def lds_b64_general(self, name, ops, mods):
+        # AMD RDNA 2 ISA guide, 10.4.3 and 12.13: indexed DS uses a per-lane byte address.
+        # D3D HLSL GroupMemoryBarrierWithGroupSync: all group threads must reach the barrier.
+        write = name == 'ds_write_b64'
+        # Check encoding fields hidden by the disassembler only on this retry path.
+        if self.pc + 8 > len(self.raw_code):
+            raise Unsupported('%s needs a complete DS encoding' % name)
+        word0, word1 = struct.unpack_from('<2I', self.raw_code, self.pc)
+        unused = 0xffff0000 if write else 0x00ffff00
+        if word0 & (1 << 16) or word1 & unused:
+            raise Unsupported('%s has reserved or unused DS fields set' % name)
+        if name not in ('ds_write_b64', 'ds_read_b64') or len(ops) != 2:
+            raise Unsupported('LDS b64 pair needs one write followed by one read')
+        addr = ops[0 if write else 1]
+        pair = _lds_pair(ops[1 if write else 0])
+        if _lds_single(addr) is None or pair is None:
+            raise Unsupported('%s needs an address VGPR and a 2-VGPR pair' % name)
+        offset, = lds_byte_offsets(name, mods)
+        if offset % 4 or not self.operand_align4(addr):
+            raise Unsupported('LDS b64 general needs a proven 4-byte aligned address')
+        limit = self._lds_require_alloc(name)
+        if not write:
+            self.emit('GroupMemoryBarrierWithGroupSync();')
+        self.emit('a = %s;' % self.u(addr))
+        for index in range(2):
+            off = offset + index * 4
+            if write:
+                value = self.u('v%d' % (pair + index))
+                if off < limit:
+                    self.emit('if (a < %du) lds[(a + %du) >> 2] = %s;' % (limit - off, off, value))
+            else:
+                self.emit('w = 0u;')
+                if off < limit:
+                    self.emit('if (a < %du) w = lds[(a + %du) >> 2];' % (limit - off, off))
+                self.set_v(pair + index, 'w')
 
     def _lds_general_barrier_ok(self):
         """True when a compute stage uses dual/atomic LDS ops in straight-line code without legacy exchange ops."""

@@ -298,7 +298,8 @@ def check_controls():
     refused('initialized span', lambda: translate_case('P', code=patch(WORDS_P, read_p, '0c00d8d908000008')))  # before span (offset:12)
     refused('one bounded qword', lambda: translate_case('P', code=patch(WORDS_P, '83000834', '82000834')))    # shift 2 instead of 3
     refused('completed fill', lambda: translate_case('P', code=patch(WORDS_P, wait + barrier, nop + barrier)))
-    refused('after the fill barrier', lambda: translate_case('P', code=patch(WORDS_P, barrier, nop)))
+    ordered = translate_case('P', code=patch(WORDS_P, barrier, nop)).hlsl_cs()
+    assert ordered.count('GroupMemoryBarrierWithGroupSync();') == 1, ordered
     refused('completed LGKM wait', lambda: translate_case('P', code=patch(WORDS_P, read_p + wait, read_p + nop)))
     refused('optional byte offset', lambda: translate_case('P', code=patch(WORDS_P, store, '100036d904050000')))  # GDS
     refused('entry EXEC', lambda: translate_case('P', code=patch(WORDS_P, store, '8003febe' + store)))
