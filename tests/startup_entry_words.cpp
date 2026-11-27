@@ -37,14 +37,17 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
 
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.Constants = {0, 0, entry_count};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, entry_count};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor = {0, 0};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     if (dynamic_heap) rs.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
-    rs.NumParameters = 1;
-    rs.pParameters = &param;
+    rs.NumParameters = dynamic_heap ? 2 : 1;
+    rs.pParameters = params;
     ComPtr<ID3DBlob> signature, errors;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)))
         throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer())
@@ -97,18 +100,23 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     ComPtr<ID3D12Resource> source;
     ComPtr<ID3D12DescriptorHeap> views, image_rtvs;
     ComPtr<ID3D12Resource> images[2];
+    constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
+    constexpr UINT index_table_offset = 3 * buffer_stride;
     if (dynamic_heap) {
         constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
-        constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
-        source = make_buffer(device, 3 * buffer_stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        constexpr std::uint32_t image_indices[]{6, 7};
+        source = make_buffer(device, index_table_offset + sizeof(image_indices), D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
         const D3D12_RANGE none{0, 0};
         check(source->Map(0, &none, &mapped), "Map heap fixture input");
         for (UINT i = 0; i < 3; ++i)
             std::memcpy(static_cast<unsigned char*>(mapped) + i * buffer_stride, values + i, sizeof(values[i]));
+        std::memcpy(static_cast<unsigned char*>(mapped) + index_table_offset, image_indices, sizeof(image_indices));
         source->Unmap(0, nullptr);
-        // Slots 0..2 are raw buffers; slots 3 and 4 are 1x1 float textures holding one distinct texel each.
-        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
+        // Slots 0..2 are raw buffers. Slots 3 and 4 are textures, repeated at 6 and 7 for the shift control.
+        // Slot 5 is a typed null texture for the image dimensions control.
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create raw fixture heap");
         auto cpu = views->GetCPUDescriptorHandleForHeapStart();
@@ -121,36 +129,47 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
         }
         D3D12_RESOURCE_DESC image_desc{};
         image_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        image_desc.Width = 1;
-        image_desc.Height = 1;
         image_desc.DepthOrArraySize = 1;
-        image_desc.MipLevels = 1;
+        image_desc.MipLevels = 3;
         image_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         image_desc.SampleDesc.Count = 1;
         image_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         static constexpr float texels[2][4]{{1.25f, 2.5f, 4.0f, 8.0f}, {16.0f, 32.0f, 64.0f, 128.0f}};
+        static constexpr UINT widths[]{37, 43}, heights[]{11, 15};
         const D3D12_DESCRIPTOR_HEAP_DESC image_rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
         check(device->CreateDescriptorHeap(&image_rtv_desc, IID_PPV_ARGS(&image_rtvs)), "Create heap fixture RTV heap");
         auto image_rtv = image_rtvs->GetCPUDescriptorHandleForHeapStart();
         const UINT rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         for (UINT i = 0; i < 2; ++i, cpu.ptr += increment, image_rtv.ptr += rtv_increment) {
+            image_desc.Width = widths[i];
+            image_desc.Height = heights[i];
             D3D12_CLEAR_VALUE value{DXGI_FORMAT_R32G32B32A32_FLOAT, {}};
             std::memcpy(value.Color, texels[i], sizeof(value.Color));
             images[i] = resource(device, image_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &value);
-            device->CreateRenderTargetView(images[i].Get(), nullptr, image_rtv);
+            D3D12_RENDER_TARGET_VIEW_DESC image_target{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RTV_DIMENSION_TEXTURE2D};
+            image_target.Texture2D = {i, 0};
+            device->CreateRenderTargetView(images[i].Get(), &image_target, image_rtv);
             list->ClearRenderTargetView(image_rtv, value.Color, 0, nullptr);
             transition(list, images[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
                                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-            view.Texture2D = {0, 1, 0, 0.0f};
+            view.Texture2D = {i, static_cast<UINT>(image_desc.MipLevels) - i, 0, 0.0f};
             device->CreateShaderResourceView(images[i].Get(), &view, cpu);
+            auto alias = cpu;
+            alias.ptr += 3 * increment;
+            device->CreateShaderResourceView(images[i].Get(), &view, alias);
         }
+        D3D12_SHADER_RESOURCE_VIEW_DESC null_view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        null_view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(nullptr, &null_view, cpu);
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);
     }
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRoot32BitConstants(0, entry_count, entry, 0);
+    if (dynamic_heap) list->SetGraphicsRootShaderResourceView(1, source->GetGPUVirtualAddress() + index_table_offset);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);

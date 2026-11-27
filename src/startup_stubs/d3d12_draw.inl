@@ -164,8 +164,10 @@ std::uint64_t process_ms()
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, desc_word };
+    enum class SnormRefusal { unchecked, other, signed_export };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    SnormRefusal snorm_refusal = SnormRefusal::unchecked;
     bool placeholder = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -175,6 +177,7 @@ struct Translation {
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     bool dynamic_heap = false;
+    bool dynamic_heap_images = false;  // manifest 'dynamic_heap_images': the shaders read image records from the heap
     std::string placeholder_ps;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
@@ -713,6 +716,7 @@ HRESULT create_title_translated_root(ID3D12Device* device, UINT constants, UINT 
 
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
+    tr.snorm_refusal = Translation::SnormRefusal::unchecked;
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
@@ -762,6 +766,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             tr.placeholder_ps = line.substr(15);
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
+        } else if (line == "dynamic_heap_images") {
+            tr.dynamic_heap_images = true;
         } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -1406,10 +1412,45 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
+bool needs_snorm_export_variant(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16_SNORM:
+        return true;
+    default: return false;
+    }
+}
+
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+    bool variant = std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
+    if (!variant && base->state == 2 &&
+        std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_snorm_export_variant)) {
+        if (base->snorm_refusal == Translation::SnormRefusal::unchecked) {
+            constexpr char signed_export[] = "signed normalized compressed export";
+            wchar_t path[MAX_PATH];
+            if (cache_path(path, L"", base->key, L".fail")) {
+                HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    char prefix[sizeof(signed_export) - 1];
+                    DWORD bytes = 0;
+                    const bool read = ReadFile(file, prefix, sizeof(prefix), &bytes, nullptr) != 0;
+                    CloseHandle(file);
+                    if (read) {
+                        const bool matches = bytes == sizeof(prefix) &&
+                                             std::memcmp(prefix, signed_export, sizeof(prefix)) == 0;
+                        base->snorm_refusal = matches ? Translation::SnormRefusal::signed_export
+                                                       : Translation::SnormRefusal::other;
+                    }
+                }
+            }
+        }
+        variant = base->snorm_refusal == Translation::SnormRefusal::signed_export;
+    }
+    if (!variant) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
         return base;
@@ -1798,6 +1839,21 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
 bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
 {
     auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
+    if (!pass.title_samplers.address && pass.sampler_heap_wrapper) {
+        AcquireSRWLockShared(&note_lock);
+        for (const auto& heap : heap_infos()) {
+            if (heap.wrapper != pass.sampler_heap_wrapper || !heap.shadow) continue;
+            const UINT capacity = reserved_fallback ? x2w_startup::translated_sampler_fallback : x2w_startup::translated_sampler_count;
+            snapshot.count = (std::min)(heap.count, capacity);
+            for (UINT i = 0; i < snapshot.count; ++i) {
+                if (!heap.shadow[i]) continue;
+                snapshot.words[i] = {view_token_magic, heap.shadow[i] - 1, 22, 0};
+                snapshot.readable.set(i);
+            }
+            break;
+        }
+        ReleaseSRWLockShared(&note_lock);
+    }
     if (pass.sampler_snapshot && *pass.sampler_snapshot == snapshot) return true;
     x2w_startup::NullSamplerCounts counts;
     DrawSamplerHeap heap;
@@ -2416,21 +2472,27 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (placed_1d && written.bc7_width) return false;
     const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
-    const bool tiled = tiled_bc7 || (tiled_address && !desktop_array) || tiled_chain;
+    // Placed sampled BC7 surfaces can carry the same 64 KiB display layout as an address-only SRV.
+    // GPU-authored resources have already returned above; only detile the CPU backing on upload.
+    const bool placed_display_bc7 = !tiled_address && original && desc.MipLevels == 1 &&
+        desc.DepthOrArraySize == 1 && desc.Format == DXGI_FORMAT_BC7_UNORM &&
+        x2w_startup::gfx10::swizzle_mode(original->console) == 10 && console_layout_srv(original->console);
+    const bool detile_console = console || placed_display_bc7;
+    const bool tiled = tiled_bc7 || (tiled_address && !desktop_array) || tiled_chain || placed_display_bc7;
     std::optional<x2w_startup::gfx10::Layout> console_layout;
-    if (console) console_layout.emplace(original->console);
+    if (detile_console) console_layout.emplace(original->console);
     const auto generation = written.generation;
     const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
                                          tiled_bc7 ? written.bc7_height : desc.Height);
-    if (tiled_bc7) {
+    if (tiled_bc7 && !placed_display_bc7) {
         if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
             original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return true;
     }
-    if (tiled && !tiled_chain && !single && !console && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !tiled_chain && !single && !detile_console && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return true;
-    if (console) {
+    if (detile_console) {
         // The desktop footprints must hold exactly the elements the console layout addresses.
         if (console_layout->mips != mips || console_layout->slices != slices || plan.count != mips) return false;
         for (UINT i = 0; i < mips; ++i)
@@ -2454,7 +2516,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         x2w_startup::drop_mips::counters.upload_unsupported.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->used_bytes()
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : detile_console ? console_layout->used_bytes()
         : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
@@ -2503,7 +2565,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (console) {
+    if (detile_console) {
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
@@ -3375,13 +3437,113 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     return {native, offset, bytes, stride, upload, input_source};
 }
 
-// Mirror the readable buffer records at their original indices. The translated tables follow those
+bool aliases_writable_target(const Pass& pass, ID3D12Resource* texture)
+{
+    if (!texture) return false;
+    for (UINT i = 0; i < pass.target_count; ++i)
+        if (pass.bound_targets[i] == texture) return true;
+    return pass.bound_depth == texture && pass.depth_view_writable;
+}
+
+bool sampled_view_format(D3D12_SHADER_RESOURCE_VIEW_DESC& view, ID3D12Resource* texture)
+{
+    view.Format = desktop_format(view.Format);
+    if (!x2w_startup::packed_target_format(view.Format)) return true;
+    const auto actual = texture->GetDesc().Format;
+    const auto verdict = x2w_startup::packed_view(view.Format, actual, x2w_startup::packed_stand_in_of(texture));
+    if (verdict == x2w_startup::PackedView::stand_in) view.Format = actual;
+    return verdict != x2w_startup::PackedView::refused;
+}
+
+void adjust_sampled_view_mips(D3D12_SHADER_RESOURCE_VIEW_DESC& view, unsigned dropped_levels)
+{
+    if (dropped_levels && (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ||
+                           view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
+        view.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(view.Texture2D.MipLevels, dropped_levels);
+}
+
+struct HeapTextureCounts {
+    enum Reason { unavailable, incompatible, writable_alias, packed_format, upload_failed, reasons };
+    UINT mirrored = 0;
+    UINT nulls[reasons]{};
+
+    void report() const
+    {
+        UINT total = 0;
+        for (UINT count : nulls) total += count;
+        static LONG shown;
+        if ((mirrored || total) && first_calls(shown, 1))
+            log("x2w-draw heap textures: %u mirrored, %u bound null", mirrored, total);
+        static LONG shown_reason[reasons];
+        const char* const descriptions[reasons] = {"view or resource unavailable", "resource incompatible with view",
+            "aliases a writable attachment or UAV", "packed format has no stand-in", "texture upload failed"};
+        for (unsigned i = 0; i < reasons; ++i)
+            if (nulls[i] && first_calls(shown_reason[i], 1))
+                log("x2w-draw heap textures: %u bound null (%s)", nulls[i], descriptions[i]);
+    }
+};
+
+template <typename Writable>
+bool heap_texture_view(Wrapper* self, const std::uint32_t* words, D3D12_CPU_DESCRIPTOR_HANDLE dest,
+                       x2w_upload::DescriptorSnapshot& snapshot, Writable writable,
+                       std::unordered_set<ID3D12Resource*>& transitions, HeapTextureCounts& counts)
+{
+    static const bool skip = x2w_local::env_on("X2W_TEST_SKIP_HEAP_TEXTURE_VIEWS");
+    ViewRecord record{};
+    bool materialized = false;
+    if (skip || !read_view_token(words, record, &materialized) || record.slot != 18 || record.desc_bytes < 40) return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    std::memcpy(&view, record.desc, 40);
+    const auto dimension = view.ViewDimension;
+    switch (dimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    case D3D12_SRV_DIMENSION_TEXTURE3D: break;
+    default: return false;
+    }
+
+    auto* device = device_of(self->own().list_device);
+    const auto bind_null = [&](HeapTextureCounts::Reason reason) {
+        // HLSL Dynamic Resources, "ResourceDescriptorHeap and SamplerDescriptorHeap": the view must
+        // match the shader's resource type. Descriptors Overview, "Null descriptors": a matching null SRV reads zero.
+        const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
+        device->CreateShaderResourceView(nullptr, &null_view, dest);
+        ++counts.nulls[reason];
+        return true;
+    };
+    if (!materialized) return bind_null(HeapTextureCounts::unavailable);
+    auto* owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    auto* texture = sampled_address_texture(owner);
+    if (!texture) return bind_null(HeapTextureCounts::unavailable);
+    const auto native = texture->GetDesc();
+    if (!x2w_view_dimension::fits(18, dimension, native.Dimension) || native.SampleDesc.Count != 1 ||
+        (native.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return bind_null(HeapTextureCounts::incompatible);
+    if (aliases_writable_target(pass_of(self), texture) || writable(texture))
+        return bind_null(HeapTextureCounts::writable_alias);
+    if (!sampled_view_format(view, texture)) return bind_null(HeapTextureCounts::packed_format);
+    if (!upload_texture(self, owner, texture)) return bind_null(HeapTextureCounts::upload_failed);
+    adjust_sampled_view_mips(view, owner->own().drop_levels);
+    if (transitions.insert(texture).second) {
+        snapshot.resources.emplace_back(texture);
+        if (!owner->own().tiled_address_srv) retire_hold(self, owner);
+    }
+    device->CreateShaderResourceView(texture, &view, dest);
+    ++counts.mirrored;
+    return true;
+}
+
+// Mirror the readable records at their original indices. The translated tables follow those
 // records in the same shader-visible heap, since D3D12 binds only one CBV/SRV/UAV heap at a time.
 template <typename Writable>
 ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RESOURCE_STATES state,
-                                          Writable writable, UINT& count)
+                                          Writable writable, UINT& count, bool textures)
 {
     const auto source = pass_of(self).title_view_heap;
+    // RDNA 2 Instruction Set Architecture, section 8.2.6 "Image Resource", Table 45 (p. 75):
+    // the T# record loaded by s_load_dwordx8 occupies eight dwords.
     constexpr UINT record_bytes = 32;
     const UINT entries = pass_of(self).title_view_heap_entries;
     if (u64{entries} + tables > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2) return nullptr;
@@ -3398,6 +3560,8 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
                                                     std::size_t{count} * record_bytes);
     try {
         std::unordered_set<ID3D12Resource*> retained, transitions;
+        std::unordered_set<ID3D12Resource*> sampled;
+        HeapTextureCounts texture_counts;
         for (UINT i = 0; i < count; ++i, dest.ptr += stride) {
             std::uint32_t words[4]{};
             const auto* entry = reinterpret_cast<const void*>(source.record(u64{i} * record_bytes, sizeof(words)));
@@ -3405,6 +3569,8 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
             if (entry && (readable_heap || x2w_local::readable(entry, sizeof(words)))) {
                 std::memcpy(words, entry, sizeof(words));
                 // The heap can contain unrelated records. An unmappable entry gets a null SRV.
+                if (textures && heap_texture_view(self, words, dest, snapshot, writable, sampled, texture_counts))
+                    continue;
                 if (words[0] || words[1] || words[2] || words[3])
                     view = indirect_table_buffer(self, words);
             }
@@ -3417,6 +3583,8 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
         }
         if (!retain_descriptor_snapshot(self, std::move(snapshot))) return nullptr;
         for (auto* resource : transitions) require_state(self, resource, state);
+        for (auto* resource : sampled) require_state(self, resource, sampled_state(self, resource) | state);
+        if (textures) texture_counts.report();
     } catch (const std::bad_alloc&) {
         return nullptr;
     }
@@ -4092,7 +4260,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
-                }, first);
+                }, first, tr->dynamic_heap_images);
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();
@@ -4262,21 +4430,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 texture = sampled_address_texture(resource);
             }
             if (texture && described) {
-                desc = title_view;
-                desc.Format = desktop_format(desc.Format);
-            }
-            if (texture && x2w_startup::packed_target_format(desc.Format)) {
-                // The view recorded from the title names a packed format: follow a stand-in texture,
-                // and bind nothing for a texture the view does not fit (packed_target_format.h).
-                const auto actual = texture->GetDesc().Format;
-                const auto verdict = x2w_startup::packed_view(desc.Format, actual, x2w_startup::packed_stand_in_of(texture));
-                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = actual;
-                if (verdict == x2w_startup::PackedView::refused) {
+                auto mapped = title_view;
+                if (sampled_view_format(mapped, texture)) desc = mapped;
+                else {
                     log_srv_refusal(srv_check::Refusal::format);
                     static LONG refused;
                     if (first_calls(refused, 6))
                         log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
-                            tr->key, i, desc.Format, actual);
+                            tr->key, i, mapped.Format, texture->GetDesc().Format);
                     texture = nullptr;
                     desc = fallback_desc;
                 }
@@ -4971,6 +5132,7 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
+    u64 sampler_wrapper = 0;
     x2w_startup::ViewTable heap_records;
     x2w_startup::ViewHeapSelection view_heaps;
     UINT heap_entries = 0;
@@ -4986,8 +5148,10 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap_entries = static_cast<UINT>((std::min)(u64{heap.logical_count}, heap_records.bytes / 32));
                 }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu) {
+                    sampler_wrapper = heap.wrapper;
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
+                }
             }
         }
         ReleaseSRWLockShared(&note_lock);
@@ -4999,6 +5163,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.compute_tables.set_view_heap(view_heaps.compute);
     pass.source_view_heap = view_heaps.graphics;
     pass.title_samplers = source;
+    pass.sampler_heap_wrapper = sampler_wrapper;
     pass.title_view_heap = heap_records;
     pass.title_view_heap_entries = heap_entries;
 }

@@ -114,6 +114,34 @@ def check(work, consumer, backend, kind, dxc, fxc):
     cache, root, output, env = main.cache, main.root, main.output, main.env
     draw, queue_request, request, compile_pair = main.draw, main.queue_request, main.request, main.compile_pair
 
+    # A refused signed-normalized compressed export needs the bound RTV format.
+    # D3D11.3 functional specification 3.2.3.3: -1 maps to -32767.
+    pack = (0xd4000000 | 0x368 << 16, 128 << 9 | 256)
+    ps.write_bytes(container(0, [vop1(1, 0, 255), 0xbf800000, *pack,
+                                 0xf8001c03, 0, 0xbf810000]))
+    snorm = session('snorm')
+    snorm.draw(58, wanted_draw=False)
+    subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', snorm.cache], env=snorm.env, check=True)
+    base = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), snorm.root.read_bytes())
+    assert (snorm.cache / f'{base:016x}.fail').read_text().startswith('signed normalized compressed export')
+    key, _ = snorm.request(58, (58,))
+    snorm.compile_pair(key)
+    pixels, _ = snorm.draw(58)
+    reference = round(max(-1.0, min(1.0, -1.0)) * 32767)
+    assert pixels == struct.pack('<h', reference), pixels.hex()
+    assert reference != -32768
+
+    # A ready base stays on its existing path for the same SNORM target.
+    ps.write_bytes(pixel((0xbf800000, 0, 0, 0)))
+    ready = session('snorm_ready')
+    ready.draw(58, wanted_draw=False)
+    subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', ready.cache], env=ready.env, check=True)
+    ready_key = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), ready.root.read_bytes()):016x}'
+    ready.compile_pair(ready_key)
+    pixels, _ = ready.draw(58)
+    assert pixels == struct.pack('<h', reference), pixels.hex()
+    assert not list(ready.cache.glob('req_*.rtv'))
+
     ps.write_bytes(pixel((INTEGER_WORD, 2, 3, 4), unorm=True))
     integer_sessions = {fmt: session(f'int{fmt}') for fmt, _, _ in INTEGER_FORMATS}
 

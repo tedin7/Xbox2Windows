@@ -5,6 +5,8 @@
   decode <libLLVM>                     disassemble the MIMG words with LLVM's C API and compare with disasm_rdna2.py
   odd-draw <dxc> <offscreen_check> warp
                                        check three odd-tail shaders on an RGBA16F input, with GPU readback controls
+  repaired-draw <dxc> <offscreen_check> warp
+                                       check divergent D16 sampling and upper-half repair, with a GPU mutant
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw four
                                        pixel fixtures (level-zero 2D A/B, explicit-mip 2D C and explicit-mip
@@ -24,6 +26,7 @@ via 'udsrc <ud> d16unorm16 <index>', restricts 'd16srv <index> exact' to the 14 
 formats, and refuses upper-half uses of odd-dmask tails. Plain VGPR copies retain the restriction until only defined bits are read.
 """
 from fractions import Fraction
+import hashlib
 import re
 import struct
 import subprocess
@@ -1243,6 +1246,199 @@ def masked_odd_tail_words():
     return words
 
 
+def check_odd_tail_branch_refusals():
+    # RDNA 2 ISA guide, sections 3.3 and 6.8: a VALU write affects only
+    # active lanes, and SDWA WORD_1 with UNUSED_PRESERVE keeps the low half.
+    def v_mov(dst, src):
+        return 0x7e000200 | (dst << 17) | src
+
+    # Save entry EXEC, initialize v21, and load only the left-hand lanes.
+    prefix = (PRE_WORDS + struct.pack('<3I', 0xbe9e037e, v_mov(21, 128), 0x7da81084)
+              + encode_mimg(IMG_LOAD, dmask=7, vaddr=8, vdata=20, d16=1)
+              + struct.pack('<I', 0xbf8c3f70))
+    # v_mov_b32_sdwa v21, 1 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+    upper = struct.pack('<2I', 0x7e2a02f9, 0x00861581)
+    restore = struct.pack('<I', 0xbefe031e)  # s_mov_b32 exec_lo, s30
+    export = struct.pack('<3I', 0xf800180f, 0x15151515, 0xbf810000)
+
+    def translate(middle):
+        return G.Pipeline(VS_WORDS, prefix + middle + export, root_blob(),
+                          ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+
+    reason = ('whole-word read of v21 after odd d16 image_load: upper half used by '
+              'exp mrt0 v21, v21, v21, v21 done vm')
+    # A narrowed write does not repair lanes loaded under an earlier mask. Here
+    # the branch boundary also prevents the same-generation shortcut.
+    narrowed = struct.pack('<I', 0xbf820000) + struct.pack('<I', 0x7da81082) + upper + restore
+    expect_refused(lambda: translate(narrowed), reason, 'upper write under narrower EXEC')
+    # A branch may bypass the repair entirely, even when EXEC was restored.
+    skipped = restore + struct.pack('<I', 0xbf820002) + upper
+    expect_refused(lambda: translate(skipped), reason, 'branch skips upper write')
+    read = struct.pack('<I', (0x03 << 25) | (30 << 17) | (21 << 9) | 242)
+    before = struct.pack('<I', 0xbf820000) + read + restore + upper
+    expect_refused(lambda: translate(before),
+                   'whole-word read of v21 after odd d16 image_load: upper half used by '
+                   'v_add_f32_e32 v30, 1.0, v21', 'whole read before upper write')
+
+
+def repaired_odd_sample_program():
+    # Pixel input v0 packs x and y. The left four lanes sample, and the first
+    # two of those replace the low half. v21 is also the original x address.
+    def mov(dst, src):
+        return 0x7e000200 | (dst << 17) | src
+
+    def words(*values):
+        return struct.pack('<%dI' % len(values), *values)
+
+    sampler = bytes.fromhex('800398be ff0399be00001000 ff039abe00000004 80039bbe')
+    coords = words(mov(21, 255), 0x3d800000, mov(22, 255), 0x3e800000)
+    low = words(0x7e2a02f9, 0x00861481)   # v21 WORD_0 = 1, preserve
+    else_low = words(0x7e2a02f9, 0x00861482)  # v21 WORD_0 = 2, preserve
+    high = words(0x7e2a02f9, 0x00861581)  # v21 WORD_1 = 1, preserve
+    sample = encode_mimg(0x27, dmask=2, vaddr=21, vdata=21, ssamp=24, d16=1)
+    return (PRE_WORDS + sampler + coords
+            + words(0xbe9e037e, 0x7da81084, 0xbf880008)  # save EXEC; x < 4; skip arm if empty
+            + sample + words(0xbf8c3f70, 0xbe9d037e, 0x7da81082) + low
+            + words(0xbefe031d, 0x8a7e7e1e) + else_low  # restore x < 4; select its complement
+            + words(0xbefe031e) + high  # restore entry EXEC and define high for every lane
+            + words(0xf800180f, 0x15151515, 0xbf810000))
+
+
+def repaired_odd_sample_hlsl():
+    pipe = G.Pipeline(VS_WORDS, repaired_odd_sample_program(), root_blob(),
+                      ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
+    return pipe.hlsl_ps()
+
+
+def repaired_odd_sample_words(*, wrong_upper=False):
+    # The point sampler reads channel y of texel (0,0); Python's binary16
+    # conversion is round-to-nearest-even. SDWA writes the integer bit 1.
+    value, = struct.unpack('<f', struct.pack('<I', FLOAT_TEXELS[0][1]))
+    half, = struct.unpack('<H', struct.pack('<e', value))
+    out = []
+    for i in range(WIDTH * HEIGHT):
+        x = i % WIDTH
+        word = 0x3d800000  # initial x coordinate, also the pre-sample v21
+        if x < 4:
+            word = 0xa5a50000 | half  # unspecified upper half after D16
+        if x < 2:
+            word = (word & 0xffff0000) | 1  # WORD_0, UNUSED_PRESERVE
+        elif x >= 4:
+            word = (word & 0xffff0000) | 2
+        word = (word & 0xffff) | ((0 if wrong_upper else 1) << 16)  # WORD_1, UNUSED_PRESERVE
+        out.extend((word,) * 4)
+    return out
+
+
+def check_repaired_odd_sample():
+    source = repaired_odd_sample_hlsl()
+    assert 'SampleLevel(q0, float2(F(v21), F(v22)), 0)' in source
+    assert 'v21 = pack16_rne(t.y);' in source
+    assert '((asuint(v21) & 0xffffu) | (((0x00000001u) & 0xffffu) << 16u))' in source
+    assert repaired_odd_sample_words() != repaired_odd_sample_words(wrong_upper=True)
+    full_write = struct.pack('<I', 0x7e000200 | (21 << 17) | 130)
+    high = struct.pack('<2I', 0x7e2a02f9, 0x00861581)
+    dword = struct.pack('<2I', 0x7e2a02f9, 0x00861681)
+    for replacement in (full_write, dword):
+        code = repaired_odd_sample_program().replace(high, replacement)
+        G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+    byte2 = struct.pack('<2I', 0x7e2a02f9, 0x00861281)
+    partial = repaired_odd_sample_program().replace(high, byte2)
+    expect_refused(lambda: G.Pipeline(VS_WORDS, partial, root_blob(), ps_hw_inputs=PACKED_INPUT,
+                                      rtv_formats=UINT_RTV).hlsl_ps(),
+                   'whole-word read of v21 after odd d16 image_load: upper half used by exp mrt0',
+                   'BYTE_2 leaves the top byte undefined')
+    refusals = []
+    G.Pipeline(VS_WORDS, repaired_odd_sample_program(), root_blob(),
+               ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV, refusals=refusals)
+    assert not refusals, refusals  # The address read precedes the odd sample.
+
+    # The vertex path uses wave64 EXEC and exports a whole parameter word.
+    word = lambda *v: struct.pack('<%dI' % len(v), *v)
+    vs = (repaired_odd_sample_program()
+          .replace(word(0xbe9e037e), word(0xbe9e047e))  # save exec in s[30:31]
+          .replace(word(0xbefe031e), word(0xbefe041e))  # restore exec
+          .replace(word(0xbe9d037e), word(0xbe9c047e))  # save narrowed exec in s[28:29]
+          .replace(word(0xbefe031d), word(0xbefe041c))
+          .replace(word(0x8a7e7e1e), word(0x8afe7e1e))
+          .replace(word(0xf800180f, 0x15151515, 0xbf810000),
+                   word(0xf800023f, 0x15151515, 0xf80008cf, 0x15151515, 0xbf810000)))
+    ps = word(0x7e000280, 0xf800180f, 0, 0xbf810000)
+    vertex = G.Pipeline(vs, ps, root_blob(), rtv_formats=UINT_RTV)
+    assert 'o.param3' in vertex.hlsl_vs()
+    assert vertex.vs.retry_odd_d16_paths
+    # Moving the high write before restoration leaves some loaded lanes undefined.
+    high = word(0x7e2a02f9, 0x00861581)
+    restore64 = word(0xbefe041e)
+    narrowed = vs.replace(restore64 + high, high + restore64)
+    expect_refused(lambda: G.Pipeline(narrowed, ps, root_blob(), rtv_formats=UINT_RTV).hlsl_vs(),
+                   'whole-word read of v21 after odd d16 image_load: upper half used by exp param3',
+                   'wave64 upper write under narrower EXEC')
+
+    # A copy retains the unknown upper half even after its source is repaired.
+    code = repaired_odd_sample_program()
+    save_narrowed = struct.pack('<I', 0xbe9d037e)
+    copy = struct.pack('<I', 0x7e000200 | (23 << 17) | (256 + 21))
+    export = struct.pack('<I', 0x15151515)
+    copied = code.replace(save_narrowed, copy + save_narrowed).replace(export, struct.pack('<I', 0x17171717))
+    copied = copied.replace(struct.pack('<I', 0xbf880008), struct.pack('<I', 0xbf880009))
+    expect_refused(lambda: G.Pipeline(VS_WORDS, copied, root_blob(), ps_hw_inputs=PACKED_INPUT,
+                                      rtv_formats=UINT_RTV).hlsl_ps(),
+                   'whole-word read of v23 after odd d16 image_load: upper half used by exp mrt0',
+                   'copy before upper repair')
+
+    # Exercise a back edge whose copy precedes the odd write in code order.
+    stage = G.Stage.__new__(G.Stage)
+    stage.ins = [(i, 1, '', '') for i in range(4)]
+    stage.spill_cfg = ([(0, 1), (1, 2), (2, 3), (3, 4)], {}, [[1], [2, 3], [1], []], {})
+    stage.odd_d16_entry_exec = set()
+    stage.odd_d16_events = {0: [('write', 21, 'full', 0)],
+                            1: [('write', 23, ('copy', 21), 1)],
+                            2: [('write', 21, 'undefined', 2)],
+                            3: [('read', 23, 'export')]}
+    assert stage.odd_d16_unsafe_read() == (23, 'export')
+    stage.odd_d16_events[3].insert(0, ('write', 23, 'full', 3))
+    stage.odd_d16_entry_exec = {3}
+    assert stage.odd_d16_unsafe_read() is None
+    stage.ins = [(i, 1, '', '') for i in range(3)]
+    stage.spill_cfg = ([(0, 3)], {}, [[]], {})
+    stage.odd_d16_entry_exec = set()
+    stage.odd_d16_events = {0: [('write', 21, 'undefined', 7)],
+                            1: [('write', 21, 'full', 7)], 2: [('read', 21, 'export')]}
+    assert stage.odd_d16_unsafe_read() is None
+    stage.odd_d16_events[1] = [('write', 21, 'full', 8)]
+    assert stage.odd_d16_unsafe_read() == (21, 'export')
+    # Baseline captured from the pre-change translator for an unrelated program.
+    pipe = G.Pipeline(VS_WORDS, odd_tail_program(3), root_blob(),
+                      ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
+    assert hashlib.sha256(pipe.hlsl_vs().encode()).hexdigest() == '7ac5b3ccc1ba98750c54dd4f8b44b3eebe992b0010ece56720386e5ec8690afa'
+    assert hashlib.sha256(pipe.hlsl_ps().encode()).hexdigest() == 'f4ff17baab48fa7222b287976dd218643a2b7bfb06dd984cc9ec7855a78dc508'
+    assert hashlib.sha256(pipe.manifest().encode()).hexdigest() == '7b710cc0d0fe56ab4d0f3af31121a25a928a33f57894c4f79a03acbdd70f5801'
+    return source
+
+
+def check_repaired_odd_sample_draw(dxc, renderer, adapter):
+    source = check_repaired_odd_sample()
+    original = '((asuint(v21) & 0xffffu) | (((0x00000001u) & 0xffffu) << 16u))'
+    wrong = '(asuint(v21) & 0xffffu)'
+    assert source.count(original) == 1
+    mutant = source.replace(original, wrong, 1)
+    out_dir = HERE.parent / 'out'
+    out_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='image-d16-repaired-', dir=out_dir) as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs', 'vs_6_0', directory)
+        for name, shader in (('reference', source), ('wrong_upper', mutant)):
+            ps = compile_hlsl(dxc, 'dxc', shader, name, 'ps_6_0', directory)
+            run = run_d16_draw(renderer, adapter, 'rgba32f_sampled', vs, ps,
+                               repaired_odd_sample_words(), directory, name)
+            if name == 'wrong_upper':
+                assert run.returncode == 1 and '16 of 16 pixels differ' in run.stderr, (run.stdout, run.stderr)
+                run = run_d16_draw(renderer, adapter, 'rgba32f_sampled', vs, ps,
+                                   repaired_odd_sample_words(wrong_upper=True), directory, name + '_model')
+            assert run.returncode == 0, (run.stdout, run.stderr)
+
+
 def odd_tail_variants(components, *, red_only=False):
     hlsl = odd_tail_hlsl(components, red_only=red_only)
     tail = 20 + components // 2
@@ -1277,6 +1473,8 @@ ODD_TAIL_CASES = ((3, False), (1, False), (3, True))
 
 
 def check_odd_tail_programs():
+    check_odd_tail_branch_refusals()
+    check_repaired_odd_sample()
     for components, red_only in ODD_TAIL_CASES:
         odd_tail_variants(components, red_only=red_only)
     expect_refused(lambda: odd_tail_hlsl(1, unsafe=True),
@@ -1440,6 +1638,8 @@ def main():
         check_decode(args[0])
     elif mode == 'odd-draw' and len(args) == 3:
         check_odd_tail_draw(*args)
+    elif mode == 'repaired-draw' and len(args) == 3:
+        check_repaired_odd_sample_draw(*args)
     elif mode == 'draw' and len(args) in (3, 4):
         controls()
         check_draw(*args)

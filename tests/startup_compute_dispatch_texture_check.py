@@ -22,7 +22,13 @@ every word keeps the sentinel.
 
 Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
 and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
-changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
+changed to clamp reads red 0 (the control); an `smpheap` line is refused with its reason.
+
+Compared input: case A with a level-zero comparison sample (image_sample_c_lz) under a constant point, clamp, LESS
+sampler that the translator writes as `smpc`, and a 2x1 R32_FLOAT texture of depths 1.0 and 2.5
+(dispatch-sampled-depth). The reference is the thread's z id and u its x id, so the 288 written words hold both
+outcomes; all 320 words equal a CPU model of the comparison. The same program with the manifest's function changed
+to GREATER matches the GREATER model (the control).
 Exit 77 when the adapter is not available.
 """
 import os
@@ -266,22 +272,101 @@ def filtered(directory, consumer, dxc, env):
     layer = clean(result)
 
     # Control: the same program under the manifest's sampler changed to clamp in U, V and W reads red 0, which the
-    # check above refuses; a comparison sampler and a sampler heap table stay refused, each with its reason.
+    # check above refuses; a sampler heap table stays refused with its reason.
     manifest = cache / f'{key:016x}.txt'
     original = manifest.read_text()
     assert original.count(line) == 1, original
     manifest.write_bytes(original.replace(line, line.replace('smpl 0 0x0 ', 'smpl 0 0x92 ')).encode())
     got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
     assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and reds(got) == {0.0}, result.stderr[-3000:]
-    for new, reason in ((line.replace('smpl', 'smpc'), 'a comparison sampler'),
-                        (line + '\nsmpheap 2048 1 fallback 2047', 'a sampler from the sampler heap')):
-        manifest.write_bytes(original.replace(line, new).encode())
-        got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
-        refused = lines(result, 'refused: ')
-        assert got == [C.SENTINEL] * C.WORDS and len(refused) == 1 and refused[0].endswith('refused: ' + reason), (
-            reason, refused, result.stderr[-3000:])
+    manifest.write_bytes(original.replace(line, line + '\nsmpheap 2048 1 fallback 2047').encode())
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    refused = lines(result, 'refused: ')
+    assert got == [C.SENTINEL] * C.WORDS and len(refused) == 1 and refused[0].endswith(
+        'refused: a sampler from the sampler heap'), (refused, result.stderr[-3000:])
     print(f'filtered input: an smpl wrap and linear sampler reads red 0.5 at the left edge of a 2x1 texture; the same '
-          f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
+          f'program with a clamp sampler reads 0; a heap sampler is refused; debug layer: {layer}')
+
+
+# The texture input case with a comparison sample: s20 clamp in U and V, TRUNC_COORD and LESS (point filters, LOD
+# range 0). The reference is v7 = float(thread id z), u is v8 = float(thread id x) and v is v9 = 0. The five new
+# instructions are not assembled by llvm-mc here; the decoder is checked to read them as written.
+POINT_LESS = 2 | 2 << 3 | 1 << 27 | 1 << 12
+POINT_GREATER = POINT_LESS ^ 1 << 12 | 4 << 12
+COMPARED = SAMPLED[:2] + ('s_mov_b32 s20, 0x%x' % POINT_LESS, SAMPLED[2], 'v_cvt_f32_u32_e32 v7, v2',
+                          'v_cvt_f32_u32_e32 v8, v0', 'v_mov_b32_e32 v9, 0',
+                          'image_sample_c_lz v12, v[7:9], s[24:31], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+                          'v_xor_b32_e32 v5, v5, v12')
+
+
+def compared(directory, consumer, dxc, env):
+    """The sampler bound is the manifest's `smpc` one: a 2x1 R32_FLOAT texture (1.0, 2.5) is compared at u = 0 (the
+    left texel) or u = 1 (clamped to the right one) with the references 0.0 to 3.0. A word is XORed with the bits of
+    1.0f where the CPU model of the comparison passes and is left as case A wrote it where the model fails."""
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    _, _, rsrc2, group, _ = C.CASES['A']
+    C.SPLICE.update({COMPARED[2]: 'ff0394be' + struct.pack('<I', POINT_LESS).hex(), COMPARED[4]: '020d0e7e',
+                     COMPARED[5]: '000d107e', COMPARED[6]: '8002127e', COMPARED[7]: '0801bcf0070ca600',
+                     COMPARED[8]: '05190a3a'})
+    code = C.splice(*COMPARED)
+    decoded = [i[3] for i in G.decode(code) if i[0] >= C.STORE_A][:len(COMPARED)]
+    assert decoded == list(COMPARED), decoded
+    pipeline = C.translate('A', code=code)
+    line = 'smpc 0 0x%x 0x0 0x0 0x0' % POINT_LESS
+    assert 'v12 = U(r1.SampleCmpLevelZero(q0, float2(F(v8), F(v9)), F(v7)));' in pipeline.hlsl_cs() and \
+        pipeline.manifest().endswith('srv 1 tex2d table 1 64\nuav 0 table 1 16\n' + line + '\n'), pipeline.manifest()
+    (directory / 'program').write_bytes(code)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    one = struct.unpack('<I', struct.pack('<f', 1.0))[0]
+    written = 24 * 3 * 2 * 2
+    plain = C.expected('A')
+    layout = '<%dI' % C.WORDS
+    depths = (1.0, 2.5)  # the consumer's texels, left and right
+
+    def model(passes):
+        # Word i is thread (x, y, z) of a 2x3x4 group: i % 24 == x + 2 * y + 6 * z. Reference z, texel x.
+        assert group == (2, 3, 4)
+        return [word ^ (one if passes(float(i % 24 // 6), depths[i % 2]) else 0)
+                for i, word in enumerate(plain[:written])] + plain[written:]
+
+    def match(got, want, result, what):
+        refused = lines(result, 'refused: ')
+        assert not refused, f'{what}: {refused[0]}'
+        wrong = [i for i in range(C.WORDS) if got[i] != want[i]]
+        assert not wrong, '%s: word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
+            what, wrong[0], got[wrong[0]], want[wrong[0]], len(wrong), result.stderr[-3000:])
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+
+    less, greater = model(lambda ref, texel: ref < texel), model(lambda ref, texel: ref > texel)
+    passing = [sum(a != b for a, b in zip(m, plain)) for m in (less, greater)]
+    differ = sum(a != b for a, b in zip(less, greater))
+    assert passing == [144, 108] and differ == 252, (passing, differ)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-depth', layout)
+    assert got == [C.SENTINEL] * C.WORDS, 'a Dispatch without a translation wrote the output'
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-depth', layout)
+    match(got, less, result, 'smpc LESS')
+    layer = clean(result)
+
+    # Control: the function is the manifest's. Under GREATER the same program passes where the reference is above
+    # the texel, a result the check above refuses at 252 words.
+    manifest = cache / f'{key:016x}.txt'
+    original = manifest.read_text()
+    assert original.count(line) == 1, original
+    manifest.write_bytes(original.replace(line, 'smpc 0 0x%x 0x0 0x0 0x0' % POINT_GREATER).encode())
+    got, result = run(directory, consumer, env, 'dispatch-sampled-depth', layout)
+    match(got, greater, result, 'smpc GREATER')
+    clean(result)
+    print(f'compared input: an smpc point, clamp, LESS sampler passes at 144 of the {written} written words and all '
+          f'{C.WORDS} words match the CPU model; the same program under GREATER matches its model (108 pass, 252 '
+          f'words differ from LESS); debug layer: {layer}')
 
 
 
@@ -381,6 +466,7 @@ def main(consumer, dxc, adapter):
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        compared(Path(temporary) / 'compared', consumer, dxc, env)
         for dim in DIMENSIONS:
             identifier_load(Path(temporary) / f'identifier-{dim}', consumer, dxc, env, dim)
         identifier_load(Path(temporary) / 'identifier-1d-mip', consumer, dxc, env, '1d', explicit_mip=True)
