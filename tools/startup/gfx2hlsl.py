@@ -2065,6 +2065,7 @@ def vertex_image_range_facts(ins):
     from vertex_image_ranges import VertexImageRanges
 
     targets = set()
+    last_load = max((pc for pc, _, name, _ in ins if name == 'global_load_dword'), default=-1)
     for pc, size, name, asm in ins:
         if name == 's_branch' or name.startswith('s_cbranch_'):
             _, ops, _ = parse(asm)
@@ -2072,8 +2073,8 @@ def vertex_image_range_facts(ins):
             if not match:
                 return {}
             target = int(match.group(1), 16)
-            if target <= pc:
-                return {}  # A linear walk cannot establish loop invariants.
+            if target <= pc and target <= last_load:
+                return {}  # A loop reaching a load needs an invariant.
             targets.add(target)
         elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap', 's_endpgm_')):
             return {}
@@ -2130,7 +2131,9 @@ def vertex_image_range_facts(ins):
         elif not mods and base == 'v_fma_f32' and len(ops) == 4:
             for source, multiplier in ((ops[1], ops[2]), (ops[2], ops[1])):
                 mul, add = float_constant(multiplier), float_constant(ops[3])
-                if source in before and mul is not None and add is not None:
+                # With a [0, 1] input the maximal product is exactly the
+                # binary32 multiplier, even if the compiler separates the FMA.
+                if before.get(source) == ('float', 0, 1) and mul is not None and add is not None:
                     facts.facts[source] = before[source]
                     facts.fma(ops[0], source, mul, add)
                     break

@@ -12,6 +12,8 @@ from startup_buffer_address_check import encode_mtbuf, encode_vop1, encode_vop2,
 from startup_gfx2hlsl_getpc_refusal_check import export
 import startup_stream_two_exit_check as streams
 import startup_stream_interface_check as stream_interface
+import gpu_case_runner
+from startup_flat_param_check import compile_hlsl
 from startup_compute_global_load_check import encode_global, GLOBAL_LOAD_DWORD
 from startup_gfx2hlsl_add_sub_co_ci_check import vop3b
 
@@ -20,8 +22,8 @@ def words(*values):
     return struct.pack('<%dI' % len(values), *values)
 
 
-def program(*, nwords=763, unbounded=False, shift=2, high_source=19, after_shift=b'', extra=b'', initial=b''):
-    mtbuf = encode_mtbuf(vdata=9)
+def program(*, nwords=763, unbounded=False, shift=2, high_source=19, after_shift=b'', extra=b'', initial=b'', addressed=False):
+    mtbuf = encode_mtbuf(vdata=9, offen=int(addressed), vaddr=0)
     fma = words(0xd54b000f, 255 | (268 << 9) | (240 << 18), 0x437f0000)
     cvt = encode_vop1(7, 15, 270 if unbounded else 271)
     cmpx = words(0x7c000000 | (0xd5 << 17) | (15 << 9) | 255, 255)
@@ -56,7 +58,7 @@ def graphics_program(*, before_exports=b'', **kwargs):
     initial = words(0xf4080400, 0xfa000010)  # s_load_dwordx4 s[16:19], s[0:1], 16
     extra = (before_exports + encode_vop1(1, 8, 242) + export(12, (8, 8, 8, 8))
              + export(32, (7, 7, 7, 7)) + export(33, (7, 7, 7, 7), done=True))
-    return program(initial=initial, extra=extra, **kwargs)[0]
+    return program(initial=initial, extra=extra, addressed=True, **kwargs)[0]
 
 
 def pipeline(code):
@@ -154,5 +156,55 @@ def main():
     translator_controls()
 
 
+def draw(compiler, renderer, adapter):
+    samples = (0, 1, 2, 7, 31, 83, 126, 253)
+    table = [0x10000000 + i for i in range(763)]
+    expected_words = [table[3 * value] for value in samples]
+    wrong_words = [table[3 * value + 1] for value in samples]
+    assert all(a != b for a, b in zip(expected_words, wrong_words))
+    source = pipeline(graphics_program()).hlsl_vs().replace('VSOut main(', 'VSOut guest_main(', 1)
+    source += """
+struct DrawOut { float4 pos : SV_Position; nointerpolation float4 color : COLOR; };
+DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
+    VSOut translated = body(4u * row);
+    DrawOut output;
+    output.pos = float4(-1.0 + 0.25 * row + (corner == 1u ? 0.5 : 0.0),
+                        corner == 2u ? 1.0 : -1.0, 0.0, 1.0);
+    output.color = translated.param0;
+    return output;
+}
+"""
+    pixel = ('float4 main(float4 pos : SV_Position, nointerpolation float4 color : COLOR) '
+             ': SV_Target { return color; }')
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(compiler, 'dxc', source, 'vertex_image', 'vs_6_0', directory)
+        ps = compile_hlsl(compiler, 'dxc', pixel, 'vertex_image_pixel', 'ps_6_0', directory)
+        expected = directory / 'expected.bin'
+        inputs = ','.join('%08x' % (sample << 24) for sample in samples)
+
+        def run(values, expect_success):
+            expected.write_bytes(b''.join(struct.pack('<4I', *([value] * 4)) for value in values))
+            result = gpu_case_runner.run(renderer, adapter, [
+                '--startup-instanced-vertex-buffer-words', vs, ps, '8', '1', expected,
+                '0,0,0,0', inputs])
+            output = result.stdout + result.stderr
+            print(output, end='')
+            if result.returncode == 77:
+                raise SystemExit(77)
+            if expect_success:
+                assert result.returncode == 0, output
+            else:
+                assert result.returncode != 0 and '8 of 8 pixels differ' in output, output
+
+        run(expected_words, True)
+        run(wrong_words, False)
+    print('vertex image %s: every pixel matches; off-by-one reference differs' % adapter)
+
+
 if __name__ == '__main__':
     main()
+    if len(sys.argv) > 1:
+        if len(sys.argv) != 5 or sys.argv[1] != 'draw':
+            raise SystemExit('usage: startup_vertex_image_address_check.py draw <dxc> <offscreen_check> <adapter>')
+        draw(*sys.argv[2:])

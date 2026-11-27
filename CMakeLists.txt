@@ -4580,6 +4580,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py" "${DXC_EXECUTABLE}"
         "$<TARGET_FILE:offscreen_check>" $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
     set_tests_properties(startup_gfx2hlsl_getpc_table_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_vertex_image_address_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_vertex_image_address_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_vertex_image_address_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # gfx2hlsl 16-bit vector ALU (#1723): the translated pairs drawn on WARP and hardware (FXC 5_1 and DXC 6_0),
     # four result words per draw against an exact binary16 reference.
     add_test(NAME startup_gfx2hlsl_f16_alu_draw_controls COMMAND "${INTAKE_PYTHON}" -B
