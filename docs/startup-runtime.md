@@ -2129,7 +2129,9 @@ reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resour
 sampler holds its own reference to the presented surface until the copy's fence has passed; a title
 may release the surface right after the present. If `Signal` fails after the copy was submitted,
 sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
-process. It publishes them in a named block,
+process. A removed device (the fence reporting `UINT64_MAX`) is never treated as a completion:
+the readback is not mapped, no sample is published, sampling stops, and the surface stays referenced
+for the rest of the process. It publishes them in a named block,
 `Local\x2w_present_signature_<process id>`, so other tools can read it too
 (`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
 formats are read; for others it logs

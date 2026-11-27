@@ -183,11 +183,60 @@ std::vector<x2w_present_signature::Snapshot> present_all(Gpu& gpu, x2w_present_s
     return published;
 }
 
+// Forwards every call to a real fence, except that GetCompletedValue reports UINT64_MAX once
+// `removed` is set: the device-removal case the sampler has to survive without treating it as
+// completion. Signal and SetEventOnCompletion still succeed, as they do while a device is being
+// removed. For the destructor controls, `pending_observations`/`next` make each successive
+// GetCompletedValue report a chosen value a fixed number of times and then the real fence's own
+// value, so a transition across the destructor's wait is deterministic: the pre-wait
+// observation sees pending, the wait runs on the real fence, the post-wait observation sees the
+// completed (or, with `removed`, the removal sentinel) state. The real fence is the only object
+// the driver ever sees.
+class RemovedFence : public ID3D12Fence {
+public:
+    explicit RemovedFence(ID3D12Fence* real) : real_(real) {}
+    bool removed = false;
+    UINT64 pending_observations = 0;  // report `next` this many times, then the real value
+    UINT64 next = 0;
+    unsigned observations = 0;        // GetCompletedValue calls since construction
+    unsigned event_registrations = 0;
+    ID3D12Fence* real() const { return real_; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override { return real_ ? real_->QueryInterface(riid, out) : E_FAIL; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return real_ ? real_->AddRef() : 0; }
+    ULONG STDMETHODCALLTYPE Release() override { return real_ ? real_->Release() : 0; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* n, void* d) override { return real_ ? real_->GetPrivateData(g, n, d) : E_FAIL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT n, const void* d) override { return real_ ? real_->SetPrivateData(g, n, d) : E_FAIL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return real_ ? real_->SetPrivateDataInterface(g, d) : E_FAIL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return real_ ? real_->SetName(name) : E_FAIL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override { return real_ ? real_->GetDevice(riid, out) : E_FAIL; }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override
+    {
+        ++observations;
+        if (pending_observations) {
+            --pending_observations;
+            return next;
+        }
+        if (removed) return UINT64_MAX;
+        return real_ ? real_->GetCompletedValue() : 0;
+    }
+    HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override
+    {
+        ++event_registrations;
+        return real_ ? real_->SetEventOnCompletion(value, event) : E_FAIL;
+    }
+    HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override { return real_ ? real_->Signal(value) : E_FAIL; }
+
+private:
+    ID3D12Fence* real_;
+};
 // Forwards every call to a real queue, except that Signal fails once `fail_signal` is set: the
-// "submitted, but no fence" case the sampler has to survive.
+// "submitted, but no fence" case the sampler has to survive. With `observed`, Signal and Wait
+// unwrap exactly our RemovedFence to its real fence, so a test fake never enters the driver.
+
 class SignalFailingQueue : public ID3D12CommandQueue {
 public:
-    explicit SignalFailingQueue(ID3D12CommandQueue* real) : real_(real) {}
+    explicit SignalFailingQueue(ID3D12CommandQueue* real, RemovedFence* observed = nullptr)
+        : real_(real), observed_(observed) {}
     bool fail_signal = false;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override { return real_->QueryInterface(riid, out); }
     ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
@@ -213,8 +262,17 @@ public:
     void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT n) override { real_->SetMarker(m, d, n); }
     void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT n) override { real_->BeginEvent(m, d, n); }
     void STDMETHODCALLTYPE EndEvent() override { real_->EndEvent(); }
-    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override { return fail_signal ? E_FAIL : real_->Signal(fence, value); }
-    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override { return real_->Wait(fence, value); }
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override
+    {
+        if (fail_signal) return E_FAIL;
+        // A test fake never enters the driver: unwrap exactly our RemovedFence to its real fence.
+        if (observed_ && fence == observed_) fence = observed_->real();
+        return real_->Signal(fence, value);
+    }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override
+    {
+        return real_->Wait(observed_ && fence == observed_ ? observed_->real() : fence, value);
+    }
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* f) override { return real_->GetTimestampFrequency(f); }
     HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* g, UINT64* c) override { return real_->GetClockCalibration(g, c); }
 #if defined(_MSC_VER) || !defined(_WIN32)
@@ -225,7 +283,86 @@ public:
 
 private:
     ID3D12CommandQueue* real_;
+    RemovedFence* observed_;
 };
+
+// Forwards every ID3D12Device method to a real device, except that CreateFence returns the
+// RemovedFence above, so the fixture controls what GetCompletedValue reports.
+class RemovalDevice : public ID3D12Device {
+public:
+    explicit RemovalDevice(ID3D12Device* real) : real_(real) {}
+    RemovedFence& fence() { return fence_; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override { return real_->QueryInterface(riid, out); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* n, void* d) override { return real_->GetPrivateData(g, n, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT n, const void* d) override { return real_->SetPrivateData(g, n, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return real_->SetPrivateDataInterface(g, d); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return real_->SetName(name); }
+    // clang-format off
+    UINT STDMETHODCALLTYPE GetNodeCount() override { return real_->GetNodeCount(); }
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **command_queue) override { return real_->CreateCommandQueue(desc, riid, command_queue); }
+    HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **command_allocator) override { return real_->CreateCommandAllocator(type, riid, command_allocator); }
+    HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) override { return real_->CreateGraphicsPipelineState(desc, riid, pipeline_state); }
+    HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) override { return real_->CreateComputePipelineState(desc, riid, pipeline_state); }
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *command_allocator, ID3D12PipelineState *initial_pipeline_state, REFIID riid, void **command_list) override { return real_->CreateCommandList(node_mask, type, command_allocator, initial_pipeline_state, riid, command_list); }
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void *feature_data, UINT feature_data_size) override { return real_->CheckFeatureSupport(feature, feature_data, feature_data_size); }
+    HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **descriptor_heap) override { return real_->CreateDescriptorHeap(desc, riid, descriptor_heap); }
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override { return real_->GetDescriptorHandleIncrementSize(descriptor_heap_type); }
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void *bytecode, SIZE_T bytecode_length, REFIID riid, void **root_signature) override { return real_->CreateRootSignature(node_mask, bytecode, bytecode_length, riid, root_signature); }
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateConstantBufferView(desc, descriptor); }
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource *resource, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateShaderResourceView(resource, desc, descriptor); }
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource *resource, ID3D12Resource *counter_resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateUnorderedAccessView(resource, counter_resource, desc, descriptor); }
+    void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateRenderTargetView(resource, desc, descriptor); }
+    void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource *resource, const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateDepthStencilView(resource, desc, descriptor); }
+    void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) override { real_->CreateSampler(desc, descriptor); }
+    void STDMETHODCALLTYPE CopyDescriptors(UINT dst_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_offsets, const UINT *dst_descriptor_range_sizes, UINT src_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_offsets, const UINT *src_descriptor_range_sizes, D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override { real_->CopyDescriptors(dst_descriptor_range_count, dst_descriptor_range_offsets, dst_descriptor_range_sizes, src_descriptor_range_count, src_descriptor_range_offsets, src_descriptor_range_sizes, descriptor_heap_type); }
+    void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset, const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset, D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override { real_->CopyDescriptorsSimple(descriptor_count, dst_descriptor_range_offset, src_descriptor_range_offset, descriptor_heap_type); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo(D3D12_RESOURCE_ALLOCATION_INFO* out, UINT visible_mask, UINT reource_desc_count, const D3D12_RESOURCE_DESC *resource_descs) override { return real_->GetResourceAllocationInfo(out, visible_mask, reource_desc_count, resource_descs); }
+    D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE GetCustomHeapProperties(D3D12_HEAP_PROPERTIES* out, UINT node_mask, D3D12_HEAP_TYPE heap_type) override { return real_->GetCustomHeapProperties(out, node_mask, heap_type); }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(UINT visible_mask, UINT reource_desc_count, const D3D12_RESOURCE_DESC *resource_descs) override { return real_->GetResourceAllocationInfo(visible_mask, reource_desc_count, resource_descs); }
+    D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT node_mask, D3D12_HEAP_TYPE heap_type) override { return real_->GetCustomHeapProperties(node_mask, heap_type); }
+#endif
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) override { return real_->CreateCommittedResource(heap_properties, heap_flags, desc, initial_state, optimized_clear_value, riid, resource); }
+    HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC *desc, REFIID riid, void **heap) override { return real_->CreateHeap(desc, riid, heap); }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) override { return real_->CreatePlacedResource(heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource); }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) override { return real_->CreateReservedResource(desc, initial_state, optimized_clear_value, riid, resource); }
+    HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle) override { return real_->CreateSharedHandle(object, attributes, access, name, handle); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE handle, REFIID riid, void **object) override { return real_->OpenSharedHandle(handle, riid, object); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandleByName(const WCHAR *name, DWORD access, HANDLE *handle) override { return real_->OpenSharedHandleByName(name, access, handle); }
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT object_count, ID3D12Pageable *const *objects) override { return real_->MakeResident(object_count, objects); }
+    HRESULT STDMETHODCALLTYPE Evict(UINT object_count, ID3D12Pageable *const *objects) override { return real_->Evict(object_count, objects); }
+    HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid, void **fence) override
+    {
+        if (riid != __uuidof(ID3D12Fence)) return E_NOINTERFACE;
+        ID3D12Fence* real_fence = nullptr;
+        const HRESULT hr = real_->CreateFence(initial_value, flags, IID_PPV_ARGS(&real_fence));
+        if (SUCCEEDED(hr)) {
+            fence_ = RemovedFence(real_fence);
+            *fence = static_cast<ID3D12Fence*>(&fence_);
+        }
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return real_->GetDeviceRemovedReason(); }
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC *desc, UINT first_sub_resource, UINT sub_resource_count, UINT64 base_offset, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts, UINT *row_count, UINT64 *row_size, UINT64 *total_bytes) override { real_->GetCopyableFootprints(desc, first_sub_resource, sub_resource_count, base_offset, layouts, row_count, row_size, total_bytes); }
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **heap) override { return real_->CreateQueryHeap(desc, riid, heap); }
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL enable) override { return real_->SetStablePowerState(enable); }
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC *desc, ID3D12RootSignature *root_signature, REFIID riid, void **command_signature) override { return real_->CreateCommandSignature(desc, root_signature, riid, command_signature); }
+    void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource *resource, UINT *total_tile_count, D3D12_PACKED_MIP_INFO *packed_mip_info, D3D12_TILE_SHAPE *standard_tile_shape, UINT *sub_resource_tiling_count, UINT first_sub_resource_tiling, D3D12_SUBRESOURCE_TILING *sub_resource_tilings) override { real_->GetResourceTiling(resource, total_tile_count, packed_mip_info, standard_tile_shape, sub_resource_tiling_count, first_sub_resource_tiling, sub_resource_tilings); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    LUID* STDMETHODCALLTYPE GetAdapterLuid(LUID* out) override { return real_->GetAdapterLuid(out); }
+#else
+    LUID STDMETHODCALLTYPE GetAdapterLuid() override { return real_->GetAdapterLuid(); }
+#endif
+    // clang-format on
+
+private:
+    ID3D12Device* real_;
+    RemovedFence fence_{nullptr};
+};
+
 
 // Error and corruption messages the debug layer has stored since the last call; prints each one.
 // `deleted_in_use` is set when one of them reports an object released while the GPU still used it.
@@ -348,6 +485,96 @@ int lifetime(Gpu& gpu, ID3D12InfoQueue* info, x2w_present_signature::Block* bloc
         check(sampler->stranded() && !sampler->in_flight() && sampler->holds_source(), "a stranded sampler records nothing more and keeps the surface");
         delete sampler;  // a stranded sampler releases nothing it may still be using
         gate->Release();
+    }
+    // Device removal while a copy is in flight: the fence reports UINT64_MAX, which is not a
+    // completion. Nothing is mapped or published, the sampler stops sampling, and the source stays
+    // held; the destructor keeps every object the copy uses. A genuine prior sample (published
+    // before the removal) stays as it was: no stale publish, no clearing.
+    {
+        ID3D12Resource* presented = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+        RemovalDevice removed_device(gpu.device);
+        // The queue proxy unwraps the sampler's RemovedFence to its real fence by exact fake
+        // identity, so no fake COM object ever reaches the driver.
+        SignalFailingQueue unwrapping(gpu.queue, &removed_device.fence());
+        x2w_present_signature::Sampler sampler(1, true, true);
+        ID3D12Fence* gate = stall(gpu);
+        const LONG64 before = block->sequence / 2;
+        // First a genuine completed copy: it publishes and fills the historical sample state.
+        sampler.present(&removed_device, &unwrapping, presented, 1, block);
+        gate->Signal(1);
+        gpu.idle();
+        sampler.present(&removed_device, &unwrapping, nullptr, 2, block);
+        ID3D12Resource* const sampled_surface = sampler.last_surface();
+        const bool had_sample = block->sequence / 2 == before + 1 && sampler.last_present() == 1
+                                && sampled_surface && !sampler.holds_source();
+        check(had_sample, "a genuine copy completes and publishes before the removal");
+        // Then a second copy whose fence will report device removal.
+        sampler.present(&removed_device, &unwrapping, presented, 3, block);
+        check(sampler.in_flight() && sampler.holds_source(), "the second copy is in flight before the removal");
+        const ULONG left = presented->Release();  // the caller's only reference
+        check(left == 1, "before the removal only the sampler's reference is left");
+        gate->Signal(1);
+        gpu.idle();  // the copy has really finished; the fence still reports device removal
+        removed_device.fence().removed = true;
+        const LONG64 published_before = block->sequence / 2;
+        sampler.present(&removed_device, &unwrapping, nullptr, 4, block);
+        check(!sampler.in_flight() && sampler.failed() && sampler.stranded(),
+              "a removed fence is not a completion: the sampler stops, stranded like a failed Signal");
+        check(sampler.holds_source(), "the source stays held after a removed fence");
+        check(block->sequence / 2 == published_before, "a removed fence publishes no sample");
+        // The prior historical sample survives exactly as it was: nothing cleared, nothing stale.
+        check(sampler.last_present() == 1 && sampler.last_surface() == sampled_surface,
+              "the prior published sample (number and surface) survives the removal unchanged");
+        sampler.present(&removed_device, &unwrapping, nullptr, 5, block);
+        check(sampler.failed() && sampler.stranded() && !sampler.in_flight() && block->sequence / 2 == published_before,
+              "a stranded sampler records nothing more and keeps the surface");
+        gate->Release();
+        // The destructor must keep every object the copy uses (stranded): nothing is released
+        // under a removed device. (The destructor runs at the block's end.)
+    }
+    // The destructor's own re-observation: a copy still pending at destruction transitions across
+    // the destructor's 10 s wait deterministically, because the fence reports a chosen value for a
+    // fixed number of observations and then the real (or removed) state. Pending that completes
+    // while the wait runs releases normally; a fence that reports removal afterwards keeps
+    // everything. The real fence is the only object the driver sees.
+    {
+        // Pending completes during the destructor's wait: normal release, no strand.
+        {
+            ID3D12Resource* presented = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+            RemovalDevice removal(gpu.device);
+            SignalFailingQueue unwrapping(gpu.queue, &removal.fence());
+            ID3D12Fence* gate = stall(gpu);
+            x2w_present_signature::Sampler* sampler = new x2w_present_signature::Sampler(1);
+            sampler->present(&removal, &unwrapping, presented, 1, block);
+            check(sampler->in_flight() && sampler->holds_source(), "a stalled copy is in flight at destruction");
+            gate->Signal(1);  // the copy really completes; the fence is scripted to report pending once
+            removal.fence().pending_observations = 1;
+            removal.fence().next = 0;
+            delete sampler;  // pre-wait observation: pending; wait: on the real fence; post-wait: completed
+            check(removal.fence().observations >= 2 && removal.fence().event_registrations == 1,
+                  "the destructor observes before and after its wait, and registers its event once");
+            check(presented->Release() == 0, "a copy that completes while the destructor waits releases the source normally");
+            gate->Release();
+        }
+        // The fence reports the removal sentinel to the post-wait observation: nothing releases.
+        {
+            ID3D12Resource* presented = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+            RemovalDevice removal(gpu.device);
+            SignalFailingQueue unwrapping(gpu.queue, &removal.fence());
+            ID3D12Fence* gate = stall(gpu);
+            x2w_present_signature::Sampler* sampler = new x2w_present_signature::Sampler(1);
+            sampler->present(&removal, &unwrapping, presented, 2, block);
+            check(sampler->in_flight() && sampler->holds_source(), "the second stalled copy is in flight at destruction");
+            gate->Signal(1);  // the copy really completes
+            removal.fence().pending_observations = 1;
+            removal.fence().next = 0;
+            removal.fence().removed = true;  // from the second observation on: the removal sentinel
+            delete sampler;
+            check(removal.fence().observations == 2 && removal.fence().event_registrations == 1,
+                  "the destructor re-observed removal after exactly one wait registration");
+            check(presented->Release() == 1, "a fence that reports removal after the wait keeps the sampler's source reference");
+            gate->Release();
+        }
     }
     const int errors = debug_errors(info);
     std::printf("held source: %d debug-layer errors\n", errors);
