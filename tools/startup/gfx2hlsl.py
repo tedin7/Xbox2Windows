@@ -2202,39 +2202,65 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
         if i + 1 < len(ins) and base not in ('s_branch', 's_endpgm'):
             edges[i].append(i + 1)
         if writes_exec(base, ops):
-            if not branches and converged is None:
-                return decline('LDS general lowering: EXEC write %s at +0x%x without convergence proof' % (base, off))
-            # Only the save/narrow and restore forms recognized by entry_exec_sites.
-            if base not in ('s_and_saveexec_b32', 's_and_saveexec_b64',
-                            's_or_b32', 's_or_b64', 's_mov_b32', 's_mov_b64'):
-                return decline('LDS general lowering: EXEC write %s at +0x%x is not supported' % (base, off))
+            # RDNA 2 ISA, sections 3.3 and 12.8: EXEC is a lane mask, not a scalar boolean.
+            if not base.startswith('v_cmpx_'):
+                save = re.fullmatch(r's_(?:and|or|andn2)_saveexec_b(32|64)', base)
+                bitwise = re.fullmatch(r's_(?:and|andn2|or|orn2|xor)_b(32|64)', base)
+                move = re.fullmatch(r's_mov_b(32|64)', base)
+                form = save or bitwise or move
+                sources = ops[1:]
+                if (not form or (form.group(1) == '32' and not wave32_exec_proof(ins))
+                        or not sources):
+                    return decline('LDS general lowering: EXEC write %s at +0x%x is not lane-exact' % (base, off))
+                width = int(form.group(1))
+                for source in sources:
+                    key = lane_bit_key(source)
+                    register = reg_range(source)
+                    valid = ((source in ('exec', 'vcc') if width == 64 else source in ('exec_lo', 'vcc_lo'))
+                             or register and register[0] == 's' and register[2] - register[1] == (width // 32 - 1))
+                    if valid and source in ('exec', 'exec_lo'):
+                        continue
+                    if not valid or not key or not lane_mask_read_exact(ins, i, key, require_mask=True):
+                        return decline('LDS general lowering: EXEC write %s at +0x%x has unproven lane mask %s' % (base, off, source))
         if base.startswith('ds_'):
             if 'gds' in mods:
                 return decline('LDS general lowering: GDS operation %s at +0x%x' % (base, off))
             if base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS:
                 return decline('LDS general lowering: %s at +0x%x is not supported' % (base, off))
-    if branches and (converged is None or not ins):
-        return decline('LDS general lowering: no convergence proof for %d instructions' % len(ins))
+    # A synchronization point is reached by every host thread if no forward
+    # branch skips it. RDNA 2 ISA sections 3.3 and 4.3: EXEC does not mask S_BARRIER.
+    crossings = [0] * (len(ins) + 1)
+    for j, targets in enumerate(edges):
+        for target in targets:
+            if target > j + 1:
+                crossings[j + 1] += 1
+                crossings[target] -= 1
+    for i in range(1, len(ins)):
+        crossings[i] += crossings[i - 1]
+    def safe(i, off):
+        return not crossings[i] or converged is not None and off in converged
     pending = [None] * len(ins)
     if pending:
         pending[0] = set()
     barriers = set()
     for i, ((off, _, _, _), (name, ops, mods)) in enumerate(zip(ins, decoded)):
         if pending[i] is None:
+            if name == 's_barrier':
+                return decline('LDS general lowering: unreachable s_barrier at +0x%x' % off)
             continue
         state = pending[i].copy()
         base = name.removesuffix('_e32').removesuffix('_e64')
         if base == 's_barrier':
             if mods or ops not in ([], ['0'], ['0x0']):
                 return decline('LDS general lowering: s_barrier at +0x%x has operands %s and modifiers %s' % (off, ops, mods))
-            if converged is not None and off not in converged:
+            if not safe(i, off):
                 return decline('LDS barrier inside per-lane control flow at +0x%x' % off)
             state.clear()
         elif base.startswith('ds_'):
             kind = 'a' if base in LDS_ATOMIC_OPS else ('w' if LDS_GENERAL_OPS[base][0] else 'r')
             if ((kind == 'r' and state & {'w', 'a'}) or (kind == 'w' and state)
                     or (kind == 'a' and state & {'r', 'w'})):
-                if converged is not None and off not in converged:
+                if not safe(i, off):
                     return decline('LDS ordering point inside per-lane control flow at +0x%x' % off)
                 barriers.add(i)
                 state.clear()
@@ -2244,8 +2270,6 @@ def lds_general_plan(ins, group, words, converged=None, refusal=None):
                 pending[target] = state.copy()
             else:
                 pending[target].update(state)
-    if branches and ins[-1][0] not in converged:
-        return decline('LDS control flow lacks proven group convergence and entry EXEC at +0x%x' % ins[-1][0])
     return barriers
 
 
@@ -2622,6 +2646,10 @@ def lane_bit_step(name, asm, state, voted=False):
     _, writes, may = scalar_effects(name, asm)
     lost = {{'exec_hi': 'exec', 'vcc_hi': 'vcc'}.get(k, k) for k in writes | may}
     out = {k: v for k, v in state.items() if k not in lost and k[2:] not in lost}
+    # A 64-bit mask's high word is part of the value represented by its low-word key.
+    for word in lost:
+        if re.fullmatch(r's\d+', word) and int(word[1:]) > 0:
+            out.pop('x:s%d' % (int(word[1:]) - 1), None)
     if 'scc' in lost or out.get('scc_is') in lost:
         out.pop('scc_is', None)
     dest = lane_bit_key(ops[0]) if ops else None
@@ -2660,10 +2688,10 @@ def lane_bit_step(name, asm, state, voted=False):
     return [(None, out)]
 
 
-def lane_mask_read_exact(ins, at, mask, voted=frozenset()):
+def lane_mask_read_exact(ins, at, mask, voted=frozenset(), require_mask=False):
     """True when every path the one-lane model takes from the entry (exec = 1) to instruction index `at` arrives with
     the lane's exec bit 1 or with `mask` ('sN') an exact lane mask: there `S & ~exec` with S = mask is the guest's bit
-    of this lane whatever else the variable holds. Paths are followed without merging (a join loses which value came
+    of this lane whatever else the variable holds. `require_mask` requires the latter on every path. Paths are followed without merging (a join loses which value came
     with which EXEC), up to LANE_FLOW_BUDGET visits. Forward control flow only: a backward branch to `at` or before it,
     or an indirect jump, ends the proof. `voted`: offsets of the branches decided by a vote (see lane_bit_step)."""
     index = {off: i for i, (off, _, _, _) in enumerate(ins)}
@@ -2686,7 +2714,7 @@ def lane_mask_read_exact(ins, at, mask, voted=frozenset()):
         if budget < 0:
             return False
         if i == at:
-            if state.get('exec') != 1 and not state.get('x:' + mask):
+            if (require_mask or state.get('exec') != 1) and not state.get('x:' + mask):
                 return False
             continue
         off, _, name, asm = ins[i]
@@ -5891,7 +5919,7 @@ class Stage:
                         self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands))
                 self.pc = off
                 if retry_wave:
-                    self.exec_known = off in self.reduction_entry_exec
+                    self.exec_known = off in self.reduction_entry_exec and not getattr(self, 'lds_live_exec', False)
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
                 self.scc_from_uniform_input = False
@@ -7755,6 +7783,21 @@ class Stage:
                         sites = self.compute_dpp_entry if self.has_branches else None
                         plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words, sites, reasons)
                         if plan is not None:
+                            if self.has_branches:
+                                bounds, _, _, _ = self.spill_cfg
+                                self.lds_safe_blocks = {self.ins[i][0]: self.ins[lo][0]
+                                                        for lo, hi in bounds for i in range(lo, hi)}
+                            writes = [(name, parse(asm)[1]) for _, _, name, asm in self.ins
+                                      if writes_exec(name, parse(asm)[1])]
+                            legacy_forms = {'s_and_saveexec_b32', 's_and_saveexec_b64',
+                                            's_or_b32', 's_or_b64', 's_mov_b32', 's_mov_b64'}
+                            legacy_sites = (self.has_branches and self.ins[-1][0] in sites and
+                                            all(self.ins[i][0] in sites for i in plan) and
+                                            all(off in sites for off, _, name, _ in self.ins if name == 's_barrier'))
+                            self.lds_live_exec = bool(writes) and not (
+                                legacy_sites and all(name in legacy_forms for name, _ in writes))
+                            if self.lds_live_exec:
+                                self.exec_known = False
                             self.lds_error = None
                             self.lds_plan = plan
                         elif reasons:
@@ -7763,11 +7806,11 @@ class Stage:
             if plan is not None:
                 if self.descriptor_instruction_index in plan:
                     if self.has_branches:
-                        self.compute_dpp_blocks.add(self.compute_dpp_entry[self.pc])
+                        self.compute_dpp_blocks.add(self.lds_safe_blocks[self.pc])
                     self.emit('GroupMemoryBarrierWithGroupSync();')
                 if base == 's_barrier':
                     if self.has_branches:
-                        self.compute_dpp_blocks.add(self.compute_dpp_entry[self.pc])
+                        self.compute_dpp_blocks.add(self.lds_safe_blocks[self.pc])
                     self._lds_require_alloc(base)
                     self.emit('GroupMemoryBarrierWithGroupSync();')
                     return None
@@ -10257,7 +10300,7 @@ class Stage:
             offsets = lds_byte_offsets(name, mods)
         limit = self._lds_require_alloc(name)
         aligned = self.operand_align4(addr)
-        guard_exec = '' if self.exec_known else '(exec & 1) && '
+        guard_exec = '' if self.exec_known and not getattr(self, 'lds_live_exec', False) else '(exec & 1) && '
         self.emit('a = %s;' % self.u(addr))
         for slot, off in enumerate(offsets):
             for word in range(count):
@@ -10402,7 +10445,7 @@ class Stage:
         addr = self.u(addr_op)
         data = self.u(data_op)
         self.emit('a = %s;' % addr)
-        exec_prefix = '' if self.exec_known else '(exec & 1) && '
+        exec_prefix = '' if self.exec_known and not getattr(self, 'lds_live_exec', False) else '(exec & 1) && '
         if off < lds_bytes:
             if has_rtn:
                 if not isinstance(getattr(self, 'used_atomic', None), set):

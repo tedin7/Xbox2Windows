@@ -178,6 +178,40 @@ def simulate(name, reverse=False):
     return result
 
 
+def masked_program():
+    # Save the entry mask, narrow at entry, initialize all slots, then restore
+    # the narrow mask. Active lanes read initialized slots owned by inactive lanes.
+    p = [raw for _, raw in enc.PREAMBLE_LINES]
+    p += [enc.sop1(4, 40, 126), enc.vopc(0xd4, 0xa0, 0),
+          enc.sop1(4, 42, 126), enc.sop1(4, 126, 40),
+          enc.vop1(1, 3, 0x100), enc.vop2(0x1a, 4, 0x82, 3),
+          enc.v_mov_imm(5, 7), enc.ds_single(0x0d, 4, data0=5), enc.sopp(10),
+          enc.sop1(4, 126, 42), enc.v_mov_imm(5, 99),
+          enc.ds_single(0x0d, 4, data0=3), enc.sopp(10),
+          enc.vop2(0x1d, 6, 0xa0, 3), enc.vop2(0x1a, 6, 0x82, 6),
+          enc.ds_single(0x36, 6, vdst=20), enc.vop2(0x1a, 13, 0x82, 3),
+          enc.mubuf_store(0x1c, 20, 13), enc.sopp(1)]
+    return b''.join(p), sibling.USER7 | sibling.TGID_X | (1 << 15), (64, 1, 1)
+
+
+def masked_pipeline():
+    code, rsrc, group = masked_program()
+    return G.ComputePipeline(code, sibling.root_blob(), rsrc, group)
+
+
+def masked_reference(mutant=False, reverse=False):
+    lds = [7] * 64
+    waves = (1, 0) if reverse else (0, 1)
+    for wave in waves:
+        for lane in range(32 * wave, 32 * wave + 32):
+            if lane < 32 or mutant:
+                lds[lane] = lane
+    result = [SENTINEL] * WORDS
+    for lane in range(32):
+        result[lane] = lds[lane ^ 32]
+    return result
+
+
 def pipeline(name):
     code, rsrc, group = program(name)
     return G.ComputePipeline(code, sibling.root_blob(), rsrc, group)
@@ -291,6 +325,18 @@ def controls():
     assert simulate('bytes')[0] == 0x83828180
     assert simulate('bytes')[0] != 0x83000000  # lost byte updates
     assert simulate('bounds')[:2] == [0, 1]
+    masked_text = masked_pipeline().hlsl_cs()
+    assert masked_text.count('GroupMemoryBarrierWithGroupSync();') == 2
+    writes = [line for line in masked_text.splitlines()
+              if 'InterlockedAnd(lds[' in line or ('lds[' in line and '] =' in line)]
+    assert writes and all('(exec & 1) && ' in line for line in writes)
+    assert masked_reference() == masked_reference(reverse=True)
+    mutant = '\n'.join(line.replace('(exec & 1) && ', '') if 'InterlockedAnd(lds[' in line or ('lds[' in line and '] =' in line)
+                       else line for line in masked_text.splitlines())
+    assert mutant != masked_text and 'if ((exec & 1) && a <' not in next(
+        line for line in mutant.splitlines() if 'InterlockedAnd(lds[' in line or ('lds[' in line and '] =' in line))
+    assert masked_reference()[0] == 7 and masked_reference(mutant=True)[0] == 32
+    assert masked_reference()[:32] == [7] * 32
     branch_text = branch_pipeline('execz').hlsl_cs()
     assert branch_text.count('GroupMemoryBarrierWithGroupSync();') == 3
     assert 'if (exec & 1)' in branch_text
@@ -327,7 +373,7 @@ def controls():
     refused('LDS scalar branch needs proven uniform SCC', lambda: G.ComputePipeline(nonuniform, sibling.root_blob(), nr, ng))
     missing_restore = nonuniform.replace(enc.sopp(5, 2), enc.sopp(8, 2)).replace(
         bytes.fromhex('7e00fe88'), enc.sopp(0))
-    refused('LDS ordering point inside per-lane control flow', lambda: G.ComputePipeline(missing_restore, sibling.root_blob(), nr, ng))
+    G.ComputePipeline(missing_restore, sibling.root_blob(), nr, ng).hlsl_cs()
     assert branch_reference('uniform', 0)[0] == 123
     assert branch_reference('uniform', 1)[0] == 0
     for name, value in (('execz', 0), ('uniform', 0), ('uniform', 1)):
@@ -342,7 +388,7 @@ def controls():
                 's_barrier', 'ds_read_b32 v20, v4', 's_endpgm']
     ins = [(i * 4, 4, line.split()[0], line) for i, line in enumerate(assembly)]
     assert G.lds_general_plan(ins, (8, 8, 1), 512) == {1, 3, 5}
-    for bad in ('s_cbranch_execz label_0004', 'ds_swizzle_b32 v1, v0', 'ds_write_b32 v4, v3 gds'):
+    for bad in ('s_cbranch_execz label_0000', 'ds_swizzle_b32 v1, v0', 'ds_write_b32 v4, v3 gds'):
         bad_ins = ins[:1] + [(4, 4, bad.split()[0], bad)] + ins[1:]
         assert G.lds_general_plan(bad_ins, (8, 8, 1), 512) is None
     assert G.lds_general_plan(ins, (4, 4, 4), 8193) is None
@@ -359,18 +405,35 @@ def controls():
     plan_reason(['s_branch label_0x40', 's_endpgm'], 'invalid branch target')
     plan_reason(['s_branch label_0x0', 's_endpgm'], 'backward branch at +0x0 to +0x0')
     plan_reason(['s_endpgm', 's_endpgm'], 'early s_endpgm at +0x0')
-    plan_reason(['s_and_saveexec_b64 s[0:1], vcc', 's_endpgm'], 'EXEC write s_and_saveexec_b64 at +0x0')
-    plan_reason(['s_xor_b64 exec, exec, s[0:1]', 's_endpgm'], 'EXEC write s_xor_b64 at +0x0', sites={0: 0, 4: 0})
+    plan_reason(['s_and_saveexec_b64 s[0:1], vcc', 's_endpgm'], 'unproven lane mask vcc')
+    plan_reason(['s_xor_b64 exec, exec, s[0:1]', 's_endpgm'], 'unproven lane mask s[0:1]', sites={0: 0, 4: 0})
     plan_reason(['ds_write_b32 v4, v3 gds', 's_endpgm'], 'GDS operation ds_write_b32 at +0x0')
     plan_reason(['ds_swizzle_b32 v1, v0', 's_endpgm'], 'ds_swizzle_b32 at +0x0 is not supported')
-    plan_reason(['s_branch label_0x4', 's_endpgm'], 'no convergence proof for 2 instructions')
     plan_reason(['s_barrier 1', 's_endpgm'], 's_barrier at +0x0 has operands')
-    plan_reason(['s_branch label_0x4', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4', sites={8: 8})
-    plan_reason(['ds_write_b32 v6, v7', 'ds_read_b32 v8, v6', 's_endpgm'],
-                'ordering point inside per-lane control flow at +0x4', sites={0: 0, 8: 8})
-    plan_reason(['s_branch label_0x4', 's_endpgm'], 'lacks proven group convergence and entry EXEC at +0x4', sites={})
+    plan_reason(['s_branch label_0x8', 's_barrier', 's_endpgm'], 'unreachable s_barrier at +0x4')
+    plan_reason(['s_cbranch_execz label_0x8', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4', sites={8: 8})
+    plan_reason(['s_cbranch_scc1 label_0x8', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4')
+    plan_reason(['ds_write_b32 v6, v7', 's_cbranch_execz label_0xc', 'ds_read_b32 v8, v6', 's_endpgm'],
+                'ordering point inside per-lane control flow at +0x8', sites={0: 0, 12: 12})
+    plan_reason(['s_mov_b64 exec, 2', 's_endpgm'], 'unproven lane mask 2')
+    plan_reason(['s_mov_b64 exec, s[0:1]', 's_endpgm'], 'unproven lane mask s[0:1]')
+    plan_reason(['s_mov_b64 s[40:41], exec', 's_mov_b32 s41, 0',
+                 's_mov_b64 exec, s[40:41]', 's_endpgm'], 'unproven lane mask s[40:41]')
+    for opcode in ('and', 'andn2', 'or', 'orn2', 'xor'):
+        lines = ['v_cmp_gt_u32 vcc, 32, v0', 's_%s_b64 exec, exec, vcc' % opcode,
+                 'ds_write_b32 v4, v3', 's_barrier', 's_endpgm']
+        instructions = [(i * 4, 4, line.split()[0], line) for i, line in enumerate(lines)]
+        assert G.lds_general_plan(instructions, (64, 1, 1), 128) == set(), opcode
+    for opcode in ('and', 'or', 'andn2'):
+        lines = ['v_cmp_gt_u32 vcc, 32, v0', 's_%s_saveexec_b64 s[0:1], vcc' % opcode,
+                 's_mov_b64 exec, s[0:1]', 's_barrier', 's_endpgm']
+        instructions = [(i * 4, 4, line.split()[0], line) for i, line in enumerate(lines)]
+        assert G.lds_general_plan(instructions, (64, 1, 1), 128) == set(), opcode
+
     invalid, rsrc, group = program('same_wave')
     write = enc.ds_single(0x0d, 4, data0=3)
+    scalar_mask = invalid.replace(write, enc.sop1(4, 126, 130) + write)
+    refused('unproven lane mask 2', lambda: G.ComputePipeline(scalar_mask, sibling.root_blob(), rsrc, group))
     refused('LDS general lowering: GDS operation', lambda: G.ComputePipeline(
         invalid.replace(write, enc.ds_single(0x0d, 4, data0=3, gds=1)), sibling.root_blob(), rsrc, group))
     refused('LDS general lowering: allocation is 8320 dwords', lambda: G.ComputePipeline(
@@ -421,11 +484,11 @@ def dispatch(dxc, runner, adapter):
             diagnostics = renderer_diagnostics(run.stderr, adapter)
             if run.returncode or diagnostics:
                 raise AssertionError('%s: exit %d %s' % (case_name, run.returncode, run.stderr))
-        for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned'):
+        for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned', 'masked'):
             src, cso, case = (directory / (name + ext) for ext in ('.hlsl', '.cso', '.case'))
-            src.write_text(pipeline(name).hlsl_cs(), encoding='ascii')
+            src.write_text((masked_pipeline() if name == 'masked' else pipeline(name)).hlsl_cs(), encoding='ascii')
             subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-            case.write_bytes(struct.pack('<I', 1) + struct.pack('<%dI' % WORDS, *simulate(name)) + struct.pack('<16I', *([0] * 16)))
+            case.write_bytes(struct.pack('<I', 1) + struct.pack('<%dI' % WORDS, *(masked_reference() if name == 'masked' else simulate(name))) + struct.pack('<16I', *([0] * 16)))
             run = subprocess.run([str(Path(runner).resolve()), adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
             print(run.stdout, end='')
             if run.returncode == 77:

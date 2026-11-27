@@ -11,15 +11,16 @@ DS accesses. The Microsoft HLSL documentation for
 `GroupMemoryBarrierWithGroupSync` specifies group synchronization.
 
 The retry inserts a group barrier between conflicting plain and atomic LDS
-operations and translates each guest barrier. For forward branches the retry
-uses `compute_dpp_sites` and `entry_exec_sites` to require group convergence and
-entry EXEC at every guest or inserted barrier. It allows the recognized EXEC
-save/narrow and restore forms, requires proven uniform SCC for scalar branches,
-and refuses loops and synchronization inside a per-lane region. Existing
-translations retain their prior output. An unaligned atomic address is refused
-unless its alignment is proven.
+operations and translates each guest barrier. A forward branch may not cross a
+guest or inserted barrier unless `compute_dpp_sites` proves the point. This
+rule also applies to scalar branches: wave-uniform SCC does not prove that every
+wave in a group takes the same edge. Backward branches remain refused.
+Lane-local compare masks and tracked lane-mask bitwise operations can update
+EXEC; scalar data and constant mask sources are refused. The general LDS path
+uses the live EXEC bit after newly supported mask writes. Unaligned atomic
+addresses still require proven alignment.
 
-On Linux, starting from `abc17bbe3`, run:
+On Linux, run against the commit containing this note:
 
 ```sh
 nice -n 15 python3 -B tests/startup_compute_lds_general_check.py
@@ -28,7 +29,9 @@ nice -n 15 python3 -B tests/startup_compute_lds_general_check.py
 The controls translate every supported DS opcode and compare a CPU LDS model
 under both wave orders for multidimensional transpose, same-wave exchange,
 byte/halfword updates, dual and wide operations, unaligned accesses, bounds,
-and forward EXEC and scalar branches.
+forward EXEC and scalar branches, and a narrowed-EXEC neighbour read. The
+masked fixture initializes every slot before narrowing; deleting the LDS write
+guard changes its CPU reference from 7 to the inactive neighbour lane number.
 The same modeled results are used by the registered D3D12 readback tests:
 
 ```powershell
@@ -40,3 +43,11 @@ were not run in the Linux Python-only environment. A same-lane reference differs
 from the peer-exchange reference; lost byte updates differ from the byte case.
 Removing a barrier or an out-of-bounds guard is not guaranteed to fail on every
 adapter: scheduling and out-of-bounds behavior can mask those mutations.
+
+On Linux with Python 3.14.8, the working tree based on `c5b1fa87e` passed
+`nice -n 15 python3 -B tests/startup_compute_lds_general_check.py` and, one at
+a time, the same command for `startup_compute_lds_b64_check.py`,
+`startup_compute_lds_b128_check.py`, `startup_compute_lds_dual_atomics_check.py`
+and `startup_gfx2hlsl_compute_check.py`. The write-guard mutant failed the
+general control: the CPU model reads 32 instead of 7 for lane 0. The WARP
+dispatch fixtures were not run on this Python-only host.
