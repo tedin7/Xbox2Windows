@@ -1926,16 +1926,21 @@ IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW 
 {
     const std::size_t bytes = view.SizeInBytes;
     const u64 address = view.BufferLocation;
-    enum class IndexCopyMutant { none, late, wide };
-    static const auto mutant = [] {
+    enum class IndexCopyFixture { none, late, wide, seed_tail, skip_zero };
+    static const auto fixture = [] {
         char value[16]{};
         const auto size = GetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_COPY", value, sizeof(value));
-        if (size >= sizeof(value)) return IndexCopyMutant::none;
-        if (std::strcmp(value, "late") == 0) return IndexCopyMutant::late;
-        if (std::strcmp(value, "wide") == 0) return IndexCopyMutant::wide;
-        return IndexCopyMutant::none;
+        if (size >= sizeof(value)) return IndexCopyFixture::none;
+        if (std::strcmp(value, "late") == 0) return IndexCopyFixture::late;
+        if (std::strcmp(value, "wide") == 0) return IndexCopyFixture::wide;
+        if (std::strcmp(value, "seed-tail") == 0) return IndexCopyFixture::seed_tail;
+        if (std::strcmp(value, "skip-zero") == 0) return IndexCopyFixture::skip_zero;
+        return IndexCopyFixture::none;
     }();
-    if (mutant == IndexCopyMutant::wide && view.Format == DXGI_FORMAT_R16_UINT) view.Format = DXGI_FORMAT_R32_UINT;
+    if (fixture == IndexCopyFixture::wide && view.Format == DXGI_FORMAT_R16_UINT) view.Format = DXGI_FORMAT_R32_UINT;
+    const std::size_t padded = (bytes + 3) & ~std::size_t{3};
+    const bool test_tail = (fixture == IndexCopyFixture::seed_tail || fixture == IndexCopyFixture::skip_zero) &&
+        view.Format == DXGI_FORMAT_R16_UINT && padded != bytes;
 
     const auto key = std::make_pair(address, bytes);
     draw_lock_acquire_exclusive();
@@ -1947,7 +1952,7 @@ IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW 
     } else {
         // Fixture mutations (X2W_TEST_INDIRECT_INDEX_COPY=late or wide) affect only the staged copy.
         u64 source = address;
-        if (mutant == IndexCopyMutant::late) {
+        if (fixture == IndexCopyFixture::late) {
             const std::size_t index_bytes = view.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
             if (readable_window(address, bytes + index_bytes) < bytes + index_bytes) return IndexCopyResult::unreadable;
             source += index_bytes;
@@ -1955,14 +1960,15 @@ IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW 
             return IndexCopyResult::unreadable;
         }
         // The translated validator reads dwords even for a final 16-bit index.
-        const std::size_t padded = (bytes + 3) & ~std::size_t{3};
         constexpr std::size_t cache_limit = 256;
         const bool cache_slice = indirect_index_copies.size() < cache_limit;
         slice = reserve_upload_ring(self, padded, cache_slice ? &indirect_index_chunks : nullptr);
         if (!slice.mapped || !slice.resource || (slice.offset & 3)) return IndexCopyResult::unavailable;
+        if (test_tail) std::memset(slice.mapped, 0x01, padded);
         if (!x2w_local::guarded_memcpy(slice.mapped, reinterpret_cast<const void*>(source), bytes, false))
             return IndexCopyResult::unreadable;
-        std::memset(slice.mapped + bytes, 0, padded - bytes);
+        if (!test_tail || fixture != IndexCopyFixture::skip_zero)
+            std::memset(slice.mapped + bytes, 0, padded - bytes);
         if (cache_slice) {
             try {
                 indirect_index_copies.insert_or_assign(key, slice);
@@ -1971,6 +1977,8 @@ IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW 
             }
         }
     }
+    // Fixtures only: let the IA fetch the staged tail as one additional R16 index.
+    if (test_tail) view.SizeInBytes = static_cast<UINT>(padded);
     view.BufferLocation = slice.resource->GetGPUVirtualAddress() + slice.offset;
     result = {view, slice.resource, slice.offset, true};
     return IndexCopyResult::copied;
