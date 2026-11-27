@@ -602,8 +602,8 @@ def check_encoding(code, off, n, name, asm):
 
 
 def native_instructions(code):
-    """[(byte offset, assembly text)] of every instruction of `code`, for pixel_aot's two-exit check; ValueError when a word
-    does not decode. Unlike decode(), nothing after the last s_endpgm is dropped: the caller checks the code ends there."""
+    """[(byte offset, assembly text)] of every instruction of `code`, for pixel_aot's control-flow check.
+    Unlike decode(), this always covers the entire span."""
     out, off = [], 0
     while off < len(code):
         try:
@@ -638,6 +638,14 @@ def decode(code, refusals=None, *, embedded_vertex=False):
                     return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
+    # A bounded stream can end in a back edge after the last exit. Keep the tail
+    # when a preceding direct branch enters it; raw captures may have dead words there.
+    if last + 1 < len(out) and out[-1][2] == 's_branch' and out[-1][0] + out[-1][1] == len(code):
+        tail_start = out[last + 1][0]
+        if any(name.startswith(('s_branch', 's_cbranch_'))
+               and tail_start <= off + 4 + 4 * struct.unpack_from('<h', code, off)[0] <= out[-1][0]
+               for off, _, name, _ in out[:last]):
+            return out
     return out[:last + 1]
 
 
@@ -12114,6 +12122,39 @@ class Stage:
             blocks[start] = lines, ('jump', end)
         return [(off, lines, term) for off, (lines, term) in blocks.items()]
 
+    def exit_exports(self, goto):
+        """Track whether each reachable exit has run an output assignment."""
+        if self.kind not in ('vs', 'ps') or sum(
+                bool(term and term[0] == 'end') for _, _, term in self.blocks) < 2:
+            return set(), set(), set()
+        if self.kind == 'ps' and not self.exports:
+            return set(), set(), set()
+        prefix = ('o.pos =',) if self.kind == 'vs' else ('o.mrt', 'o.depth =')
+        writes = {i for i, (_, lines, _) in enumerate(self.blocks)
+                  if any(line.lstrip().startswith(prefix) for line in lines)}
+        with_export, without_export, seen = set(), set(), set()
+        pending = [(0, False)]
+        while pending:
+            i, exported = pending.pop()
+            if (i, exported) in seen or i == len(self.blocks):
+                continue
+            seen.add((i, exported))
+            exported |= i in writes
+            term = self.blocks[i][2]
+            if term and term[0] == 'end':
+                (with_export if exported else without_export).add(i)
+                continue
+            if term:
+                pending.append((goto(term[-1]), exported))
+            if not term or term[0] != 'jump':
+                pending.append((i + 1, exported))
+        if self.kind == 'vs' and without_export:
+            raise Unsupported('early exit without exports in a vertex stage')
+        if self.kind == 'ps' and kill_exit_block(self.ins):
+            # This exit already discards through its null export's valid mask.
+            without_export.discard(len(self.blocks) - 1)
+        return without_export - with_export, without_export & with_export, writes
+
     def body(self):
         """Statements of the whole program as structured HLSL."""
         out = []
@@ -12131,7 +12172,10 @@ class Stage:
             if off not in index:
                 raise Unsupported('branch into the middle of a block (+0x%x)' % off)
             return index[off]
+        discard, conditional_discard, export_blocks = self.exit_exports(goto)
         out.append('    uint pc = 0;')
+        if conditional_discard:
+            out.append('    bool wrote_output = false;')
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
@@ -12154,6 +12198,8 @@ class Stage:
             if off in getattr(self, 'mesh_collect_masks', {}):
                 out.append('        uint mesh_mask = mesh_mask_%d;' % i)
             out += ['        ' + line for line in lines]
+            if conditional_discard and i in export_blocks:
+                out.append('        wrote_output = true;')
             if off in getattr(self, 'mesh_collect_votes', {}):
                 word = self.mesh_collect_votes[off]
                 out += ['    }',
@@ -12165,6 +12211,10 @@ class Stage:
             if not term:
                 out.append('        pc = %d;' % nxt)
             elif term[0] == 'end':
+                if i in discard:
+                    out.append('        discard;')
+                elif i in conditional_discard:
+                    out.append('        if (!wrote_output) discard;')
                 out.append('        pc = 0xffffu;')
             elif term[0] == 'jump':
                 out.append('        pc = %d;' % goto(term[1]))
@@ -14412,9 +14462,8 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         from resource_inventory import parts
         try:
             container, ps_container = a, b
-            # Only the pixel stage may have two exits (a kill or demote block after the first s_endpgm, kill_exit_block);
-            # the instruction boundaries of that check come from this translator's own decoder, no LLVM library needed.
-            a, b = (container_code(parts(blob)[b'DXIL'], stage=stage, decoder=native_instructions if stage == 0 else None)
+            a, b = (container_code(parts(blob)[b'DXIL'], stage=stage, decoder=native_instructions,
+                                   vertex_fetch=struct.pack('<I', FETCH_CALL))
                     for blob, stage in ((a, 1), (b, 0)))
             attr_map = stream_interface(container, ps_container)
             if starts_with_fetch_call(a):

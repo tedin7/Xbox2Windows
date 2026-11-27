@@ -77,19 +77,18 @@ def verify(directory, kind, tool, objcopy, library):
     nop = bytes.fromhex("000080bf")
     # Replacing the jump over the first exit makes the second exit unreachable.
     dead_path = mesh_container(replace(exits[0] - 4, nop))
-    rejects("Unreachable code", mesh_entry_aot.decode_mesh, dead_path, library)
-    rejects("Unverified multi-exit program", extract, code + code[-4:])
+    rejects("unreachable instruction", mesh_entry_aot.decode_mesh, dead_path, library)
+    rejects("3 decoded exits: unreachable instruction", extract, code + code[-4:])
     allocation, = [pc for pc, op in decoded if op == "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"]
     rejects("missing mesh allocation", extract, replace(allocation, nop))
     # Keep the real allocation and replace the later, reachable barrier with
     # s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP). Only the allocation may fall through.
     barrier, = [pc for pc, op in decoded if op == "s_barrier"]
-    rejects("Unverified multi-exit control flow: s_sendmsg", extract, replace(barrier, bytes.fromhex("030090bf")))
+    rejects("unsupported mesh message s_sendmsg", extract, replace(barrier, bytes.fromhex("030090bf")))
     rejects("Unverified multi-exit program", extract, code, llvm=None)
-    rejects("Unverified multi-exit program", extract, code, features=b"+wavefrontsize32")
+    rejects("multi-exit mesh requires the gfx1013 wave64 layout", extract, code, features=b"+wavefrontsize32")
     compute = parts(mesh_container(code, stage=5))[b"DXIL"]
-    rejects("Unverified multi-exit control flow: s_sendmsg", container_code, compute,
-            stage=5, llvm=library, features=MESH_WAVE64)
+    assert container_code(compute, stage=5, llvm=library, features=MESH_WAVE64) == code
     print(f"{len(code)} bytes: both CLIs and the profile audit match the single-exit mesh; refusal checks passed")
     return outputs
 
