@@ -21,7 +21,7 @@
 using Microsoft::WRL::ComPtr;
 
 extern "C" __declspec(dllimport) int x2w_d3d12_fixture_debug_present(ID3D12Device*, ID3D12CommandQueue*, const char*, ID3D12Resource*, int,
-                                                                      ID3D12Resource*, int, ID3D12Resource*, char*, std::size_t);
+                                                                      ID3D12Resource*, int, ID3D12Resource*, ID3D12Resource*, char*, std::size_t);
 
 namespace {
 
@@ -94,6 +94,20 @@ bool fill_depth(Scene& s, ID3D12Resource* depth, float clear, float left, float 
     return run_list(s);
 }
 
+bool fill_depth_all(Scene& s, ID3D12Resource* depth, float value)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    if (FAILED(s.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)))) return false;
+    const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_DEPTH_STENCIL_VIEW_DESC view{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_FLAG_NONE, {}};
+    s.device->CreateDepthStencilView(depth, &view, handle);
+    barrier(s.list.Get(), depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    s.list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, value, 0, 0, nullptr);
+    barrier(s.list.Get(), depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
+    return run_list(s);
+}
+
 bool clear_rects(Scene& s, ID3D12Resource* target, const float (&base)[4], const float (&a)[4], const D3D12_RECT& area_a,
                  const float (&b)[4], const D3D12_RECT& area_b)
 {
@@ -152,14 +166,14 @@ struct Pixel { unsigned char b, g, r; };
 
 // Expected picture: every surface pixel (x, y) comes from source pixel (x / 2, y / 2).
 template<class Func>
-bool expect(Scene& s, ID3D12Resource* surface, const char* label, Func source_pixel)
+bool expect(Scene& s, ID3D12Resource* surface, const char* label, Func source_pixel, UINT scale = 2, UINT edge = surface_size)
 {
     std::vector<unsigned char> got;
     if (!read_surface(s, surface, got)) return fail("surface readback failed");
-    for (UINT y = 0; y < surface_size; ++y)
-        for (UINT x = 0; x < surface_size; ++x) {
-            const Pixel want = source_pixel(x / 2, y / 2);
-            const unsigned char* p = &got[(static_cast<std::size_t>(y) * surface_size + x) * 4];
+    for (UINT y = 0; y < edge; ++y)
+        for (UINT x = 0; x < edge; ++x) {
+            const Pixel want = source_pixel(x / scale, y / scale);
+            const unsigned char* p = &got[(static_cast<std::size_t>(y) * edge + x) * 4];
             if (p[0] != want.b || p[1] != want.g || p[2] != want.r || p[3] != 255) {
                 std::fprintf(stderr, "startup_debug_present: %s: surface (%u,%u) is B%u G%u R%u A%u, expected B%u G%u R%u A255\n", label, x, y,
                              p[0], p[1], p[2], p[3], want.b, want.g, want.r);
@@ -219,21 +233,37 @@ int main(int argc, char** argv)
     auto surface = texture(s.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, surface_size, surface_size, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     if (!depth || !reversed || !colour || !surface) return 22;
 
+    // A bigger depth buffer (a shadow atlas): 24x24, one value everywhere.
+    auto big = texture(s.device.Get(), DXGI_FORMAT_R32_TYPELESS, 24, 24, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    auto small_surface = texture(s.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, size, size, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    if (!big || !small_surface) return 22;
     const float black[4]{0, 0, 0, 1}, red[4]{1, 0, 0, 1}, green[4]{0, 0.5f, 0, 1};
     if (!fill_depth(s, depth.Get(), 1.0f, 0.25f, 0.75f) || !fill_depth(s, reversed.Get(), 0.0f, 0.9f, 0.5f) ||
         !clear_rects(s, colour.Get(), black, red, D3D12_RECT{0, 0, 8, 8}, green, D3D12_RECT{8, 8, 16, 16}))
         return fail("the scene could not be drawn"), 23;
 
     char what[128];
-    const auto show = [&](const char* spec, ID3D12Resource* with_depth) {
+    const auto show_on = [&](ID3D12Resource* target_surface, const char* spec, ID3D12Resource* with_depth, ID3D12Resource* second_depth) {
         return x2w_d3d12_fixture_debug_present(s.device.Get(), s.queue.Get(), spec, colour.Get(), dxgi_rgba16f, with_depth, dxgi_d32,
-                                               surface.Get(), what, sizeof(what));
+                                               second_depth, target_surface, what, sizeof(what));
     };
+    const auto show = [&](const char* spec, ID3D12Resource* with_depth) { return show_on(surface.Get(), spec, with_depth, nullptr); };
 
     // depth
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("depth", depth.Get()) != 0 || std::strcmp(what, "depth 16x16 fmt 40")) return fail(what), 30;
     if (!expect(s, surface.Get(), "depth", wrong_target ? colour_pixel : depth_pixel)) return 31;
+    // Two depth buffers are bound. With no size match the biggest wins (24x24, one value: every pixel is geometry at the floor
+    // grey 40); a presented surface of exactly the 16x16 depth's size prefers that depth over the bigger one.
+    if (!fill_depth_all(s, big.Get(), 0.3f)) return 23;
+    if (!paint_magenta(s, surface.Get())) return 24;
+    if (show_on(surface.Get(), "depth", depth.Get(), big.Get()) != 0 || std::strcmp(what, "depth 24x24 fmt 40") ||
+        !expect(s, surface.Get(), "biggest depth", [](UINT, UINT) { return Pixel{40, 40, 40}; }))
+        return fail(what), 38;
+    if (!paint_magenta(s, small_surface.Get())) return 24;
+    if (show_on(small_surface.Get(), "depth", depth.Get(), big.Get()) != 0 || std::strcmp(what, "depth 16x16 fmt 40") ||
+        !expect(s, small_surface.Get(), "depth matching the surface size", depth_pixel, 1, size))
+        return fail(what), 39;
     // reversed Z
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("depth", reversed.Get()) != 0 || !expect(s, surface.Get(), "reversed Z", reversed_pixel)) return 32;
