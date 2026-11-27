@@ -1243,6 +1243,41 @@ def masked_odd_tail_words():
     return words
 
 
+def check_odd_tail_branch_refusals():
+    # RDNA 2 ISA guide, sections 3.3 and 6.8: a VALU write affects only
+    # active lanes, and SDWA WORD_1 with UNUSED_PRESERVE keeps the low half.
+    def v_mov(dst, src):
+        return 0x7e000200 | (dst << 17) | src
+
+    # Save entry EXEC, initialize v21, and load only the left-hand lanes.
+    prefix = (PRE_WORDS + struct.pack('<3I', 0xbe9e037e, v_mov(21, 128), 0x7da81084)
+              + encode_mimg(IMG_LOAD, dmask=7, vaddr=8, vdata=20, d16=1)
+              + struct.pack('<I', 0xbf8c3f70))
+    # v_mov_b32_sdwa v21, 1 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+    upper = struct.pack('<2I', 0x7e2a02f9, 0x00861581)
+    restore = struct.pack('<I', 0xbefe031e)  # s_mov_b32 exec_lo, s30
+    export = struct.pack('<3I', 0xf800180f, 0x15151515, 0xbf810000)
+
+    def translate(middle):
+        return G.Pipeline(VS_WORDS, prefix + middle + export, root_blob(),
+                          ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+
+    reason = ('whole-word read of v21 after odd d16 image_load: upper half used by '
+              'exp mrt0 v21, v21, v21, v21 done vm')
+    # A narrowed write does not repair lanes loaded under an earlier mask. Here
+    # the branch boundary also prevents the same-generation shortcut.
+    narrowed = struct.pack('<I', 0xbf820000) + struct.pack('<I', 0x7da81082) + upper + restore
+    expect_refused(lambda: translate(narrowed), reason, 'upper write under narrower EXEC')
+    # A branch may bypass the repair entirely, even when EXEC was restored.
+    skipped = restore + struct.pack('<I', 0xbf820002) + upper
+    expect_refused(lambda: translate(skipped), reason, 'branch skips upper write')
+    read = struct.pack('<I', (0x03 << 25) | (30 << 17) | (21 << 9) | 242)
+    before = struct.pack('<I', 0xbf820000) + read + restore + upper
+    expect_refused(lambda: translate(before),
+                   'whole-word read of v21 after odd d16 image_load: upper half used by '
+                   'v_add_f32_e32 v30, 1.0, v21', 'whole read before upper write')
+
+
 def odd_tail_variants(components, *, red_only=False):
     hlsl = odd_tail_hlsl(components, red_only=red_only)
     tail = 20 + components // 2
@@ -1277,6 +1312,7 @@ ODD_TAIL_CASES = ((3, False), (1, False), (3, True))
 
 
 def check_odd_tail_programs():
+    check_odd_tail_branch_refusals()
     for components, red_only in ODD_TAIL_CASES:
         odd_tail_variants(components, red_only=red_only)
     expect_refused(lambda: odd_tail_hlsl(1, unsafe=True),
