@@ -10353,7 +10353,8 @@ class Stage:
             self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
+                        array_ok=False):
         level_zero = name == 'image_gather4_lz'
         if self.kind == 'vs' and level_zero:
             if len(ops) != 4:
@@ -10366,8 +10367,13 @@ class Stage:
                 continue
             if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
                 raise Unsupported('%s modifier %s' % (name, modifier))
-        if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
+        # Only the compute level-zero gather also takes a 2D array, whose slice is the third address register.
+        dimensions = ['dim:SQ_RSRC_IMG_2D'] + (['dim:SQ_RSRC_IMG_2D_ARRAY'] if array_ok and self.kind == 'cs' else [])
+        if [m for m in mods if m.startswith('dim:')] not in [[d] for d in dimensions]:
             raise Unsupported('%s requires a 2D texture' % name)
+        array = 'dim:SQ_RSRC_IMG_2D_ARRAY' in mods
+        if array:
+            addr_count, addr_label = 3, 'three VGPR address registers: x, y and slice'
         channels = {'dmask:0x1': ('Red', 0), 'dmask:0x2': ('Green', 1), 'dmask:0x4': ('Blue', 2), 'dmask:0x8': ('Alpha', 3)}
         masks = [m for m in mods if m.startswith('dmask:')]
         if len(masks) != 1 or masks[0] not in channels:
@@ -10420,7 +10426,10 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
-        tex = self.pipe.resource(key, 'tex2d') if key is not None else None
+        tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d') if key is not None else None
+        if array and tex is not None:
+            # The compute runtime binds a Texture2DArray input only under the typed-SRV manifest line.
+            self.pipe.typed_srvs = True
         return dst, addr, words, channels[masks[0]], tex
 
     def op_image_gather4(self, ops, mods):
@@ -10430,14 +10439,24 @@ class Stage:
         regs = [] if self.kind in ('cs', 'vs') else None
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
             'image_gather4_lz', ops, mods, 2, 'two VGPR address registers' if regs is not None else
-            'two contiguous address registers', mip_preclamp=True, regs_out=regs)
+            'two contiguous address registers', mip_preclamp=True, regs_out=regs, array_ok=True)
         if tex is None:
             return self.null_image_read(dst, 15)
         smp = self.pipe.sampler(tuple(words))
-        u, v = (self.f('v%d' % i) for i in (regs if regs is not None else range(addr[1], addr[2] + 1)))
+        array = 'dim:SQ_RSRC_IMG_2D_ARRAY' in mods
+        u, v = (self.f('v%d' % i) for i in (regs if regs is not None else range(addr[1], addr[2] + 1))[:2])
         coords = 'float2(%s, %s)' % (u, v)
         # Texture2D.Gather* uses view mip zero in every stage, without derivatives.
-        if regs is not None and (words[0] & (1 << 15) or 'unorm' in mods):
+        if array:
+            # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type;
+            # a normalized or unnormalized position does not scale it.
+            slice_ = self.f('v%d' % regs[2])
+            if words[0] & (1 << 15) or 'unorm' in mods:
+                self.emit('{ uint gw, gh, gn; %s.GetDimensions(gw, gh, gn); t = %s.Gather%s(%s, float3(%s / float2(gw, gh), %s)); }' %
+                          (tex, tex, channel_name, smp, coords, slice_))
+            else:
+                self.emit('t = %s.Gather%s(%s, float3(%s, %s, %s));' % (tex, channel_name, smp, u, v, slice_))
+        elif regs is not None and (words[0] & (1 << 15) or 'unorm' in mods):
             # GetDimensions with no mip argument returns the extent at view mip zero.
             self.emit('{ uint gw, gh; %s.GetDimensions(gw, gh); t = %s.Gather%s(%s, %s / float2(gw, gh)); }' %
                       (tex, tex, channel_name, smp, coords))
@@ -13855,6 +13874,7 @@ class Pipeline:
     uses_store_format_xyzw = False
     srv_formats = ()
     integer_texture_srvs = False
+    typed_srvs = False  # a Texture2DArray input (compute gather) needs the runtime's typed-SRV binding
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
     def _init_pixel_context(self, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
@@ -14065,7 +14085,7 @@ class Pipeline:
             yield res, len(self.resources) + 2 * ordinal, len(self.uds) + ordinal
 
     def integer_srv_manifest(self):
-        if self.integer_texture_srvs and any(r['kind'] != 'buf' for r in self.resources.values()):
+        if (self.integer_texture_srvs or self.typed_srvs) and any(r['kind'] != 'buf' for r in self.resources.values()):
             yield 'srvtypes 1'
             for res, reg, entry in self.integer_srv_bindings():
                 yield 'srvint %d %d %d' % (res['index'], reg, entry)
