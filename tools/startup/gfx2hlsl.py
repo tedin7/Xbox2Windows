@@ -12676,13 +12676,15 @@ class Stage:
         if span and span[0] == 's' and span[2] == span[1] + 1 and span[2] < 106:
             return frozenset(span[1:])
 
-    @staticmethod
-    def interp_exec_step(identity, effects):
+    def interp_exec_step(self, identity, effects):
         """Advance EXEC identity and coverage for one omitted half."""
         same, masked, current, at_same, covered = identity
         # 'masked' pairs may name different subsets of the lanes covered by the write.
         # Only 'current' records equality with the entire current mask.
-        writes, save, restore, exec_write, narrows = effects
+        writes, save, restore, exec_write, bounds = effects
+        # Operands of saveexec describe the mask before it writes D, even when D aliases S.
+        narrows_to_covered = any(covered if token == 'exec' else self.interp_scalar_pair(token) in masked
+                                 for token in bounds)
         same, masked, current = (frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
                                  for pairs in (same, masked, current))
         if save is not None:
@@ -12699,8 +12701,7 @@ class Stage:
                 current = frozenset({restore})
         elif exec_write:
             at_same, current = False, frozenset()
-            # An AND can only remove covered lanes. An OR or an unknown write can expose stale lanes.
-            covered = covered and narrows
+            covered = narrows_to_covered
         return same, masked, current, at_same, covered
 
     def interp_exec_effects(self, name, asm, ops, exec_write):
@@ -12711,9 +12712,22 @@ class Stage:
                 save = self.interp_scalar_pair(ops[0])
             if ops[0] == 'exec':
                 restore = self.interp_scalar_pair(ops[1])
-        if name in ('s_and_saveexec_b64', 's_or_saveexec_b64') and ops:
+        bounds = ()
+        if name.startswith('v_cmpx'):
+            bounds = ('exec',)
+        elif len(ops) == 3 and ops[0] == 'exec':
+            if name == 's_and_b64':
+                bounds = tuple(ops[1:])
+            elif name == 's_andn2_b64':
+                bounds = (ops[1],)
+        elif len(ops) == 2 and name in ('s_and_saveexec_b64', 's_or_saveexec_b64',
+                                       's_andn1_saveexec_b64', 's_andn2_saveexec_b64'):
             save = self.interp_scalar_pair(ops[0])
-        return writes, save, restore, exec_write, name == 's_and_saveexec_b64'
+            if name in ('s_and_saveexec_b64', 's_andn1_saveexec_b64'):
+                bounds = ('exec',)
+            elif name == 's_andn2_saveexec_b64':
+                bounds = (ops[1],)
+        return writes, save, restore, exec_write, bounds
 
     def interp_read_halves(self, name, asm, sources, mods):
         halves = [3] * len(sources)
@@ -12865,12 +12879,11 @@ class Stage:
                 raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
                                   'a v_interp_p2_f16 that wrote another register' % (reg, name))
             identity = self.interp_exec_step(identity, exec_effects[i])
-            same, _, current, at_same, covered = identity
+            same, masked, current, at_same, _ = identity
             if reg in written and written_halves & half:
                 if at_same:
                     continue
-                if not covered:
-                    identity = same, current, current, False, True
+                identity = same, masked | current, current, False, True
             if name.startswith(('s_setpc', 's_swappc')):
                 raise Unsupported('unmodelled v_interp_p2_f16 result across an indirect jump')
             for j in successors[i]:

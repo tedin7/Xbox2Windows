@@ -376,6 +376,7 @@ def controls():
     barycentric_controls(expected)
     flow_controls()
     extended_flow_controls()
+    monotone_exec_controls()
     assert len(set(flow_reference(8, 4)[::4])) == 8
     loop_controls(expected)
     plain_controls(expected)
@@ -605,6 +606,66 @@ def scan_decoded(*instructions):
     stage = G.Stage.__new__(G.Stage)
     stage.ins = [(4 * i, 4, G.parse(asm)[0], asm) for i, asm in enumerate(instructions)]
     stage.interp_f16_scan()
+
+
+def monotone_exec_controls():
+    masked = (
+        's_mov_b64 s[20:21], exec',
+        's_and_saveexec_b64 s[24:25], vcc',
+        's_mov_b64 s[22:23], exec',
+        's_mov_b64 exec, s[20:21]',
+        'v_interp_p1ll_f16 v12, v0, attr0.x',
+        'v_interp_p2_f16 v20, v1, attr0.x, v12',
+        's_mov_b64 exec, s[22:23]',
+        'v_mov_b32 v12, v20',
+    )
+    read = 'v_mov_b32 v30, v12'
+    scan_decoded(*masked, 's_and_b64 exec, s[34:35], exec', read, 's_andn2_b64 exec, s[22:23], exec', read)
+    for narrow in (
+            's_and_b64 exec, exec, s[34:35]',
+            's_andn2_b64 exec, exec, s[34:35]',
+            's_and_saveexec_b64 s[26:27], s[34:35]',
+            's_andn1_saveexec_b64 s[26:27], s[34:35]',
+            'v_cmpx_lt_f32 v2, v3',
+            'v_cmpx_lt_f32_e64 v2, v3',
+            'v_cmpx_lt_f32_sdwa v2, v3',
+    ):
+        scan_decoded(*masked, narrow, read)
+    for bound in (
+            's_and_b64 exec, s[22:23], s[34:35]',
+            's_and_b64 exec, s[34:35], s[22:23]',
+            's_andn2_b64 exec, s[22:23], s[34:35]',
+            's_andn2_saveexec_b64 s[22:23], s[22:23]',
+    ):
+        scan_decoded(*masked, 's_mov_b64 exec, s[34:35]', bound, read)
+    scan_decoded(*masked, 's_andn2_saveexec_b64 s[26:27], s[34:35]',
+                 's_mov_b64 exec, s[26:27]', read)  # save the old, covered EXEC
+    scan_decoded(*masked, 's_mov_b64 exec, s[34:35]', 'v_mov_b32 v12, v20',
+                 's_mov_b64 exec, s[22:23]', read)  # a second write retains the older mask
+
+    for label, widen in (
+            ('OR can expose stale lanes', 's_or_b64 exec, s[34:35], exec'),
+            ('ANDN2 with unproven first operand', 's_andn2_b64 exec, s[34:35], exec'),
+    ):
+        try:
+            scan_decoded(*masked, widen, read)
+        except G.Unsupported as error:
+            assert 'reads it after' in str(error), (label, error)
+        else:
+            raise AssertionError(label)
+    # Exercise the same source selection through the decoder and pixel lowering.
+    p1, p2 = interp_words(12, 20, 0)
+    cmp = words(0x7c020000 | 2 << 9 | 242)  # v_cmp_lt_f32 vcc_lo, 1.0, v2
+    and_exec = words(0x80000000 | 0x0f << 23 | 126 << 16 | 126 << 8 | 20)
+    andn2_exec = words(0x80000000 | 0x15 << 23 | 126 << 16 | 126 << 8 | 22)
+    overwrite = words(0x7e000314 | 12 << 17)  # v_mov_b32 v12, v20
+    read12 = words(0x7e00030c | 30 << 17)
+    code = (M0 + mov(2, 0x40000000) + cmp + save_exec(20, 106) + words(0xbe96047e)
+            + restore_exec(20) + p1 + p2 + restore_exec(22) + overwrite
+            + and_exec + read12 + andn2_exec + read12 + export_words(30, 30, 30, 30) + END)
+    ps = translate(code).hlsl_ps()
+    assert ps.count('v30 = v12;') == 2
+    print('EXEC narrowing, older covered masks, and widening controls passed')
 
 
 def extended_flow_controls():

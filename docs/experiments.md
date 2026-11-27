@@ -15582,7 +15582,9 @@ of that unmodeled half. [RDNA 2 ISA reference, PDF pp.102, 188, 190](https://gpu
 A forward control-flow proof tracks both halves of an omitted result separately. Full
 32- and 64-bit VALU results and full-width image results replace the written registers.
 Half writes replace only their destination half. Saved EXEC pairs can restore the mask
-under which a write is valid. A narrowing AND preserves coverage for lane-local reads.
+under which a write is valid. A later write keeps older covered masks. An EXEC update
+bounded by a covered mask preserves coverage for lane-local reads. The Python controls
+exercise consecutive AND and AND-NOT narrowing and reject widening OR.
 Compressed exports to R-only render targets need only the first register's low half and
 still require the second register for blending. A write to an entry barycentric register
 is allowed when no reachable interpolation uses the old entry value.
