@@ -126,7 +126,9 @@ def store(directory, consumer, dxc, env):
     for mode, old, new, reason in (
             ('texture-store-uint', '', '', 'an output texture format is not a float or normalized one'),
             ('texture-store', 'x2w-manifest 2', 'x2w-manifest 3', 'manifest version'),
-            ('texture-store', 'stage cs', 'stage ps', 'not a compute manifest')):
+            ('texture-store', 'stage cs', 'stage ps', 'not a compute manifest'),
+            ('texture-store-self', 'uav 0 tex2d', 'srv 0 tex2d table 1 0' + chr(10) + 'uav 0 tex2d',
+             'an output texture is also an input of the dispatch')):
         assert not old or original.count(old) == 1, original
         manifest.write_bytes(original.replace(old, new).encode() if old else original.encode())
         got, result = run(directory, consumer, env, mode, layout)
@@ -134,22 +136,6 @@ def store(directory, consumer, dxc, env):
         assert got == untouched and len(refused) == 1 and refused[0].endswith('refused: ' + reason), (
             mode, reason, refused, result.stderr[-3000:])
     manifest.write_bytes(original.encode())
-
-    # The output texture is also named as an input (a manifest line added here for a view the consumer creates at table
-    # byte 0). The dispatch used to be refused; now the input is bound from a copy made before the dispatch, so the
-    # output texture is written exactly as without the input and the debug layer sees no SRV/UAV state conflict.
-    assert original.count('uav 0 tex2d') == 1, original
-    manifest.write_bytes(original.replace('uav 0 tex2d', 'srv 0 tex2d table 1 0' + chr(10) + 'uav 0 tex2d').encode())
-    got, result = run(directory, consumer, env, 'texture-store-self', layout)
-    wrong = [i for i in range(halves) if got[i] != expected[i]]
-    assert not wrong, 'self input: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
-    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
-    assert len(lines(result, 'compute input texture copied before its own output is written')) == 1, result.stderr[-3000:]
-    clean(result)
-    # Without the input in the manifest no copy is made.
-    manifest.write_bytes(original.encode())
-    got, result = run(directory, consumer, env, 'texture-store', layout)
-    assert got == expected and not lines(result, 'copied before its own output'), result.stderr[-3000:]
 
     # The same compiled program under a manifest without entry values (the program reads none of its three): the
     # runtime binds no constants. The manifest is edited here; the translator writes `ud 0` for a root without them.

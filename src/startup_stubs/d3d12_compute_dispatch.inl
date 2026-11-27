@@ -366,33 +366,6 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     return nullptr;
 }
 
-// A copy of an input texture made on the recording before a dispatch whose output is the same texture: the shader reads
-// the copy (what the title's input read) while the output unordered access view writes the original. Null when the copy
-// cannot be made or kept with the recording (the dispatch is refused then). The copy has no render or unordered-access flags.
-LONG compute_input_snapshots;
-ID3D12Resource* snapshot_input_texture(Wrapper* self, ID3D12Resource* source)
-{
-    auto* list = recording(self);
-    if (!list || !source) return nullptr;
-    D3D12_RESOURCE_DESC desc = source->GetDesc();
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.SampleDesc.Count > 1) return nullptr;
-    desc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
-    desc.Alignment = 0;
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    x2w_startup::ComPtr<ID3D12Resource> copy;
-    if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-                                                              nullptr, IID_PPV_ARGS(&copy)))) return nullptr;
-    ID3D12Resource* const held = copy.Get();
-    if (!retain_with_recording(self, std::move(copy))) return nullptr;
-    require_state(self, source, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    require_state(self, held, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyResource(held, source);
-    static LONG logged;
-    if (first_calls(logged, 4)) log("x2w-draw compute input texture copied before its own output is written");
-    return held;
-}
-
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
 x2w_phase::Totals dispatch_phase_totals;
 
@@ -433,8 +406,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
-        bool aliased_output;          // an input texture that one of the dispatch's outputs also names
-        ID3D12Resource* snapshot;     // its copy from before the dispatch, bound as the input (held by the recording)
     } views[40]{};
     bool formatted_inputs[32]{};  // input count is bounded by the manifest parser
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
@@ -624,11 +595,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                                                                          sizeof(support))) ? 0 : support.Support2;
                 reason = x2w_startup::pixel_uav_support_reason(bits, true);
             }
-            // A texture bound as both SRV and UAV needs two states at once. The input is bound from a copy taken before
-            // the dispatch (below), which reads what the title's own input read. Two outputs of one texture (two mips)
-            // share the unordered access state.
+            // A texture bound as both SRV and UAV is refused. A typed load through its own UAV uses the same state.
+            // Two outputs of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].wrapper == wrapper) views[input].aliased_output = true;
+                if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
             std::memcpy(views[i].desc, &desc, sizeof(desc));
             views[i].wrapper = wrapper;
@@ -748,17 +718,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
-    // An input that an output also names is read from a copy of it made before the dispatch writes.
-    for (std::size_t i = 0; i < inputs && !reason; ++i) {
-        if (!views[i].aliased_output) continue;
-        views[i].snapshot = snapshot_input_texture(self, views[i].resource);
-        if (!views[i].snapshot) {
-            reason = "an input texture could not be copied before its own output";
-            std::memset(words, 0, sizeof(words));
-        } else {
-            InterlockedIncrement(&compute_input_snapshots);
-        }
-    }
     ID3D12DescriptorHeap* view_heap = draw_heap;
     UINT first = 0;
     if (!reason && tr->dynamic_heap) {
@@ -806,22 +765,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
-            ID3D12Resource* const shader_input = view.snapshot ? view.snapshot : view.resource;
-            require_state(self, shader_input, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                : sampled_state(self, shader_input) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             const auto* desc = view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr;
             const auto dimension = tr->srvs[i].srv_dimension;
-            const UINT integer = shader_input ? integer_view_type(desc ? desc->Format : shader_input->GetDesc().Format) : 0;
+            const UINT integer = view.resource ? integer_view_type(desc ? desc->Format : view.resource->GetDesc().Format) : 0;
             if (const auto* twin = tr->integer_srvs.find(static_cast<UINT>(i))) {
                 values[twin->entry] = integer;
                 const D3D12_CPU_DESCRIPTOR_HANDLE twin_dest{dest.ptr + (twin->reg - i) * draw_heap_increment};
-                bind_typed_texture_srv(shader_input, desc, dimension, integer, dest, twin_dest, draw_heap_increment);
+                bind_typed_texture_srv(view.resource, desc, dimension, integer, dest, twin_dest, draw_heap_increment);
             } else if (integer && tr->integer_srvs.typed) {
                 count_filtered_integer_srv(tr->integer_srvs, tr->key, static_cast<UINT>(i));
                 const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
                 device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
             } else {
-                device_of(the_device)->CreateShaderResourceView(shader_input, desc, dest);
+                device_of(the_device)->CreateShaderResourceView(view.resource, desc, dest);
             }
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
