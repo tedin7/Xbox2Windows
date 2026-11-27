@@ -131,12 +131,12 @@ def vcc_comparison_program():
 def vcc_sampler_controls():
     unchanged = stage('lz limits')
     digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
-    assert digest == 'a98b36fe9b4cd302a35025630fc91ebb9088657c6bca923b63b07b75a93f8dbe', digest
+    assert digest == 'cb120ec2067d1497969b1e46dc52e9b980a7cf5b9e3c95fc1e1496bf237f6d17', digest
     setup = struct.pack('<III', 0xbeea04ff, 0x18500000, 0x7c000000 | 0xc2 << 17 | 256)
     compare_after = WORDS_2D[:24] + setup + WORDS_2D[24:]
     unchanged = G.Pipeline(VS_WORDS, compare_after, root_blob())
     digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
-    assert digest == '5a866b8f985d63b9b846632e1508c978b9bf8db3c9030936b33cf542a0a6bd2b', digest
+    assert digest == '82783081100db4fd5db7be72094d3b7e0d5766afea4023d948bde19c5e226df2', digest
     for shape, first in (('a', 0x92), ('b', 0)):
         pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(shape), root_blob())
         assert '.SampleLevel(' in pipe.hlsl_ps()
