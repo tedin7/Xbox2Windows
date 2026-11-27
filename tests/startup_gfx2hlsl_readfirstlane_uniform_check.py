@@ -214,14 +214,21 @@ check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7
 got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
 check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
 # An EXEC write that only narrows the mask (a compare into EXEC) leaves every lane that is still active a lane that
-# ran the definition, so the read past it recomputes from the scalars. A write that can widen the mask still refuses.
+# ran the definition, so the read past it recomputes from the scalars, provided an s_cbranch_execz has shown that a
+# lane is still live (on empty EXEC the hardware reads lane 0 as it was). A write that can widen the mask still refuses.
+GUARDED = (MOVE, 's_cbranch_scc0 label_0018', 'v_cmpx_lt_f32_e32 v0, v1', 's_cbranch_execz label_0018', READ,
+           's_endpgm', 's_endpgm')
+got = run(*GUARDED)
+check('read after a compare into EXEC and a live-lane branch recomputed', isinstance(got, list) and 's9 = s2;' in got,
+      repr(got))
 got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
-check('read after a compare into EXEC recomputed', isinstance(got, list) and 's9 = s2;' in got, repr(got))
-got = run(MOVE, 's_cbranch_scc0 label_0014', 's_or_b32 exec_lo, exec_lo, s3', READ, 's_endpgm', 's_endpgm')
+check('read after a compare into EXEC without a live-lane branch refused', got == REFUSAL, repr(got))
+got = run(MOVE, 's_cbranch_scc0 label_0018', 's_or_b32 exec_lo, exec_lo, s3', 's_cbranch_execz label_0018', READ, 's_endpgm',
+          's_endpgm')
 check('read after an EXEC write that can widen refused', got == REFUSAL, repr(got))
 original_narrows = G.Stage.__dict__['exec_write_only_narrows']
 G.Stage.exec_write_only_narrows = staticmethod(lambda name, ops: False)
-got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
+got = run(*GUARDED)
 G.Stage.exec_write_only_narrows = original_narrows
 check('mutant: without the narrowing rule the read after a compare into EXEC is refused', got == REFUSAL, repr(got))
 # EXEC returned to a copy taken earlier: what was defined before the copy was run by every lane that comes back, what

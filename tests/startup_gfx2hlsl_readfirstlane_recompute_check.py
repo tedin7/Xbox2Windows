@@ -63,6 +63,10 @@ ACCEPTED = [
     ('fall-through between definition and read', JOIN + (LOAD, DEFINE, 's_cbranch_scc1 label_0020', READ,
                                                           's_endpgm')),
     ('chain through a second VGPR', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 'v_mul_f32_e64 v7, v6, 2.0', READ)),
+    # The second link is defined under the narrowed mask, the same mask the read runs under: as for a definition
+    # after a narrowing, the first active lane ran it.
+    ('chain across an EXEC write', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 's_and_saveexec_b32 s8, s2',
+                                           'v_mul_f32_e64 v7, v6, 2.0', READ)),
     ('unrelated scalar write in between', JOIN + (LOAD, DEFINE, 's_mov_b32 s2, 0', READ)),
     ('median of three after a join', JOIN + (LOAD, 'v_med3_f32 v7, s3, 0, 0.5', READ)),
     ('log2 then ceil after a join', JOIN + (LOAD, 'v_log_f32_e32 v7, s3', 'v_ceil_f32_e32 v7, v7', READ)),
@@ -82,7 +86,8 @@ ACCEPTED = [
       's_mov_b32 s3, 2', 's_mov_b32 s3, 0', 's_add_u32 s3, s3, 1', 's_cmp_lt_u32 s3, 4',
       's_cbranch_scc1 label_0018', DEFINE, READ, 's_endpgm')),
 ]
-EXPECTED = {'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);',
+EXPECTED = {'chain across an EXEC write': 's9 = U(F((s3)) * 2.0);',
+            'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);',
             'median of three after a join': 's9 = U(med3_32(F(s3), F(0x00000000u), 0.5));',
             'log2 then ceil after a join': 's9 = U(ceil(F((U(log2(F(s3)))))));'}
 for label, instructions in ACCEPTED:
@@ -122,8 +127,6 @@ REFUSED = [
     ('lane-varying source', JOIN + ('v_mul_f32_e64 v7, v0, 2.0', READ)),
     ('lane mask source', JOIN + ('v_cmp_lt_f32_e64 s3, v0, v1', DEFINE, READ)),
     ('VGPR overwritten in between', JOIN + (LOAD, DEFINE, 'v_add_f32_e64 v7, v0, 1.0', READ)),
-    ('chain across an EXEC write', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 's_and_saveexec_b32 s8, s2',
-                                           'v_mul_f32_e64 v7, v6, 2.0', READ)),
     ('median of three across an EXEC write', JOIN + (LOAD, 'v_med3_f32 v7, s3, 0, 0.5', 's_and_saveexec_b32 s8, s2',
                                                      READ)),
     ('select on an SCC from before the join', JOIN + ('s_cselect_b32 s3, 1, 0', DEFINE, READ)),
