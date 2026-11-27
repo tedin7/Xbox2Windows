@@ -1461,10 +1461,25 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         ": translated draw requires the guest pipeline's root signature";
     const std::string want_tex = "x2w-render translated ExecuteIndirect Draw refused, shader " + parsed[0].key +
         ": translated draw requires a matching sampled texture distinct from the target";
+    // The incomplete-buffer key also logs which input failed and why, once per (shader, reason): the upload-crossing
+    // fixture names its upload allocation, and no other key gets such a line.
+    const std::string why_prefix = "x2w-render indirect input buffer refused, shader ";
+    const std::string want_why = why_prefix + parsed[3].key + ": ";
+    bool saw_upload_why = false;
+    int why_lines_other_keys = 0;
     while (std::getline(file, log_line)) {
         if (!log_line.empty() && log_line.back() == '\r') log_line.pop_back();
         if (log_line == want_root) saw_root_log = true;
         if (log_line == want_tex) saw_tex_log = true;
+        if (log_line.rfind(why_prefix, 0) == 0) {
+            if (log_line.rfind(want_why, 0) != 0) ++why_lines_other_keys;
+            else if (log_line.find("upload allocation") != std::string::npos) saw_upload_why = true;
+        }
+    }
+    if (!saw_upload_why || why_lines_other_keys) {
+        std::fprintf(stderr, "incomplete-buffer reason lines for key %s: upload-crossing reason=%d, lines for other keys=%d\n",
+                     parsed[3].key.c_str(), saw_upload_why ? 1 : 0, why_lines_other_keys);
+        return false;
     }
     if (!saw_root_log || !saw_tex_log) {
         std::fprintf(stderr, "indirect-draw refusal log lines missing for key %s (root=%d, texture=%d)\n",
