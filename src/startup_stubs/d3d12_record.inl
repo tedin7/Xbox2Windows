@@ -636,9 +636,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
 }
 
 void stop(bool at_exit, bool from_present = false);
+bool draw_pages;
+double draw_pages_ms = 100.0;
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
-u64 pages_before_call(bool root, u64 address, bool submit);
+u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool root, bool submit, bool scan);
 void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
@@ -657,16 +659,22 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     constexpr bool descriptor_copy = K == device_kind && N == 23;
     // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
     // ranges X2W_REPLAY_TITLE_RANGES, or a scan before each submit X2W_REPLAY_PAGES_AT_SUBMIT).
+    // Draw-page captures use the same sequence lock as scans.
     constexpr bool root = K == list_kind && N >= 41 && N <= 46;
     constexpr bool submit = K == queue_kind && N == 10;
     constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
                                     (K == device_kind && (N == 23 || N == 24)) || submit;
+    constexpr bool draw_page_slot = K == list_kind && (N == 12 || N == 13 || N == 14 || N == 61 || (N >= 41 && N <= 48));
     u64 seq;
-    if constexpr (consumes_pages)
-        seq = (extra_title_pages || (submit && (scan_submit_pages || replay_dump_enabled()) && window_open)) ? pages_before_call(root, r8, submit)
-                                                                                   : static_cast<u64>(InterlockedIncrement64(&next_seq));
-    else
+    if constexpr (consumes_pages || draw_page_slot) {
+        const bool scan = consumes_pages && (extra_title_pages ||
+            (submit && (scan_submit_pages || replay_dump_enabled()) && window_open));
+        const bool capture = draw_page_slot && draw_pages && window_open.load(std::memory_order_relaxed);
+        seq = scan || capture ? pages_before_call(K, N, rcx, rdx, r8, r9, root, submit, scan)
+                              : static_cast<u64>(InterlockedIncrement64(&next_seq));
+    } else {
         seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    }
     if constexpr (K == device_kind && N == 17)
         if (extra_title_pages) remember_cbv_pages(rdx);
     HeapPlacement placement{};
@@ -958,10 +966,9 @@ void present()
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (!extra_title_pages) {
-            if (window_open && !was_open) pages_at_window_open(b, seq, present);
-            else if (window_open) pages_at_present(b, seq, present);
-        }
+        if (!extra_title_pages && window_open && !was_open) pages_at_window_open(b, seq, present);
+        if (window_open && (draw_pages || (!extra_title_pages && was_open)))
+            pages_at_present(b, seq, present, !extra_title_pages && was_open);
     }
     if (!base_warming && (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)))
         InterlockedExchange(&stop_requested, 1);
@@ -1081,9 +1088,16 @@ void install()
     write_raw(head.data(), head.size());
     whole_bytes = bytes_written;
     scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
-    char ranges[8]{}, pages[8]{};
-    extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
-        !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
+    char ranges[8]{}, pages[8]{}, draw[8]{}, draw_ms[32]{};
+    const bool pages_enabled = !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
+    extra_title_pages = pages_enabled &&
+        GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1';
+    draw_pages = pages_enabled && !(GetEnvironmentVariableA("X2W_REPLAY_DRAW_PAGES", draw, sizeof(draw)) == 1 && draw[0] == '0');
+    const DWORD draw_ms_length = GetEnvironmentVariableA("X2W_REPLAY_DRAW_PAGES_MS", draw_ms, sizeof(draw_ms));
+    if (draw_ms_length && draw_ms_length < sizeof(draw_ms)) {
+        const double ms = std::atof(draw_ms);
+        if (ms > 0) draw_pages_ms = ms;
+    }
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
     armed = true;

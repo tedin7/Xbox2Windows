@@ -8,6 +8,8 @@
 // X2W_REPLAY_SCAN_MS (default 250) continues round-robin and writes only pages that changed since this recording last saw
 // them. By default a MAP read at present N is stamped with the mark of present N-1.
 // X2W_REPLAY_PAGES_AT_SUBMIT=1 also scans before each submission inside the window.
+// Draw pages capture root addresses at binding and again with vertex and index spans before draws and dispatches.
+// X2W_REPLAY_DRAW_PAGES=0 disables these captures. X2W_REPLAY_DRAW_PAGES_MS limits their time per Present.
 // X2W_REPLAY_TITLE_RANGES=1 adds named title memory and scans in call order before the stand-in reads it.
 // The size cap is X2W_REPLAY_MAX_MIB as for calls. X2W_REPLAY_PAGES=0 leaves the pages out.
 // One line of counters after the base image and about every 20th scan:
@@ -16,6 +18,14 @@
 constexpr std::size_t page_slab_bytes = 1u << 20;
 
 struct PageRange { u64 address, bytes; };
+// Draw capture state (pages_lock).
+std::unordered_map<u64, std::vector<PageRange>> draw_pending;
+std::vector<PageRange> draw_ranges;
+LONG draw_ranges_present = -1, draw_time_present = -1;
+u64 draw_captures, draw_outside, draw_over_time, draw_pending_dropped;
+double draw_time_used;
+bool draw_time_logged;
+std::vector<unsigned char> draw_read_buffer;
 x2w_replay::PageWriter* page_writer;  // created lazily by the first page hook; never freed
 bool page_writer_tried;
 ThreadBuffer* page_target;            // the buffer the running scan appends to (its lock is held by the caller)
@@ -190,10 +200,9 @@ u64 title_texture_bytes(const Wrapper* w, const void* memory, const D3D12_RESOUR
 }
 
 // Merge page-aligned resource ranges and any enabled named title ranges.
-void page_gather_ranges(bool placed)
+std::vector<PageRange> page_merge_ranges(bool placed, u64& unsized, u64& big)
 {
     std::vector<PageRange> raw;
-    u64 unsized = 0, big = 0;
     if (placed) {
         note_lock_acquire(false);
         for (const auto& item : resource_infos()) {
@@ -210,19 +219,42 @@ void page_gather_ranges(bool placed)
     }
     if (extra_title_pages) gather_named_pages(raw, big);
     std::sort(raw.begin(), raw.end(), [](const PageRange& a, const PageRange& b) { return a.address < b.address; });
-    page_ranges.clear();
+    std::vector<PageRange> merged;
     for (const PageRange& r : raw) {
-        if (!page_ranges.empty() && r.address <= page_ranges.back().address + page_ranges.back().bytes) {
-            const u64 end = (std::max)(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
-            page_ranges.back().bytes = end - page_ranges.back().address;
+        if (!merged.empty() && r.address <= merged.back().address + merged.back().bytes) {
+            const u64 end = (std::max)(merged.back().address + merged.back().bytes, r.address + r.bytes);
+            merged.back().bytes = end - merged.back().address;
         } else {
-            page_ranges.push_back(r);
+            merged.push_back(r);
         }
     }
+    return merged;
+}
+
+void page_gather_ranges(bool placed)
+{
+    u64 unsized = 0, big = 0;
+    page_ranges = page_merge_ranges(placed, unsized, big);
     std::sort(page_ranges.begin(), page_ranges.end(), page_scan_order);
     page_skipped_no_size = unsized;
     page_skipped_big = big;
     if (page_cursor_range >= page_ranges.size()) { page_cursor_range = 0; page_cursor_offset = 0; }
+}
+
+bool page_budget_or_cap_reached()
+{
+    if (page_bytes_out >= page_budget_bytes) {
+        if (!page_budget_reached) {
+            page_budget_reached = true;
+            log("x2w-replay pages: budget of %llu MiB reached, no more pages are written (calls go on)", page_budget_bytes >> 20);
+        }
+        return true;
+    }
+    if (cap_exceeded(page_target->bytes.size())) {  // the same cap as the calls: the recording ends with its XEND
+        if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+        return true;
+    }
+    return false;
 }
 
 // Whether a page pass ends before the next slab of `range` at `offset`: a base image at 3/4 of the page budget (one slab
@@ -239,18 +271,7 @@ bool page_pass_ends(const PageRange& range, u64 offset, bool base)
             page_bytes_out >> 20, page_budget_bytes >> 20, range.bytes);
         return true;
     }
-    if (page_bytes_out >= page_budget_bytes) {
-        if (!page_budget_reached) {
-            page_budget_reached = true;
-            log("x2w-replay pages: budget of %llu MiB reached, no more pages are written (calls go on)", page_budget_bytes >> 20);
-        }
-        return true;
-    }
-    if (cap_exceeded(page_target->bytes.size())) {  // the same cap as the calls: the recording ends with its XEND
-        if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
-        return true;
-    }
-    return false;
+    return page_budget_or_cap_reached();
 }
 
 // One slab: the committed, readable pages at the start of `want` bytes at `at`, into the page writer.
@@ -464,32 +485,149 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
-// With submit scans enabled, changes observed at Present must follow the latest scanned submission.
-inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
+const PageRange* draw_find_range(u64 address)
 {
-    (void)present;
-    if (replay_dump_enabled()) return;
-    const u64 stamp = page_prev_mark ? page_prev_mark : seq;
-    page_prev_mark = seq;
-    if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
-    init_page_writer();  // a window that was open from the start never calls pages_at_window_open
-    scan_pages_into(b, !page_base_done, (std::max)(stamp, page_last_submit));
+    const auto it = std::upper_bound(draw_ranges.begin(), draw_ranges.end(), address,
+        [](u64 at, const PageRange& range) { return at < range.address; });
+    if (it == draw_ranges.begin()) return nullptr;
+    const auto& range = *(it - 1);
+    return address - range.address < range.bytes ? &range : nullptr;
+}
+
+void draw_log_counters(LONG present, double used)
+{
+    log("x2w-replay draw pages: captures %llu, outside title memory %llu, over the per-present time %llu, "
+        "pending dropped %llu, used %.1f ms of %.0f ms at present %ld",
+        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, used, draw_pages_ms, present);
+}
+
+bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
+{
+    const double used = draw_time_used + page_ms_since(start);
+    if (used < draw_pages_ms) return false;
+    draw_over_time += skipped;
+    return true;
+}
+
+void draw_capture_span(const PageRange& span, LONG present, u64 stamp, const LARGE_INTEGER& start)
+{
+    if (draw_time_exhausted(start, 1)) return;
+    const PageRange* range = draw_find_range(span.address);
+    if (!range && draw_ranges_present != present) {
+        u64 unsized = 0, big = 0;
+        draw_ranges = page_merge_ranges(true, unsized, big);
+        draw_ranges_present = present;
+        range = draw_find_range(span.address);
+    }
+    if (!range) { ++draw_outside; return; }
+    if (page_after_cut(*range)) return;
+    constexpr u64 mask = x2w_replay::page_bytes - 1;
+    const u64 end = (std::min)(range->address + range->bytes,
+        (span.address + (std::min<u64>)(span.bytes, 4u << 20) + mask) & ~mask);
+    bool captured = false;
+    for (u64 at = span.address & ~mask; at < end; at += page_slab_bytes) {
+        if (page_budget_or_cap_reached() || draw_time_exhausted(start, 1)) break;
+        if (draw_read_buffer.empty()) draw_read_buffer.resize(page_slab_bytes);
+        page_capture_slab(at, static_cast<std::size_t>((std::min<u64>)(end - at, page_slab_bytes)), draw_read_buffer, stamp);
+        captured = true;
+    }
+    if (captured) ++draw_captures;
+}
+
+void draw_add_pending(u64 list, u64 address, u64 bytes)
+{
+    if (!address || !bytes) return;
+    auto& spans = draw_pending[list];
+    for (auto& span : spans) {
+        if (span.address != address) continue;
+        span.bytes = (std::max)(span.bytes, bytes);
+        return;
+    }
+    if (spans.size() == 64) { ++draw_pending_dropped; return; }
+    spans.push_back({address, bytes});
+}
+
+void draw_consume_pending(u64 list, LONG present, u64 stamp, const LARGE_INTEGER& start)
+{
+    const auto it = draw_pending.find(list);
+    if (it == draw_pending.end()) return;
+    for (const auto& span : it->second) draw_capture_span(span, present, stamp, start);
+    draw_pending.erase(it);
+}
+
+void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
+{
+    const LONG present = InterlockedCompareExchange(&presents, 0, 0);
+    if (draw_time_present != present) {
+        draw_time_present = present;
+        draw_time_used = 0;
+    }
+    LARGE_INTEGER start{};
+    QueryPerformanceCounter(&start);
+    if (slot <= 14 || slot == 61) {
+        draw_consume_pending(list, present, stamp, start);
+    } else if (!draw_time_exhausted(start, 1)) {
+        if (slot <= 46) {
+            if (r8) draw_capture_span({r8, 0x10000}, present, stamp, start);
+            draw_add_pending(list, r8, 0x10000);
+        } else if (slot == 47) {
+            D3D12_INDEX_BUFFER_VIEW view{};
+            if (rdx && copy_readable(rdx, &view, sizeof(view)))
+                draw_add_pending(list, view.BufferLocation, view.SizeInBytes);
+        } else {
+            D3D12_VERTEX_BUFFER_VIEW views[16];
+            const UINT count = (std::min)(static_cast<UINT>(r8), 16u);
+            if (r9 && count && copy_readable(r9, views, count * sizeof(views[0])))
+                for (UINT i = 0; i < count; ++i)
+                    draw_add_pending(list, views[i].BufferLocation, views[i].SizeInBytes);
+        }
+    }
+    draw_time_used += page_ms_since(start);
+    if (draw_time_used >= draw_pages_ms && !draw_time_logged) {
+        draw_time_logged = true;
+        draw_log_counters(present, draw_time_used);
+    }
+}
+
+// With submit scans enabled, changes observed at Present must follow the latest scanned submission.
+inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present, bool scan)
+{
+    scan = scan && !replay_dump_enabled();
+    u64 stamp = 0;
+    if (scan) {
+        stamp = page_prev_mark ? page_prev_mark : seq;
+        page_prev_mark = seq;
+    }
+    const bool log_draw = draw_pages && present % 20 == 0;
+    if ((!scan && !log_draw) || !TryAcquireSRWLockExclusive(&pages_lock)) return;
+    if (log_draw) draw_log_counters(present, draw_time_present == present - 1 ? draw_time_used : 0.0);
+    if (scan) {
+        init_page_writer();  // a window that was open from the start never calls pages_at_window_open
+        scan_pages_into(b, !page_base_done, (std::max)(stamp, page_last_submit));
+    }
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
-// Take the snapshot in sequence order, so PageWriter's deltas are applied in the order it saw them. A submit scan
-// (X2W_REPLAY_PAGES_AT_SUBMIT) keeps the stamp of later Present scans after the submission.
-u64 pages_before_call(bool root, u64 address, bool submit)
+// Allocate the call sequence with pages_lock held. Present scans may still use older stamps.
+u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool root, bool submit, bool scan)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
     AcquireSRWLockExclusive(&pages_lock);
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
-    if (root) remember_page_range(address, 0x10000, false);
+    if (root && extra_title_pages) remember_page_range(r8, 0x10000, false);
     init_page_writer();
-    if (page_writer && !page_budget_reached && !stop_requested && active) {
+    if (scan && page_writer && !page_budget_reached && !stop_requested && active) {
         scan_pages_into(b, window_open && !page_base_done, seq - 1, window_open);
         if (submit) page_last_submit = (std::max)(page_last_submit, seq);
+    }
+    const bool draw_slot = kind == list_kind &&
+        (slot == 12 || slot == 13 || slot == 14 || slot == 61 || (slot >= 41 && slot <= 48));
+    if (draw_slot && draw_pages && window_open && page_writer && !page_budget_reached && !stop_requested && active) {
+        page_target = &b;
+        draw_pages_at_call(slot, rcx, rdx, r8, r9, seq - 1);
+        page_flush_target();
+        page_target = nullptr;
     }
     ReleaseSRWLockExclusive(&pages_lock);
     ReleaseSRWLockExclusive(&b.lock);

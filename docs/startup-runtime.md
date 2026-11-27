@@ -2080,6 +2080,17 @@ copies can capture named ranges before the window opens. The regular page and sc
 at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
 must match the original pictures with the switch enabled and differ when the switch is off.
 
+By default, draw pages capture up to 64 KiB at root descriptor setters and capture those root spans again with the bound
+vertex and index views before draws, dispatches and indirect execution. The recorder clips each span to 4 MiB
+and to its containing title range. `X2W_REPLAY_DRAW_PAGES_MS` sets the time budget per Present (default 100 ms).
+The `x2w-replay draw pages` counters report captures, spans outside title memory, time skips, pending drops and
+time used. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
+
+The page writer compares against the newest MAP stamp for each page and writes it again at a later stamp after
+conflicting equal-stamp writes. `startup_replay_draw_pages_warp` compares four live and replayed ring colours
+and checks that disabling draw pages changes the replay while leaving the live pictures identical.
+
 The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
 creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
 destination starts, destination sizes, source starts and source sizes of a `CopyDescriptors` call. Its header is the call

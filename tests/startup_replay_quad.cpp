@@ -27,7 +27,7 @@ namespace {
 
 constexpr UINT width = 64, height = 32;
 constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
-enum class TitleRange { none, root, generated, supplied };
+enum class TitleRange { none, root, generated, supplied, ring };
 
 struct Scene {
     void* target = nullptr;
@@ -40,6 +40,7 @@ struct Scene {
     SIZE_T rtv = 0, fallback_rtv = 0;
     TitleRange title_range = TitleRange::none;
     unsigned char* constants = nullptr;
+    unsigned char* ring = nullptr;
     void* view_heap = nullptr;
     Word view_cpu = 0, view_gpu = 0;
     UINT view_stride = 0;
@@ -268,6 +269,20 @@ int create_indirect_arguments(void* device, Scene& s)
 int create_title_range(void* device, Scene& s)
 {
     if (s.title_range == TitleRange::none) return 0;
+    if (s.title_range == TitleRange::ring) {
+        constexpr SIZE_T bytes = 1u << 20;
+        s.ring = static_cast<unsigned char*>(
+            VirtualAlloc(reinterpret_cast<void*>(0x21200000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!s.ring) return 46;
+        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.ring), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                               arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
+            !s.title_buffer)
+            return 46;
+        std::printf("title ranges: %llx 0\n", arg(s.ring));
+        return 0;
+    }
     s.constants = static_cast<unsigned char*>(VirtualAlloc(nullptr, cbv_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!s.constants) return 40;
     if (s.title_range == TitleRange::root) {
@@ -299,8 +314,32 @@ int create_title_range(void* device, Scene& s)
     return 0;
 }
 
+int wait_for_frame(const Scene& s, UINT frame)
+{
+    const Word value = frame + 1;
+    if (FAILED(static_cast<HRESULT>(invoke(s.queue, 14, arg(s.fence), value)))) return 32;
+    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(s.fence, 8) < value;) {
+        if (GetTickCount64() > deadline) return 33;
+        Sleep(1);
+    }
+    return 0;
+}
+
 int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool slot_layouts)
 {
+    unsigned char* slice = nullptr;
+    if (s.ring) {
+        if (frame >= 8) return 47;
+        slice = s.ring + frame * 0x20000;
+        constexpr float colours[4][4] = {
+            {1.0f, 0.0f, 0.5f, 1.0f}, {0.0f, 1.0f, 0.25f, 1.0f},
+            {0.75f, 0.25f, 0.0f, 1.0f}, {0.25f, 0.75f, 1.0f, 1.0f},
+        };
+        const auto& parts = colours[frame % 4];
+        const float vertices[3][4] = {{parts[2], parts[3]}, {}, {}};
+        std::memcpy(slice, parts, 2 * sizeof(float));
+        std::memcpy(slice + 0x1000, vertices, sizeof(vertices));
+    }
     const float t = s.constants ? 0.0f : static_cast<float>(frame) / static_cast<float>(frames);
     if (s.constants) {
         const float colour[] = {float(frame % 2 == 0), float(frame % 2 != 0), 0.0f, 1.0f};
@@ -308,7 +347,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     }
     const float colour[] = {t, 0.25f, 1.0f - t, 1.0f};
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT scissor{0, 0, static_cast<LONG>(s.constants ? width : 4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(s.constants || slice ? width : 4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
     if (s.upload) {
@@ -349,7 +388,12 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
             invoke(s.list, 34, arg(stream_root_signature()));
             invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), 0, 0, 0);
         } else {
-            if (s.constants) {
+            if (slice) {
+                invoke(s.list, 34, arg(stream_root_signature()));
+                invoke(s.list, 44, 0, arg(slice));
+                const D3D12_VERTEX_BUFFER_VIEW view{arg(slice + 0x1000), 48, 16};
+                invoke(s.list, 48, 0, 1, arg(&view));
+            } else if (s.constants) {
                 invoke(s.list, 34, arg(stream_root_signature()));
                 if (s.title_range == TitleRange::root) {
                     invoke(s.list, 42, 0, arg(s.constants));
@@ -363,6 +407,10 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     invoke(s.queue, 10, 1, arg(&s.list));
+    if (slice) {
+        if (const int rc = wait_for_frame(s, frame)) return rc;
+        std::memset(slice, 0, 0x2000);
+    }
     if (!s.signature) {
         // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
         alignas(8) unsigned char plane[0x48]{};
@@ -377,13 +425,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         std::fprintf(stderr, "replay quad: about to signal submit %u\n", frame + 1);
         std::fflush(stderr);
     }
-    const Word value = frame + 1;
-    if (FAILED(static_cast<HRESULT>(invoke(s.queue, 14, arg(s.fence), value)))) return 32;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(s.fence, 8) < value;) {
-        if (GetTickCount64() > deadline) return 33;
-        Sleep(1);
-    }
-    return 0;
+    return slice ? 0 : wait_for_frame(s, frame);
 }
 
 }  // namespace
@@ -402,6 +444,7 @@ int main(int argc, char** argv)
         if (!std::strcmp(mode, "root")) scene.title_range = TitleRange::root;
         else if (!std::strcmp(mode, "generated")) scene.title_range = TitleRange::generated;
         else if (!std::strcmp(mode, "supplied")) scene.title_range = TitleRange::supplied;
+        else if (!std::strcmp(mode, "ring")) scene.title_range = TitleRange::ring;
         else return 2;
     }
     const bool table = scene.title_range == TitleRange::generated || scene.title_range == TitleRange::supplied;
