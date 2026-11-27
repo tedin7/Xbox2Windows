@@ -35,11 +35,11 @@ CMP_VCC = ('v_cmp_eq_i32_e32 vcc_lo, 7, v5', '870a047d')
 NARROW_ABOVE = ('v_cmpx_lt_u32_e32 s4, v0', '0400a27d')
 EXEC_ONE = ('s_mov_b32 exec_lo, 1', '8103febe')
 REMAINING_ONE = ('s_mov_b32 s21, 1', '810395be')
-EXEC_HIGH_PAIR = (('s_mov_b32 s30, 0', '80039ebe'), ('s_mov_b32 s31, 1', '81039fbe'),
-                  ('s_mov_b64 exec, s[30:31]', '1e04febe'))
+EXEC_HIGH_PAIR = (('s_mov_b32 s36, 0', '8003a4be'), ('s_mov_b32 s37, 1', '8103a5be'),
+                  ('s_mov_b64 exec, s[36:37]', '2404febe'))
 VCC_WORD = ('s_mov_b32 vcc_lo, s4', '0403eabe')
-VCC_PAIR = (EXEC_HIGH_PAIR[0], ('s_mov_b32 s31, s4', '04039fbe'),
-            ('s_mov_b64 vcc, s[30:31]', '1e04eabe'))
+VCC_PAIR = (EXEC_HIGH_PAIR[0], ('s_mov_b32 s37, s4', '0403a5be'),
+            ('s_mov_b64 vcc, s[36:37]', '2404eabe'))
 PARTIAL_MASK = 'uses a whole-word mask value in a partial wave'
 
 
@@ -359,9 +359,9 @@ def partial_mask_controls():
             assert translate(rows, 32, group32).retry_group_vote
         else:
             refused(PARTIAL_MASK, lambda: translate(rows, 32, group32))
-    for literal, code, fits in ((0x8000, 'ff039fbe00800000', True),
-                                (0x10000, 'ff039fbe00000100', False)):
-        rows = tuple(('s_mov_b32 s31, %d' % literal, code) if row == VCC_PAIR[1] else row for row in wave64)
+    for literal, code, fits in ((0x8000, 'ff03a5be00800000', True),
+                                (0x10000, 'ff03a5be00000100', False)):
+        rows = tuple(('s_mov_b32 s37, %d' % literal, code) if row == VCC_PAIR[1] else row for row in wave64)
         if fits:
             assert translate(rows, 64, group64).retry_group_vote
         else:
