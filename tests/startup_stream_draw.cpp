@@ -16,6 +16,7 @@
 #include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char*, std::size_t);
 extern "C" __declspec(dllimport) HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, void***, UINT64, UINT64);
 
 // The components under test receive the guest ABI's vtable slots. The observation
@@ -431,8 +432,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const bool mapped_spans = !std::strcmp(frame_copy_mode, "mapped-spans");
     const bool single = typed;
     const bool legacy = !single;
+    char placeholder_mode[16]{};
+    GetEnvironmentVariableA("X2W_TEST_PLACEHOLDER_DRAW", placeholder_mode, sizeof(placeholder_mode));
+    const bool placeholder_fixture = placeholder_mode[0] != 0;
     const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const UINT height = placeholder_fixture ? 8 : mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
@@ -448,7 +452,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain && !placeholder_fixture ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -623,6 +627,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
+        if (std::strcmp(placeholder_mode, "clipped") == 0) {
+            // Keep the counted draw but exclude every target pixel.
+            const D3D12_RECT outside{8, 0, 9, 8};
+            invoke(list, 22, 1, arg(&outside));
+        }
         invoke(list, 12, 3, 1);
     }
     if (console_view) {
@@ -750,5 +759,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (const int rc = root_heap_report()) return rc;
     }
 
+    if (placeholder_fixture) {
+        std::vector<char> report(x2w_d3d12_census_report(nullptr, 0) + 1);
+        x2w_d3d12_census_report(report.data(), report.size());
+        std::fputs(report.data(), stdout);
+    }
     return read_stream_target(desktop.Get(), frame, pixels);
 }
