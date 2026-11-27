@@ -244,7 +244,8 @@ bool address_resource_overlap(u64 address, u64 span)
 // Find a whole subresource window in a live slot 133 texture. Compare the console layout
 // before referring to the desktop backing, whose physical tile layout is private to D3D12.
 const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D12_RESOURCE_DESC& requested,
-                         const x2w_startup::gfx10::Layout& layout, D3D12_SHADER_RESOURCE_VIEW_DESC& view)
+                         const x2w_startup::gfx10::Layout& layout, UINT backing_mips,
+                         D3D12_SHADER_RESOURCE_VIEW_DESC& view)
 {
     const auto& owner = info.console;
     if (owner.Layout != requested.Layout || owner.Format != requested.Format || owner.SampleDesc.Quality ||
@@ -282,12 +283,12 @@ const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D1
     if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
         if (owner.DepthOrArraySize != 1) return "alias_view_dimension_mismatch";
         auto& v = view.Texture2D;
-        if (v.MipLevels == UINT_MAX) v.MipLevels = requested.MipLevels - v.MostDetailedMip;
-        v.MostDetailedMip += first_mip;
+        if (!x2w_startup::remap_alias_mips(v, requested.MipLevels, first_mip, backing_mips))
+            return "alias_native_mip_range";
     } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
         auto& v = view.Texture2DArray;
-        if (v.MipLevels == UINT_MAX) v.MipLevels = requested.MipLevels - v.MostDetailedMip;
-        v.MostDetailedMip += first_mip;
+        if (!x2w_startup::remap_alias_mips(v, requested.MipLevels, first_mip, backing_mips))
+            return "alias_native_mip_range";
         v.FirstArraySlice += static_cast<UINT>(first_slice);
     } else {
         return "alias_view_dimension_mismatch";
@@ -352,15 +353,23 @@ Wrapper* find_texture_alias(Wrapper* device, u64 address, const D3D12_RESOURCE_D
     // Lazy and format/size-substituted resources have no verified backing for this mapping.
     if (retained->own().lazy_slot133_texture || !retained->own().real || retained->own().drop_levels) {
         why = "alias_backing_unavailable";
-    } else if (!(why = remap_texture_alias(info, address - reinterpret_cast<u64>(retained->own().title_memory),
-                                           desc, layout, view))) {
+    } else {
         const auto native = static_cast<ID3D12Resource*>(retained->own().real)->GetDesc();
-        const auto& source = info.console;
-        if (native.Width == source.Width && native.Height == source.Height && native.Format == source.Format &&
-            native.DepthOrArraySize == source.DepthOrArraySize && native.MipLevels == source.MipLevels &&
-            !(native.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && x2w_startup::address_view_fits(native, view))
-            return retained;
-        why = "alias_native_view_incompatible";
+        why = remap_texture_alias(info, address - reinterpret_cast<u64>(retained->own().title_memory),
+                                  desc, layout, native.MipLevels, view);
+        if (!why) {
+            const auto& source = info.console;
+            if (native.Width == source.Width && native.Height == source.Height && native.Format == source.Format &&
+                native.DepthOrArraySize == source.DepthOrArraySize && native.MipLevels == source.MipLevels &&
+                !(native.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && x2w_startup::address_view_fits(native, view))
+                return retained;
+            why = "alias_native_view_incompatible";
+        } else if (std::strcmp(why, "alias_native_mip_range") == 0) {
+            static LONG refused;
+            if (first_calls(refused, 6))
+                log("x2w-d3d12 SRV alias refused: site=remap_texture_alias desktop mips=%u requested mips=%u",
+                    static_cast<UINT>(native.MipLevels), static_cast<UINT>(desc.MipLevels));
+        }
     }
     release(retained);
     return nullptr;

@@ -1,6 +1,7 @@
 // Synthetic SRV regression. Mutant: make check() return Refusal::none without changing
 // the descriptor. The pure test must fail on the reported mip shape even if WARP accepts it.
-#include "startup_stubs/view_desc_check.h"
+#include "startup_stubs/create_srv.h"
+#include "startup_stubs/address_texture.h"
 
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
@@ -47,6 +48,64 @@ static bool unchanged(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURC
     return check(view, resource) == srv::Refusal::none && std::memcmp(before, &view, sizeof(view)) == 0;
 }
 
+static D3D12_SHADER_RESOURCE_VIEW_DESC raw_buffer_view(UINT64 first, UINT count)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Buffer = {first, count, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    return view;
+}
+
+static bool buffer_checks()
+{
+    D3D12_RESOURCE_DESC resource{};
+    resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource.Width = 64;
+    auto raw = raw_buffer_view(4, 12);
+    auto typed = raw;
+    typed.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    typed.Format = DXGI_FORMAT_R32_UINT;
+    auto structured = typed;
+    structured.Format = DXGI_FORMAT_UNKNOWN;
+    structured.Buffer = {1, 3, 16, D3D12_BUFFER_SRV_FLAG_NONE};
+    if (!unchanged(raw, resource) || !unchanged(typed, resource) || !unchanged(structured, resource))
+        return false;
+
+    auto bad_raw = raw;
+    bad_raw.Format = DXGI_FORMAT_R32_UINT;
+    auto out_of_range = raw_buffer_view(16, 1);
+    auto overflowing = raw_buffer_view(~UINT64{0}, 1);
+    auto zero = raw_buffer_view(0, 0);
+    auto wrong_stride = structured;
+    wrong_stride.Format = DXGI_FORMAT_R32_UINT;
+    auto wrong_typed = typed;
+    wrong_typed.Format = DXGI_FORMAT_R32_TYPELESS;
+    return check(bad_raw, resource) == srv::Refusal::format &&
+        check(out_of_range, resource) == srv::Refusal::buffer_range &&
+        check(overflowing, resource) == srv::Refusal::buffer_range &&
+        check(zero, resource) == srv::Refusal::buffer_range &&
+        check(wrong_stride, resource) == srv::Refusal::format &&
+        check(wrong_typed, resource) == srv::Refusal::format &&
+        check(raw, texture_desc()) == srv::Refusal::dimension;
+}
+
+static bool alias_checks()
+{
+    // A three-mip alias starts at mip 4. Its mip 1 maps to desktop mip 5,
+    // with the all-mips sentinel limited to the two mips left in the alias.
+    D3D12_TEX2D_SRV view{1, ~0u, 0, 0};
+    if (!x2w_startup::remap_alias_mips(view, 3, 4, 8) ||
+        view.MostDetailedMip != 5 || view.MipLevels != 2) return false;
+    D3D12_TEX2D_ARRAY_SRV missing_first{1, ~0u, 0, 1, 0, 0};
+    D3D12_TEX2D_SRV missing_tail{1, ~0u, 0, 0};
+    return !x2w_startup::remap_alias_mips(missing_first, 3, 4, 5) &&
+        missing_first.MostDetailedMip == 1 && missing_first.MipLevels == ~0u &&
+        !x2w_startup::remap_alias_mips(missing_tail, 3, 4, 6) &&
+        missing_tail.MostDetailedMip == 1 && missing_tail.MipLevels == ~0u;
+}
+
 static bool pure_checks()
 {
     auto resource = texture_desc();
@@ -55,6 +114,12 @@ static bool pure_checks()
         std::puts("FAIL: reported mip shape must be refused");
         return false;
     }
+    const D3D12_BUFFER_SRV buffer_fields{13, 1, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    auto union_mismatch = view_desc(0, 1, 0);
+    std::memcpy(&union_mismatch.Texture2D, &buffer_fields, sizeof(union_mismatch.Texture2D));
+    if (union_mismatch.Texture2D.MostDetailedMip != 13 || union_mismatch.Texture2D.MipLevels != 0) return false;
+    if (check(union_mismatch, resource) != srv::Refusal::mip_range) return false;
+
     auto zero_mips = view_desc(0, 0);
     auto bad_start = view_desc(8, 1);
     if (check(zero_mips, resource) != srv::Refusal::mip_range ||
@@ -140,15 +205,18 @@ static int warp_check()
     if (messages) messages->ClearStoredMessages();
 
     auto repairable = view_desc(6, 8, 0);
-    if (check(repairable, resource->GetDesc()) != srv::Refusal::none) return 1;
     auto dest = descriptors->GetCPUDescriptorHandleForHeapStart();
-    device->CreateShaderResourceView(resource.Get(), &repairable, dest);
+    if (!x2w_startup::x2w_create_srv(device.Get(), resource.Get(), &repairable, dest, "fixture-repair"))
+        return 1;
 
     auto reported = view_desc(13, 0);
-    if (check(reported, resource->GetDesc()) != srv::Refusal::mip_range) return 1;
-    auto null_view = view_desc(0, 1);
     dest.ptr += device->GetDescriptorHandleIncrementSize(heap_desc.Type);
-    device->CreateShaderResourceView(nullptr, &null_view, dest);
+    if (x2w_startup::x2w_create_srv(device.Get(), resource.Get(), &reported, dest, "fixture-refusal"))
+        return 1;
+    const auto history = x2w_startup::recent_srvs();
+    if (!x2w_startup::last_srv.site || std::strcmp(x2w_startup::last_srv.site, "fixture-refusal") ||
+        !history[14].site || std::strcmp(history[14].site, "fixture-repair") ||
+        !history[15].site || std::strcmp(history[15].site, "fixture-refusal")) return 1;
     if (FAILED(device->GetDeviceRemovedReason())) return 1;
     if (messages && messages->GetNumStoredMessages() != 0) {
         std::puts("FAIL: debug layer reported messages while creating SRVs");
@@ -160,11 +228,11 @@ static int warp_check()
 
 int main(int argc, char** argv)
 {
-    if (!pure_checks()) {
-        std::puts("FAIL: texture SRV descriptor checks");
+    if (!buffer_checks() || !alias_checks() || !pure_checks()) {
+        std::puts("FAIL: texture, alias mip and buffer SRV descriptor checks");
         return 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "warp") == 0) return warp_check();
-    std::puts("PASS: texture SRV descriptor checks");
+    std::puts("PASS: texture, alias mip and buffer SRV descriptor checks");
     return 0;
 }

@@ -429,10 +429,10 @@ void bind_typed_texture_srv(ID3D12Resource* texture, const D3D12_SHADER_RESOURCE
     const auto null_float = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
     const auto null_uint = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_UINT);
     const auto null_sint = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_SINT);
-    device->CreateShaderResourceView(integer ? nullptr : texture, integer || !texture ? &null_float : view, dest);
-    device->CreateShaderResourceView(integer == 1 ? texture : nullptr, integer == 1 ? view : &null_uint, twin);
+    x2w_create_srv(device, integer ? nullptr : texture, integer || !texture ? &null_float : view, dest, "sampled-float", log);
+    x2w_create_srv(device, integer == 1 ? texture : nullptr, integer == 1 ? view : &null_uint, twin, "sampled-uint", log);
     twin.ptr += increment;
-    device->CreateShaderResourceView(integer == 2 ? texture : nullptr, integer == 2 ? view : &null_sint, twin);
+    x2w_create_srv(device, integer == 2 ? texture : nullptr, integer == 2 ? view : &null_sint, twin, "sampled-sint", log);
 }
 
 LONG frame_number;
@@ -2120,7 +2120,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
     desc.Buffer.FirstElement = buffer ? offset / 4 : 0;
     desc.Buffer.NumElements = buffer ? static_cast<UINT>((bytes + 3) / 4) : 1;
     desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    device_of(the_device)->CreateShaderResourceView(buffer, &desc, dest);
+    x2w_create_srv(device_of(the_device), buffer, &desc, dest, "raw-buffer", log);
 }
 
 // Texture contents. Linear backing uses desktop copyable footprints; an announced BC7 4 KiB
@@ -4094,9 +4094,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     log_srv_refusal(srv_check::Refusal::dimension);
                     texture = nullptr;
                     mismatched = true;
-                } else if (!checked_texture_srv(device_of(the_device), view, real_desc,
-                                                resource ? resource->own().drop_levels : 0)) {
-                    texture = nullptr;
+                } else {
+                    const auto refusal = x2w_startup::validate_srv(device_of(the_device), view, real_desc,
+                        resource ? resource->own().drop_levels : 0, "draw-texture", log);
+                    if (refusal != srv_check::Refusal::none) {
+                        x2w_startup::srv_diagnostic("draw-texture", "refused", static_cast<unsigned>(refusal), 0, 0, log);
+                        texture = nullptr;
+                    }
                 }
             }
             if (indirect && !texture) {
@@ -4130,10 +4134,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 count_filtered_integer_srv(tr->integer_srvs, tr->key, i);
                 texture = nullptr;
                 const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
-                device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
+                x2w_create_srv(device_of(the_device), nullptr, &null_view, dest, "draw-filtered-integer", log);
             } else {
                 const auto null_view = null_srv_desc(dimension);
-                device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &null_view, dest);
+                x2w_create_srv(device_of(the_device), texture, texture ? view : &null_view, dest, "draw-texture", log);
             }
             if (texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;

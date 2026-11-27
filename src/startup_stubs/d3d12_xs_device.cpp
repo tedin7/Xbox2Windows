@@ -68,7 +68,7 @@
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
-#include "startup_stubs/view_desc_check.h"
+#include "startup_stubs/create_srv.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
@@ -481,6 +481,18 @@ ID3D12InfoQueue* info_queue;
 ID3D12Device* removal_device;
 LONG removal_reported, debug_lines;
 SRWLOCK debug_lock = SRWLOCK_INIT;
+bool debug_srv_history_reported;
+
+void log_debug_srv(const char* label, const x2w_startup::SrvCreation& srv)
+{
+    char bytes[3 * sizeof(srv.desc) + 2] = {};
+    if (srv.described) hex_text(srv.desc, sizeof(srv.desc), bytes, sizeof(bytes));
+    const auto& r = srv.resource;
+    log("x2w-d3d12-debug %s: site=%s desc=%s resource dim=%d %llux%u depth/array=%u mips=%u fmt=%d flags=0x%x",
+        label, srv.site ? srv.site : "(none on this thread)", srv.described ? bytes : "(null)",
+        r.Dimension, static_cast<unsigned long long>(r.Width), r.Height, static_cast<UINT>(r.DepthOrArraySize),
+        static_cast<UINT>(r.MipLevels), r.Format, static_cast<UINT>(r.Flags));
+}
 
 void check_device(const char* context, int slot)
 {
@@ -503,6 +515,15 @@ void check_device(const char* context, int slot)
             ++debug_lines;
             log("x2w-d3d12-debug [%s %d] sev=%d id=%d %.900s", context, slot, message->Severity, message->ID,
                 message->pDescription);
+            if (message->ID == 27 || message->ID == 31 ||
+                (message->pDescription && std::strstr(message->pDescription, "CreateShaderResourceView"))) {
+                log_debug_srv("last SRV", x2w_startup::last_srv);
+                if (!debug_srv_history_reported) {
+                    debug_srv_history_reported = true;
+                    for (const auto& srv : x2w_startup::recent_srvs())
+                        if (srv.site) log_debug_srv("SRV history", srv);
+                }
+            }
         }
     }
     info_queue->ClearStoredMessages();
@@ -4991,67 +5012,20 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension);
 
 namespace srv_check = x2w_startup::view_desc;
+using x2w_startup::x2w_create_srv;
 
 void log_srv_refusal(srv_check::Refusal refusal)
 {
     static LONG counts[static_cast<unsigned>(srv_check::Refusal::count)]{};
     static constexpr const char* reasons[] = {
         "", "dimension or sample count", "mip range", "array range", "format",
-        "plane slice", "minimum LOD", "resource denies shader resource views", "view addresses dropped mips"
+        "plane slice", "minimum LOD", "resource denies shader resource views", "view addresses dropped mips",
+        "buffer element range"
     };
     const auto index = static_cast<unsigned>(refusal);
     const auto count = static_cast<unsigned>(InterlockedIncrement(&counts[index]));
     if (count <= 6 || (count & (count - 1)) == 0)
         log("x2w-d3d12 view refused: %s (count %u)", reasons[index], count);
-}
-
-void log_srv_repair(srv_check::Field field, UINT old_value, UINT new_value, const D3D12_RESOURCE_DESC& resource)
-{
-    static constexpr const char* names[] = {"MipLevels", "ArraySize", "NumCubes", "Shader4ComponentMapping", "Format"};
-    struct RepairCensus {
-        unsigned count;
-        unsigned used;
-        UINT old_values[6];
-        UINT new_values[6];
-    };
-    static RepairCensus cases[static_cast<unsigned>(srv_check::Field::count)]{};
-    static SRWLOCK lock = SRWLOCK_INIT;
-    const auto index = static_cast<unsigned>(field);
-    AcquireSRWLockExclusive(&lock);
-    auto& entry = cases[index];
-    const unsigned count = ++entry.count;
-    bool first = entry.used < 6;
-    for (unsigned i = 0; i < entry.used; ++i)
-        if (entry.old_values[i] == old_value && entry.new_values[i] == new_value) first = false;
-    if (first) {
-        entry.old_values[entry.used] = old_value;
-        entry.new_values[entry.used++] = new_value;
-    }
-    ReleaseSRWLockExclusive(&lock);
-    if (first)
-        log("x2w-d3d12 view repaired: %s %u -> %u (resource %llux%u mips %u fmt %u)",
-            names[index], old_value, new_value, static_cast<unsigned long long>(resource.Width),
-            resource.Height, static_cast<unsigned>(resource.MipLevels), static_cast<unsigned>(resource.Format));
-    if (count > 6 && (count & (count - 1)) == 0)
-        log("x2w-d3d12 view repair count: %s %u", names[index], count);
-}
-
-bool checked_texture_srv(ID3D12Device* device, D3D12_SHADER_RESOURCE_VIEW_DESC* view,
-                         const D3D12_RESOURCE_DESC& resource, unsigned dropped_levels)
-{
-    if (resource.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return true;
-    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
-    if (view && view->Format != resource.Format && !x2w_startup::is_typeless(resource.Format) &&
-        x2w_startup::compatible_formats(resource.Format, view->Format)) {
-        device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
-    }
-    const auto refusal = view ? srv_check::check(*view, resource, dropped_levels,
-        [&](srv_check::Field field, UINT old_value, UINT new_value) {
-            log_srv_repair(field, old_value, new_value, resource);
-        }, options.CastingFullyTypedFormatSupported != FALSE) : srv_check::check_default(resource);
-    if (refusal == srv_check::Refusal::none) return true;
-    log_srv_refusal(refusal);
-    return false;
 }
 
 #include "startup_stubs/d3d12_draw.inl"
@@ -5537,26 +5511,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     return S_OK;
 }
 
-// A null R8G8B8A8_UNORM SRV of a texture dimension (2 to 10; any other value gives texture 2D). A null resource
-// reads no more of the description than its format and dimension.
 D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension)
 {
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension));
-    switch (desc.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-    default: desc.Texture2D.MipLevels = 1; break;
-    }
-    return desc;
+    return x2w_startup::safe_null_srv(
+        static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension)),
+        DXGI_FORMAT_R8G8B8A8_UNORM);
 }
 
 // X2W_D3D12_VIEW_DEFAULTS (view_dimension.h): which slots give an unknown-dimension view the resource's default view.
@@ -5698,7 +5657,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
                 std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
             const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
-            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            x2w_create_srv(device_of(self), nullptr, &null_view,
+                           D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])}, "slot18-refused", log);
             record_view(false);
         } else if constexpr (N == 17) {
             record_view(false);  // Translated constant-buffer views use only the descriptor record.
@@ -5783,8 +5743,9 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                         ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(args[1])
                         : nullptr;
                     const D3D12_SHADER_RESOURCE_VIEW_DESC placeholder = lazy_null_srv_desc(lazy_rec.desc, requested);
-                    device_of(self)->CreateShaderResourceView(
-                        nullptr, &placeholder, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+                    x2w_create_srv(device_of(self), nullptr, &placeholder,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])},
+                                   "slot18-lazy-placeholder", log);
                     removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
                     created = SUCCEEDED(removed);
                     record_view(created);
@@ -5809,38 +5770,27 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[0] = reinterpret_cast<u64>(materialize_lazy_texture(lazy_wrapper));
         }
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC checked_srv;
-    if constexpr (N == 18) {
-        if (args[0]) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr;
-            if (args[1]) {
-                if (x2w_local::readable(reinterpret_cast<const void*>(args[1]), sizeof(checked_srv))) {
-                    std::memcpy(&checked_srv, reinterpret_cast<const void*>(args[1]), sizeof(checked_srv));
-                    view = &checked_srv;
-                } else {
-                    log_srv_refusal(srv_check::Refusal::dimension);
-                    refuse_view();
-                    return 0;
-                }
-            }
-            const auto resource = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
-            const unsigned dropped_levels = lazy_wrapper ? lazy_wrapper->own().drop_levels : 0;
-            if (!checked_texture_srv(device_of(self), view, resource, dropped_levels)) {
-                refuse_view();
-                return 0;
-            }
-            args[1] = reinterpret_cast<u64>(view);
-        }
-    }
     const LONG removed_before = removal_reported;
-    const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
-    // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
-    // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
-    // reference and adds none.
+    u64 result = 0;
+    bool srv_written = true;
+    if constexpr (N == 18) {
+        const auto* view = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(args[1]);
+        if (view && !x2w_local::readable(view, sizeof(*view))) {
+            log_srv_refusal(srv_check::Refusal::dimension);
+            refuse_view();
+            return 0;
+        }
+        srv_written = x2w_create_srv(device_of(self), reinterpret_cast<ID3D12Resource*>(args[0]), view,
+                                     D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])}, "slot18", log,
+                                     lazy_wrapper ? lazy_wrapper->own().drop_levels : 0);
+    } else {
+        result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    }
+    // A refused SRV or a removed device leaves the slot unmaterialized and releases its old view reference.
     const HRESULT removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
-    const bool created = SUCCEEDED(removed);
+    const bool created = srv_written && SUCCEEDED(removed);
     record_view(created);
-    if (!created) {
+    if (FAILED(removed)) {
         static LONG failed;
         if (first_calls(failed, 6))
             log("x2w-d3d12 Device::slot%d view not created: device removed, reason 0x%08lx", N,
@@ -5880,7 +5830,7 @@ void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_
     if (described) std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
     const auto bind_null = [&] {
         const auto null_view = lazy_null_srv_desc(created_desc, described ? &srv_desc : nullptr);
-        device->CreateShaderResourceView(nullptr, &null_view, dest);
+        x2w_create_srv(device, nullptr, &null_view, dest, "lazy-refresh-null", log);
     };
     D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr;
     if (described && srv_desc.ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) {
@@ -5902,11 +5852,7 @@ void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_
         bind_null();
         return;
     }
-    if (!checked_texture_srv(device, view, created_desc, dropped_levels)) {
-        bind_null();
-        return;
-    }
-    device->CreateShaderResourceView(created, view, dest);
+    x2w_create_srv(device, created, view, dest, "lazy-refresh", log, dropped_levels);
 }
 
 // After a guest descriptor copy: a destination slot that now names a lazy texture which already has its real resource got
@@ -6641,8 +6587,9 @@ void null_lazy_views(Wrapper* w, ID3D12Device* device)
             view.Format = desktop_format(view.Format);
             if (view.Format == DXGI_FORMAT_UNKNOWN) view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             if (!view.Shader4ComponentMapping) view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            device->CreateShaderResourceView(nullptr, &view,
-                                             D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)});
+            x2w_create_srv(device, nullptr, &view,
+                           D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)},
+                           "lazy-eviction", log);
         }
     }
     ReleaseSRWLockShared(&note_lock);

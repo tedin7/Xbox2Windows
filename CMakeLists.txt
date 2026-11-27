@@ -668,6 +668,10 @@ target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi)
 add_test(NAME startup_view_desc COMMAND startup_view_desc)
 add_test(NAME startup_view_desc_warp COMMAND startup_view_desc warp)
 set_tests_properties(startup_view_desc_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME startup_srv_wrapper_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_srv_wrapper_check.py")
+endif()
 # The same through d3d12_xs.dll: an unknown-dimension SRV samples its texture's colour, an incompatible explicit SRV is
 # refused without device removal, and a refused replacement leaves a null descriptor, not the slot's old view. The
 # off control (X2W_D3D12_VIEW_DEFAULTS=off) must fail on the missing default view alone, with the device not removed.

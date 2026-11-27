@@ -1,7 +1,8 @@
-// Device-independent validation of desktop texture SRVs.
+// Device-independent validation of desktop SRVs.
 #pragma once
 
 #include "startup_stubs/list_copy.h"
+#include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/texture_drop_mips.h"
 
 #include <cmath>
@@ -9,7 +10,7 @@
 namespace x2w_startup::view_desc {
 
 enum class Refusal {
-    none, dimension, mip_range, array_range, format, plane, lod, denied, dropped_mips, count
+    none, dimension, mip_range, array_range, format, plane, lod, denied, dropped_mips, buffer_range, count
 };
 
 enum class Field { mip_levels, array_size, num_cubes, mapping, format, count };
@@ -70,6 +71,7 @@ inline D3D12_SRV_DIMENSION default_dimension(const D3D12_RESOURCE_DESC& resource
 {
     const bool array = resource.DepthOrArraySize > 1;
     switch (resource.Dimension) {
+    case D3D12_RESOURCE_DIMENSION_BUFFER: return D3D12_SRV_DIMENSION_BUFFER;
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
         return array ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -104,6 +106,25 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
               unsigned dropped_levels, Repair repair, bool fully_typed_casting = false)
 {
     if (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return Refusal::denied;
+
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER ||
+        resource.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER ||
+            resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            return Refusal::dimension;
+        const UINT stride = buffer_srv_element_bytes(view, false);
+        if (!stride) return view.Buffer.NumElements ? Refusal::format : Refusal::buffer_range;
+        const UINT64 total = resource.Width / stride;
+        if (view.Buffer.FirstElement >= total || view.Buffer.NumElements > total - view.Buffer.FirstElement ||
+            (view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW &&
+             view.Buffer.FirstElement % (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / 4) != 0))
+            return Refusal::buffer_range;
+        if (!valid_mapping(view.Shader4ComponentMapping)) {
+            repair(Field::mapping, view.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+        return Refusal::none;
+    }
 
     const bool tex1d = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     const bool tex2d = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -175,6 +196,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         break;
     }
     if (!fits) return Refusal::dimension;
+    if (!mip_count && !resource.MipLevels) return Refusal::mip_range;
 
     if (mip_count && (first_mip >= resource.MipLevels || *mip_count == 0))
         return Refusal::mip_range;

@@ -176,7 +176,7 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
                                              SIZE_T{index} * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
     if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.compositor.initial_pipeline()))) return false;
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const UINT drawn = p.compositor.record(device, p.list, target, p.width, p.height, steps, count, plane_surfaces);
+    const UINT drawn = p.compositor.record(device, p.list, target, p.width, p.height, steps, count, plane_surfaces, log);
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     if (!drawn) {
         p.list->Close();

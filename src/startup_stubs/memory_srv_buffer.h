@@ -75,10 +75,11 @@ inline bool valid_buffer_resource_desc(const D3D12_RESOURCE_DESC& r)
            !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
 }
 
-inline std::uint32_t buffer_srv_element_bytes(const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+inline std::uint32_t buffer_srv_element_bytes(const D3D12_SHADER_RESOURCE_VIEW_DESC& v,
+                                              bool require_default_mapping = true)
 {
     if (v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER ||
-        v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING ||
+        (require_default_mapping && v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING) ||
         v.Buffer.NumElements == 0)
         return 0;
     const UINT flags = static_cast<UINT>(v.Buffer.Flags);

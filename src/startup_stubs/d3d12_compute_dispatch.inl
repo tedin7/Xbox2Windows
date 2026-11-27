@@ -829,9 +829,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             } else if (integer && tr->integer_srvs.typed) {
                 count_filtered_integer_srv(tr->integer_srvs, tr->key, static_cast<UINT>(i));
                 const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
-                device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
+                x2w_create_srv(device_of(the_device), nullptr, &null_view, dest, "compute-filtered-integer", log);
             } else {
-                device_of(the_device)->CreateShaderResourceView(shader_input, desc, dest);
+                x2w_create_srv(device_of(the_device), shader_input, desc, dest, "compute-texture", log);
             }
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;

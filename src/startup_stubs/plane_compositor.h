@@ -25,6 +25,7 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 
+#include "startup_stubs/create_srv.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/present_view_format.h"
 
@@ -111,7 +112,8 @@ public:
     // steps[0..count) as from composite_steps; plane_surfaces[step.plane] is that plane's surface,
     // or null to leave the step out. Returns the number of planes drawn (0: nothing recorded).
     UINT record(ID3D12Device* device, ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE target, UINT width,
-                UINT height, const PlaneStep* steps, unsigned count, ID3D12Resource* const* plane_surfaces)
+                UINT height, const PlaneStep* steps, unsigned count, ID3D12Resource* const* plane_surfaces,
+                SrvLog srv_log = nullptr)
     {
         if (!opaque_ || !list || !steps || !plane_surfaces) return 0;
         ID3D12Resource* drawn[16] = {};
@@ -132,8 +134,9 @@ public:
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             view.Texture2D.MipLevels = 1;
-            device->CreateShaderResourceView(drawn[i], &view,
-                                             D3D12_CPU_DESCRIPTOR_HANDLE{textures_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * step});
+            x2w_create_srv(device, drawn[i], &view,
+                           D3D12_CPU_DESCRIPTOR_HANDLE{textures_->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * step},
+                           "plane-compositor", srv_log);
         }
         for (UINT i = 0; i < planes; ++i) transition(list, drawn[i], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
