@@ -3,7 +3,9 @@
 Run with no arguments for translation controls; `binary <llvm-mc>` independently
 assembles the recorded instructions before running those same controls.
 """
+import struct
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -184,6 +186,33 @@ def check_refusal_census():
     assert_result(proven, (0, 20, 24), 24)
 
 
+def check_image_request():
+    from startup_compute_global_load_check import IMAGE_JUMP_TARGET, IMAGE_TABLE, RSRC2_A, image_program, root_blob_cs
+
+    code, root = image_program(), root_blob_cs()
+    # The request's second byte blob is deliberately different from its image.
+    # The table belongs to the image, whose offsets are relative to GETPC.
+    data, state_b = bytes(64), b''
+    state_a = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1, 0, RSRC2_A)
+    desc = struct.pack('<12Q', 0, 0, len(state_a), 0, len(state_b), 0, len(code), 0, len(data), 0, 0, 0)
+    key = G.compute_key(code, data, root, desc, state_a, state_b)
+    out = HERE.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as directory:
+        prefix = Path(directory) / ('req_%016x' % key)
+        for ext, value in (('.c67', code), ('.data', data), ('.root', root), ('.desc', desc),
+                           ('.sa', state_a), ('.sb', state_b)):
+            prefix.with_suffix(ext).write_bytes(value)
+        pipe = G.load_compute_request(directory, key)
+        assert pipe.cs.calculated_pc[16] == IMAGE_JUMP_TARGET
+        assert tuple(pipe.cs.image_tables.values()) == (IMAGE_TABLE,)
+        assert pipe.manifest().splitlines() == [
+            'x2w-manifest 2', 'stage cs', 'group 32 1 1', 'ud 2',
+            'udsrc 0 rootconst 0 0', 'udsrc 1 rootconst 0 1', 'uav 0 table 2 0',
+        ]
+    print('compute request: shared calculated jump pair and image load with ordinary manifest')
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == 'binary':
         for name, fixture in FIXTURES.items():
@@ -196,6 +225,7 @@ def main():
     assert_result(translate(DIRECT), (0, 8, 12), 12)
     check_root_bypass()
     check_refusal_census()
+    check_image_request()
     for name in ('competing entry', 'ambiguous', 'clobber', 'literal target', 'outside'):
         try:
             translate(FIXTURES[name])
