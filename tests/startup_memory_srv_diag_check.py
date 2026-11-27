@@ -71,7 +71,10 @@ def check(directory, consumer, backend, control=False):
         if right != bytes((23 + 32 * (y % 2), 0, 0, 255)):
             raise AssertionError(f"column 1 row {y}: {right.hex()}, expected the R8 texel")
 
-    lines = census_block(result.stdout)
+    block = census_block(result.stdout)
+    # The report also lists the first and last use of each pipeline key; the drawn pipeline is the only one here.
+    key_uses = [line for line in block if line.startswith("x2w-render key use ")]
+    lines = [line for line in block if line not in key_uses]
     if len(lines) != 4:
         raise AssertionError("census report is not four lines:\n" + "\n".join(lines))
     if not re.fullmatch(REFUSALS, lines[0]):
@@ -83,6 +86,9 @@ def check(directory, consumer, backend, control=False):
         raise AssertionError(f"token nulls\n  line     {lines[2]}\n  expected {TOKENS}")
     if not re.fullmatch(WRITES, lines[3]):
         raise AssertionError(f"slot 70 writes\n  line     {lines[3]}\n  expected {WRITES}")
+    if len(key_uses) != 1 or not re.fullmatch(
+            rf"x2w-render key use graphics {tokens.group(1)} first [0-9.]+ s last [0-9.]+ s uses [0-9]+", key_uses[0]):
+        raise AssertionError("key use lines (one, for the pipeline that drew the null):\n" + "\n".join(key_uses))
 
     log = trap_log.read_text(errors="replace").splitlines()
     slot70 = [line for line in log if "Device::slot70" in line]
