@@ -166,7 +166,53 @@ WORDS_R = bytes.fromhex(
     '7fc08cbf0785158f15001a4a841a1a34001078e00d090480000081bf'
 )
 
+# Two distinct qwords per lane, with a nonzero base and mirrored reads.
+SOURCE_TWO_QWORDS = PREAMBLE + """\
+v_add_nc_u32 v18, 61, v0
+v_xor_b32 v19, 0x13570000, v18
+v_add_nc_u32 v20, 97, v0
+v_not_b32 v21, v20
+v_lshlrev_b32 v22, 4, v0
+ds_write_b64 v22, v[18:19] offset:16
+ds_write_b64 v22, v[20:21] offset:24
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v23, 31, v0
+v_lshlrev_b32 v23, 4, v23
+v_and_b32 v23, 0x1f0, v23
+ds_read_b64 v[24:25], v23 offset:16
+s_waitcnt lgkmcnt(0)
+v_and_b32 v23, 0x1f0, v23
+ds_read_b64 v[26:27], v23 offset:24
+s_waitcnt lgkmcnt(0)
+v_lshlrev_b32 v28, 4, v0
+buffer_store_dwordx4 v[24:27], v28, s[16:19], 0 offen
+s_endpgm
+"""
+SOURCE_OVERLAP = SOURCE_TWO_QWORDS.replace('v22, 4, v0', 'v22, 3, v0')
+SOURCE_UNPROVEN = SOURCE_TWO_QWORDS.replace('ds_write_b64 v22, v[20:21]', 'ds_write_b64 v19, v[20:21]')
+
+WORDS_TWO_QWORDS = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbfbd00244aff24263a00005713ff00284a'
+    '61000000146f2a7e84002c34100034d916120000180034d9161400007fc08cbf00008abf'
+    '9f002e3a842e2e34ff2e2e36f00100001000d8d9170000187fc08cbfff2e2e36f0010000'
+    '1800d8d91700001a7fc08cbf84003834001078e01c180480000081bf'
+)
+WORDS_OVERLAP = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbfbd00244aff24263a00005713ff00284a'
+    '61000000146f2a7e83002c34100034d916120000180034d9161400007fc08cbf00008abf'
+    '9f002e3a842e2e34ff2e2e36f00100001000d8d9170000187fc08cbfff2e2e36f0010000'
+    '1800d8d91700001a7fc08cbf84003834001078e01c180480000081bf'
+)
+WORDS_UNPROVEN = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbfbd00244aff24263a00005713ff00284a'
+    '61000000146f2a7e84002c34100034d916120000180034d9131400007fc08cbf00008abf'
+    '9f002e3a842e2e34ff2e2e36f00100001000d8d9170000187fc08cbfff2e2e36f0010000'
+    '1800d8d91700001a7fc08cbf84003834001078e01c180480000081bf'
+)
+
 CASES = {
+    'two-qwords': (SOURCE_TWO_QWORDS, WORDS_TWO_QWORDS, USER7 | TGID_X | (2 << 15), (32, 1, 1), (1, 1, 1)),
     'Q': (SOURCE_Q, WORDS_Q, USER7 | TGID_X | (2 << 15), (32, 1, 1), (2, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | (2 << 15), (64, 1, 1), (1, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | (1 << 15), (32, 1, 1), (1, 1, 1)),
@@ -188,7 +234,12 @@ SENTINEL = 0xc5c5c5c5
 
 def expected_words(name):
     out = [SENTINEL] * WORDS
-    if name == 'Q':
+    if name == 'two-qwords':
+        for lane in range(32):
+            peer = 31 - lane
+            first, second = peer + 61, peer + 97
+            out[lane * 4:lane * 4 + 4] = [first, first ^ 0x13570000, second, 0xffffffff ^ second]
+    elif name == 'Q':
         for g in range(2):
             for l in range(32):
                 peer = (g << 8) + (l ^ 17)
@@ -241,7 +292,36 @@ def translate_case(name, code=None, rsrc2=None, group=None):
                              default_rsrc2 if rsrc2 is None else rsrc2, local if group is None else group)
 
 
+def check_strided_layouts():
+    def scan(source):
+        ins = [(i * 4, 4, asm.split()[0], asm) for i, asm in enumerate(source.splitlines())]
+        return G.check_lds_exchange(ins, (32, 1, 1), 512)
+
+    # Three slots in a 32-byte record. Compute the middle slot's offset in ALU,
+    # and leave the final qword in each record uninitialized.
+    gapped = SOURCE_TWO_QWORDS.replace('v22, 4, v0', 'v22, 5, v0').replace(
+        'ds_write_b64 v22, v[20:21] offset:24',
+        'v_lshl_add_u32 v32, v0, 5, 24\nds_write_b64 v32, v[20:21]\n'
+        'ds_write_b64 v22, v[18:19] offset:32')
+    gapped = gapped.replace('v23, 4, v23', 'v23, 5, v23').replace('0x1f0', '0x3e0')
+    assert scan(gapped) == 258
+    refused('initialized span', lambda: scan(gapped.replace('v23 offset:24', 'v23 offset:40')))
+    refused('one bounded qword', lambda: scan(gapped.replace('offset:32', 'offset:48')))
+    refused('one bounded qword', lambda: scan(gapped.replace('offset:32', 'offset:28')))
+    multiplied = gapped.replace('v_lshlrev_b32 v22, 5, v0', 'v_mul_u32_u24 v22, 32, v0')
+    assert scan(multiplied) == 258
+
+
 def check_controls():
+    check_strided_layouts()
+    hlsl = translate_case('two-qwords').hlsl_cs()
+    assert 'groupshared uint lds[132];' in hlsl
+    assert mutate(hlsl, 'qwords-overlap')
+    for code in (WORDS_OVERLAP, WORDS_UNPROVEN):
+        refused('LDS exchange needs one bounded qword per local X ID',
+                lambda: translate_case('two-qwords', code=code).hlsl_cs())
+    refused('LDS exchange needs one bounded qword per local X ID',
+            lambda: translate_case('two-qwords', rsrc2=USER7 | TGID_X | (1 << 15)).hlsl_cs())
     # Positive HLSL lowering: declarations, single-eval alias-safe index, barrier, and all 4 dwords.
     hlsl_q = translate_case('Q').hlsl_cs()
     assert 'groupshared uint lds[256];' in hlsl_q, hlsl_q
@@ -432,6 +512,8 @@ def check_binary(llvm_mc):
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
+    for source, words in ((SOURCE_OVERLAP, WORDS_OVERLAP), (SOURCE_UNPROVEN, WORDS_UNPROVEN)):
+        assert assemble(llvm_mc, source) == words
     for line, hex_words in VERIFIED_SNIPPETS.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == hex_words, '%s: assembled %s, recorded %s' % (line, built, hex_words)
@@ -439,6 +521,7 @@ def check_binary(llvm_mc):
 
 
 CONTROLS = {
+    'qwords-overlap': ('two-qwords', '    v22 = v0 << (0x00000004u & 31);\n', '    v22 = v0 << (0x00000003u & 31);\n'),
     'q-same-lane': ('Q', '    v9 = 0x00000110u ^ v4;\n', '    v9 = v4;\n'),
     'q-swap-dwords': ('Q', '    v11 = lds[a + 2u];\n    v12 = lds[a + 3u];\n',
                       '    v11 = lds[a + 3u];\n    v12 = lds[a + 2u];\n'),
@@ -452,7 +535,17 @@ CONTROLS = {
 def mutate(hlsl, control):
     _, old, new = CONTROLS[control]
     assert hlsl.count(old) == 1, (control, hlsl)
-    return hlsl.replace(old, new)
+    hlsl = hlsl.replace(old, new)
+    if control == 'qwords-overlap':
+        # Order the two write rounds so the second slot deterministically overwrites
+        # its adjacent lane's first slot. Read at the same reduced stride.
+        second_store = '    a = (v22 + 24u) >> 2;\n'
+        shift = '    v23 = v23 << (0x00000004u & 31);\n'
+        mask = '    v23 = 0x000001f0u & v23;\n'
+        assert hlsl.count(second_store) == 1 and hlsl.count(shift) == 1 and hlsl.count(mask) == 2
+        hlsl = hlsl.replace(second_store, '    GroupMemoryBarrierWithGroupSync();\n' + second_store)
+        hlsl = hlsl.replace(shift, shift.replace('4u', '3u')).replace(mask, mask.replace('01f0', '00f8'))
+    return hlsl
 
 
 def run_case(name, dxc, runner, adapter, directory, control=None):
