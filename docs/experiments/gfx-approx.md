@@ -31,3 +31,35 @@ python3 -B tests/startup_gfx2hlsl_approx_check.py
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_approx_(controls|warp)$'
 ```
+
+## Level 2 (permissive)
+
+Set `X2W_GFX_APPROX=2` explicitly in the translator and replay environments
+to diagnose refused shaders. Level 2 is diagnostic only and is never enabled
+by default. It lives only on the branch replay-permissive; never merge it
+into the tester-loop or replay lines.
+
+The translator keeps accepted shaders byte-for-byte. For a refusal or a
+placeholder pixel stage it tries the level 1 lowerings, then collects
+refusals while continuing to lower the shader. A skipped instruction writes
+zero to its register destinations. A skipped store, atomic or export drops
+its side effect. A skipped atomic with a return value writes zero to that
+destination. Proof failures can leave code in place under weaker
+assumptions. For example, a recognized reduction can use the HLSL wave
+intrinsic over the active desktop lanes. Shader results can be wrong.
+If a retry cannot produce a complete shader and manifest, the translator
+keeps the strict refusal or the configured placeholder pixel stage.
+
+The marker records the affected stages and counts the observed sites in
+`readfirstlane`, `reduction`, `uniform` (including lane masks and SCC),
+`execz`, `resource`, `mesh`, `store_dropped`, `unknown_op` and `other`
+order. It appears on translator stderr and in the derived manifest. The
+derived key hashes `approx2` with the original request key as the seed. The
+translator writes `<request-key>.approx2.txt` after the manifest. Replay
+prefers an exact result and can use the alias when the exact result is
+absent or a placeholder. Slot 57 mesh results are offline only.
+
+The controls above also check level 2 key derivation, cache publication,
+failure fallback and classification on synthetic programs. The WARP test
+compares all 320 words against a CPU reference, including pairs of a
+supported value and the zero result in each of eight threads.

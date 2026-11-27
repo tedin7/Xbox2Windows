@@ -388,6 +388,23 @@ def normal_reason(reason):
     return re.sub(r"\d+", "N", reason)[:110]
 
 
+def approx2_cache_marker(cache_dir, key, kind):
+    from gfx2hlsl import APPROX2_MARKER, fnv
+
+    try:
+        with open(os.path.join(cache_dir, key + ".approx2.txt"), encoding="ascii") as handle:
+            marker = handle.readline().strip()
+        match = APPROX2_MARKER.fullmatch(marker)
+        if match and int(match[1], 16) == fnv(b"approx2", int(key, 16)):
+            for suffix in READY_SUFFIXES[kind]:
+                with open(os.path.join(cache_dir, match[1] + suffix), encoding="ascii") as handle:
+                    if "# " + marker in handle.read().splitlines():
+                        return marker
+    except (OSError, UnicodeError):
+        pass
+    return ""
+
+
 def cache_results(cache_dir):
     """[(key, kind, status, reason)] for every request key in a shader cache folder, sorted by kind and key. Status is
     `ok` (published manifest), `approximated` (published diagnostic result), `refused` (first line of its `.fail`),
@@ -406,6 +423,11 @@ def cache_results(cache_dir):
     rows = []
     for key, kind in found.items():
         status, reason = "pending", ""
+        if key + ".approx2.txt" in by_key[key]:
+            marker = approx2_cache_marker(cache_dir, key, kind)
+            if marker:
+                rows.append((key, kind, "approximated", marker))
+                continue
         if key + ".approx.txt" in by_key[key]:
             try:
                 with open(os.path.join(cache_dir, key + ".approx.txt"), encoding="ascii") as handle:
@@ -422,7 +444,7 @@ def cache_results(cache_dir):
                 with open(os.path.join(cache_dir, name), "r", encoding="utf-8", errors="replace") as handle:
                     status, reason = "refused", clean_reason(handle.read(4096))
                 break
-            if not name.endswith(".approx.txt") and name.endswith(READY_SUFFIXES[kind]):
+            if not name.endswith((".approx.txt", ".approx2.txt")) and name.endswith(READY_SUFFIXES[kind]):
                 status = "ok"
         rows.append((key, kind, status, reason))
     return sorted(rows, key=lambda row: (row[1], row[0]))
@@ -459,6 +481,10 @@ def loaded_approximations(logdir):
             for line in handle:
                 marker = line.rstrip()
                 match = APPROX_LOG_RE.fullmatch(marker)
+                if marker.startswith("x2w-gfx approx2:"):
+                    from gfx2hlsl import APPROX2_MARKER
+
+                    match = APPROX2_MARKER.fullmatch(marker)
                 if match:
                     found[match[1]] = marker
     except OSError:

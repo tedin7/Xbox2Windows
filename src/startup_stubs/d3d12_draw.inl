@@ -455,20 +455,23 @@ bool cache_path(wchar_t* out, const wchar_t* prefix, u64 key, const wchar_t* ext
 bool read_text(const wchar_t* path, std::string& out);
 
 constexpr char approx_marker_prefix[] = "x2w-gfx approx: key ";
+constexpr char approx2_marker_prefix[] = "x2w-gfx approx2: key ";
 
-bool gfx_approx_enabled()
+int gfx_approx_enabled()
 {
-    static const bool enabled = [] {
+    static const int level = [] {
         char flag[2]{};
-        return GetEnvironmentVariableA("X2W_GFX_APPROX", flag, sizeof(flag)) == 1 && flag[0] == '1';
+        if (GetEnvironmentVariableA("X2W_GFX_APPROX", flag, sizeof(flag)) != 1) return 0;
+        return flag[0] == '1' || flag[0] == '2' ? flag[0] - '0' : 0;
     }();
-    return enabled;
+    return level;
 }
 
-u64 approx_key(const std::string& marker)
+u64 approx_key(const std::string& marker, int level)
 {
-    constexpr std::size_t prefix = sizeof(approx_marker_prefix) - 1;
-    if (marker.size() < prefix + 23 || marker.compare(0, prefix, approx_marker_prefix) != 0 ||
+    const char* prefix_text = level == 2 ? approx2_marker_prefix : approx_marker_prefix;
+    const std::size_t prefix = level == 2 ? sizeof(approx2_marker_prefix) - 1 : sizeof(approx_marker_prefix) - 1;
+    if (marker.size() < prefix + 23 || marker.compare(0, prefix, prefix_text) != 0 ||
         marker.compare(prefix + 16, 7, " stage ") != 0) return 0;
     const std::string hex = marker.substr(prefix, 16);
     if (hex.find_first_not_of("0123456789abcdef") != std::string::npos) return 0;
@@ -478,13 +481,14 @@ u64 approx_key(const std::string& marker)
 // The prefetcher returns the resolved manifest under the original request key.
 u64 translation_output_key(std::string& manifest, u64 request_key, std::string& marker)
 {
-    if (!gfx_approx_enabled()) return request_key;
-    const auto start = manifest.rfind("\n# x2w-gfx approx: key ");
+    const int level = gfx_approx_enabled();
+    if (!level) return request_key;
+    const auto start = manifest.rfind(level == 2 ? "\n# x2w-gfx approx2: key " : "\n# x2w-gfx approx: key ");
     if (start == std::string::npos) return request_key;
     const auto end = manifest.find_first_of("\r\n", start + 3);
     marker = manifest.substr(start + 3, end - (start + 3));
-    const u64 key = approx_key(marker);
-    if (key != fnv_bytes("approx1", 7, request_key)) {
+    const u64 key = approx_key(marker, level);
+    if (key != fnv_bytes(level == 2 ? "approx2" : "approx1", 7, request_key)) {
         marker.clear();
         return request_key;
     }
@@ -521,11 +525,12 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
         WIN32_FIND_DATAW found;
         HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) return keys;
+        const int level = gfx_approx_enabled();
         do {
             // Exact manifests and opt-in aliases wake waiters for the original request key.
             const auto length = wcslen(found.cFileName);
-            if (length != 20 && !(gfx_approx_enabled() && length == 27 &&
-                                  !wcscmp(found.cFileName + 16, L".approx.txt"))) continue;
+            if (length != 20 && !(level == 1 && length == 27 && !wcscmp(found.cFileName + 16, L".approx.txt")) &&
+                !(level == 2 && length == 28 && !wcscmp(found.cFileName + 16, L".approx2.txt"))) continue;
             wchar_t* end = nullptr;
             const u64 key = wcstoull(found.cFileName, &end, 16);
             if (end == found.cFileName + 16) keys.push_back(key);
@@ -536,14 +541,17 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
     io.read = [](u64 key, std::string& text) {
         wchar_t path[MAX_PATH];
         const bool exact = cache_path(path, L"", key, L".txt") && read_text(path, text);
-        if (!gfx_approx_enabled() || (exact && text.find("\nplaceholder rgb ") == std::string::npos))
+        const int level = gfx_approx_enabled();
+        if (!level || (exact && text.find("\nplaceholder rgb ") == std::string::npos))
             return exact;
         std::string marker, approximate;
-        if (!cache_path(path, L"", key, L".approx.txt") || !read_text(path, marker)) return exact;
+        if (!cache_path(path, L"", key, level == 2 ? L".approx2.txt" : L".approx.txt") || !read_text(path, marker))
+            return exact;
         const auto end = marker.find_first_of("\r\n");
         if (end != std::string::npos) marker.resize(end);
-        const u64 derived = approx_key(marker);
-        if (derived && derived == fnv_bytes("approx1", 7, key) && cache_path(path, L"", derived, L".txt") && read_text(path, approximate) &&
+        const u64 derived = approx_key(marker, level);
+        if (derived && derived == fnv_bytes(level == 2 ? "approx2" : "approx1", 7, key) &&
+            cache_path(path, L"", derived, L".txt") && read_text(path, approximate) &&
             (approximate.find("\n# " + marker + "\r\n") != std::string::npos ||
              approximate.find("\n# " + marker + "\n") != std::string::npos)) {
             text = std::move(approximate);

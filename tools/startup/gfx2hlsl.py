@@ -40,15 +40,40 @@ READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 
 
 _APPROX_RETRY = ContextVar('gfx_approx_retry', default=False)
+_PERMISSIVE = ContextVar('gfx_permissive', default=False)
 APPROX_REFUSALS = (READFIRSTLANE_UNIFORM, WAVE_REDUCTION_ENTRY)
 APPROX_ATTEMPT = 'x2w-approx-attempt'
 APPROX_MARKER = re.compile(
     r'x2w-gfx approx: key ([0-9a-f]{16}) stage (?:vs|ms|ps|cs)(?:\+(?:vs|ms|ps|cs))*'
     r' lifted [0-9]+ readfirstlane, [0-9]+ reductions')
 
+APPROX2_ATTEMPT = 'x2w-approx2-attempt'
+APPROX2_RULES = tuple((kind, re.compile(pattern, re.I)) for kind, pattern in (
+    ('readfirstlane', r'^v_readfirstlane_b32 requires|wave-wide read|readfirstlane.*uniform'),
+    ('reduction', r'wave reduction'),
+    ('uniform', r'exec.*(?:not proven|entry mask)|entry exec|lane[- ]mask|\bs_(?:nand|nor|ff1|bcnt)\w*.*mask'
+                r'|unverified scc|scc.*not proven|joined at a branch target'
+                r'|is read where it is not defined for every lane'),
+    ('execz', r'skips per lane|branch out of (?:the|a) block|execz|loop.*inside.*block'),
+    ('resource', r's_load.*(?:heap|register offset)|descriptor words?|formatted load'
+                 r'|(?:image|buffer).*descriptor|descriptor.*(?:image|buffer)'),
+    ('mesh', r'^slot 57 mesh'),
+    ('store_dropped', r'\b(?:\w*[_ ]store\w*|\w*[_ ]atomic\w*|ds_write\w*|exp)\b'),
+))
+APPROX2_CLASSES = tuple(kind for kind, _ in APPROX2_RULES) + ('unknown_op', 'other')
+DS_MEMORY_WRITES = frozenset(name for name, _, _, data0, _, _, gds in D.DS_OPS.values()
+                             if data0 or gds == 'gds_only' or name in ('ds_consume', 'ds_append'))
+APPROX2_MARKER = re.compile(
+    r'x2w-gfx approx2: key ([0-9a-f]{16}) stage (?:vs|ms|ps|cs)(?:\+(?:vs|ms|ps|cs))* lifted'
+    + ''.join(r'(?: ' + kind + r'=[1-9][0-9]*)?' for kind in APPROX2_CLASSES))
+
+
+def approx_level():
+    return {'1': 1, '2': 2}.get(os.environ.get('X2W_GFX_APPROX'), 0)
+
 
 def approx_enabled():
-    return os.environ.get('X2W_GFX_APPROX') == '1'
+    return approx_level() == 1
 
 
 def approximate_translation(lower):
@@ -70,7 +95,100 @@ def approximate_translation(lower):
         _APPROX_RETRY.reset(token)
 
 
+def approx2_side_effect(instruction):
+    return ('_store' in instruction or '_atomic' in instruction
+            or instruction.startswith(('ds_write', 'exp'))
+            or instruction in DS_MEMORY_WRITES)
+
+
+def approx2_class(reason, instruction):
+    for kind, pattern in APPROX2_RULES:
+        if kind == 'store_dropped' and instruction:
+            if approx2_side_effect(instruction):
+                return kind
+        elif pattern.search(reason):
+            return kind
+    return 'unknown_op' if instruction else 'other'
+
+
+class InstructionRefusal(str):
+    """Keep the refusal text comparable to the proof retries' existing strings."""
+
+    def __new__(cls, reason, instruction):
+        value = super().__new__(cls, reason)
+        value.instruction = instruction
+        return value
+
+
+def permissive_translation(lower):
+    refusals = []
+    token = _PERMISSIVE.set(True)
+    try:
+        return lower(refusals), refusals
+    finally:
+        _PERMISSIVE.reset(token)
+
+
+def diagnostic_translation(lower):
+    if approx_level() != 2:
+        return approximate_translation(lower)
+    try:
+        original = lower()
+    except Unsupported as reason:
+        original, failure = None, reason
+    else:
+        if not isinstance(getattr(original[0], 'ps', None), PlaceholderPixelStage):
+            return original
+
+    token = _APPROX_RETRY.set(True)
+    try:
+        try:
+            result = lower()
+        except Unsupported:
+            result = None
+        refusals = []
+        if result is None or isinstance(getattr(result[0], 'ps', None), PlaceholderPixelStage):
+            result, refusals = permissive_translation(lower)
+        pipe = result[0]
+        if not isinstance(getattr(pipe, 'ps', None), PlaceholderPixelStage):
+            pipe.approx2_refusals = refusals
+            return result
+    except Exception:
+        # Keep the normal diagnostic or placeholder if either retry cannot finish.
+        pass
+    finally:
+        _APPROX_RETRY.reset(token)
+    if original is not None:
+        return original
+    raise failure
+
+
+def approx2_result(key, pipe):
+    counts, stages = Counter(), set()
+    for reason, kind in pipe.approx2_refusals:
+        counts[approx2_class(reason, getattr(reason, 'instruction', None))] += 1
+        if kind in ('vs', 'ms', 'ps', 'cs'):
+            stages.add(kind)
+    pipeline_stages = []
+    for kind in ('vs', 'ps', 'cs'):
+        stage = getattr(pipe, kind, None)
+        if stage is None:
+            continue
+        pipeline_stages.append(stage.kind)
+        for category, sites in (('readfirstlane', 'approx_reads'), ('reduction', 'approx_reductions')):
+            n = len(getattr(stage, sites, ()))
+            if n:
+                stages.add(stage.kind)
+                counts[category] += n
+    names = '+'.join(kind for kind in pipeline_stages if kind in stages) or '+'.join(pipeline_stages)
+    lifted = ''.join(' %s=%d' % (kind, counts[kind]) for kind in APPROX2_CLASSES if counts[kind])
+    key = fnv(b'approx2', key)
+    return key, 'x2w-gfx approx2: key %016x stage %s lifted%s' % (key, names, lifted)
+
+
 def approx_result(key, pipe):
+    if approx_level() == 2:
+        return approx2_result(key, pipe) if hasattr(pipe, 'approx2_refusals') else (key, '')
     stages, reads, reductions = [], 0, 0
     for kind in ('vs', 'ps', 'cs'):
         stage = getattr(pipe, kind, None)
@@ -88,7 +206,10 @@ def approx_result(key, pipe):
 
 
 def publish_approx(base, marker):
-    if marker:
+    if marker.startswith('x2w-gfx approx2:'):
+        atomic_retry_text(base + '.approx2.txt', marker + '\n')
+        print(marker, file=sys.stderr, flush=True)
+    elif marker:
         atomic_retry_text(base + '.approx.txt', marker + '\n')
 
 
@@ -756,7 +877,8 @@ def native_instructions(code):
     return out
 
 
-def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, embedded_pixel=False):
+def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, embedded_pixel=False,
+           refusal_scope='decode'):
     out, off = [], 0
     saw_getpc = False
     saw_end = unreadable_tail = False
@@ -787,7 +909,7 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, em
         except Unsupported as reason:
             if refusals is None:
                 raise
-            refusals.append((str(reason), 'decode'))
+            refusals.append((str(reason), refusal_scope))
         else:
             out.append((off, n, name, asm))
             if embedded_vertex or embedded_pixel:
@@ -1136,6 +1258,35 @@ def scalar_destinations(name, asm):
         if r and r[0] == 's':
             out.update(range(r[1], r[2] + 1))
     return out
+
+
+def approx2_destinations(name, asm):
+    """Explicit register destinations, including an atomic's pre-operation return."""
+    _, ops, mods = parse(asm)
+    if approx2_side_effect(name):
+        returns = ('_atomic' in name and 'glc' in mods or '_rtn_' in name
+                   or name in ('ds_consume', 'ds_append', 'ds_ordered_count'))
+        if not returns:
+            return (), ()
+        dest = reg_range(ops[0]) if ops else None
+        # MUBUF and MIMG put both CAS inputs in VDATA, then return one value starting there (RDNA 2 ISA §8).
+        if dest and name.startswith(('buffer_atomic_cmpswap', 'image_atomic_cmpswap', 'image_atomic_fcmpswap')):
+            return (), range(dest[1], (dest[1] + dest[2]) // 2 + 1)
+        vgprs = range(dest[1], dest[2] + 1) if dest and dest[0] == 'v' else ()
+        sgprs = range(dest[1], dest[2] + 1) if dest and dest[0] == 's' else ()
+        return sgprs, vgprs
+    if name.startswith(NO_SCALAR_DESTINATION + ('s_movreld', 'v_movreld')):
+        return (), ()
+    if name.startswith('v_cmp') and len(ops) == 2:  # VOPC has an implicit mask destination.
+        return (), ()
+    vgprs, sgprs = [], scalar_destinations(name, asm) - {'any', 'm0'}
+    for tok in effect_destinations(name, ops)[0]:
+        dest = reg_range(tok)
+        if dest and dest[0] == 'v' and not name.startswith('v_cmp'):
+            vgprs.extend(range(dest[1], dest[2] + 1))
+        if dest and dest[0] == 's':
+            sgprs.update(range(dest[1], dest[2] + 1))
+    return sorted(sgprs), vgprs
 
 
 def desc_key(sym):
@@ -3407,8 +3558,9 @@ class Stage:
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
         if self.image_proof is None:
+            collect = {'refusal_scope': kind} if _PERMISSIVE.get() else {}
             self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs',
-                               embedded_pixel=kind == 'ps')
+                               embedded_pixel=kind == 'ps', **collect)
                         if refusals is None or decoded is None else decoded)
         if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
             self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
@@ -5432,6 +5584,7 @@ class Stage:
                                   if self.firstlane_cfg and self.kind == 'ps' else None)
         self.firstlane_ps_full_exec = (self.entry_exec_sites(self.spill_cfg, pixel_full=True)
                                        if self.firstlane_ps_exec is not None else set())
+        permissive = _PERMISSIVE.get()
         for _ in range(max(4, len(self.ins) + 2)):
             self.approx_reads, self.approx_reductions = set(), set()
             scc_effects = {}
@@ -5733,6 +5886,8 @@ class Stage:
                 else:
                     for reg in dests:
                         self.float_const_s.pop(reg, None)
+                if permissive:
+                    line_start = len(self.lines)
                 try:
                     if off in refused:
                         if not scalar_vote:
@@ -5844,10 +5999,20 @@ class Stage:
                             reason.instruction = name  # for fail_reason(); the message itself is unchanged
                         raised_unsupported = reason
                         break
-                    refusals.append((str(reason), self.kind))
+                    if permissive:
+                        del self.lines[line_start:]
+                        self.approx_reductions.discard(off)
+                        sgprs, vgprs = approx2_destinations(re.sub(r'_e(32|64)$', '', name), asm)
+                        for n in sgprs:
+                            self.set_s(n, '0u')
+                        for n in vgprs:
+                            self.set_v(n, '0u')
+                        refusals.append((InstructionRefusal(str(reason), name), self.kind))
+                    else:
+                        refusals.append((str(reason), self.kind))
                     continue
                 except Exception as error:
-                    if refusals is None:
+                    if refusals is None or permissive:
                         raise
                     refusals.append((handler_error(name, error, refusals), self.kind))
                     continue
@@ -13684,17 +13849,22 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
+        permissive = _PERMISSIVE.get()
         if retry_wave and pc not in self.reduction_entry_exec:
-            if not (self.retry_paired_exec and _APPROX_RETRY.get()):
+            if not (permissive or self.retry_paired_exec and _APPROX_RETRY.get()):
                 raise Unsupported(WAVE_REDUCTION_ENTRY)
             self.approx_reductions.add(pc)
         if not getattr(self, 'wave_exec', False):
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
                 raise Unsupported(WAVE_REDUCTION_BRANCHES)
             if not getattr(self, 'exec_known', False):
-                raise Unsupported('wave reduction: EXEC is not the entry mask')
+                if not permissive:
+                    raise Unsupported('wave reduction: EXEC is not the entry mask')
+                self.approx_reductions.add(pc)
         if getattr(self, 'wqm_exec', False):
-            raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
+            if not permissive:
+                raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
+            self.approx_reductions.add(pc)
         after_restore = index + first + 7
         if retry_wave:
             self.recognized_reductions.add(pc)
@@ -13734,8 +13904,9 @@ class Stage:
         def refuse(reason):
             raise Unsupported('wave reduction in the wave64 form: ' + reason)
 
+        approximate = not self.exec_known or self.wqm_exec
         if (self.kind != 'ps' or self.fetched or self.has_branches or self.blocks or self.calculated_pc
-                or not self.exec_known or self.wqm_exec):
+                or approximate and not _PERMISSIVE.get()):
             refuse('requires a straight-line pixel stage with entry EXEC')
         if op != 'v_add_nc_u32':
             refuse('the two half-wave results must be sums')
@@ -13774,6 +13945,8 @@ class Stage:
                     for operand in operands if (r := reg_range(operand.strip('-|')))):
                 refuse('a half-wave temporary is used after the chain')
 
+        if approximate:
+            self.approx_reductions.add(self.ins[index][0])
         plan = self.reduce_plan = getattr(self, 'reduce_plan', {})
         for pc, _, _, _ in self.ins[index + 1:index + end + 1]:
             plan[pc] = None
@@ -15727,10 +15900,10 @@ def translate_compute(out_dir, key):
     with suppress(FileNotFoundError):
         os.remove(name + '.txt')  # the result is unpublished until validation and compilation finish
     try:
-        def lower():
-            pipe = load_compute_request(out_dir, key)
+        def lower(refusals=None):
+            pipe = load_compute_request(out_dir, key, refusals) if refusals is not None else load_compute_request(out_dir, key)
             return pipe, pipe.hlsl_cs(), pipe.manifest()
-        pipe, hlsl, manifest = approximate_translation(lower)
+        pipe, hlsl, manifest = diagnostic_translation(lower)
     except Unsupported as reason:
         reason = fail_reason(reason)
         write_failure(name + '.fail', reason)
@@ -15886,11 +16059,12 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     name = os.path.join(out_dir, '%016x' % key)
     discard_stale_placeholder(name + '.txt')
     try:
-        def lower():
+        def lower(refusals=None):
+            collect = {'refusals': refusals} if refusals is not None else {}
             pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch,
-                            ps_attr_map=ps_attr_map, ps_hw_inputs=ps_hw_inputs)
+                            ps_attr_map=ps_attr_map, ps_hw_inputs=ps_hw_inputs, **collect)
             return pipe, pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
-        pipe, vs, ps, manifest = approximate_translation(lower)
+        pipe, vs, ps, manifest = diagnostic_translation(lower)
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
@@ -16203,16 +16377,23 @@ def translate_mesh57(out_dir, key):
         try:
             validate_mesh57_pixel(ps)
         except Unsupported as reason:
-            if not placeholder_ps_enabled():
+            if not placeholder_ps_enabled() and approx_level() != 2:
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
-    def lower():
-        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
+
+    def lower(refusals=None):
+        if pixel_refusal is not None:
+            if refusals is not None:
+                refusals.append((str(pixel_refusal), 'ps'))
+            elif not placeholder_ps_enabled():
+                raise pixel_refusal
+        collect = {'refusals': refusals} if refusals is not None else {}
+        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal, **collect)
         sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
         if ps:
             sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
         return pipe, sources, pipe.manifest()
-    pipe, sources, manifest = approximate_translation(lower)
+    pipe, sources, manifest = diagnostic_translation(lower)
     base = name
     output_key, marker = approx_result(key, pipe)
     name = os.path.join(out_dir, '%016x' % output_key)
@@ -16256,9 +16437,11 @@ def translate_request(out_dir, key):
     """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
     global _REQUEST_KEY
     _REQUEST_KEY = key
-    if approx_enabled():
+    level = approx_level()
+    if level:
+        suffix = '.approx2.txt' if level == 2 else '.approx.txt'
         with suppress(FileNotFoundError):
-            os.remove(os.path.join(out_dir, '%016x.approx.txt' % key))
+            os.remove(os.path.join(out_dir, '%016x%s' % (key, suffix)))
     if is_compute_request(out_dir, key):
         return translate_compute(out_dir, key)
     if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):
@@ -16278,7 +16461,7 @@ def translate_request(out_dir, key):
                 record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
         except Unsupported:
             # A result published earlier was translated from sources or masks this request no longer confirms.
-            for suffix in ('.txt', '.approx.txt'):
+            for suffix in ('.txt', '.approx.txt', '.approx2.txt'):
                 with suppress(FileNotFoundError):
                     os.remove(os.path.join(out_dir, '%016x%s' % (key, suffix)))
             raise
@@ -16687,6 +16870,8 @@ def write_failure(path, reason, *, version=None, context=None):
     detail = reason + '\n' + (context + '\n' if context else '')
     if approx_enabled() and reason.removesuffix(PLACEHOLDER_DRAWN) in APPROX_REFUSALS:
         detail += APPROX_ATTEMPT + '\n'
+    elif approx_level() == 2:
+        detail += APPROX2_ATTEMPT + '\n'
     if not family_retry_enabled():
         with open(path, 'w') as handle:
             handle.write(detail)
@@ -17130,11 +17315,21 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     waiting for the next pass; a request already handled in this pass is queued again only when its marker is
     rewritten. Results are printed as they finish.
     """
+    level2 = approx_level() == 2
+    approximated = 0
     stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
     if not queue:
+        if level2:
+            print('approximated (level 2) 0', flush=True)
         return
     handled = {}  # key -> marker time it was queued with in this pass
+
+    def report(key, result):
+        nonlocal approximated
+        if level2 and result == 'ok' and os.path.isfile(os.path.join(out_dir, '%016x.approx2.txt' % key)):
+            approximated += 1
+        print('%016x: %s%s' % (key, result, clock() if clock else ''), flush=True)
 
     def refill(queue):
         # A failure written during this pass is final for the pass (skip_failed), as on the next pass.
@@ -17158,13 +17353,13 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 key = queue.pop(0)
                 handled[key] = stamps[key]
                 if pool is None:
-                    print('%016x: %s%s' % (key, translate_one(out_dir, key), clock() if clock else ''), flush=True)
+                    report(key, translate_one(out_dir, key))
                     break
                 running[pool.submit(translate_one, out_dir, key)] = key
             if running:
                 done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
                 for future in done:
-                    print('%016x: %s%s' % (running.pop(future), future.result(), clock() if clock else ''), flush=True)
+                    report(running.pop(future), future.result())
             if monitor is not None:
                 monitor.tick(pool, len(running or ()))
             idle = not queue and not running
@@ -17173,6 +17368,8 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 last_scan = time.monotonic()
                 idle = not queue and not running
             if idle:
+                if level2:
+                    print('approximated (level 2) %d' % approximated, flush=True)
                 return
     finally:
         if pool is not None:
@@ -17190,6 +17387,7 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
     failures = {name for name in names if name.endswith('.fail')}
     rgb = placeholder_rgb_text()
     diagnostic = approx_enabled()
+    permissive = approx_level() == 2
     for name in names:
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
         if not m:
@@ -17208,15 +17406,21 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         # the request is retried.
         described = None
         lost = False
+        source_stamp = 0
         if m.group(2) in ('a', 'rtv'):
             with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
-                described = os.path.getmtime(request_source(out_dir, key)[3])
+                _, source, _, description = request_source(out_dir, key)
+                if permissive and source != key:
+                    source_stamp = os.path.getmtime(os.path.join(out_dir, 'req_%016x.a' % source))
+                described = os.path.getmtime(description)
             # A result translated with a description recorded it (dependency_record). With that description gone,
             # the result is checked again and withdrawn; a legacy request without a record is not read again.
             lost = described is None and os.path.isfile(result + '.psdep')
         failure_name = '%016x.fail' % key
         fail = os.path.join(out_dir, failure_name)
         placeholder = not compute and failure_name in failures and is_placeholder_failure(fail)
+        if permissive and not compute and not placeholder:
+            placeholder = placeholder_manifest_rgb(manifest) is not None
         if diagnostic and (not os.path.isfile(manifest) or placeholder):
             alias = result + '.approx.txt'
             with suppress(OSError, UnicodeError):
@@ -17234,6 +17438,33 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
                 if reason in APPROX_REFUSALS and APPROX_ATTEMPT not in failure.read().splitlines():
                     keys.append(key)
                     continue
+        if permissive and (not os.path.isfile(manifest) or placeholder):
+            inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0, source_stamp)
+            alias = result + '.approx2.txt'
+            with suppress(OSError, UnicodeError):
+                line = Path(alias).read_text(encoding='ascii').strip()
+                marker = APPROX2_MARKER.fullmatch(line)
+                if marker and int(marker[1], 16) == fnv(b'approx2', key) and not lost and (
+                        os.path.getmtime(alias) >= inputs):
+                    derived = os.path.join(out_dir, marker[1])
+                    derived_manifest = derived + ('.ms57.txt' if mesh else '.txt')
+                    lines = Path(derived_manifest).read_text(encoding='ascii').splitlines()
+                    needed = stages[:1] if mesh and 'ps none' in lines else stages
+                    if '# ' + line in lines and (
+                            manifest_only or all(ready_bytecode(derived + suffix) for suffix in needed)):
+                        continue
+            if failure_name in failures:
+                with suppress(OSError):
+                    attempted = APPROX2_ATTEMPT in Path(fail).read_text(
+                        encoding='utf-8', errors='replace').splitlines()
+                    if not attempted or lost or os.path.getmtime(fail) < inputs:
+                        keys.append(key)
+                        continue
+                    if not placeholder or placeholder_manifest_rgb(manifest) == rgb:
+                        continue
+            elif placeholder:
+                keys.append(key)
+                continue
         if placeholder and placeholder_manifest_rgb(manifest) != rgb:
             keys.append(key)
             continue

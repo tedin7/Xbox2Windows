@@ -34,7 +34,7 @@ Use `#dev-coordination` on Discord to find a reviewer and `#windows-testing` to 
 
 The pixel translator also supports [vector bitfield extraction, bit scans, reversal and population counts](docs/experiments.md#vector-bit-operations-in-pixel-shaders), checked by twelve source-built instruction forms.
 The [pixel readback checks](docs/experiments.md#offline-pixel-shader-recompilation) also cover `v_sat_pk_u8_i16` in e32 and e64 on hardware and WARP.
-For replay diagnosis, `X2W_GFX_APPROX=1` enables [two approximate shader lowerings and their census](docs/experiments/gfx-approx.md).
+Replay diagnosis has two opt-in [approximate shader translation levels](docs/experiments/gfx-approx.md).
 
 ### Instruction coverage
 

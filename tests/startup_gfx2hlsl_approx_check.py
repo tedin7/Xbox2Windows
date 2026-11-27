@@ -1,5 +1,7 @@
 """Exercise the opt-in gfx2hlsl diagnostic cache with original synthetic shaders."""
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import os
 import struct
 import subprocess
@@ -51,6 +53,27 @@ def compute_program(proven=False):
     )
 
 
+def permissive_program(body):
+    return bytes.fromhex(
+        '06038abe 80038bbe'          # s_mov_b32 s10, s6; s_mov_b32 s11, 0
+        '05030cf4000000fa 7fc08cbf'  # s_load_dwordx8 s[12:19], s[10:11], 0; s_waitcnt lgkmcnt(0)
+        '83000834 91000e3a'          # v_lshlrev_b32 v4, 3, v0; v_xor_b32 v7, 17, v0
+        + body
+        + '001074e004070480 000081bf'  # buffer_store_dwordx2 v[7:8], v4, s[16:19], 0 offen; s_endpgm
+    )
+
+
+UNKNOWN_PROGRAM = permissive_program(
+    'b502107e 007f107e'  # v_mov_b32 v8, 53; v_frexp_exp_i32_f32 v8, v0
+)
+STORE_PROGRAM = permissive_program(
+    '8d02107e 021070e004070480'  # v_mov_b32 v8, 13; buffer_store_dword v7, v4, s[16:19], 0 offen offset:2
+)
+EXECZ_PROGRAM = permissive_program(
+    '8b02107e 010088bf 000092bf'  # v_mov_b32 v8, 11; s_cbranch_execz over s_trap 0
+)
+
+
 def pixel_program(proven=False):
     # Reach the reduction by jumping back from a block that narrows EXEC.
     init = [('v_mov_b32_e32 v1, v0', wave.vop1_mov(1, 256))]
@@ -80,13 +103,17 @@ def compute(directory, proven=False):
     return key, G.translate_request(directory, key)
 
 
-def pixel(directory, proven=False):
-    code = pixel_program(proven)
+def pixel_request(directory, code):
     root = root_blob()
     key = G.pipeline_key(VERTEX, code, root, ps_inputs=wave.PACKED)
     ps_inputs = f'psin1 {key:016x} ena=0x8000 addr=0x8000\n'.encode('ascii')
     for suffix, blob in (('a', VERTEX), ('b', code), ('root', root), ('psin', ps_inputs)):
         (directory / f'req_{key:016x}.{suffix}').write_bytes(blob)
+    return key
+
+
+def pixel(directory, proven=False):
+    key = pixel_request(directory, pixel_program(proven))
     return key, G.translate_request(directory, key)
 
 
@@ -101,6 +128,16 @@ def check_approx(directory, key, stage, reads, reductions):
     assert artifact(directory, key, 'approx.txt').read_text().splitlines() == [marker]
     assert artifact(directory, derived, 'txt').read_text().splitlines().count('# ' + marker) == 1
     return artifact(directory, derived, f'{stage}.hlsl')
+
+
+def check_approx2(directory, key, stage, lifted):
+    derived = G.fnv(b'approx2', key)
+    marker = f'x2w-gfx approx2: key {derived:016x} stage {stage} lifted {lifted}'
+    assert derived != key and G.APPROX2_MARKER.fullmatch(marker)
+    assert artifact(directory, key, 'approx2.txt').read_text().splitlines() == [marker]
+    assert '# ' + marker in artifact(directory, derived, 'txt').read_text().splitlines()
+    assert not artifact(directory, key, 'approx.txt').exists()
+    return marker, artifact(directory, derived, stage + '.hlsl')
 
 
 def controls(directory):
@@ -120,11 +157,13 @@ def controls(directory):
             baseline = [artifact(directory, strict, suffix).read_bytes() for suffix in suffixes]
             hashes = tuple(hashlib.sha256(data.replace(b'\r\n', b'\n')).hexdigest() for data in baseline)
             assert hashes == BASELINE[stage], (stage, hashes)
-            for value in ('0', '1'):
+            for value in ('0', '1', '2'):
                 os.environ[SWITCH] = value
                 assert translate(directory, proven=True) == (strict, 'ok')
                 assert baseline == [artifact(directory, strict, suffix).read_bytes() for suffix in suffixes]
                 assert not artifact(directory, strict, 'approx.txt').exists()
+                assert not artifact(directory, strict, 'approx2.txt').exists()
+            os.environ[SWITCH] = '1'
             assert key in G.pending_keys(directory, skip_failed=True)
             result = translate(directory)
             assert result == (key, 'ok'), result
@@ -158,6 +197,177 @@ def controls(directory):
         assert not artifact(directory, key, 'approx.txt').exists()
 
 
+def permissive_controls(directory):
+    fixtures = (
+        (UNKNOWN_PROGRAM, 'v_frexp_exp_i32_f32', 'unknown_op=1'),
+        (STORE_PROGRAM, 'buffer store at unaligned immediate offset 2', 'store_dropped=1'),
+        (EXECZ_PROGRAM, 's_trap inside a block s_cbranch_execz skips per lane: effect outside scalar registers',
+         'execz=1'),
+    )
+    for reason, instruction, kind in (
+        (READ_REFUSAL, 'v_readfirstlane_b32', 'readfirstlane'),
+        (REDUCE_REFUSAL, None, 'reduction'),
+        ('s_nand_b32 on a lane mask', 's_nand_b32', 'uniform'),
+        ('branch out of the block', None, 'execz'),
+        ('s_load_dwordx4 with a register offset', 's_load_dwordx4', 'resource'),
+        ('slot 57 mesh: a loop outside the group-memory exchanges is not covered', None, 'mesh'),
+        ('unsupported memory operation', 'ds_max_i32', 'store_dropped'),
+        ('v_frexp_exp_i32_f32', 'v_frexp_exp_i32_f32_e32', 'unknown_op'),
+        ('unreadable shader request', None, 'other'),
+    ):
+        assert G.approx2_class(reason, instruction) == kind, reason
+
+    regs = G.approx2_destinations('ds_max_rtn_i32', 'ds_max_rtn_i32 v8, v4, v7')
+    assert tuple(map(tuple, regs)) == ((), (8,))
+    regs = G.approx2_destinations('buffer_atomic_add', 'buffer_atomic_add v8, v4, s[16:19], 0 offen')
+    assert tuple(map(tuple, regs)) == ((), ())
+    regs = G.approx2_destinations('image_atomic_cmpswap',
+                                  'image_atomic_cmpswap v[8:11], v4, s[16:23] dmask:0xf glc')
+    assert tuple(map(tuple, regs)) == ((), (8, 9))
+
+    markers = []
+    with patch.dict(os.environ, {'X2W_FXC': '', 'X2W_PLACEHOLDER_PS': '0', 'X2W_PRE_RUN_FAMILY_RETRY': '0'}):
+        for code, reason, lifted in fixtures:
+            key = compute_request(directory, code)
+            os.environ.pop(SWITCH, None)
+            for value in (None, '0', '1', '02'):
+                if value is not None:
+                    os.environ[SWITCH] = value
+                result = G.translate_request(directory, key)
+                assert result == 'unsupported: ' + reason, (value, result)
+                assert artifact(directory, key, 'fail').read_text().splitlines()[0] == reason
+
+            os.environ[SWITCH] = '2'
+            assert key in G.pending_keys(directory, skip_failed=True)
+            stderr = io.StringIO()
+            write_alias = G.atomic_retry_text
+
+            def after_manifest(path, data):
+                if path == str(artifact(directory, key, 'approx2.txt')):
+                    derived_manifest = artifact(directory, G.fnv(b'approx2', key), 'txt')
+                    assert '# ' + data.strip() in derived_manifest.read_text().splitlines()
+                write_alias(path, data)
+
+            with patch.object(G, 'atomic_retry_text', side_effect=after_manifest), redirect_stderr(stderr):
+                assert G.translate_request(directory, key) == 'ok'
+            marker, source = check_approx2(directory, key, 'cs', lifted)
+            assert stderr.getvalue().splitlines() == [marker]
+            markers.append(marker)
+            assert key not in G.pending_keys(directory, skip_failed=True)
+            assert (f'{key:016x}', 'compute', 'approximated', marker) in tester_pack.cache_results(directory)
+            hlsl = source.read_text()
+            if lifted == 'unknown_op=1':
+                assert 'v8 = 0u;' in hlsl
+            elif lifted == 'store_dropped=1':
+                assert '.Store(' not in hlsl and hlsl.count('.Store2(') == 1 and 'v7 = 0u;' not in hlsl
+
+        key = compute_request(directory, UNKNOWN_PROGRAM)
+        original = fixtures[0][1]
+        alias = artifact(directory, key, 'approx2.txt')
+        # Simulate a newer request publication even on filesystems with coarse mtimes.
+        stamp = alias.stat().st_mtime - 2
+        os.utime(alias, (stamp, stamp))
+        assert key in G.pending_keys(directory, skip_failed=True)
+        derived = G.fnv(b'approx2', key)
+        artifact(directory, derived, 'txt').unlink()
+        artifact(directory, derived, 'cs.hlsl').unlink()
+        with patch.object(G, 'permissive_translation', side_effect=RuntimeError('injected failure')):
+            assert G.translate_request(directory, key) == 'unsupported: ' + original
+        assert artifact(directory, key, 'fail').read_text().splitlines() == [original, G.APPROX2_ATTEMPT]
+        assert not alias.exists() and not artifact(directory, derived, 'txt').exists()
+        assert not artifact(directory, derived, 'cs.hlsl').exists()
+        assert key not in G.pending_keys(directory, skip_failed=False)
+        alias.write_text(markers[0] + '\n')
+        assert (f'{key:016x}', 'compute', 'refused', original) in tester_pack.cache_results(directory)
+        artifact(directory, key, 'fail').unlink()
+        assert (f'{key:016x}', 'compute', 'pending', '') in tester_pack.cache_results(directory)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            G.translate_pending(directory, skip_failed=True, jobs=1)
+        assert stdout.getvalue().splitlines()[-1] == 'approximated (level 2) 1'
+
+    (directory / 'stderr.txt').write_text('\n'.join(markers * 2) + '\n')
+    assert set(tester_pack.loaded_approximations(directory).values()) == set(markers)
+
+
+def permissive_lifts_and_placeholder(directory):
+    with patch.dict(os.environ, {SWITCH: '2', 'X2W_FXC': '', 'X2W_PLACEHOLDER_PS': '0'}):
+        for translate, stage, lifted, expression in (
+            (compute, 'cs', 'readfirstlane=1', 's22 = v5;'),
+            (pixel, 'ps', 'reduction=1', 'WaveActiveMax(v1)'),
+        ):
+            key, status = translate(directory)
+            assert status == 'ok', status
+            _, source = check_approx2(directory, key, stage, lifted)
+            assert expression in source.read_text()
+        code = compute_program()[:-4] + bytes.fromhex('007f107e 000081bf')
+        key = compute_request(directory, code)
+        assert G.translate_request(directory, key) == 'ok'
+        check_approx2(directory, key, 'cs', 'readfirstlane=1 unknown_op=1')
+
+        code = wave.program([('v_mov_b32_e32 v1, v0', wave.vop1_mov(1, 256))], wave.WQM,
+                            wave.chain('v_max_u32'), [wave.move(4, 1)], wave.export('v4', 'v1', 'v4'))[1]
+        key = pixel_request(directory, code)
+        with patch.dict(os.environ, {SWITCH: '1'}):
+            assert 'helper lanes' in G.translate_request(directory, key)
+        assert G.translate_request(directory, key) == 'ok'
+        _, source = check_approx2(directory, key, 'ps', 'reduction=1')
+        assert 'WaveActiveMax(v1)' in source.read_text()
+
+    with patch.dict(os.environ, {SWITCH: '0', 'X2W_FXC': '', 'X2W_PLACEHOLDER_PS': '1'}):
+        code = bytes.fromhex('007f107e') + b''.join(data for _, data in wave.export('v8', 'v8', 'v8'))
+        key = pixel_request(directory, code)
+        assert G.translate_request(directory, key) == 'ok'
+        exact = artifact(directory, key, 'txt')
+        fallback = exact.read_bytes()
+        assert b'placeholder rgb ' in fallback
+        fail = artifact(directory, key, 'fail')
+        reason = fail.read_text().splitlines()[0]
+
+        os.environ[SWITCH] = '2'
+        assert key in G.pending_keys(directory, skip_failed=True)
+        with patch.object(G, 'permissive_translation', side_effect=RuntimeError('injected failure')):
+            assert G.translate_request(directory, key) == 'ok'
+        assert fallback == exact.read_bytes()
+        assert fail.read_text().splitlines()[0] == reason
+        assert G.APPROX2_ATTEMPT in fail.read_text().splitlines()
+        assert not artifact(directory, key, 'approx2.txt').exists()
+        assert key not in G.pending_keys(directory, skip_failed=False)
+
+        os.environ[SWITCH] = '0'
+        assert G.translate_request(directory, key) == 'ok'
+        os.environ[SWITCH] = '2'
+        assert key in G.pending_keys(directory, skip_failed=True)
+        assert G.translate_request(directory, key) == 'ok'
+        check_approx2(directory, key, 'ps', 'unknown_op=1')
+        assert fallback == exact.read_bytes()
+        assert key not in G.pending_keys(directory, skip_failed=True)
+
+
+def permissive_dispatch(directory, dxc, runner, adapter):
+    with patch.dict(os.environ, {SWITCH: '2', 'X2W_FXC': ''}):
+        key = compute_request(directory, UNKNOWN_PROGRAM)
+        assert G.translate_request(directory, key) == 'ok'
+    _, src = check_approx2(directory, key, 'cs', 'unknown_op=1')
+    shader = src.with_suffix('.cso')
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+    expected = [word for tid in range(8) for word in (tid ^ 17, 0)] + [SENTINEL] * (WORDS - 16)
+    words = [1, *expected, *([0] * 16), *([0] * WORDS)]
+    case = directory / 'permissive-zero.case'
+    case.write_bytes(struct.pack('<%dI' % len(words), *words))
+    status = check_references('permissive zero', runner, adapter, shader, [(case, 'eight threads', None)],
+                              allow_skip=True)
+    if status == 77:
+        return status
+    hlsl = src.read_text()
+    assert hlsl.count('v8 = 0u;') == 1
+    broken = directory / 'permissive-nonzero.hlsl'
+    broken.write_text(hlsl.replace('v8 = 0u;', 'v8 = 23u;'), encoding='ascii')
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, broken], check=True)
+    return check_references('permissive nonzero control', runner, adapter, shader,
+                            [(case, 'eight threads', 'word=1 expected=00000000 actual=00000017')])
+
+
 def dispatch(directory, dxc, runner, adapter):
     # Scope the opt-in to translating this fixture inside the existing WARP suite.
     with patch.dict(os.environ, {SWITCH: '1', 'X2W_FXC': ''}):
@@ -183,13 +393,20 @@ def dispatch(directory, dxc, runner, adapter):
     broken.write_text(hlsl.replace('s22 = v5;', 's22 = 0u;'), encoding='ascii')
     subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, broken], check=True)
     case, label, _ = cases[0]
-    return check_references('zeroed readfirstlane control', runner, adapter, shader,
-                            [(case, label, 'word=0 expected=00000025 actual=00000000')])
+    check_references('zeroed readfirstlane control', runner, adapter, shader,
+                     [(case, label, 'word=0 expected=00000025 actual=00000000')])
+    return permissive_dispatch(directory, dxc, runner, adapter)
 
 
 if __name__ == '__main__':
     output = Path(__file__).resolve().parents[1] / 'out'
     output.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output) as tmp:
-        controls(Path(tmp))
+        directory = Path(tmp)
+        controls(directory)
+        permissive = directory / 'permissive'
+        permissive.mkdir()
+        permissive_controls(permissive)
+        with redirect_stderr(io.StringIO()):
+            permissive_lifts_and_placeholder(permissive)
     print('approximate translation, cache keys and strict controls passed')
