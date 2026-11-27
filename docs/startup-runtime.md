@@ -354,6 +354,18 @@ to a real present. The contract under the switch:
 
   Neither line is the composited window picture.
 
+The diagnostic readback publishes pixels only after its queue fence reaches
+the submitted value without reporting device removal. A timeout, a failed
+event registration or an incomplete fence after the event registers a drain:
+a threadpool wait on the submitted fence value that releases the held surface
+and queue references once the fence completes and publishes no pixels, so a
+final sample no longer keeps them for the module lifetime. The drain releases
+only the submission it was registered for (a later sample owns its own) and
+never releases pending, failed-signal or device-removed work; a failed signal
+or removed device disables further diagnostic readback for the module
+lifetime. `startup_present_readback` exercises the completion policy and the
+ownership retirement without a GPU.
+
 The first presents and every 300th log each plane:
 
 ```text
