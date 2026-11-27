@@ -611,7 +611,6 @@ NULL_TARGET_RE = re.compile(
 STARVED_TARGET_RE = re.compile(
     rf"^x2w-render starved target ({TARGET_LABEL}): last drawn frame -?\d+, "
     r"(?:not drawn since: .+|starved, no candidate)$")
-PLACEHOLDER_TOTAL_RE = re.compile(r"^x2w-render placeholder total: draws (\d+)$")
 DRAW_PIPELINE_RE = re.compile(
     rf"^x2w-render not drawn key ([0-9a-f]{{16}}): (\d+) \([^)]+\)(?:, targets ({TARGET_LABEL}))?$")
 
@@ -628,7 +627,6 @@ def null_inputs_section(stderr_text):
     pipelines = {}
     starved = {}
     totals = ""
-    placeholder_draws = None
     for line in stderr_text.splitlines():
         if match := NULL_INPUT_RE.match(line):
             key, index, cause, calls = match.groups()
@@ -648,20 +646,15 @@ def null_inputs_section(stderr_text):
                         f"1D textures: bound {one_d_bound}, refused {one_d_refused}"]
         elif line.startswith("x2w-render totals:"):
             totals = line
-        elif match := PLACEHOLDER_TOTAL_RE.fullmatch(line):
-            placeholder_draws = int(match[1])
         elif match := STARVED_TARGET_RE.fullmatch(line):
             starved[match[1]] = line
         elif match := DRAW_PIPELINE_RE.fullmatch(line):
             key, calls, target = match.groups()
             pipelines[key] = (int(calls), line if target else line + ", targets unknown")
-    if placeholder_draws is None and not (inputs or windows or starved or pipelines or switches):
+    if not (inputs or windows or starved or pipelines or switches):
         return ""
     rows = [line for _, line in sorted(inputs.values(), key=lambda row: (-row[0], row[1]))]
     sections = ["null inputs", *rows, "", "render target windows", *windows, "", "render summary"]
-    if placeholder_draws is not None:
-        summary = f"placeholder draws {placeholder_draws}"
-        totals = f"{totals}, {summary}" if totals else summary
     if totals:
         sections.append(totals)
     sections.extend(["", "starved targets", *starved.values()])
