@@ -164,8 +164,10 @@ std::uint64_t process_ms()
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, desc_word };
+    enum class SnormRefusal { unchecked, other, signed_export };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    SnormRefusal snorm_refusal = SnormRefusal::unchecked;
     bool placeholder = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -636,6 +638,7 @@ HRESULT create_title_translated_root(ID3D12Device* device, UINT constants, UINT 
 
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
+    tr.snorm_refusal = Translation::SnormRefusal::unchecked;
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
@@ -1295,10 +1298,45 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
+bool needs_snorm_export_variant(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16_SNORM:
+        return true;
+    default: return false;
+    }
+}
+
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+    bool variant = std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
+    if (!variant && base->state == 2 &&
+        std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_snorm_export_variant)) {
+        if (base->snorm_refusal == Translation::SnormRefusal::unchecked) {
+            constexpr char signed_export[] = "signed normalized compressed export";
+            wchar_t path[MAX_PATH];
+            if (cache_path(path, L"", base->key, L".fail")) {
+                HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    char prefix[sizeof(signed_export) - 1];
+                    DWORD bytes = 0;
+                    const bool read = ReadFile(file, prefix, sizeof(prefix), &bytes, nullptr) != 0;
+                    CloseHandle(file);
+                    if (read) {
+                        const bool matches = bytes == sizeof(prefix) &&
+                                             std::memcmp(prefix, signed_export, sizeof(prefix)) == 0;
+                        base->snorm_refusal = matches ? Translation::SnormRefusal::signed_export
+                                                       : Translation::SnormRefusal::other;
+                    }
+                }
+            }
+        }
+        variant = base->snorm_refusal == Translation::SnormRefusal::signed_export;
+    }
+    if (!variant) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
         return base;

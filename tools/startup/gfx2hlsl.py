@@ -10074,9 +10074,12 @@ class Stage:
                     word and word[0] in ('desc', 'const') for word in words)
                 if any(word and word[0] == 'desc' for word in words):
                     wave = getattr(self.pipe, 'wave_size', None)
+                    # AMD RDNA 2 ISA guide, 3.9 VCC and VOP3 compares, p.19 and p.260:
+                    # a compare's pair carries one bit per lane in wave64; wave32 reads only the low word.
                     if (source[1] % 2 == 0 and source[2] == source[1] + 1 and source[1] in self.masks
                             and (not words[0] or words[0][0] != 'desc') and words[1] and words[1][0] == 'desc'
-                            and (wave == 32 or wave is None and wave32_exec_proof(self.ins))
+                            and (wave == 32 or wave is None and wave32_exec_proof(self.ins)
+                                 or wave in (None, 64) and high in self.mask_high)
                             and self.dead_vcc_high()):
                         self.sym.pop(106, None)
                         self.sym.pop(107, None)
