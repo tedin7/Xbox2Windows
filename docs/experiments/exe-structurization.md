@@ -196,10 +196,11 @@ uniform values in the reverse translation direction. [Whole-Function Vectorizati
 Phase 2 numbers group-uniform values through forward SCC branches and
 read-only loads. VGPR bounds and their first-lane copies share a value
 number. The mesh walk tags a register when every lane with
-`thread < B` defines it before the full EXEC reset. After the count exchange
-the tag covers an export under zero or the same published bound. A later
-VGPR write invalidates its tag. A count SGPR can be reused after publication
-while index clamping keeps the published vertex count. See the
+`thread < B` defines it before the full EXEC reset or the count exchange.
+The tag covers an export under zero or the same published bound. A later
+VGPR write or exchange clobber invalidates its tag. A count SGPR can be
+reused after publication while index clamping keeps the published vertex
+count. See the
 [slot 57 wave block](startup-mesh57-wave-block.md#group-uniform-values-and-guarded-exports)
 and [Partial Control-Flow Linearization, §3](https://doi.org/10.1145/3192366.3192413).
 

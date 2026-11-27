@@ -48,7 +48,8 @@ unless noted:
   refused, because that path reaches the block without the compare.
 - **Implicit EXEC writers** (`v_cmpx`, `s_*_saveexec`) between the reset and the compare end the
   reset search. The EXEC tracker of `mesh_skeleton` then refuses them with its own messages.
-- **A block ending at the count exchange** keeps the exchange refusal of #2643.
+- **A block with a scalar load that skips to the count exchange** keeps the
+  exchange refusal of #2643.
 
 ## Tests
 
@@ -259,6 +260,21 @@ On Linux, the no-argument check passed. Against `319e68f77`, the three
 split-pair variants and the adjacent-pair VGPR-bound control changed from
 refused to accepted. All seven negative controls remained refused. The
 VGPR-bound clamp mutant changed 72 and 38 CPU pixels in the two arms.
+
+### Primitive indices before the count exchange
+
+A lane-only block can use an unsigned `thread < P` guard and branch
+directly to the count-exchange barrier. The walk tags primitive VGPRs
+written on every lane selected by the guard before clearing pending
+definitions at the exchange. The exchange drops tags for its own VGPR
+clobbers. After the position export, a clamp under the published primitive
+count can read the tagged indices when that count is zero or uses the same
+group-uniform bound.
+
+Against `fb04793a1`, the scalar and VGPR count-entry fixtures changed from
+the undefined-`v54` refusal to acceptance in the no-argument Python
+check. A wave-dependent bound, a count selected from a different SGPR and
+an exchange clobber kept that refusal.
 
 ### Synthetic controls and draw
 

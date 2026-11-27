@@ -3459,18 +3459,19 @@ def mesh_guard_covers(count, tag, thread, selects):
         count in allowed or count in selects and set(selects[count]) <= allowed)
 
 
-def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform):
-    """Prove definitions on all lanes of a prefix guard up to its full EXEC reset."""
-    if compare not in value_at or len(branches) != 1:
+def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform, *, count_exchange=None):
+    """Prove prefix-guarded definitions until the EXEC reset or the count exchange."""
+    if thread is None or compare not in value_at or len(branches) != 1:
         return None
     name, asm = ins[compare][2:]
     scalars, vectors, full = value_at[compare]
     if not full:
         return None
     ops = parse(asm)[1]
-    if name == 'v_cmpx_gt_u32_e32':
+    thread_operand = f'v{thread}'
+    if name == 'v_cmpx_gt_u32_e32' and ops[1] == thread_operand:
         bound = mesh_value(scalars, ops[0])
-    elif name == 'v_cmpx_lt_u32_e32':
+    elif name == 'v_cmpx_lt_u32_e32' and ops[0] == thread_operand:
         bound = vectors.get(ops[1])
     else:
         return None
@@ -3480,12 +3481,28 @@ def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform):
     if any(compare <= source < branch for source in edges):
         return None
     close = edges[branch]
-    while close in value_at and ins[close][3] != 's_mov_b64 exec, -1':
-        close += 1
-    if close not in value_at:
-        return None
-    scalar_compare = ins[compare][0] if name == 'v_cmpx_gt_u32_e32' else None
+    scalar_compare = None
+    if close != count_exchange:
+        while close in value_at and ins[close][3] != 's_mov_b64 exec, -1':
+            close += 1
+        if close not in value_at:
+            return None
+        if name == 'v_cmpx_gt_u32_e32':
+            scalar_compare = ins[compare][0]
     return close, (bound, thread), mesh_guard_definitions(ins, branch, close, edges), scalar_compare
+
+
+def mesh_tag_guard_writes(index, block, pending, tags, uniform_bounds):
+    """Publish only the pending definitions guaranteed for every lane in this guard."""
+    if block is None or index != block[0]:
+        return
+    _, tag, defined, compare_off = block
+    proved = pending & defined
+    if proved and compare_off is not None and uniform_bounds is not None:
+        uniform_bounds.add(compare_off)
+    for word in pending - proved:
+        tags.pop(word, None)
+    tags.update(dict.fromkeys(proved, tag))
 
 
 def mesh_mbcnt_high(ins, low, base, token, targets):
@@ -3908,7 +3925,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
     # State of the walk over the code outside the two exchanges.
     value_at, uniform_values, count_selects = {}, set(), {}
-    if load_branches:
+    if load_branches or count_entry is not None:
         read_only = not (pixel_writes or mesh_memory_writes(ins[:start] + ins[a_end:count_at] + ins[b_end:]))
         value_at, uniform_values, count_selects = mesh_value_numbers(
             ins, a_end, count_at, edges, constant_trips, read_only)
@@ -3990,6 +4007,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             out.append(span(count_at, b_end - 2) + (
                 'x2w_mesh_counts', 'x2w_mesh_counts %s, %s, %s' % (env['prims'], env['verts'], env['b_tmp'])))
             out.append(ins[b_end - 1])
+            mesh_tag_guard_writes(index, guard_block, pending, tags, uniform_bounds)
             clobbers = {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
             stale |= pending | clobbers
             tags = {v: tag for v, tag in tags.items() if v not in clobbers}
@@ -4094,14 +4112,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         # Saveexec uses a fresh VCC from an adjacent compare. Only the matching complement can read the
         # saved mask. Hardware SCC (whether any bit is set) is not represented by a per-lane boolean.
         if asm == 's_mov_b64 exec, -1':
-            if guard_block is not None and index == guard_block[0]:
-                _, tag, defined, compare_off = guard_block
-                proved = pending & defined
-                if proved and compare_off is not None and uniform_bounds is not None:
-                    uniform_bounds.add(compare_off)
-                for word in pending - proved:
-                    tags.pop(word, None)
-                tags.update(dict.fromkeys(proved, tag))
+            mesh_tag_guard_writes(index, guard_block, pending, tags, uniform_bounds)
             guard_block = None
             mask = None
             stale |= pending
@@ -4132,6 +4143,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         elif index == count_entry:
             if mask is not None or mesh_vregs(ops) & stale:
                 raise Unsupported(exchange_branch_refusal)
+            guard_block = mesh_guard_block(ins, index, [count_entry_branch], edges, thread, value_at,
+                                          uniform_values, count_exchange=count_at)
             mask = 'count_entry'
         elif index in load_compares:
             if thread != load_compares[index] or thread in stale:

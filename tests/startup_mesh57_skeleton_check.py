@@ -456,6 +456,30 @@ def count_guard_mesh(case='select'):
     return MESH[:before] + prefix + table + bounds + position_block + primitive_block + exchange + pos + clamp
 
 
+def count_entry_guard_mesh(case='scalar bound'):
+    """Write primitive indices only on the lanes that fall through to the count exchange."""
+    mesh = count_guard_mesh()
+    at = mesh.index('7da8002b')
+    exchange = mesh.index('bf8a0000', at)
+    # v_lshlrev_b32 v4, 4, v0; buffer_load_dwordx3 v[54:56], v4, s[16:19], 0 offen offset:384.
+    body = '34080084 e03c1180 80043604 bf8c3f70'.split()
+    compare = '7da27d00' if case == 'vector bound' else '7da8002b'
+    mesh[at:exchange] = [compare, branch(0xbf88, 0, len(body) + 1)] + body
+    end_bounds = mesh.index('802b812b') + 1
+    if case == 'vector bound':
+        # v_mov_b32 v62, s43; v_readfirstlane_b32 s43, v62 under full EXEC.
+        # The count-entry compare is v_cmpx_lt_u32_e32 v0, v62.
+        mesh[end_bounds:end_bounds] = '7e7c022b 7e56053e'.split()
+    elif case == 'wave bound':
+        mesh.insert(end_bounds, '80ab062b')  # s_sub_u32 s43, s43, s6
+    elif case == 'different count':
+        mesh = mutate('850d2b80', '850d0980', mesh=mesh)  # s_cselect_b32 s13, 0, s9
+    elif case == 'exchange clobber':
+        mesh = mutate('7e02020d', '7e6c020d', mesh=mesh)  # v_mov_b32 v54, s13
+        mesh = mutate('00000102', '00003602', mesh=mesh)  # ds_write_b32 v2, v54
+    return mesh
+
+
 def vector_count_guard_mesh(case='select mask'):
     """Derive the two counts in full-EXEC VGPRs and narrow positions by the VGPR bound."""
     mesh = count_guard_mesh()
@@ -1041,6 +1065,22 @@ def vector_count_guard_controls(tmp):
         expect('VGPR bound clamp mutant changes prefix arm %d' % bit, guest != wrong, True)
 
 
+def count_entry_guard_controls(tmp):
+    for label in ('scalar bound', 'vector bound'):
+        key, result = request(tmp, count_entry_guard_mesh(label))
+        expect('count-entry primitive guard with ' + label, result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            steps = ('if (exec & 1) v54 = r0.Load(', 'SetMeshOutputCounts(',
+                     'o.pos = ', 'int(s13) > int(v0)', 'if (exec & 1) v54 = min(s14, v54);')
+            offsets = [source.find(step) for step in steps]
+            expect('primitive load before exchange and count-masked clamp after the position export',
+                   offsets == sorted(set(offsets)) and offsets[0] >= 0, True)
+    for label in ('wave bound', 'different count', 'exchange clobber'):
+        expect('count-entry primitive guard with ' + label, request(tmp, count_entry_guard_mesh(label))[1],
+               GUARDED_REFUSAL.replace('v50', 'v54'))
+
+
 def count_guard_controls(tmp):
     for label in COUNT_GUARD_ACCEPTED:
         key, result = request(tmp, count_guard_mesh(label))
@@ -1097,6 +1137,7 @@ def lane_mask_controls(tmp):
             expect('export count mutant changes the CPU image', good != bad, True)
     count_guard_controls(tmp)
     vector_count_guard_controls(tmp)
+    count_entry_guard_controls(tmp)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
     for label, mesh, reason in MASK_CONTROLS:
