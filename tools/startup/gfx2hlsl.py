@@ -5722,6 +5722,7 @@ class Stage:
             wrote = scalar_destinations(name, asm)
             wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
             self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
+        self.firstlane_image_regs = ()
         try:
             term = self.lower(base, asm, ops, mods)
         finally:
@@ -5732,7 +5733,7 @@ class Stage:
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
-            self.firstlane_v.update(extra_regs)
+            self.firstlane_v.update(extra_regs or self.firstlane_image_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
                 reg = reg_range(token)
@@ -9000,15 +9001,15 @@ class Stage:
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
     def op_buffer_store_format_xyzw(self, ops, mods):
-        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+        """Lower MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
 
         FORMAT, stride and num_records are read at dispatch from the same entry constants as
         buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
         name = 'buffer_store_format_xyzw'
-        if self.kind != 'cs':
-            raise Unsupported(name)  # the unknown-op refusal
+        if self.kind != 'cs' and not (self.kind == 'ps' and self.pipe.pixel_formatted_stores):
+            raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
         if raw and pc is not None and pc + 8 <= len(raw):
@@ -9049,7 +9050,11 @@ class Stage:
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        if self.kind == 'ps' and key in self.pipe.stored_images() and not self.pipe.uavs[key].get('pixel_format'):
+            raise Unsupported('%s shares a vertex UAV' % name)
         uav = self.pipe.uav(key, 'raw')
+        if self.kind == 'ps':
+            self.pipe.uavs[key]['pixel_format'] = True
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
@@ -9057,7 +9062,8 @@ class Stage:
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
             uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
-        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+        # D3D pixel helper invocations have no UAV side effects. Also honor the guest's per-lane EXEC bit.
+        self.emit(call if self.kind == 'cs' and self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -9070,6 +9076,25 @@ class Stage:
 
     def op_tbuffer_load_format_xyzw(self, ops, mods):
         self.tbuffer(ops, mods, 4)
+
+    def prove_pixel_image_uniform(self, desc, coords):
+        """Prove a fixed image binding and lane-invariant address in the pixel first-lane retry."""
+        if (not getattr(self.pipe, 'retry_firstlane_images', False) or self.kind != 'ps' or
+                not self.firstlane_cfg or not self.uniform_cf or not self.uniform_entry_exec() or
+                (self.firstlane_ps_exec is not None and self.pc not in self.firstlane_ps_exec) or
+                not all(self.firstlane_source(coord, '') for coord in coords)):
+            return False
+        rsrc = reg_range(desc)
+        if not rsrc or rsrc[0] != 's' or rsrc[2] - rsrc[1] != 7 or rsrc[2] > 105:
+            return False
+        first = self.sym.get(rsrc[1])
+        if (not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or
+                first[3] % 8 or not names_one_value(first) or
+                any(self.sym.get(rsrc[1] + i) != desc_word(first, first[3] + i) for i in range(8))):
+            return False
+        key = desc_key(first)
+        return (key not in self.pipe.modified and key not in self.pipe.other_modified and
+                (not self.past_entry or self.formatted_descriptor_from_block(rsrc, first)))
 
     def image(self, ops, mods, how):
         if getattr(self, 'kind', None) == 'cs' and 'd16' in mods:
@@ -9327,6 +9352,13 @@ class Stage:
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
+        if ((how == 'load' or (how == 'lz' and words and not self.default_sampler_words(words))) and
+                dst and dst[0] == 'v' and dst[2] <= 255 and self.prove_pixel_image_uniform(ops[2], cs)):
+            count = dmask.bit_count()
+            if sample_d16 or (how == 'load' and 'd16' in mods):
+                count = (count + 1) // 2
+            if dst[2] - dst[1] + 1 == count:
+                self.firstlane_image_regs = range(dst[1], dst[2] + 1)
         self.emit('t = %s;' % call)
         if sample_d16 or (how in ('load', 'load_mip') and 'd16' in mods):
             self.pipe.uses_pack16_rne = True
@@ -12788,6 +12820,7 @@ class Pipeline:
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
+    pixel_formatted_stores = False
     srv_formats = ()
     integer_texture_srvs = False
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -12839,28 +12872,35 @@ class Pipeline:
 
     def _build_pixel_stage(self, code, refusals=None, decoded=None):
         # Translation can allocate bindings before refusing. Restore the state left
-        # by the vertex stage so the retry allocates only the bindings it uses.
-        state = deepcopy(self.__dict__, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+        # by the vertex stage so the retry allocates only the bindings it uses. Keep the original retry
+        # ahead of the image proof so already accepted shaders retain their original output.
         before = len(refusals) if refusals is not None else 0
-        try:
-            stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
-        except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
-                raise
-        else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
-                return stage
-        self.__dict__.clear()
-        self.__dict__.update(state)
-        self.retry_firstlane = True
-        if refusals is not None:
-            del refusals[before:]
-        return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+        state = self.__dict__
+        for attempt in range(3):
+            if attempt < 2:
+                self.__dict__ = deepcopy(state, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+            else:
+                self.__dict__ = state
+            if attempt:
+                self.retry_firstlane = True
+                if refusals is not None:
+                    del refusals[before:]
+            if attempt == 2:
+                self.retry_firstlane_images = True
+            try:
+                stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+            except Unsupported as reason:
+                if attempt == 2 or str(reason) != READFIRSTLANE_UNIFORM:
+                    raise
+            else:
+                if attempt == 2 or refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+                    return stage
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
+        self.pixel_formatted_stores = self.vertex_kind == 'vs'
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
@@ -14765,6 +14805,8 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('pixel-firstlane-image', r'^' + re.escape(READFIRSTLANE_UNIFORM) + r'$'),
+    ('pixel-formatted-store', r'^buffer_store_format_xyzw$'),
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),

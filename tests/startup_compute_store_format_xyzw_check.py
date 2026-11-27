@@ -389,15 +389,14 @@ def check_controls():
         refused(fragment, lambda i=inserted: translate('X', code=patch(WORDS_X, STORE_X, i + STORE_X)).hlsl_cs())
     # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
     translate('X', code=patch(WORDS_X, STORE_X, '000082bf' + STORE_X)).hlsl_cs()
-    for kind in ('ps', 'vs'):  # outside compute: the unknown-op refusal, the bare mnemonic
-        stage = G.Stage.__new__(G.Stage)
-        stage.kind = kind
-        try:
-            stage.op_buffer_store_format_xyzw(['v[4:7]', 'v0', 's[16:19]', '0'], ['idxen'])
-        except G.Unsupported as reason:
-            assert str(reason) == 'buffer_store_format_xyzw', str(reason)
-        else:
-            raise AssertionError('%s stage accepted buffer_store_format_xyzw' % kind)
+    vertex = G.Stage.__new__(G.Stage)
+    vertex.kind = 'vs'
+    try:
+        vertex.op_buffer_store_format_xyzw(['v[4:7]', 'v0', 's[16:19]', '0'], ['idxen'])
+    except G.Unsupported as reason:
+        assert str(reason) == 'buffer_store_format_xyzw', str(reason)
+    else:
+        raise AssertionError('vertex stage accepted buffer_store_format_xyzw')
     cs = translate('X').cs
     cs.raw_code = b''  # synthetic operand lists below
     for ops, mods, fragment in (
