@@ -762,7 +762,8 @@ def check_record_spec():
     assert T.parse_record_spec(" F4000,24 ")["spec"] == "f4000,24" and T.parse_record_spec("f4000,24")["by"] == "frame"
     assert T.parse_record_spec("auto")["spec"] == T.RECORD_DEFAULT_SPEC == "slow" and T.parse_record_spec("Default")["by"] == "slow" and T.parse_record_spec("SLOW")["spec"] == "slow"
     assert T.RECORD_DEFAULT_MAX_MIB == 400 < T.RECORD_EXPLICIT_MAX_MIB and T.parse_record_spec("140,20")["by"] == "time"
-    for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1"):
+    assert T.parse_record_spec(" D200,10 ") == {"spec": "d200,10", "by": "draws", "start": 200, "length": 10}
+    for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1", "d0,10", "d200,121", "d200"):
         try:
             T.parse_record_spec(bad)
         except ValueError:

@@ -982,26 +982,31 @@ RECORD_DEFAULT_SPEC = "slow"         # `-Record auto` = the runtime trigger (c25
                                      # The tester's clock runs ~200 s later than ours, so a trigger on the slowdown beats a fixed time
 RECORD_DEFAULT_MAX_MIB = 400         # ... capped at 400 MiB so the upload stays small (c25 may change both here, one place)
 RECORD_EXPLICIT_MAX_MIB = 2048       # an explicit -Record spec keeps the old cap unless -RecordMaxMiB says otherwise
-RECORD_RE = re.compile(r"^(f)?(\d+),(\d+)$")
+RECORD_RE = re.compile(r"^([fd])?(\d+),(\d+)$")
 RECORD_MAX_SECONDS = 120
 RECORD_MAX_FRAMES = 2000
+RECORD_BY = {"f": "frame", "d": "draws", None: "time"}
 
 
 def parse_record_spec(spec):
-    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60) or `f<first frame>,<frames>`.
-    Returns {"spec": normalized text, "by": "time"|"frame", "start", "length"}. Raises ValueError for anything else, a window longer
-    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder) or an empty window."""
+    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60), `f<first frame>,<frames>`
+    or `d<draws>,<seconds>` (the window opens at the first frame with that many translated draws: play, not a loading screen).
+    Returns {"spec": normalized text, "by": "time"|"frame"|"draws", "start", "length"}. Raises ValueError for anything else, a window longer
+    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder), an empty window or a draw count of 0."""
     if spec.strip().lower() in ("auto", "default", "slow"):
         return {"spec": "slow", "by": "slow", "start": 120, "length": 10}   # the runtime decides the window; these are its documented defaults
     match = RECORD_RE.match(spec.strip().lower())
     if not match:
-        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60) or f<first frame>,<frames> (e.g. f4000,24), got %r" % spec)
-    by = "frame" if match.group(1) else "time"
+        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60), f<first frame>,<frames> (e.g. f4000,24) or "
+                         "d<draws in a frame>,<seconds> (e.g. d200,10), got %r" % spec)
+    by = RECORD_BY[match.group(1)]
     start, length = int(match.group(2)), int(match.group(3))
-    if length < 1 or length > (RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS):
-        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds",
-                                                                      RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS))
-    return {"spec": ("f" if by == "frame" else "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
+    limit = RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS
+    if length < 1 or length > limit:
+        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds", limit))
+    if by == "draws" and start < 1:
+        raise ValueError("-Record d<draws>,<seconds> wants at least 1 draw, got %r" % spec)
+    return {"spec": (match.group(1) or "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
 
 
 PREFIX_ONLY_LINE = "the cap stopped the recording BEFORE the window opened"

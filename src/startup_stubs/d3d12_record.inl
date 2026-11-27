@@ -71,6 +71,15 @@ constexpr LONG memory_cache_presents = 16;
 // slow_gap_s, or at slow_fallback_s; it lasts slow_seconds.
 bool slow_mode;
 double slow_after_s = 120, slow_gap_s = 0.5, slow_seconds = 10, slow_fallback_s = 180, last_present_s = -1;
+// "d<draws>,<seconds>": the window opens at the first present whose frame made at least draw_trigger translated draws
+// (a title's play, not its loading screens: a few draws a frame against hundreds); it lasts draw_seconds. The draws of a
+// frame are the translated draws counted since the previous present, so they need X2W_D3D12_RENDER. While it waits, the
+// largest frame of every 600 presents is logged, so a too-high count can be seen and lowered.
+bool draw_mode;
+LONG draw_trigger;
+double draw_seconds;
+LONG draws_at_present, draws_most;
+constexpr LONG draw_log_presents = 600;
 
 struct ThreadBuffer {
     SRWLOCK lock = SRWLOCK_INIT;
@@ -907,6 +916,22 @@ void present()
                 gap >= slow_gap_s ? "first slowdown" : "fallback time", gap * 1000, slow_seconds);
         }
     }
+    if (draw_mode && end_s >= 1e300) {
+        const LONG draws = translated_draws, in_frame = draws - draws_at_present;
+        draws_at_present = draws;
+        draws_most = (std::max)(draws_most, in_frame);
+        if (present > 1 && in_frame >= draw_trigger) {  // the first present's count holds everything before it
+            const double t = seconds_now();
+            start_s = t;
+            end_s = t + draw_seconds;
+            log("x2w-replay record: window opens at %.1f s, present %ld (%ld translated draws in its frame, at least %ld) for %.1f s",
+                t, present, in_frame, draw_trigger, draw_seconds);
+        } else if (present % draw_log_presents == 0) {
+            log("x2w-replay record: waiting for a frame of %ld translated draws: the most in one frame of presents %ld-%ld was %ld",
+                draw_trigger, present - draw_log_presents + 1, present, draws_most);
+            draws_most = 0;
+        }
+    }
     if (!base_image_holds_window(b, present)) update_window();
     if (window_open || (present == first_present && !base_warming)) {
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
@@ -950,10 +975,20 @@ void install()
         slow_mode = true;
         slow_after_s = after, slow_gap_s = gap_ms / 1000, slow_seconds = seconds, slow_fallback_s = fallback;
         start_s = 1e300;  // closed until the trigger sets it
+    } else if (value[0] == 'd') {
+        long draws = 0;
+        double seconds = 0;
+        if (std::sscanf(value + 1, "%ld,%lf", &draws, &seconds) != 2 || draws <= 0 || seconds <= 0) {
+            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (d<translated draws in a frame>,<seconds>)", value);
+            return;
+        }
+        draw_mode = true;
+        draw_trigger = draws, draw_seconds = seconds;
+        start_s = 1e300;  // closed until the trigger sets it
     } else if (value[0] == 'f') {
         long first = 0, count = 0;
         if (std::sscanf(value + 1, "%ld,%ld", &first, &count) != 2 || first < 0 || count <= 0) {
-            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (all | <start s>,<seconds> | f<present>,<presents>)", value);
+            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (all | <start s>,<seconds> | f<present>,<presents> | d<draws>,<seconds> | slow)", value);
             return;
         }
         first_present = first;
@@ -961,7 +996,7 @@ void install()
     } else if (std::strcmp(value, "all") != 0) {
         double start = 0, seconds = 0;
         if (std::sscanf(value, "%lf,%lf", &start, &seconds) != 2 || start < 0 || seconds <= 0) {
-            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (all | <start s>,<seconds> | f<present>,<presents>)", value);
+            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (all | <start s>,<seconds> | f<present>,<presents> | d<draws>,<seconds> | slow)", value);
             return;
         }
         start_s = start;

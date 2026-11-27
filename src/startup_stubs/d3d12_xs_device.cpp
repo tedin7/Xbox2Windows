@@ -2566,6 +2566,7 @@ std::size_t readable_window(u64 address, std::size_t wanted);
 std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
 u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc);  // d3d12_memory_srv.inl
+extern LONG translated_draws;  // d3d12_draw.inl: the recorder's "d" window counts them per frame
 #include "startup_stubs/d3d12_record.inl"
 #include "startup_stubs/d3d12_present_pictures.inl"
 #include "startup_stubs/d3d12_debug_present.inl"
