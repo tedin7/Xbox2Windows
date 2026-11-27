@@ -62,8 +62,11 @@ def check(folder, player, args, env):
         recording = folder / f"ranges-{enabled}.x2wr"
         original = folder / f"original-{enabled}"
         original.mkdir()
+        # Draw pages capture descriptor tables and root spans on their own (startup_replay_draw_tables_warp and
+        # startup_replay_draw_pages_warp cover them); they are off here so the control proves the title-range rule alone.
         code, text = run(args, dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
-                                    X2W_PRESENT_PICTURES=str(original), X2W_REPLAY_TITLE_RANGES=enabled))
+                                    X2W_PRESENT_PICTURES=str(original), X2W_REPLAY_TITLE_RANGES=enabled,
+                                    X2W_REPLAY_DRAW_PAGES="0"))
         assert code == 0, text[-3000:]
         constants, heap = (int(word, 16) for word in re.search(r"title ranges: ([0-9a-f]+) ([0-9a-f]+)", text).groups())
         captured = list(mapped_pages(recording))
