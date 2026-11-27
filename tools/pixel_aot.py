@@ -175,7 +175,7 @@ def _vertex_getpc_tail(code, decoder, *, vertex_fetch, mesh_layout):
         if any(word & 0xff80ffff == 0xbe801f00
                for word, in struct.iter_unpack("<I", code[end:offset])):
             continue
-        return True
+        return end, offset
     return False
 
 

@@ -1936,6 +1936,126 @@ def vertex_image_address_proof(ins, getpc):
     return loads
 
 
+
+def vertex_image_elision_proof(ins, getpc, loads):
+    """Reject uses of the address words and VCC values erased by lowering."""
+    _, _, _, pairs = getpc
+    high_pairs = set(pairs.values())
+    by_pc = {row[0]: row for row in ins}
+    # May-taint catches escapes; must-taint proves every load path has its address.
+    incoming = {0: ({}, frozenset(), False)}
+    pending = [0]
+    full_vector = {'v_mov_b32', 'v_add_nc_u32', 'v_sub_nc_u32', 'v_mul_u32_u24',
+                   'v_add_f32', 'v_mul_f32', 'v_fma_f32', 'v_lshl_add_u32',
+                   'v_lshlrev_b32', 'v_lshlrev_b64', 'v_ashrrev_i32', 'v_cvt_u32_f32'}
+
+    def regs(tokens):
+        return {reg for reg in ImageLoadProof.mentions(tokens) if reg.startswith('v')}
+
+    while pending:
+        pc = pending.pop()
+        tainted, must_taint, stale_vcc = incoming[pc]
+        tainted, must_taint = tainted.copy(), set(must_taint)
+        if pc not in by_pc:
+            raise Unsupported('program image control flow leaves executable code')
+        _, size, name, asm = by_pc[pc]
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        reads_s, writes_s, may_s = scalar_effects(name, asm)
+        if pc in pairs or pc in high_pairs:
+            # The high half is the only permitted consumer of the erased carry.
+            if pc in pairs and regs(ops[2:]) & tainted.keys():
+                raise Unsupported('program image address uses an elided vector word')
+            if pc in high_pairs and regs(ops[2:4]) & tainted.keys():
+                raise Unsupported('program image address high word escapes')
+            dst = ops[0]
+            tainted[dst] = tainted.get(dst, False)
+            must_taint.add(dst)
+            stale_vcc = True
+        else:
+            if stale_vcc and reads_s & {'vcc', 'vcc_hi', 's106', 's107'}:
+                raise Unsupported('program image vector carry escapes')
+            if 'vcc' in writes_s and 'vcc_hi' in may_s:
+                stale_vcc = False
+            if writes_exec(name, ops):
+                tainted = dict.fromkeys(tainted, True)
+            if ('movrel' in name or 'swaprel' in name) and tainted:
+                raise Unsupported('program image address meets indirect register access')
+            can_write = (not mods and (base in full_vector or base.startswith((
+                'global_load_', 'flat_load_', 'buffer_load_', 'tbuffer_load_', 'image_load_')))
+                         and 'd16' not in base)
+            if pc in loads:
+                addr = reg_range(ops[1])
+                required = {'v%d' % addr[1], 'v%d' % addr[2]}
+                if not required <= must_taint:
+                    raise Unsupported('program image load is not dominated by its address')
+                read_regs = set()
+                can_write = True
+            elif can_write:
+                read_regs = regs(ops[1:])
+            else:
+                read_regs = regs(ops)
+            if read_regs & tainted.keys():
+                raise Unsupported('program image address word escapes')
+            if can_write:
+                for reg in regs(destinations(base, ops)):
+                    if not tainted.get(reg, True):
+                        tainted.pop(reg, None)
+                        must_taint.discard(reg)
+        successors = []
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            target = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
+            if not target:
+                raise Unsupported('program image unsupported branch')
+            successors.append(int(target.group(1), 16))
+        if name not in ('s_branch', 's_endpgm'):
+            successors.append(pc + size)
+        for target in successors:
+            previous = incoming.get(target)
+            if previous is None:
+                merged = (tainted.copy(), frozenset(must_taint), stale_vcc)
+            else:
+                old, old_must, old_vcc = previous
+                merged = ({reg: old.get(reg, False) or tainted.get(reg, False)
+                           for reg in old.keys() | tainted.keys()},
+                          old_must & must_taint, old_vcc or stale_vcc)
+            if previous != merged:
+                incoming[target] = merged
+                pending.append(target)
+
+
+
+def vertex_image_plan(code):
+    """Return an image plan only for a validated vertex tail with GLOBAL loads."""
+    from pixel_aot import _vertex_getpc_tail
+    aligned = code[:len(code) & ~3]
+    words = tuple(word for word, in struct.iter_unpack('<I', aligned))
+    if (not any(word & 0xff80ffff == 0xbe801f00 for word in words)
+            or not any(word & 0xfc000000 == 0xdc000000 for word in words)):
+        return None
+    boundary = _vertex_getpc_tail(code, native_instructions,
+                                  vertex_fetch=struct.pack('<I', FETCH_CALL), mesh_layout=True)
+    if not boundary:
+        return None
+    end, start = boundary
+    ins = decode(code[:end])
+    if not any(name == 'global_load_dword' for _, _, name, _ in ins):
+        return None
+    getpc = vertex_image_getpc_proof(code, ins)
+    if getpc[0] != start:
+        raise Unsupported('vertex program image: inconsistent table start')
+    loads = vertex_image_address_proof(ins, getpc)
+    vertex_image_elision_proof(ins, getpc, loads)
+    capture = {}
+    by_pc = {pc: asm for pc, _, _, asm in ins}
+    for _, shift_pc, _ in loads.values():
+        _, ops, _ = parse(by_pc[shift_pc])
+        reg = reg_range(ops[0])
+        capture[shift_pc] = 'v%d' % reg[1]
+    skipped = set(getpc[2]) | set(getpc[3]) | set(getpc[3].values())
+    return {'ins': ins, 'words': getpc[1], 'loads': loads, 'capture': capture, 'skip': skipped}
+
+
 def vertex_image_range_facts(ins):
     """Bounds immediately before decoded instructions; discard unmodelled joins.
 
@@ -3834,9 +3954,12 @@ class Stage:
         self.raw_code = strip_header(code)
         self.image_proof = None
         self.image_tables = {}
+        self.vertex_image = vertex_image_plan(self.raw_code) if kind == 'vs' else None
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
-        if self.image_proof is None:
+        if self.vertex_image is not None:
+            self.ins = self.vertex_image['ins']
+        elif self.image_proof is None:
             self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs',
                                embedded_pixel=kind == 'ps')
                         if refusals is None or decoded is None else decoded)
@@ -5842,7 +5965,10 @@ class Stage:
         vcc_compares = set().union(*vcc_branches.values())
         try:
             image = getattr(self, 'image_proof', None)
-            self.calculated_pc = image.lowered if image else calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+            vertex_image = getattr(self, 'vertex_image', None)
+            self.calculated_pc = (image.lowered if image else
+                                  dict.fromkeys(vertex_image['skip']) if vertex_image else
+                                  calculated_pc_proof(self.ins, getattr(self, 'kind', None)))
         except Unsupported as reason:
             if refusals is None:
                 raise
@@ -7071,6 +7197,14 @@ class Stage:
         _, ops, mods = parse(asm)
         if writes_exec(name, ops):
             self.exec_generation += 1
+        vertex_image = getattr(self, 'vertex_image', None)
+        if vertex_image:
+            if self.pc in vertex_image['capture']:
+                self.emit('x2w_image_index_%x = %s;' % (self.pc, self.u(vertex_image['capture'][self.pc])))
+            if self.pc in vertex_image['loads']:
+                dst, shift_pc, _ = vertex_image['loads'][self.pc]
+                self.set_v(int(dst[1:]), 'x2w_image_table[x2w_image_index_%x]' % shift_pc)
+                return None
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
             return self.lower_image_instruction(image, name, asm, ops, mods)
@@ -15949,6 +16083,10 @@ class Pipeline:
                 '    uint i = a >> 2u;',
                 '    ' + unaligned_dword_body('embedded_vs[i]', 'embedded_vs[i + 1u]'),
             ]
+        image = getattr(self.vs, 'vertex_image', None) if embedded_vertex else None
+        if image:
+            out.append('static const uint x2w_image_table[%d] = { %s };' %
+                       (len(image['words']), ', '.join('0x%08xu' % word for word in image['words'])))
         return out
 
     def interface(self, for_pixel):
@@ -15988,7 +16126,9 @@ class Pipeline:
                                           'before the first branch defines' % min(unwritten))
                     if target and index == 0 and start == 0:
                         written.add(int(target.group(1)))
-        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
+        captures = (['    uint x2w_image_index_%x = 0u;' % pc for pc in s.vertex_image['capture']]
+                    if s.vertex_image else [])
+        out += s.declarations() + captures + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
             '    if (ud%d == 0) return body(vid);' % self.rect,
@@ -16783,7 +16923,14 @@ def classify_decoded(ins):
 
 
 def classify(blob):
-    return classify_decoded(decode(strip_header(blob), embedded_vertex=True, embedded_pixel=True))
+    code = strip_header(blob)
+    try:
+        return classify_decoded(decode(code, embedded_vertex=True, embedded_pixel=True))
+    except Unsupported:
+        plan = vertex_image_plan(code)
+        if plan is None:
+            raise
+        return classify_decoded(plan['ins'])
 
 
 def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
