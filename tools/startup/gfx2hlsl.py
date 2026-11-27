@@ -11974,14 +11974,12 @@ class Stage:
             return False
 
     def op_image_store(self, ops, mods):
-        """Write the selected channels of a typed image texel.
+        """Write a whole typed image texel, zeroing channels absent from DMASK.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. A partial mask uses a typed UAV load to preserve the other channels. This assumes that
-        each active lane owns its texel, including across groups, for the duration of the read-modify-write.
-        The bound float or normalized view must support typed UAV stores and, for partial masks, loads.
+        registers. The bound float or normalized view must support typed UAV stores.
         The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
         from helper lanes as the hardware drops them for lanes outside exec.
         """
@@ -12020,15 +12018,11 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
-        # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
         channels = [i for i in range(4) if mask >> i & 1]
-        if not channels or mask > 0xf or mask < 0 or (d16 and mask != 0xf):
-            raise Unsupported('%s with dmask %s: %s' % (
-                name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
-                else 'no channel selected or out of range'))
+        if not channels or mask > 0xf or mask < 0:
+            raise Unsupported('%s with dmask %s: no channel selected or out of range' % (name, masks[0]))
         data = reg_range(ops[0])
-        count = 2 if d16 else len(channels)
+        count = (len(channels) + 1) // 2 if d16 else len(channels)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
             raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], {1: 'one', 2: 'two', 3: 'three', 4: 'four'}[count]))
         coords = ops[1]
@@ -12050,12 +12044,15 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
-        if d16:
-            # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
-            rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
-            value = 'float4(%s)' % ', '.join(rgba)
-        else:
-            value = 'asfloat(uint4(%s))' % ', '.join(words)
+        rgba = ['0.0' if d16 else '0u'] * 4
+        for i, channel in enumerate(channels):
+            if d16:
+                # Packed D16 components follow DMASK order, low half first.
+                half = ' & 0xffffu' if i % 2 == 0 else ' >> 16'
+                rgba[channel] = 'f16tof32(%s%s)' % (words[i // 2], half)
+            else:
+                rgba[channel] = words[i]
+        value = ('float4(%s)' if d16 else 'asfloat(uint4(%s))') % ', '.join(rgba)
         if (self.kind == 'ps' and getattr(self.pipe, 'pixel_rw_images', None) is not None
                 and self.is_fixed_table_image(ops[2], key)):
             for earlier in self.pixel_rw_loads.get(key, ()):
@@ -12071,12 +12068,7 @@ class Stage:
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
             index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        if len(channels) == 4 or d16:
-            body = '%s[%s] = %s;' % (image, index, value)
-        else:
-            sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
-            body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
-            self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
+        body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
@@ -17937,7 +17929,8 @@ LIFTED_REASONS = (
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
-    ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
+    # Recognize cached refusals from older translators so these stores are retried.
+    ('dmask', r'image_store with dmask \S+: (?:a typed UAV|a 16-bit) store writes all four channels'),
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
     ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),

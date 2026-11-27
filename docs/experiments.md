@@ -15367,23 +15367,22 @@ and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
 64 differences with the store omitted and 128 with the layer changed. Use the
 startup_compute_image_store CTests above to repeat the comparison.
 
-For FP32 stores with DMASK `0x1` through `0xe`, the startup compute translator
-reads the texel through the same UAV, replaces the selected channels in
-consecutive VDATA order, and writes it back under EXEC. This covers 1D, 2D,
-2D-array and 3D output views. The version 2 manifest adds `uavload N` for
-each affected output. Dispatch requires typed UAV load and store support for
-the bound format. [D3D12 typed UAV load support](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads)
+For FP32 stores with DMASK `0x1` through `0xe`, the startup translator
+writes the entire texel under EXEC. Selected channels use consecutive VDATA
+words, and the other channels receive zero. This covers pixel 2D and 2D-array
+views and compute 1D, 2D, 2D-array and 3D views. A store alone needs typed UAV
+store support. An explicit load from a shared pixel UAV still needs typed UAV
+load support and contributes `uavload N` to the manifest.
 
-The read-modify-write assumes exclusive texel ownership by each active lane,
-including across groups and through aliasing UAV views, for the duration of
-the operation. The translator does not prove ownership. Lanes that write
-different channels of the same texel can lose updates. A partial D16 store
-remains unsupported.
+Partial compute D16 stores support 2D and 2D-array views. Selected channels
+consume the packed half-floats in VDATA order, low half first, and the other
+channels receive zero.
 
-The WARP fixtures dispatch two groups against an RGBA32_FLOAT UAV. They compare
-every channel of every texel, including untouched mips and slices, against a
-CPU reference for each of the 14 masks on all four shapes. Each control
-replaces the typed load with zero and must fail at the first preserved channel.
+The WARP compute FP32 fixtures compare every texel, including untouched mips and
+slices, against the CPU reference for all 14 partial masks on each of the four
+shapes. Compute D16 compares masks `0x3`, `0x9` and `0x7` against raw half-float
+references. Preserving the initial channels or filling them with nonzero
+values causes a readback mismatch.
 
 ```powershell
 ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_image_store_partial_(1d|2d|array|3d)_warp$' -V

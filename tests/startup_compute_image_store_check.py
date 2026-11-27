@@ -159,11 +159,10 @@ def array_reference(layer):
 # Four distinct finite values and distinct initial channel words detect reordered or overwritten components.
 PARTIAL_CASES = {
     '1d': (STORE_1D, HEAD, 'v8', TEXTURE_1D_FLAG, 'tex1d'),
-    '2d': (STORE, ARRAY_PROLOGUE, 'uint2(v8, v9)', 0, 'tex2d'),
+    '2d': (STORE, ARRAY_PROLOGUE, 'uint2(v8, v9)', fixture.FLOAT_TEXTURE_FLAG, 'tex2d'),
     'array': (ARRAY_STORE, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', ARRAY_FLAG, 'tex2da'),
     '3d': (STORE_3D, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', VOLUME_FLAG, 'tex3d'),
 }
-UAV_LOAD_FLAG = 1 << 21  # tests/compute_check.cpp texture_uav_load_flag
 
 
 def partial_pipeline(shape, mask):
@@ -191,6 +190,7 @@ def partial_reference(shape, mask):
     expected = initial.copy()
     selected = [c for c in range(4) if mask & (1 << c)]
     for word in range(first, first + 4 * 4 * fixture.GROUPS, 4):
+        expected[word:word + 4] = [0] * 4
         for c, value in zip(selected, ARRAY_VALUES):
             expected[word + c] = value
     return initial, expected, first
@@ -201,20 +201,14 @@ def partial_controls():
         for mask in range(1, 15):
             pipe = partial_pipeline(shape, mask)
             source = pipe.hlsl_cs()
-            assert f'if (exec & 1) {{ t = w0[{index}];' in source, (shape, mask)
-            assert f'w0[{index}] = t; }}' in source, (shape, mask)
             selected = [c for c in range(4) if mask & (1 << c)]
-            for c in range(4):
-                assignment = f't.{"xyzw"[c]} = asfloat(v'
-                if c in selected:
-                    assert f'{assignment}{14 + selected.index(c)});' in source, (shape, mask)
-                else:
-                    assert assignment not in source, (shape, mask)
-            assert pipe.manifest().splitlines()[-2:] == [
-                f'uav 0 {kind} float table 1 64 channels 4', 'uavload 0',
-            ]
+            values = [f'v{14 + selected.index(c)}' if c in selected else '0u' for c in range(4)]
+            store = f'if (exec & 1) w0[{index}] = asfloat(uint4({", ".join(values)}));'
+            assert source.count(store) == 1 and source.count(f'w0[{index}]') == 1, (shape, mask)
+            manifest = pipe.manifest().splitlines()
+            assert f'uav 0 {kind} float table 1 64 channels 4' in manifest and 'uavload 0' not in manifest
             initial, expected, _ = partial_reference(shape, mask)
-            assert sum(before != after for before, after in zip(initial, expected)) == 4 * fixture.GROUPS * len(selected)
+            assert sum(before != after for before, after in zip(initial, expected)) == 4 * fixture.GROUPS * 4
     refused('no channel selected', lambda: partial_pipeline('2d', 0))
     pipe = partial_pipeline('2d', 1)
     for mask in ('0x10', '-1'):
@@ -375,17 +369,19 @@ def dispatch_partial(directory, compiler, renderer, adapter, shape):
     for mask in range(1, 15):
         initial, expected, first = partial_reference(shape, mask)
         source = partial_pipeline(shape, mask).hlsl_cs()
-        load = f't = w0[{index}];'
-        assert source.count(load) == 1
-        first_preserved = first + next(c for c in range(4) if not mask & (1 << c))
+        store = next(line for line in source.splitlines() if f'w0[{index}] = asfloat(uint4(' in line)
+        first_zero = first + next(c for c in range(4) if not mask & (1 << c))
+        # Read-modify-write would retain nonzero sentinels and fail this same zero-channel comparison.
+        nonzero = source.replace(store, store.replace('0u', '0x3f800000u'))
+        assert nonzero != source
         cases = (
             (f'{shape} mask {mask:#x}', source, 0, None),
-            (f'{shape} mask {mask:#x}, clobber preserved channels', source.replace(load, 't = 0;'),
+            (f'{shape} mask {mask:#x}, fill unselected channels with one', nonzero,
              (4 - mask.bit_count()) * 4 * fixture.GROUPS,
-             f'mip=0 word={first_preserved} expected={initial[first_preserved]:08x} actual=00000000'),
+             f'mip=0 word={first_zero} expected=00000000 actual=3f800000'),
         )
         if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
-                      selector=fixture.GROUPS | shape_flag | UAV_LOAD_FLAG, compared=len(initial)) == 77:
+                      selector=fixture.GROUPS | shape_flag, compared=len(initial)) == 77:
             return 77
     return 0
 
