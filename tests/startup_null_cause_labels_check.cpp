@@ -1,6 +1,7 @@
 // Checks src/startup_stubs/null_binding_cause.h without a device: the slot of the x2w-render totals
 // line each cause is counted in, and the label printed for that slot. The device indexes its counts
 // by the cause's value and prints slots 0 to 4 as entry, buffer, token, wrapper and dimension.
+#include "startup_stubs/target_draw_census.h"
 #include "startup_stubs/null_input_census.h"
 
 #include <cstdio>
@@ -66,16 +67,41 @@ void census_rows()
     census.note({9, 1, NullCause::unknown_token, 1, 28, 55, {0x56573258, 123}, 0, nullptr, 6, 6});
     census.note({9, 2, NullCause::unknown_token, 5, 11, 0, {0x56573258, 456}, 0, nullptr, 7, 7});
     census.note({9, 1, NullCause::unknown_token, 1, 11, 0, {0x56573258, 789}, 0, nullptr, 8, 8});
-    census.note_target({12, 4, 2, 28, 6, 6}, false);
-    census.note_target({12, 4, 2, 28, 8, 8}, true);
+    x2w_startup::TargetDrawCensus targets;
+    targets.draw({12, 4, 2, 28}, 6, false);
+    targets.draw({12, 4, 2, 28}, 8, true);
     Census::Batch batch;
     census.report(batch, true);
     same_text("top cumulative binding", batch.count > 0 ? batch.lines[0].data() : "missing",
         "x2w-render null input: key 0000000000000009 input 1 (2D) cause token calls 2 frames 6..8 target format 28 depth format 55 words 56573258 0000007b");
     same_text("second index and cube label", batch.count > 1 ? batch.lines[1].data() : "missing",
         "x2w-render null input: key 0000000000000009 input 2 (cube) cause token calls 1 frames 7..7 target format 11 depth format 0 words 56573258 000001c8");
-    same_text("one poisoned draw", batch.count > 2 ? batch.lines[2].data() : "missing",
+    std::string target_line;
+    const auto collect = [&](const char* line) { target_line = line; };
+    targets.report(collect, 8, 30, false);
+    same_text("one poisoned draw", target_line.c_str(),
         "x2w-render target c (4x2 format 28): draws 2, with a null input 1 frames 6..8");
+    targets.next_window();
+    target_line.clear();
+    targets.report(collect, 8, 30, false);
+    same_text("unchanged target census", target_line.c_str(), "");
+
+    const x2w_startup::TargetDrawCensus::Surface surface{12, 4, 2, 28};
+    targets.refuse(surface, 9, "missing", 10);
+    targets.refuse(surface, 8, "root", 10);
+    targets.next_window();
+    targets.refuse(surface, 9, "missing", 40);
+    targets.refuse(surface, 7, "pipeline", 40);
+    targets.refuse(surface, 6, "pipeline", 40);
+    targets.read(12, 40);
+    targets.report(collect, 40, 30, true);
+    same_text("starvation ranks refusals across windows", target_line.c_str(),
+              "x2w-render starved target c (4x2 format 28): last drawn frame 8, not drawn since: "
+              "0000000000000009 x2 (missing), 0000000000000006 x1 (pipeline), 0000000000000007 x1 (pipeline)");
+    target_line.clear();
+    targets.next_window();
+    targets.report(collect, 71, 30, true);
+    same_text("stale read does not report starvation", target_line.c_str(), "");
     batch.count = 0;
     census.report(batch, true);
     same_text("unchanged census", batch.count == 0 ? "empty" : "repeated", "empty");
@@ -83,12 +109,21 @@ void census_rows()
     Census full;
     for (unsigned i = 0; i < 513; ++i)
         full.note({i, 0, NullCause::ring_full, 0, 0, 0, {}, 9, nullptr, 0, 0});
-    for (unsigned i = 1; i <= 65; ++i)
-        full.note_target({i, 1, 1, 28, 0, 0}, false);
     batch.count = 0;
     full.report(batch, true);
-    same_text("report caps rows and counts overflow", batch.count == 89 ? batch.lines[88].data() : "wrong row count",
-        "x2w-render null census overflow: inputs 1, target draws 1");
+    same_text("report caps rows and counts overflow", batch.count == 25 ? batch.lines[24].data() : "wrong row count",
+        "x2w-render null census overflow: inputs 1, target draws 0");
+    for (unsigned i = 1; i <= 514; ++i)
+        targets.draw({i, 1, 1, 28}, 9, false);
+    targets.report(collect, 9, 30, false);
+    same_text("target census capacity", target_line.c_str(),
+              "x2w-render target census omitted: not drawn 0, target draws 2");
+    x2w_startup::TargetDrawCensus pairs;
+    for (unsigned key = 0; key < 1025; ++key)
+        pairs.refuse(surface, key, "missing", 10);
+    pairs.report(collect, 10, 30, false);
+    same_text("key-target census capacity", target_line.c_str(),
+              "x2w-render target census omitted: not drawn 1, target draws 0");
 }
 }  // namespace
 

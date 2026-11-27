@@ -1838,6 +1838,15 @@ add_test(NAME startup_indirect_translated_refusal_census_control_warp
     COMMAND startup_indirect_draw_indexed warp translated-refusal-census-control)
 set_tests_properties(startup_indirect_translated_refusal_census_control_warp PROPERTIES TIMEOUT 60
     PASS_REGULAR_EXPRESSION "got +'x2w-d3d12 indirect-draw refusals: total 5. distinct keys 3, distinct pairs 3 \\(overflow calls 0\\)'")
+add_test(NAME startup_target_starvation_warp COMMAND startup_indirect_draw_indexed warp starved-target)
+add_test(NAME startup_target_starvation_control_warp COMMAND startup_indirect_draw_indexed warp starved-target-control)
+add_test(NAME startup_target_starvation_mutant_warp COMMAND startup_indirect_draw_indexed warp starved-target-mutant)
+set_tests_properties(startup_target_starvation_warp startup_target_starvation_control_warp
+    startup_target_starvation_mutant_warp PROPERTIES TIMEOUT 120)
+# The fixture exits nonzero for the mutant. Require the diagnostic mismatch after successful GPU readback.
+set_tests_properties(startup_target_starvation_mutant_warp PROPERTIES
+    PASS_REGULAR_EXPRESSION "starvation mutant detected: refused draws lost their target")
+
 # Negative control for the per-(key, reason) ExecuteIndirect other-refusal census: replacing the second refusal on
 # key 1 with a valid draw must report the real total (3) and pair count (2) as a mismatch.
 add_test(NAME startup_indirect_other_refusal_census_control_warp
