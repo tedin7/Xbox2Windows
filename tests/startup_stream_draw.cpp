@@ -437,7 +437,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_PLACEHOLDER_DRAW", placeholder_mode, sizeof(placeholder_mode));
     const bool placeholder_fixture = placeholder_mode[0] != 0;
     const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = placeholder_fixture ? 8 : mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const bool pixel_uav_rw = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
+    const UINT height = placeholder_fixture ? 8 : mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : pixel_uav_rw ? 8 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))

@@ -3,7 +3,7 @@
 //
 // Four committed 4x4 textures with two mips each, every word of every texel a distinct sentinel:
 //   A R32G32B32A32_FLOAT with ALLOW_UNORDERED_ACCESS, B the same, C without the flag, D R32G32B32A32_TYPELESS.
-// One shader-visible heap of eight entries:
+// One shader-visible heap of nine entries:
 //   0 UAV of A (explicit 2D view, mip 0)   1 UAV of B (no description: the default view)
 //   2 UAV of C (the stand-in skips the desktop call and keeps the title's view)
 //   3 UAV of D as R32G32B32A32_UINT        4 left unwritten
@@ -12,7 +12,8 @@
 // The case names the table bound at root parameter 0 (and, for srv-and-uav, parameter 1); one draw follows.
 // The target case binds E as the draw's render target first.
 // After the fence every subresource of the four textures is written to <pixels>.uav, and the debug layer's
-// errors are counted when it is on.
+// errors are counted when it is on. The rw cases use 8x8 textures and two draws that add a colour to each texel.
+// The stale cases read an untouched copy from entry 1.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <wrl/client.h>
@@ -31,7 +32,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 
-constexpr UINT side = 4, mips = 2, textures = 4, array_slices = 6;
+constexpr UINT side_default = 4, mips = 2, textures = 4, array_slices = 6;
 
 // The sentinel of word c of texel (x, y) of mip m of texture t; tests/startup_pixel_uav_check.py makes the same.
 std::uint32_t sentinel(UINT t, UINT m, UINT texel, UINT c) { return 0xc0000000u | (t << 12) | (m << 8) | (texel << 2) | c; }
@@ -40,6 +41,8 @@ std::uint32_t array_sentinel(UINT s, UINT m, UINT texel, UINT c) { return 0xd000
 struct Fixture {
     ID3D12Device* desktop = nullptr;
     bool array_mode = false;
+    bool read_write = false;
+    UINT side = side_default;
     void* resources[textures]{};
     ComPtr<ID3D12Resource> natives[textures];
     void* array_resources[3]{};
@@ -60,16 +63,33 @@ ComPtr<ID3D12Resource> native_of(void* guest, void* wrapped)
     return result;
 }
 
+// The destination and the stale copy start with the same exact binary32 values.
+std::uint32_t pattern(UINT layer, UINT texel, UINT channel)
+{
+    const float value = float(1 + layer * 256 + texel * 4 + channel) / 128.0f;
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void draw_twice(void* list)
+{
+    static constexpr float colour[] = {0.25f, 0.5f, -0.125f, 0.0625f};
+    invoke(list, 40, 1, 4, ptr(colour), 0);
+    invoke(list, 12, 3, 1);
+    invoke(list, 12, 3, 1);
+}
+
 D3D12_RESOURCE_DESC texture_desc(UINT t)
 {
-    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, mips,
+    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, fixture.side, fixture.side, 1, mips,
             t == 3 ? DXGI_FORMAT_R32G32B32A32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0},
             D3D12_TEXTURE_LAYOUT_UNKNOWN, t == 2 ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
 }
 
 D3D12_RESOURCE_DESC array_texture_desc(UINT t)
 {
-    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, array_slices, mips,
+    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, fixture.side, fixture.side, array_slices, mips,
             t == 2 ? DXGI_FORMAT_R32G32B32A32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0},
             D3D12_TEXTURE_LAYOUT_UNKNOWN, t == 1 ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
 }
@@ -126,7 +146,9 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
     const auto desc = texture_desc(0);
     device->GetCopyableFootprints(&desc, 0, mips, 0, footprints, nullptr, nullptr, &total);
     if (!total || total == ~UINT64{0}) return false;
-    auto staging = buffer(device, to_textures ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, total * textures,
+    constexpr UINT64 alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    const UINT64 stride = (total + alignment - 1) & ~(alignment - 1);
+    auto staging = buffer(device, to_textures ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, stride * textures,
                           to_textures ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
     Copier copier;
     if (!staging || !copier.open(device)) return false;
@@ -135,12 +157,13 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
         if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
         for (UINT t = 0; t < textures; ++t)
             for (UINT m = 0; m < mips; ++m) {
-                const UINT n = side >> m;
+                const UINT n = fixture.side >> m;
                 for (UINT y = 0; y < n; ++y)
                     for (UINT x = 0; x < n; ++x)
                         for (UINT c = 0; c < 4; ++c) {
-                            const std::uint32_t value = sentinel(t, m, y * n + x, c);
-                            std::memcpy(memory + t * total + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + (x * 4 + c) * 4,
+                            const std::uint32_t value = fixture.read_write && t < 2 && m == 0
+                                ? pattern(0, y * n + x, c) : sentinel(t, m, y * n + x, c);
+                            std::memcpy(memory + t * stride + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + (x * 4 + c) * 4,
                                         &value, 4);
                         }
             }
@@ -153,7 +176,7 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
         for (UINT m = 0; m < mips; ++m) {
             D3D12_TEXTURE_COPY_LOCATION placed{staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
             placed.PlacedFootprint = footprints[m];
-            placed.PlacedFootprint.Offset += t * total;
+            placed.PlacedFootprint.Offset += t * stride;
             D3D12_TEXTURE_COPY_LOCATION subresource{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             subresource.SubresourceIndex = m;
             if (to_textures) copier.list->CopyTextureRegion(&subresource, 0, 0, 0, &placed, nullptr);
@@ -166,11 +189,11 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
     if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
     for (UINT t = 0; t < textures; ++t)
         for (UINT m = 0; m < mips; ++m) {
-            const UINT n = side >> m;
+            const UINT n = fixture.side >> m;
             for (UINT y = 0; y < n; ++y)
                 for (UINT x = 0; x < n * 4; ++x) {
                     std::uint32_t value = 0;
-                    std::memcpy(&value, memory + t * total + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + x * 4, 4);
+                    std::memcpy(&value, memory + t * stride + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + x * 4, 4);
                     words->push_back(value);
                 }
         }
@@ -179,7 +202,7 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
 }
 
 // Fills every subresource of the 6-slice array texture with its sentinels (to_texture) or copies them all back.
-bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t>* words)
+bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t>* words, UINT texture_index = 0)
 {
     constexpr UINT subresources = array_slices * mips;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[subresources]{};
@@ -196,18 +219,19 @@ bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t
         if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
         for (UINT s = 0; s < array_slices; ++s)
             for (UINT m = 0; m < mips; ++m) {
-                const UINT sub = s * mips + m, n = side >> m;
+                const UINT sub = s * mips + m, n = fixture.side >> m;
                 for (UINT y = 0; y < n; ++y)
                     for (UINT x = 0; x < n; ++x)
                         for (UINT c = 0; c < 4; ++c) {
-                            const std::uint32_t value = array_sentinel(s, m, y * n + x, c);
+                            const std::uint32_t value = fixture.read_write && m == 0
+                                ? pattern(s, y * n + x, c) : array_sentinel(s, m, y * n + x, c);
                             std::memcpy(memory + footprints[sub].Offset + y * footprints[sub].Footprint.RowPitch + (x * 4 + c) * 4,
                                         &value, 4);
                         }
             }
         staging->Unmap(0, nullptr);
     }
-    auto* texture = fixture.array_natives[0].Get();
+    auto* texture = fixture.array_natives[texture_index].Get();
     const auto state = to_texture ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier(copier.list.Get(), texture, D3D12_RESOURCE_STATE_COMMON, state);
     for (UINT sub = 0; sub < subresources; ++sub) {
@@ -224,7 +248,7 @@ bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t
     if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
     for (UINT s = 0; s < array_slices; ++s)
         for (UINT m = 0; m < mips; ++m) {
-            const UINT sub = s * mips + m, n = side >> m;
+            const UINT sub = s * mips + m, n = fixture.side >> m;
             for (UINT y = 0; y < n; ++y)
                 for (UINT x = 0; x < n * 4; ++x) {
                     std::uint32_t value = 0;
@@ -251,6 +275,9 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     const std::string which(mode);
     fixture.desktop = desktop;
     fixture.array_mode = which.rfind("arr-", 0) == 0;
+    fixture.read_write = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
+    fixture.side = fixture.read_write ? 8 : side_default;
+    const bool stale = which == "rw-stale" || which == "arr-rw-stale";
     if (fixture.array_mode) {
         using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT, const void*,
                                          void*, UINT, const void*, REFIID, void**);
@@ -268,7 +295,7 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
         if (FAILED(create(guest, &heap, 0, &plain_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
                           __uuidof(ID3D12Resource), &fixture.resources[0])) || !fixture.resources[0])
             return 70;
-        if (!copy_array(desktop, true, nullptr)) return 72;
+        if (!copy_array(desktop, true, nullptr) || (stale && !copy_array(desktop, true, nullptr, 1))) return 72;
 
         struct Extended {
             D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -298,11 +325,13 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
         D3D12_UNORDERED_ACCESS_VIEW_DESC integer = arr_view;
         integer.Format = DXGI_FORMAT_R32G32B32A32_UINT;
         invoke(guest, 19, ptr(fixture.array_resources[2]), 0, ptr(&integer), cpu + 6 * stride);
+        if (stale) invoke(guest, 18, ptr(fixture.array_resources[1]), ptr(&arr_srv), cpu + stride);
 
         struct Case { const char* name; int entry; int srv_entry; };
         static const Case cases[] = {
             {"arr-ok", 0, -1}, {"arr-2d-view", 1, -1}, {"arr-default", 2, -1}, {"arr-mip1", 3, -1},
             {"arr-srv-and-uav", 0, 4}, {"arr-no-ua", 5, -1}, {"arr-uint", 6, -1},
+            {"arr-rw", 0, -1}, {"arr-rw-stale", 0, -1},
         };
         const Case* chosen = nullptr;
         for (const Case& c : cases)
@@ -312,7 +341,8 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
         invoke(list, 32, 1, ptr(&desc_heap));
         if (chosen->entry >= 0) invoke(list, 36, 0, gpu + Word(chosen->entry) * stride);
         if (chosen->srv_entry >= 0) invoke(list, 36, 1, gpu + Word(chosen->srv_entry) * stride);
-        invoke(list, 12, 3, 1);
+        if (fixture.read_write) draw_twice(list);
+        else invoke(list, 12, 3, 1);
         return 0;
     }
     for (UINT t = 0; t < textures; ++t) {
@@ -351,6 +381,7 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
                                         D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     srv.Texture2D.MipLevels = 1;
     invoke(guest, 18, ptr(fixture.resources[0]), ptr(&srv), cpu + 5 * stride);
+    if (stale) invoke(guest, 18, ptr(fixture.resources[1]), ptr(&srv), cpu + stride);
     D3D12_UNORDERED_ACCESS_VIEW_DESC mip1 = view;
     mip1.Texture2D.MipSlice = 1;
     invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&mip1), cpu + 6 * stride);
@@ -363,7 +394,7 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT, const void*,
                                      void*, UINT, const void*, REFIID, void**);
     const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
-    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, fixture.side, fixture.side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
         D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     static void* target = nullptr;
     if (FAILED(reinterpret_cast<Create>((*static_cast<void***>(guest))[127])(guest, &default_heap, 0, &target_desc,
@@ -386,7 +417,7 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     static const Case cases[] = {
         {"a", 0, -1}, {"b", 1, -1}, {"no-ua", 2, -1}, {"uint", 3, -1}, {"missing", 4, -1}, {"srv", 5, -1},
         {"mip1", 6, -1}, {"array", 7, -1}, {"out-of-range", 7, -1}, {"no-table", -1, -1}, {"srv-and-uav", 0, 5},
-        {"target", 8, -1},
+        {"target", 8, -1}, {"rw", 0, -1}, {"rw-stale", 0, -1},
     };
     const Case* chosen = nullptr;
     for (const Case& c : cases)
@@ -397,7 +428,8 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     invoke(list, 32, 1, ptr(&heap));
     if (chosen->entry >= 0) invoke(list, 36, 0, gpu + Word(chosen->entry) * stride);
     if (chosen->srv_entry >= 0) invoke(list, 36, 1, gpu + Word(chosen->srv_entry) * stride);
-    invoke(list, 12, 3, 1);
+    if (fixture.read_write) draw_twice(list);
+    else invoke(list, 12, 3, 1);
     return 0;
 }
 
