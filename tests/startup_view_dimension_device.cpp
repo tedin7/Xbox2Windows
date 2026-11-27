@@ -375,15 +375,104 @@ int check_memory_buffer(Context& c, bool off, bool mutant, bool recover, bool ca
     return mutant ? 2 : 0;
 }
 
+// The regular lookup cannot serve these spans. Only the last span may be snapshotted.
+int check_snapshot_diagnostics(Context& c, IUnknown* other_device, bool diagnostics_off, bool snapshot_off)
+{
+    static constexpr UINT stride = 256;  // Matches the structured-buffer probe.
+    struct Reservation {
+        void* base = VirtualAlloc(nullptr, 4 * 65536, MEM_RESERVE, PAGE_NOACCESS);
+        ~Reservation() { if (base) VirtualFree(base, 0, MEM_RELEASE); }
+    } reservation;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (!reservation.base || system.dwPageSize < stride || system.dwPageSize >= 65536) return 4;
+    auto* base = static_cast<unsigned char*>(reservation.base);
+    const D3D12_RESOURCE_DESC request{D3D12_RESOURCE_DIMENSION_BUFFER, 0, stride, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    std::array<ComPtr<IUnknown>, 3> owners;
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        UINT64 address;
+        UINT64 tail[2];
+    } at{};
+    static_assert(offsetof(decltype(at), address) == 0x28);
+    at.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    at.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    at.view.Buffer.NumElements = 1;
+    at.view.Buffer.StructureByteStride = stride;
+    const std::array<float, 4> reference{23, 74, 119, 211};
+    const char* const reasons[]{"snapshot_already_owned", "snapshot_placement_rejected", "snapshot_resource_overlap"};
+    for (UINT i = 0; i < 4; ++i) {
+        // Use a nonaligned placement address, so slot 133 uses a real committed default buffer.
+        auto* data = base + i * 65536 + system.dwPageSize;
+        if (!VirtualAlloc(data, system.dwPageSize, MEM_COMMIT, PAGE_READWRITE)) return 4;
+        std::array<UINT, stride / sizeof(UINT)> words{};
+        words[0] = static_cast<UINT>(reference[0]);
+        words[1] = static_cast<UINT>(reference[1]);
+        words[62] = static_cast<UINT>(reference[2]);
+        words[63] = static_cast<UINT>(reference[3]);
+        std::memcpy(data, words.data(), stride);
+        if (i < owners.size()) {
+            auto placed = request;
+            // The guest DENY flag stays in the placement record. Slot 133 strips it from native buffers.
+            if (i == 0) placed.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            if (i == 1) placed.Width = stride / 2;
+            if (!require(invoke(i == 2 ? other_device : c.guest, 133, data, &placed,
+                                D3D12_RESOURCE_STATE_COMMON, nullptr, &__uuidof(ID3D12Resource),
+                                owners[i].GetAddressOf()), "snapshot diagnostic placement"))
+                return 4;
+        }
+        at.address = reinterpret_cast<UINT64>(data);
+        auto cpu = c.heap_real->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += i * c.increment;
+        c.device->CreateShaderResourceView(nullptr, &at.view, cpu);
+        invoke<void>(c.guest, 70, &request, &at, c.slot(i));
+        if (!diagnostics_off && !snapshot_off && i < owners.size()) {
+            const std::string total = "memory SRV diagnostics (slot 70): total " + std::to_string(i + 1) + ";";
+            const std::string shape = std::string("reason=") + reasons[i] +
+                " dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 calls=1";
+            const std::string count = std::string(reasons[i]) + " 1";
+            if (!check_snapshot_counts(total.c_str()) || !check_snapshot_counts(count.c_str()) ||
+                !check_snapshot_counts(shape.c_str())) return 4;
+        }
+    }
+    if (diagnostics_off || snapshot_off) {
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
+        if (report.find("memory SRV diagnostics") != std::string::npos) return 4;
+    }
+    if (!diagnostics_off && !snapshot_off && !check_snapshot_counts("memory SRV diagnostics (slot 70): total 3;"))
+        return 4;
+    if (!snapshot_off && !check_snapshot_counts("snapshot attempts 4 bound 1 bytes 256")) return 4;
+    for (UINT i = 0; i < 4; ++i) {
+        float texel[4]{};
+        if (!c.read_slot(i, texel) || !c.device_ok()) return 4;
+        const std::array<float, 4> actual{texel[0], texel[1], texel[2], texel[3]};
+        const auto expected = i < 3 || snapshot_off ? std::array<float, 4>{} : reference;
+        if (actual != expected) {
+            std::printf("FAIL: diagnostic slot %u readback %.0f %.0f %.0f %.0f\n",
+                        i, actual[0], actual[1], actual[2], actual[3]);
+            return 1;
+        }
+        if (snapshot_off && i == 3 && actual != reference)
+            std::puts("slot70 snapshot off control: fitting span failed the enabled readback oracle");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
+    const bool diagnostics_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-diagnostics-off") == 0;
+    const bool snapshot_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-diagnostics-no-snapshot") == 0;
+    const bool diagnostics = diagnostics_off || snapshot_off ||
+        (argc == 3 && std::strcmp(argv[2], "memory-buffer-diagnostics") == 0);
     const bool memory_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-off") == 0;
     const bool memory_mutant = argc == 3 && std::strcmp(argv[2], "memory-buffer-stale") == 0;
     const bool cache_first = argc == 3 && std::strcmp(argv[2], "memory-buffer-cache-first") == 0;
     const bool recover = cache_first || (argc == 3 && std::strcmp(argv[2], "memory-buffer-recover") == 0);
-    const bool memory_buffer = recover || memory_off || memory_mutant ||
+    const bool memory_buffer = diagnostics || recover || memory_off || memory_mutant ||
         (argc == 3 && std::strcmp(argv[2], "memory-buffer") == 0);
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
         (argc == 3 && !memory_buffer && std::strcmp(argv[2], "off")))
@@ -505,6 +594,13 @@ int main(int argc, char** argv)
         return 4;
     }
     c.heap_cpu = invoke<UINT64>(c.heap.Get(), 9);
+    if (diagnostics) {
+        ComPtr<IUnknown> other_device;
+        if (!require(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device),
+                                          reinterpret_cast<void**>(other_device.GetAddressOf())), "second Xbox device") ||
+            other_device.Get() == guest.Get()) return 4;
+        return check_snapshot_diagnostics(c, other_device.Get(), diagnostics_off, snapshot_off);
+    }
     if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant, recover, cache_first);
 
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
