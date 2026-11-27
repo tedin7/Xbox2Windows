@@ -3218,7 +3218,7 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
-            if s[0] == 'desc' and getattr(self.pipe, 'raw_descriptor_values', False):
+            if s[0] == 'desc' and getattr(getattr(self, 'pipe', None), 'raw_descriptor_values', False):
                 return self.descriptor_value(s)
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
@@ -3250,7 +3250,7 @@ class Stage:
         return 'ud%d' % self.pipe.ud(('desc_null' if null_test else 'desc_word', key, word))
 
     def descriptor_null_compare(self, ops, mods, equal):
-        if not getattr(self.pipe, 'raw_descriptor_values', False) or mods or len(ops) != 2:
+        if not getattr(getattr(self, 'pipe', None), 'raw_descriptor_values', False) or mods or len(ops) != 2:
             raise Unsupported('scalar 64-bit compare')
         for pair, zero in (ops, ops[::-1]):
             r = reg_range(pair)
@@ -7020,7 +7020,7 @@ class Stage:
                     self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
-        raw_values = getattr(self.pipe, 'raw_descriptor_values', False)
+        raw_values = getattr(getattr(self, 'pipe', None), 'raw_descriptor_values', False)
         raw_words = any(s and s[0] == 'desc' for s in syms) and all(
             not s or s[0] not in ('descnum', 'ptr', 'ptrhi') for s in syms)
         if raw_values and raw_words and base == 's_mov_b32' and dname == 'vcc_lo' and len(syms) == 1 and not mods:
@@ -7704,7 +7704,7 @@ class Stage:
             return
         if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
-        if p[1] == ('resheap',) and not base_off and self.kind in ('vs', 'ps'):
+        if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
                                             "s_load with a register offset through ('resheap',)")
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
@@ -10761,7 +10761,7 @@ class Stage:
             self.reject_lane_mask_data('v_cndmask_b32', source)
         token = ops[3] if len(ops) > 3 else 'vcc_lo'
         numeric = getattr(self, 'numeric_vcc', None) if token in ('vcc', 'vcc_lo') else None
-        if getattr(self.pipe, 'raw_descriptor_values', False) and not numeric:
+        if getattr(getattr(self, 'pipe', None), 'raw_descriptor_values', False) and not numeric:
             reg = reg_range(token)
             sym = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
             if sym and sym[0] == 'desc':
