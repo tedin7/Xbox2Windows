@@ -67,6 +67,28 @@ FIXTURE_WORDS = struct.pack('<37I', *(
     0xbe820380, 0xbe880380, 0xd7600003, 0x0001010a, 0xd7600004, 0x00013f0a, 0xd7600005, 0x0001010b,
     0xd761000a, 0x00010005, 0xd7600006, 0x0001010a, 0xd7600009, 0x00010f0c, 0x38020003, 0x38040004,
     0x38060006, 0x38080009, 0xf800180f, 0x04030201, 0xbf810000))
+# The same program for a wave64 stage: it copies the 64-bit exec pair first (only a wave64 compiler emits that form), and
+# v10 holds lanes 8 and 40, which are one slot in wave32 and two in wave64.
+W64_TEXT = 's_mov_b64 s[20:21], exec\n' + FIXTURE_TEXT.replace(
+    'v_writelane_b32 v10, s0, 0', 'v_writelane_b32 v10, s0, 8').replace(
+    'v_writelane_b32 v10, s1, 31', 'v_writelane_b32 v10, s1, 40').replace(
+    'v_writelane_b32 v10, s5, 0', 'v_writelane_b32 v10, s5, 8').replace(
+    'v_readlane_b32 s3, v10, 0', 'v_readlane_b32 s3, v10, 8').replace(
+    'v_readlane_b32 s4, v10, 31', 'v_readlane_b32 s4, v10, 40').replace(
+    'v_readlane_b32 s6, v10, 0', 'v_readlane_b32 s6, v10, 8')
+_LANE_WORDS = {(0xd761000a, 0x00010000): 0x00011000, (0xd761000a, 0x00013e01): 0x00015001,
+               (0xd761000a, 0x00010005): 0x00011005, (0xd7600003, 0x0001010a): 0x0001110a,
+               (0xd7600004, 0x00013f0a): 0x0001510a, (0xd7600006, 0x0001010a): 0x0001110a}
+
+
+def _wave64_words():
+    words = list(struct.unpack('<37I', FIXTURE_WORDS))
+    for i in range(len(words) - 1):
+        words[i + 1] = _LANE_WORDS.get((words[i], words[i + 1]), words[i + 1])
+    return struct.pack('<38I', 0xbe94047e, *words)  # s_mov_b64 s[20:21], exec
+
+
+W64_WORDS = _wave64_words()
 failures = []
 
 
@@ -78,16 +100,18 @@ def check(label, ok, detail=''):
             print('  ' + detail)
 
 
-def reference_slots():
+def reference_slots(text=FIXTURE_TEXT):
     """Execute the fixture's lane writes and reads on a model of the VGPRs: eight-by-thirty-two lanes of words."""
     lanes, scalars = {}, {}
-    for line in FIXTURE_TEXT.splitlines():
+    for line in text.splitlines():
         op, _, rest = line.partition(' ')
         args = [a.strip() for a in rest.split(',')]
         if op == 's_mov_b32':
             scalars[args[0]] = 0x40800000 if args[1] == '4.0' else int(args[1], 0)
         elif op == 's_or_b32':
             scalars[args[0]] = scalars[args[1]] | scalars[args[2]]
+        elif op == 's_mov_b64':
+            pass  # the exec copy of the wave64 fixture: no value the image reads
         elif op == 'v_writelane_b32':
             lanes[(args[0], int(args[2]))] = scalars[args[1]]
         elif op == 'v_readlane_b32':
@@ -95,15 +119,15 @@ def reference_slots():
     return [scalars[r] for r in ('s3', 's4', 's6', 's9')]
 
 
-def pixel_words(x, y):
-    return [(x | y << 16) | value for value in reference_slots()]
+def pixel_words(x, y, text=FIXTURE_TEXT):
+    return [(x | y << 16) | value for value in reference_slots(text)]
 
 
-def image():
+def image(text=FIXTURE_TEXT):
     words = []
     for y in range(HEIGHT):
         for x in range(WIDTH):
-            words += pixel_words(x, y)
+            words += pixel_words(x, y, text)
     return words
 
 
@@ -188,6 +212,25 @@ def controls():
     check('wave64 lanes 40 and 63 are accepted', refused(wave64) is None, str(refused(wave64)))
     check('refused: a shader with branches (%s)' % refused(ok, branches=True), refused(ok, branches=True) is not None)
 
+    # 4b. Lanes 8 and 40 of one VGPR are two slots only when the program proves wave64 by its own exec forms.
+    pair = ['v_writelane_b32 v10, s0, 8', 'v_writelane_b32 v10, s1, 40', 'v_readlane_b32 s2, v10, 8']
+    check('lanes 8 and 40 with a 64-bit exec form are accepted', refused(['s_mov_b64 s[20:21], exec'] + pair) is None,
+          str(refused(['s_mov_b64 s[20:21], exec'] + pair)))
+    for label, exec_form in (('no exec form', []), ('a wave32 exec form', ['s_and_saveexec_b32 s20, s21']),
+                             ('both exec forms', ['s_mov_b64 s[20:21], exec', 's_and_saveexec_b32 s22, s23'])):
+        reason = refused(exec_form + pair)
+        check('lanes 8 and 40 with %s stay refused (%s)' % (label, reason), 'one slot in wave32' in (reason or ''), str(reason))
+    check('the wave64 fixture decodes to its source',
+          [G.re.sub(r'_e(32|64)\b', '', a) for _, _, _, a in G.decode(W64_WORDS)] ==
+          [G.re.sub(r'_e(32|64)\b', '', w) for w in W64_TEXT.splitlines()])
+    check('wave64 reference: lanes 8 and 40 of v10 are separate slots', reference_slots(W64_TEXT) == [A, B, C, A | B],
+          str(reference_slots(W64_TEXT)))
+    check('wave64 program: proven by its code and translated',
+          'sp10_8 = 0x40200000u' in pipeline(W64_WORDS).hlsl_ps() and 'sp10_40 = 0x40400000u' in pipeline(W64_WORDS).hlsl_ps())
+    check('wave32-safe fixture still has no exec form (decided by lanes 0 and 31 only)',
+          not G.wave64_exec_proof(G.decode(FIXTURE_WORDS)))
+    check('wave64 fixture is proven wave64', G.wave64_exec_proof(G.decode(W64_WORDS)))
+
     # 5. The reload keeps the constant the write stored, so later scalar folding sees the same word.
     stage = Probe(['v_writelane_b32 v10, 7, 3', 'v_readlane_b32 s1, v10, 3'])
     for _, _, name, asm in stage.ins:
@@ -208,6 +251,7 @@ def controls():
 
 def check_binary(llvm_mc):
     check('llvm-mc assembles the fixture to the same words', assemble(llvm_mc, FIXTURE_TEXT) == FIXTURE_WORDS)
+    check('llvm-mc assembles the wave64 fixture to the same words', assemble(llvm_mc, W64_TEXT) == W64_WORDS)
 
 
 def words_file(directory, name, words):
@@ -257,6 +301,24 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                    profile_ps, directory)
                 run = draw(renderer, adapter, vs, bad, good)
                 check('%s %s mutation "%s" fails against the reference' % (adapter, stage_name, label),
+                      run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+            # The wave64 program: lanes 8 and 40 of v10 are two slots, proven by its 64-bit exec copy.
+            text64 = pipeline(W64_WORDS).hlsl_ps()
+            good64 = words_file(directory, 'good64', image(W64_TEXT))
+            ps64 = compile_hlsl(compiler, stage_name, text64, 'ps64_' + stage_name, profile_ps, directory)
+            run = draw(renderer, adapter, vs, ps64, good64)
+            check('%s %s wave64 (lanes 8 and 40): all %d pixels equal the slot reference' % (adapter, stage_name, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout, run.stdout + run.stderr)
+            wrong64 = {
+                'the overwritten slot keeps its first value': mutate(text64, r'sp10_8 = s5;', 'sp10_8 = sp10_8;'),
+                'lane 40 reads lane 8 of the same VGPR': mutate(text64, r'v2 = 0x40400000u', 'v2 = 0x40200000u'),
+                'no reload (the clobbered SGPR stays)': mutate(text64, r'(s9) = sp12_7;', r'\1 = 0;'),
+            }
+            for label, source in wrong64.items():
+                bad = compile_hlsl(compiler, stage_name, source, 'bad64_%s_%d' % (stage_name, abs(hash(label))),
+                                   profile_ps, directory)
+                run = draw(renderer, adapter, vs, bad, good64)
+                check('%s %s wave64 mutation "%s" fails against the reference' % (adapter, stage_name, label),
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
 
 
