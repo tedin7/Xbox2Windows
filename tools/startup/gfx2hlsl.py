@@ -1711,6 +1711,104 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+
+def vertex_image_range_facts(ins):
+    """Bounds immediately before decoded instructions; discard unmodelled joins.
+
+    This is a forward-only dataflow building block, not an address proof. Callers
+    must still validate every use and overwrite of the GETPC-derived words.
+    """
+    from vertex_image_ranges import VertexImageRanges
+
+    targets = set()
+    for pc, size, name, asm in ins:
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            _, ops, _ = parse(asm)
+            match = len(ops) == 1 and re.fullmatch(r'label_0x([0-9a-f]+)', ops[0])
+            if not match:
+                return {}
+            target = int(match.group(1), 16)
+            if target <= pc:
+                return {}  # A linear walk cannot establish loop invariants.
+            targets.add(target)
+        elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap', 's_endpgm_')):
+            return {}
+
+    facts = VertexImageRanges()
+    result = {}
+
+    def float_constant(token):
+        try:
+            if token.startswith('0x'):
+                return struct.unpack('<f', struct.pack('<I', int(token, 16)))[0]
+            if token in ('0.5', '1.0', '2.0', '4.0'):
+                return FLOATS[token]
+        except (ValueError, OverflowError, struct.error):
+            pass
+        return None
+
+    clear_next = False
+    for pc, size, name, asm in ins:
+        if pc in targets or clear_next:
+            facts.exec_changed()
+        clear_next = name in ('s_branch', 's_endpgm')
+        result[pc] = facts.facts.copy()
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        if base == 'v_cmpx_ne_u32' and len(ops) == 2 and not mods:
+            constant = pc_word(ops[0])
+            if constant is not None and re.fullmatch(r'v\d+', ops[1]):
+                facts.cmpx_ne(ops[1], constant & 0xffffffff)
+                continue
+        if writes_exec(name, ops) or 'movrel' in name or 'swaprel' in name:
+            facts.exec_changed()
+        if not ops:
+            continue
+        written = set()
+        for op in destinations(base, ops):
+            reg = reg_range(op)
+            if reg and reg[0] == 'v':
+                written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
+        if base.startswith('v_cmp'):
+            written.clear()
+        before = facts.facts.copy()
+        facts.forget(*written)
+        # Model only full-register, unmodified instructions.
+        if base.startswith('tbuffer_load_format_') and len(ops) == 4:
+            formats = [m for m in mods if m.startswith('format:')]
+            if (len(formats) == 1 and re.fullmatch(r'format:\[BUF_FMT_(?:8(?:_8){0,3}|16(?:_16){0,3})_UNORM\]', formats[0])
+                    and all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith(('format:', 'offset:'))
+                            for m in mods) and written):
+                facts.unorm(*written)
+        elif not mods and base == 'v_cvt_u32_f32' and len(ops) == 2 and ops[1] in before:
+            facts.facts[ops[1]] = before[ops[1]]
+            facts.cvt_u32(ops[0], ops[1])
+        elif not mods and base == 'v_fma_f32' and len(ops) == 4:
+            for source, multiplier in ((ops[1], ops[2]), (ops[2], ops[1])):
+                mul, add = float_constant(multiplier), float_constant(ops[3])
+                if source in before and mul is not None and add is not None:
+                    facts.facts[source] = before[source]
+                    facts.fma(ops[0], source, mul, add)
+                    break
+        elif not mods and base in ('v_lshl_add_u32', 'v_add_nc_u32', 'v_mul_u32_u24'):
+            # Capture sources before invalidating a destination that aliases one.
+            def old(token):
+                value = pc_word(token)
+                return ('uint', value & 0xffffffff, value & 0xffffffff) if value is not None else before.get(token)
+            a = old(ops[1]) if len(ops) > 1 else None
+            b = old(ops[2]) if len(ops) > 2 else None
+            c = old(ops[3]) if len(ops) > 3 else None
+            if base == 'v_lshl_add_u32' and len(ops) == 4 and a and b and c and b[1] == b[2] and b[2] < 32:
+                if a[0] == b[0] == c[0] == 'uint':
+                    facts.integer(ops[0], (a[1] << b[1]) + c[1], (a[2] << b[1]) + c[2])
+            elif base == 'v_add_nc_u32' and len(ops) == 3 and a and b and a[0] == b[0] == 'uint':
+                facts.integer(ops[0], a[1] + b[1], a[2] + b[2])
+            elif base == 'v_mul_u32_u24' and len(ops) == 3 and a and b and a[0] == b[0] == 'uint':
+                if a[2] < 1 << 24 and b[2] < 1 << 24:
+                    facts.integer(ops[0], a[1] * b[1], a[2] * b[2])
+    return result
+
+
 class ImageAccessRefusal(Unsupported):
     """A proved program-image use that cannot be lowered."""
 
