@@ -6,9 +6,8 @@ usage: startup_gfx2hlsl_src_scc_check.py
 The census contained `s_mul_i32 s28, 1.0, src_scc`, refused as `operand 'src_scc'` (#870, issue #1820).
 Source code 253 reads the SCC bit as the integer value 0 or 1; the generated shader carries SCC as a
 `bool scc`, so `Stage.u()` lowers `src_scc` to `(scc ? 1u : 0u)` when a modeled writer has set SCC on
-every reaching path in the current block, and refuses when the incoming SCC is unverified (at shader entry,
-after an unmodeled SCC writer such as `s_add_u32`, after descriptor-elided SCC, or across control-flow
-joins).
+every reaching path. Entry without a producer and descriptor-elided writes remain unverified. Pixel
+joins can merge different verified writers under uniform control flow.
 
 The instruction bytes are **constructed here** from the field layout the checked-in decoder reads
 (`tools/disasm_rdna2.py`):
@@ -220,7 +219,8 @@ check('entry src_scc in s_mul_i32 is refused',
       .startswith('src_scc with unverified SCC'))
 check('the refusal names its path, opcode and destination class',
       refused_reason(encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC) + encode_sopp(SOPP_ENDPGM))
-      == 'src_scc with unverified SCC [operand read: s_mul_i32, destination sgpr]')
+      == ('src_scc with unverified SCC [operand read: s_mul_i32, destination sgpr] at +0x0: '
+          'entry path has no SCC producer'))
 check('entry src_scc in s_and_b32 is refused',
       refused_reason(encode_sop2(SOP2_AND_B32, S28, S_SCC, S5) + encode_sopp(SOPP_ENDPGM))
       .startswith('src_scc with unverified SCC'))
@@ -290,16 +290,14 @@ check('reading src_scc after s_add_u32 sees the add\'s carry',
       carry_line in emitted and emitted.index(carry_line) < emitted.index('0x3f800000u * (scc ? 1u : 0u)'), emitted)
 
 # 6. Across a control-flow join: branch skips an SCC write to target 0x0c, so the two paths into the join carry
-#    different SCC writes and src_scc there is refused unless a modeled writer runs inside the joined block first.
-#    (A skipped block without an SCC write keeps SCC proven: startup_gfx2hlsl_src_scc_join_check.py.)
-join_refused = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)     # 0x00
+#    different SCC writes. Both are modeled, and the branch is uniform.
+join_different_writers = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)     # 0x00
                 + encode_sopp(SOPP_CBRANCH_SCC0, simm=1)          # 0x04 -> label_0x0c (skip 1 dword at 0x08)
                 + encode_sopc(SOPC_CMP_EQ_U32, S4, S5)            # 0x08
                 + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)    # 0x0c (branch target / join)
                 + encode_sopp(SOPP_ENDPGM))                       # 0x10
-check('src_scc across a control-flow join is refused',
-      refused_reason(join_refused).startswith('src_scc with unverified SCC'),
-      repr(refused_reason(join_refused)))
+check('src_scc across both verified incoming edges lowers to the SCC bit',
+      '(scc ? 1u : 0u)' in translate_program(join_different_writers)[1])
 
 join_rewritten = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)   # 0x00
                   + encode_sopp(SOPP_CBRANCH_SCC0, simm=1)        # 0x04 -> 0x0c
