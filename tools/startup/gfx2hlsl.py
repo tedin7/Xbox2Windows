@@ -8463,6 +8463,8 @@ class Stage:
         glc = False
         offen = 'offen' in mods
         extended = self.raw_uav_retry()
+        if extended and offen and 'idxen' in mods and not allow_index:
+            raise Unsupported('%s with idxen and offen' % kind_label)
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
                 offset += int(m[7:], 0)
