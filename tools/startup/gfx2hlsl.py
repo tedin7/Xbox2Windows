@@ -12676,33 +12676,91 @@ class Stage:
         if span and span[0] == 's' and span[2] == span[1] + 1 and span[2] < 106:
             return frozenset(span[1:])
 
+    @staticmethod
+    def interp_live_pairs(pairs, writes):
+        return frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
+
+    def interp_exec_entry_facts(self, successors, effects, indirect):
+        """At each reachable instruction, pairs equal to EXEC or a proven superset of it."""
+        empty = frozenset()
+        if not successors:
+            return {}
+        facts = {0: (empty, empty)}
+        work = [0]
+        while work:
+            i = work.pop()
+            if i in indirect:
+                return {}  # An unknown incoming edge can invalidate facts at any origin.
+            writes, save, restore, exec_write, bounds = effects[i]
+            equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in facts[i])
+            if restore is not None:
+                if restore not in equal:
+                    equal = superset = frozenset({restore})
+                # A proven no-op restore keeps the other aliases of unchanged EXEC.
+            elif exec_write:
+                if 'exec' in bounds:
+                    superset |= equal
+                    if save is not None:
+                        superset |= {save}
+                    equal = empty
+                else:
+                    equal = superset = empty
+            elif save is not None:
+                equal |= {save}
+                superset |= {save}
+
+            for j in successors[i]:
+                previous = facts.get(j)
+                merged = ((equal & previous[0], superset & previous[1])
+                          if previous is not None else (equal, superset))
+                if merged != previous:
+                    facts[j] = merged
+                    work.append(j)
+        return facts
+
+    @staticmethod
+    def interp_lane_local(name):
+        if name == 'exp' or name.startswith(('image_load', 'image_store', 'image_atomic')):
+            return True
+        if name.startswith(('image_sample', 'image_gather4')):
+            # Implicit LOD and bias can observe coordinates from other lanes in the quad.
+            return re.fullmatch(r'image_(?:sample|gather4)(?:_c)?_l(?:z)?(?:_o)?', name) is not None
+        if name.startswith(('buffer_', 'tbuffer_', 'global_')):
+            return name.split('_', 2)[1] in ('load', 'store', 'atomic')
+        return name.startswith('v_') and not (
+            name.endswith('_dpp') or name.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane',
+                                                      'v_movrel', 'v_permlane')))
+
     def interp_exec_step(self, identity, effects):
         """Advance EXEC identity and coverage for one omitted half."""
-        same, masked, current, at_same, covered = identity
+        same, superset, masked, current, at_same, at_superset, covered = identity
         # 'masked' pairs may name different subsets of the lanes covered by the write.
         # Only 'current' records equality with the entire current mask.
         writes, save, restore, exec_write, bounds = effects
         # Operands of saveexec describe the mask before it writes D, even when D aliases S.
         narrows_to_covered = any(covered if token == 'exec' else self.interp_scalar_pair(token) in masked
                                  for token in bounds)
-        same, masked, current = (frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
-                                 for pairs in (same, masked, current))
+        same, superset, masked, current = (self.interp_live_pairs(pairs, writes)
+                                           for pairs in (same, superset, masked, current))
         if save is not None:
             if at_same:
                 same |= {save}
+            if at_superset:
+                superset |= {save}
             if covered:
                 masked |= {save}
             current |= {save}
         if restore is not None:
-            at_same, covered = restore in same, restore in masked
+            at_same, at_superset, covered = restore in same, restore in superset, restore in masked
             if at_same:
                 current = same
             elif restore not in current:
                 current = frozenset({restore})
         elif exec_write:
-            at_same, current = False, frozenset()
+            at_same = at_superset = False
+            current = frozenset()
             covered = narrows_to_covered
-        return same, masked, current, at_same, covered
+        return same, superset, masked, current, at_same, at_superset, covered
 
     def interp_exec_effects(self, name, asm, ops, exec_write):
         writes = scalar_destinations(name, asm)
@@ -12768,8 +12826,7 @@ class Stage:
         barycentrics = {}
         base = getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0)
         pending, omitted, exec_effects = {}, [], []
-        empty_identity = (frozenset(), frozenset(), frozenset(), False, False)
-        prefix_identity = empty_identity
+        empty = frozenset()
         for i, (_, _, _, asm) in enumerate(self.ins):
             name, ops, mods = parse(asm)
             name = re.sub(r'_e(32|64)$', '', name)
@@ -12795,11 +12852,7 @@ class Stage:
             exec_write = writes_exec(name, ops)
             effects = self.interp_exec_effects(name, asm, ops, exec_write)
             exec_effects.append(effects)
-            # RDNA 2 ISA PDF p.107: EXEC applies to all exports.
-            lane_local = name == 'exp' or (name.startswith('v_') and not (
-                name.endswith('_dpp') or name.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane',
-                                                          'v_movrel', 'v_permlane'))))
-            rows.append((name, read, written, self.interp_write_halves(name, mods), lane_local))
+            rows.append((name, read, written, self.interp_write_halves(name, mods), self.interp_lane_local(name)))
             if interp:
                 self.interp_f16_pair(name, ops)
             if base is not None and name in ('v_interp_p1_f32', 'v_interp_p2_f32',
@@ -12809,8 +12862,6 @@ class Stage:
             if name == 's_endpgm':
                 pending.clear()
             boundary = i in targets or name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_swappc'))
-            if i in targets:
-                prefix_identity = empty_identity
             if boundary and pending:
                 raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
                                   'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
@@ -12834,18 +12885,16 @@ class Stage:
                 halves = 3
                 if partial == int(ops[0][1:]):
                     halves = 1 if INTERP_DST_HIGH in mods else 2
-                omitted.append((i, partial, halves, prefix_identity[2]))
-            prefix_identity = (empty_identity if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_endpgm'))
-                               else self.interp_exec_step(prefix_identity, effects))
+                omitted.append((i, partial, halves))
 
         predecessors = [[] for _ in rows]
         for i, edges in enumerate(successors):
             for j in edges:
                 predecessors[j].append(i)
-        indirect = [i for i, (name, *_) in enumerate(rows)
-                    if name.startswith(('s_setpc', 's_swappc')) and not successors[i]]
+        indirect = {i for i, (name, *_) in enumerate(rows)
+                    if name.startswith(('s_setpc', 's_swappc')) and not successors[i]}
         for reg, readers in barycentrics.items():
-            work = [p for i in readers for p in predecessors[i]] + indirect
+            work = [p for i in readers for p in predecessors[i]] + list(indirect)
             seen = set()
             while work:
                 i = work.pop()
@@ -12858,10 +12907,15 @@ class Stage:
                                       'where interpolation reads them' % (name, reg))
                 work.extend(predecessors[i])
 
-        # Each half has its own coverage. A write under the p1ll mask kills it; another
-        # write covers just the lanes in that write's EXEC. Aliases can restore either mask.
-        work = [(j, reg, half, halves != 3, (pairs, frozenset(), pairs, True, False))
-                for i, reg, halves, pairs in omitted for half in (1, 2) if halves & half for j in successors[i]]
+        entry_facts = self.interp_exec_entry_facts(successors, exec_effects, indirect)
+        work = []
+        for i, reg, halves in omitted:
+            # EXEC cannot change between p1ll and p2. Using facts at p2 also drops pairs
+            # clobbered since p1ll and includes any intervening copies of that same EXEC.
+            equal, superset = entry_facts.get(i, (empty, empty))
+            identity = equal, superset | equal, empty, equal, True, True, False
+            work.extend((j, reg, half, halves != 3, identity)
+                        for half in (1, 2) if halves & half for j in successors[i])
         seen = set()
         while work:
             state = work.pop()
@@ -12872,18 +12926,18 @@ class Stage:
                 raise Unsupported('v_interp_p1ll_f16 liveness state budget exceeded')
             i, reg, half, alias, identity = state
             name, read, written, written_halves, lane_local = rows[i]
-            if read.get(reg, 0) & half and not (identity[4] and lane_local):
+            if read.get(reg, 0) & half and not (identity[-1] and lane_local):
                 if alias:
                     raise Unsupported('%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' %
                                       (name, reg))
                 raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
                                   'a v_interp_p2_f16 that wrote another register' % (reg, name))
             identity = self.interp_exec_step(identity, exec_effects[i])
-            same, masked, current, at_same, _ = identity
+            same, superset, masked, current, _, at_superset, _ = identity
             if reg in written and written_halves & half:
-                if at_same:
+                if at_superset:
                     continue
-                identity = same, masked | current, current, False, True
+                identity = same, superset, masked | current, current, False, False, True
             if name.startswith(('s_setpc', 's_swappc')):
                 raise Unsupported('unmodelled v_interp_p2_f16 result across an indirect jump')
             for j in successors[i]:

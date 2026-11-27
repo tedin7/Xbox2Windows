@@ -377,6 +377,7 @@ def controls():
     flow_controls()
     extended_flow_controls()
     monotone_exec_controls()
+    cfg_exec_and_memory_controls()
     assert len(set(flow_reference(8, 4)[::4])) == 8
     loop_controls(expected)
     plain_controls(expected)
@@ -666,6 +667,91 @@ def monotone_exec_controls():
     ps = translate(code).hlsl_ps()
     assert ps.count('v30 = v12;') == 2
     print('EXEC narrowing, older covered masks, and widening controls passed')
+
+
+def cfg_exec_and_memory_controls():
+    pair = ('v_interp_p1ll_f16 v12, v0, attr0.x', 'v_interp_p2_f16 v20, v1, attr0.x, v12')
+    overwrite = 'v_mov_b32 v12, v20'
+    read = 'v_mov_b32 v30, v12'
+
+    def refuses(label, *instructions):
+        try:
+            scan_decoded(*instructions)
+        except G.Unsupported as error:
+            assert 'reads it after' in str(error), (label, error)
+        else:
+            raise AssertionError(label)
+
+    def arm(join_clobber='s_nop 0', arm_clobber='s_nop 0', replacement=overwrite):
+        # s24 preserves the entry EXEC on both paths. The condition and direct jump
+        # split the narrowed arm before p1ll. s20 may be clobbered on just one path.
+        return ('s_mov_b64 s[24:25], exec', 's_and_saveexec_b64 s[20:21], vcc',
+                's_cbranch_scc0 label_0010', join_clobber, 's_branch label_0018', 's_nop 0',
+                *pair, arm_clobber, 's_mov_b64 exec, s[20:21]', replacement,
+                's_mov_b64 exec, s[24:25]', read)
+
+    scan_decoded(*arm())
+    refuses('saved EXEC overwritten in the arm', *arm(arm_clobber='s_load_dwordx2 s[20:21], s[8:9], 0'))
+    refuses('saved EXEC overwritten on one incoming path', *arm(join_clobber='s_mov_b32 s21, 0'))
+    refuses('saved EXEC overwritten by scalar buffer load',
+            *arm(join_clobber='s_buffer_load_dwordx2 s[20:21], s[32:35], 0'))
+    refuses('restored superset does not define the omitted value before a write', *arm(replacement=read))
+
+    # A restore of an already equal mask preserves other equal copies, as in
+    # the original straight-line proof.
+    scan_decoded('s_mov_b64 s[20:21], exec', 's_mov_b64 s[22:23], exec', 's_mov_b64 exec, s[20:21]',
+                 *pair, 's_and_saveexec_b64 s[24:25], vcc', 's_mov_b64 exec, s[22:23]', overwrite,
+                 's_mov_b64 exec, s[20:21]', read)
+
+    # The full shader path also decodes and lowers an if-arm with two branch
+    # instructions between saveexec and p1ll.
+    p1, p2 = interp_words(12, 20, 0)
+    save_entry = words(0xbe98047e)
+    cmp = words(0x7c020000 | 2 << 9 | 242)  # v_cmp_lt_f32 vcc_lo, 1.0, v2
+    nop = words(0xbf800000)
+    write12 = words(0x7e000314 | 12 << 17)
+    guarded = (M0 + mov(2, 0x40000000) + cmp + save_entry + save_exec(20, 106)
+               + branch(4, nop) + nop + branch(2, nop) + nop + p1 + p2
+               + restore_exec(20) + write12 + restore_exec(24) + export_words(12, 12, 12, 12) + END)
+    assert 'v12 = v20;' in translate(guarded).hlsl_ps()
+
+    # Equality must disappear at saveexec, even though the previously equal
+    # pair and the pair just saved both bound the narrowed EXEC.
+    stage = G.Stage.__new__(G.Stage)
+    instructions = ('s_mov_b64 s[24:25], exec', 's_and_saveexec_b64 s[20:21], vcc')
+    effects = []
+    for asm in instructions:
+        name, ops, _ = G.parse(asm)
+        effects.append(stage.interp_exec_effects(name, asm, ops, G.writes_exec(name, ops)))
+    effects.append((set(), None, None, False, ()))
+    facts = stage.interp_exec_entry_facts([[1], [2], []], effects, set())
+    assert facts[2] == (frozenset(), {frozenset({20, 21}), frozenset({24, 25})}), 'saveexec must clear EQ'
+
+    masked = ('s_mov_b64 s[24:25], exec', *pair, 's_and_saveexec_b64 s[20:21], vcc', overwrite)
+    load = 'image_load v30, [v12, v13], s[32:39]'
+    store = 'buffer_store_dword v12, v13, s[32:35], 0 offen'
+    scan_decoded(*masked, load, store)
+    for masked_read in (
+            'image_store v12, v[16:17], s[32:39]',
+            'image_atomic_add v12, v[16:17], s[32:39]',
+            'tbuffer_load_format_x v30, v12, s[32:35], 0 offen',
+            'global_atomic_add v30, v[12:13], v14, off',
+            'image_sample_lz v30, v[12:13], s[32:39], s[40:43]',
+            'image_sample_l v30, v[12:14], s[32:39], s[40:43]',
+            'image_gather4_c_lz_o v[30:33], v[12:16], s[32:39], s[40:43]',
+    ):
+        scan_decoded(*masked, masked_read)
+    for quad_read in (
+            'image_sample v30, v[12:13], s[32:39], s[40:43]',
+            'image_sample_b v30, v[12:14], s[32:39], s[40:43]',
+            'image_gather4 v[30:33], v[12:13], s[32:39], s[40:43]',
+            'ds_swizzle_b32 v30, v12',
+            'ds_permute_b32 v30, v12, v13',
+            'ds_bpermute_b32 v30, v12, v13',
+    ):
+        refuses('cross-lane read must still fail: ' + quad_read, *masked, quad_read)
+    refuses('restored active lanes may read a stale address', *masked, 's_mov_b64 exec, s[24:25]', load)
+    print('EXEC CFG facts and masked memory controls passed')
 
 
 def extended_flow_controls():

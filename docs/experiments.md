@@ -15585,6 +15585,11 @@ Half writes replace only their destination half. Saved EXEC pairs can restore th
 under which a write is valid. A later write keeps older covered masks. An EXEC update
 bounded by a covered mask preserves coverage for lane-local reads. The Python controls
 exercise consecutive AND and AND-NOT narrowing and reject widening OR.
+A forward must-dataflow pass intersects saved EXEC facts at joins. Restoring
+a saved superset of the p1ll mask lets a write replace all omitted lanes.
+Ordinary vector memory accesses and explicit-LOD samples can read within
+covered EXEC. Implicit-LOD, bias and cross-lane LDS accesses require the
+omitted source to be replaced.
 Compressed exports to R-only render targets need only the first register's low half and
 still require the second register for blending. A write to an entry barycentric register
 is allowed when no reachable interpolation uses the old entry value.
