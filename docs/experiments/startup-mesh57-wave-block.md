@@ -303,3 +303,61 @@ count already holds the old value. The bound-rewrite control now feeds the
 replacement value into the count and retains the refusal. The rewritten
 clamp changed 72 CPU pixels in the scalar arm and 38 in the formatted-load
 arm. The widened export changed 80 CPU pixels.
+
+## Wave-coherent blocks
+
+The fallback runs after the earlier mesh proofs decline. It requires a
+full EXEC reset, a thread-index prefix compare and an outer EXEC-zero skip
+to the closing full reset. Every edge inside the block is forward and
+stays inside or reaches the closing reset. Each EXEC-zero, EXEC-nonzero,
+VCC-zero and VCC-nonzero branch tests all 64 lanes of the guest wave.
+The VCC vote includes lanes with clear EXEC. SCC branches keep their
+branches when the emitter proves a wave-uniform scalar comparison. All
+group threads reach each vote call in the generated dispatch, and only
+threads at the matching guest program counter contribute.
+
+Scalar instructions run together for each guest wave, including when
+EXEC is empty. Scalar loads require a wave-uniform resource and offset.
+The first-lane read uses the existing collective. Vector instructions
+retain their lane predicates. Saved EXEC copies, AND-saveexec,
+intersections, compares, complements, OR restores and moves preserve
+the exact bit for each lane. Pure masks can remain live across the closing
+reset. The export proof follows these EXEC transfers to check definitions
+in both arms before the export.
+
+Backward edges, including constant-trip loops, external entries, edges
+that bypass the closing reset, other EXEC writes and half accesses stay
+refused. So do VCC votes with numeric mask uses, reads of SCC from mask
+operations, unproven scalar inputs and operations with external effects
+such as stores, atomics, barriers, messages or LDS accesses.
+[RDNA 2 Instruction Set Architecture, pp. 20 and 125 (§12.5)](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+[Partial Control-Flow Linearization, §3, pp. 543–556](https://doi.org/10.1145/3192366.3192413)
+[Convergence And Uniformity, Uniformity of Values and Instructions](https://llvm.org/docs/ConvergenceAndUniformity.html)
+
+The offline check covers S5 CMPX with a voted else skip, S6 narrowing
+chains with shared restores, S7 nested restores with EXEC and VCC votes,
+and S8 nested if/else under an SCC switch. It also checks mask liveness,
+guarded position definitions, numeric scalar pairs and the named refusals.
+The existing `lanemask` draw runs S5 and S6 with mixed, empty and full then arms.
+After EXEC is restored, every exported lane observes the wave's scalar
+load result. The CPU reference executes scalar work at wave scope and
+predicates vector writes per lane.
+
+```text
+python3 -B tests/startup_mesh57_skeleton_check.py
+ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton(_lanemask_warp)?$'
+```
+
+The draw runs m1 by replacing the first inner EXEC vote with a lane
+test. It runs m2 on S5 by replacing the saved-mask complement with the
+current EXEC. Both mutants must change the HLSL and the expected
+pixels. The renderer checks each mutant against both CPU references.
+The offline m3 control hides the numeric use of VCC from the purity
+proof and verifies that this changes the VCC vote's classification.
+
+On Linux x64 with Python 3.14.8, the no-argument check passed. The CPU
+reference predicted 66 different pixels for m1 in each S5 and S6 draw
+and 259 for m2 in each S5 draw. A before/after run against `ce9f90b7b`
+matched 1,709 HLSL and manifest outputs from the mesh57 and gfx2hlsl
+fixture scripts. A separate byte comparison matched all 215 published
+mesh fixture files. Windows WARP readback is pending.

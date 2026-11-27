@@ -261,6 +261,126 @@ MASK_CASES = (
                                       'd4c6002e 00010100')),
     ('S4 closure', lane_mask_mesh(otherwise=MASK_ELSE + ' 88fe2e7e')),
 )
+
+COHERENT_THEN = 'f4200a08 520001e0 bf8cc07f 7e0e0228'  # s40 = buffer[480 + 4*wave], v7 = s40
+COHERENT_ELSE = 'f4200f08 520001e8 bf8cc07f 7e0e023c'  # s60 = buffer[488 + 4*wave], v7 = s60
+
+
+def coherent_words(parts):
+    """Resolve SOPP displacements in the synthetic wave64 words."""
+    words, labels, fixups = [], {}, {}
+    for part in parts:
+        if isinstance(part, tuple):
+            fixups[len(words)] = part
+            words.append(None)
+        elif part.endswith(':'):
+            labels[part[:-1]] = len(words)
+        else:
+            words.extend(part.split())
+    for at, (opcode, label) in fixups.items():
+        words[at] = branch(opcode, at, labels[label])
+    return ' '.join(words)
+
+
+def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=False, live_mask=False,
+                  numeric_pair=False):
+    # Wave 0 has six then lanes. Wave 1 has zero or 64. The enclosing prefix covers both waves.
+    threshold = 'bf068006 ' + ('8532ff86 00000080' if full else '8532c086')  # s50 = SCC ? 6 : 128/64
+    before = ['beb4047e bf8cc07f', 'head:', '7da80032']  # save EXEC, wait, CMPX s50 > v0
+    then = [COHERENT_THEN]
+    at_else = ['8afe7e34', (0xbf88, 'join')]  # exec = s[52:53] & ~exec; skip empty else
+    otherwise = [COHERENT_ELSE]
+    join = ['80288028', 'f4200bc8 520001e0 bf8cc07f', 'befe0434']
+    if control == 'backward':
+        then.append((0xbf82, 'head'))
+    elif control == 'constant-trip':
+        # s58 = 3, then add 2 while the counter is below 9.
+        then.extend(('beba0383', 'loop:', '803a823a bf0a893a', (0xbf85, 'loop')))
+    elif control == 'EXEC xor':
+        then.insert(0, '89fe347e')
+    elif control == 'EXEC half':
+        then.insert(0, 'befe0380')
+    elif control == 'mask SCC':
+        before.extend(('7d880032 beb6246a', (0xbf84, 'join')))  # SCC from AND-saveexec
+    elif control == 'varying address':
+        before.append('bebe047e')  # save the narrowed EXEC in s[62:63]
+        then[0] = COHERENT_THEN.replace('520001e0', '7c0001e0')  # use its low word as a numeric offset
+    elif control == 'varying SCC':
+        then[:0] = ['7d880032 bf06806a', (0xbf84, 'join')]  # numeric compare reads VCC_LO
+    if positions:
+        before.insert(1, '87fe7e34 87fe347e')  # both operand orders of EXEC &= saved EXEC
+        then.append(GUARDED_POSITION_LOAD)
+        if control != 'missing position':
+            otherwise.append(GUARDED_POSITION_LOAD)
+
+    if shape == 'S6':
+        # Narrow three times to one shared restore, then run a second chain on the opposite lanes.
+        body = ['8533ff88 00000080 beb4047e 7d880033 beae046a 87fe7e2e', (0xbf88, 'restore'),
+                '7d880032 beb6246a', (0xbf88, 'restore'), 'beb8246a', (0xbf88, 'restore'),
+                *then, 'restore:', 'befe0434 7d860032 beb6246a', (0xbf88, 'done'),
+                'beb8246a', (0xbf88, 'done'), COHERENT_ELSE, 'done:', 'befe0434']
+    elif shape == 'S7':
+        # Keep VCC from before the last narrowing so its vote must also count inactive lanes.
+        numeric = '7e78026a' if control == 'numeric VCC' else ''
+        body = ['beb4047e 7d880032 beb6246a', (0xbf88, 'outer restore'),
+                'beb8246a', (0xbf89 if nonzero else 0xbf88, 'inner compare'), '7e0e02f2', 'inner compare:',
+                '7da80080', (0xbf88, 'inner restore'), '7e0e02f2',
+                'inner restore:', 'befe0438 87ea7e38',  # VCC = saved s[56:57] & EXEC
+                '7da80080', numeric, (0xbf86, 'outer restore'), (0xbf87 if nonzero else 0xbf86, 'load'),
+                '7e0e02f2', 'load:', COHERENT_THEN,
+                'outer restore:', 'befe0436', 'befe0434']
+    else:
+        if shape == 'S8':
+            before = ['7d880032 beb4246a']
+            # The uniform switch can enter either inner if/else. Their saves have separate lifetimes.
+            then = ['bf068006', (0xbf84, 'other case'),
+                    'beb6047e 7da80083', (0xbf88, 'then complement'), COHERENT_THEN,
+                    'then complement:', '8afe7e36', (0xbf88, 'then restore'), COHERENT_ELSE,
+                    'then restore:', 'befe0436', (0xbf82, 'switch join'),
+                    'other case:', 'beb8047e 7da80084', (0xbf88, 'case complement'), COHERENT_THEN,
+                    'case complement:', '8afe7e38', (0xbf88, 'case restore'), COHERENT_ELSE,
+                    'case restore:', 'befe0438', 'switch join:']
+            otherwise = ['beba047e 7da8008c', (0xbf88, 'else complement'), COHERENT_THEN,
+                         'else complement:', '8afe7e3a', (0xbf88, 'else restore'), COHERENT_ELSE,
+                         'else restore:', 'befe043a']
+        body = [*before, (0xbf88, 'else'), *then, 'else:', *at_else, *otherwise, 'join:', *join]
+    prefix = MASK_PREFIX
+    if positions:
+        prefix = prefix.replace('beaa03ff 00000080', 'be8e0309').replace(' beaa0380', '')
+        prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da8000e')
+    exports = '7e280228 7e2a0307'
+    if live_mask:
+        prefix += ' bebe0480'  # s[62:63] = 0 on the outer skip
+        body.insert(-1, 'bebe047e')  # save the else EXEC, including zero when the else was skipped
+        exports = '7e280228 d5010015 00fa0e80'  # v_cndmask_b32_e64 v21, 0, v7, s[62:63]
+    setup = []
+    if numeric_pair:
+        # A 64-bit zero written as scalar data can feed a wave-uniform SCC branch.
+        setup = ['bebe0480 bf06803e', (0xbf84, 'threshold'), 'bf800000', 'threshold:']
+    mesh = wave_load_mesh(prefix, coherent_words([*setup, threshold, *body]), exports=exports)
+    if positions:
+        mesh.pop(mesh.index('be8e0309', mesh.index('be8d0308')))  # count is already set by the prefix
+        mesh = mutate('13121110', '35343332', mesh=mesh)
+    if control == 'outside entry':
+        at = mesh.index('befe04c1', mesh.index('beaa03ff'))  # full reset immediately before the prefix
+        target = mesh.index('beb4047e', at)
+        mesh.insert(at, branch(0xbf84, at, target + 1))
+    return mesh
+
+
+COHERENT_DRAWS = ('S5', 'S6')
+COHERENT_CONTROLS = (
+    ('S5', 'backward', 'a backward branch inside the block'),
+    ('S5', 'constant-trip', 'a backward branch inside the block'),
+    ('S5', 'outside entry', 'a branch from outside lands inside the block'),
+    ('S5', 'EXEC xor', 'an unsupported EXEC write or half access (s_xor_b64)'),
+    ('S5', 'EXEC half', 'an unsupported EXEC write or half access (s_mov_b32)'),
+    ('S7', 'numeric VCC', 'VCC vote does not read a pure lane mask'),
+    ('S5', 'mask SCC', 'SCC of a mask operation is read'),
+    ('S5', 'varying address', 'a scalar load address is not wave-uniform'),
+    ('S5', 'varying SCC', 'SCC is not proven wave-uniform'),
+)
+
 MASK_MEMORY = (
     ('tbuffer', wave_load_mesh(body='f4200a08 520001e0 e8b001e8 80040700 bf8c007f')),
     ('image', wave_load_mesh(body='f4200a08 520001e0 f40c0e05 fa000020 bf8cc07f '
@@ -285,13 +405,14 @@ MASK_CONTROLS = (
      'a saved EXEC mask is live after the if/else'),
     ('c5 mask SCC', lane_mask_mesh(setup='87ae2e7e 85b4c180'),
      'SCC of a mask operation is read'),
-    ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT),
-     'the voted branch is reached through unproven EXEC control flow'),
-    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'),
-     'the else arm has scalar work without a voted EXEC branch'),
     ('undefined VALU on restored lanes',
      lane_mask_mesh(left='beb4047e 7da80084 7e6402f2 befe0434 7e0e0332 ' + MASK_LEFT),
      'a vector input is undefined on the active lanes'),
+)
+
+COHERENT_LEGACY_CASES = (
+    ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT), 2),
+    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'), 1),
 )
 
 
@@ -1158,6 +1279,62 @@ def lane_mask_controls(tmp):
     expect('m3 ignoring the whole-word read fails c1', compare_web(MASK_CASES[0][1]), True)
 
 
+def coherent_controls(tmp):
+    for label, shape, options, votes in (
+            ('S5', 'S5', {}, (2, 0)), ('S5 full', 'S5', {'full': True}, (2, 0)),
+            ('S6', 'S6', {}, (5, 0)), ('S6 full', 'S6', {'full': True}, (5, 0)),
+            ('S7', 'S7', {}, (5, 0)), ('S7 nonzero votes', 'S7', {'nonzero': True}, (3, 2)),
+            ('S8', 'S8', {}, (8, 0)), ('S5 position exports', 'S5', {'positions': True}, (2, 0)),
+            ('S5 live mask', 'S5', {'live_mask': True}, (2, 0)),
+            ('S5 numeric scalar pair', 'S5', {'numeric_pair': True}, (2, 0))):
+        key, result = request(tmp, coherent_mesh(shape, **options))
+        expect(label, result, 'ok')
+        if result != 'ok':
+            continue
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        expect(label + ' votes', (source.count('mesh_vote == 0u'), source.count('mesh_vote != 0u')), votes)
+        if label.startswith('S7'):
+            expect(label + ' counts VCC even under zero EXEC',
+                   bool(re.search(r'mesh_first_active\(tid, pc == \d+ && \(vcc & 1u\) != 0u', source)), True)
+        if shape in COHERENT_DRAWS and options.keys() <= {'full'}:
+            full = options.get('full', False)
+            _, guest = coherent_reference(shape, full)
+            for mutant, changed in lane_mask_mutants(shape, source):
+                _, wrong = coherent_reference(shape, full, mutant)
+                expect(label + ' ' + mutant + ' changes source and pixels', (changed != source, wrong != guest),
+                       (True, True))
+    for label, mesh, votes in COHERENT_LEGACY_CASES:
+        key, result = request(tmp, mesh)
+        expect(label, result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect(label + ' votes', source.count('mesh_vote == 0u'), votes)
+    for shape, control, reason in COHERENT_CONTROLS:
+        mesh = coherent_mesh(shape, control=control)
+        if control == 'constant-trip':
+            ins = G.decode(code(mesh))
+            offsets = {item[0]: i for i, item in enumerate(ins)}
+            scc_edges = ((i, offsets[int(G.parse(item[3])[1][0].split('_')[1], 16)])
+                         for i, item in enumerate(ins) if item[2] == 's_cbranch_scc1')
+            latch, header = next((i, j) for i, j in scc_edges if j < i)
+            expect('the control has a proven three-trip loop', G.mesh_constant_trip(ins, header, latch, offsets), (3,))
+        expect(control, request(tmp, mesh)[1],
+               f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
+    expect('one missing position arm',
+           request(tmp, coherent_mesh('S5', positions=True, control='missing position'))[1], GUARDED_REFUSAL)
+
+    # m3 removes the numeric use from the proof's view of the program. The same
+    # VCC purity assertion used by the block must change from refusal to acceptance.
+    ins = G.decode(code(coherent_mesh('S7', control='numeric VCC')))
+    vote = next(i for i, item in enumerate(ins) if item[2] == 's_cbranch_vccz')
+    numeric_read = next(i for i, item in enumerate(ins) if item[3] == 'v_mov_b32_e32 v60, vcc_lo')
+    mutant = ins.copy()
+    mutant[numeric_read] = (*ins[numeric_read][:2], 's_nop', 's_nop 0')
+    expect('m3 control sees impure VCC', 'vcc' in G.lane_mask_webs(ins).get(vote, ()), False)
+    expect('m3 accepting the numeric VCC fails the purity control',
+           'vcc' in G.lane_mask_webs(mutant).get(vote, ()), True)
+
+
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
@@ -1194,6 +1371,7 @@ def controls():
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
     with tempfile.TemporaryDirectory() as tmp:
         lane_mask_controls(tmp)
+        coherent_controls(tmp)
         key, result = request(tmp, WAVE_LOAD_MESH)
         expect('pre-exchange wave load translates', result, 'ok')
         if result == 'ok':
@@ -1233,7 +1411,8 @@ def controls():
         expect('scalar defined on both paths to an inner join translates',
                request(tmp, scalar_position_mesh(1, 'defined inner result'))[1], 'ok')
         for control, expected in (
-            ('backward', 'a loop outside the group-memory exchanges is not covered'),
+            ('backward', 's_cbranch_execz skips code with effects outside active lanes '
+                         '(wave-load block: a backward branch inside the block)'),
             ('outside', 's_cbranch_execz skips code with effects outside active lanes'),
             ('exchange', 'a branch enters or crosses a group-memory exchange'),
             ('enters block', 's_cbranch_execz skips code with effects outside active lanes'),
@@ -1381,6 +1560,10 @@ v_mov_b32 v7, 0.25
     expect('S1 assembled words', wave_load_mesh(' '.join(assemble(mc, prefix)),
            ' '.join(assemble(mc, 's_cmp_eq_u32' + body))), MASK_CASES[0][1])
     for label, asm, expected in (
+            ('S5 CMPX and complement', 's_mov_b64 s[52:53], exec\nv_cmpx_gt_u32_e32 s50, v0\n'
+             's_andn2_b64 exec, s[52:53], exec', 'beb4047e 7da80032 8afe7e34'),
+            ('S6 narrowing and restore', 's_and_b64 exec, s[46:47], exec\ns_and_saveexec_b64 s[54:55], vcc\n'
+             's_and_saveexec_b64 s[56:57], vcc\ns_mov_b64 exec, s[52:53]', '87fe7e2e beb6246a beb8246a befe0434'),
             ('tbuffer', 'tbuffer_load_format_x v7, off, s[16:19], 0 format:[BUF_FMT_32_FLOAT] offset:488',
              'e8b001e8 80040700'),
             ('image', 'image_load v7, v[50:51], s[56:63] dmask:0x1 dim:SQ_RSRC_IMG_2D',
@@ -1482,6 +1665,8 @@ def rasterise(points, colours, indices, verts, prims):
 
 def lane_mask_reference(label, full, mutant=None):
     """Simulate scalar state per guest wave and VALU under that lane's EXEC."""
+    if label in COHERENT_DRAWS:
+        return coherent_reference(label, full, mutant)
     points, colours, indices = geometry()
     triangles = [tuple(slot + first for slot in tri) for tri, first in zip(indices, (32, 0, 64, 64))]
     data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
@@ -1545,8 +1730,54 @@ def lane_mask_reference(label, full, mutant=None):
     return data, rasterise(points, colours, triangles, 128, len(triangles))
 
 
+def coherent_reference(shape, full, mutant=None):
+    """Interpret the voted arms for two guest wave64s and rasterize their outputs."""
+    points, colours, indices = geometry()
+    triangles = [tuple(slot + base for slot in tri) for tri, base in zip(indices, (32, 0, 64, 64))]
+    data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
+    then_red, else_green = (255, 192), (64, 96)
+    for wave in (0, 1):
+        struct.pack_into('<f', data, 480 + 4 * wave, then_red[wave] / 255)
+        struct.pack_into('<f', data, 488 + 4 * wave, else_green[wave] / 255)
+        saved = [True] * 64
+        threshold = 6 if wave == 0 else 128 if full else 64
+        cut = (8 if wave == 0 else 128) if shape == 'S6' else threshold
+        active = [e and 64 * wave + lane < cut for lane, e in enumerate(saved)]
+        first_vote = active
+        if shape == 'S6':
+            # The second compare can empty the wave even when the first vote passed.
+            vcc = [e and 64 * wave + lane < threshold for lane, e in enumerate(active)]
+            for _ in range(2):
+                if not any(active):
+                    break
+                active = [e and bit for e, bit in zip(active, vcc)]
+        then_runs = any(active)
+        red = then_red[wave] if then_runs else 64
+        green = [then_red[wave] if e else 0 for e in active]
+        if mutant == 'wrong complement':
+            other = active
+        else:
+            other = [s and not e for s, e in zip(saved, active)]
+        if any(other):
+            green = [else_green[wave] if e else old for e, old in zip(other, green)]
+        # Restoring EXEC makes the wave scalar observable on every exported lane.
+        for tid in {i for tri in triangles for i in tri if i // 64 == wave}:
+            lane, slot = tid & 63, tid & 15
+            result = 64 if mutant == 'per-lane EXEC branch' and not first_vote[lane] else red
+            colours[slot] = (result, green[lane], *colours[slot][2:])
+    return data, rasterise(points, colours, triangles, 128, len(triangles))
+
+
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label in COHERENT_DRAWS:
+        expect(label + ' inner EXEC vote is present', 'mesh_vote == 0u' in source, True)
+        mutants = [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
+        if label == 'S5':
+            complement = 'exec = (s52 & ~exec) & 1;'
+            expect(label + ' complement is unique', source.count(complement), 1)
+            mutants.append(('wrong complement', source.replace(complement, 'exec = exec & 1;')))
+        return mutants
     if label.endswith('mask regions'):
         expect(label + ' has two votes', source.count('mesh_vote == 0u'), 2)
         return [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
@@ -1595,6 +1826,12 @@ def draw_lane_masks(dxc, renderer, adapter):
         for full, program in programs:
             with tempfile.TemporaryDirectory() as tmp:
                 status = draw_lane_mask_case(tmp, dxc, renderer, adapter, label, program, full)
+                if status:
+                    return status
+    for shape in COHERENT_DRAWS:
+        for full in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                status = draw_lane_mask_case(tmp, dxc, renderer, adapter, shape, coherent_mesh(shape, full=full), full)
                 if status:
                     return status
     with tempfile.TemporaryDirectory() as tmp:
