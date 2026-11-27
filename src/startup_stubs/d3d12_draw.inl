@@ -1405,10 +1405,10 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
-// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+// Only the depth view actually bound to this pass determines the draw format.
 inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
 {
-    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    return x2w_startup::draw_dsv_format(pass.bound_depth != nullptr, pass.dsv_format, bound.dsv_format);
 }
 
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
@@ -1417,8 +1417,8 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
-    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    // No depth or stencil state is meaningful without a bound depth view.
+    const bool use_depth_stencil = x2w_startup::draw_depth_state_enabled(bound.has_depth_stencil, dsv_format);
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
