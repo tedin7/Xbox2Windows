@@ -125,6 +125,30 @@ def check_stub_cascade():
     assert 's20 holds a stubbed instruction result' in errors['s_mov_b32'], errors
 
 
+def check_carry_masks_use_partial_exec():
+    carry = [
+        'beea04c1',              # s_mov_b64 vcc, -1
+        'be9e04c1',              # s_mov_b64 s[30:31], -1
+        '50040081',              # v_add_co_ci_u32_e32 v2, vcc_lo, 1, v0, vcc_lo
+        'd7101e03', '00020080',  # v_sub_co_u32 v3, s30, 0, v0
+    ]
+    calls = []
+    carry_out, carry_in_out = G.Stage.carry_out_op, G.Stage.carry_in_out_op
+
+    def track(op):
+        def lower(stage, operands, modifiers, kind):
+            calls.append((operands[1], stage.exec_known))
+            return op(stage, operands, modifiers, kind)
+        return lower
+
+    with patch.object(G.Stage, 'carry_out_op', track(carry_out)), \
+            patch.object(G.Stage, 'carry_in_out_op', track(carry_in_out)):
+        status, _ = run(SERIAL_MESH[:8] + carry + SERIAL_MESH[9:], 'force')
+    assert status == 'ok', status
+    # The shared emitters use EXEC to clear inactive bits only in this mode.
+    assert calls and set(calls) == {('vcc_lo', False), ('s30', False)}, calls
+
+
 def main():
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
@@ -165,6 +189,7 @@ def main():
     check_vcc_descriptor_alias()
     check_mesh_heap_image_record()
     check_stub_cascade()
+    check_carry_masks_use_partial_exec()
     print('ok')
 
 

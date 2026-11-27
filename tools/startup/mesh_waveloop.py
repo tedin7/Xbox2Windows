@@ -451,7 +451,8 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 if token.startswith('s'):
                     value = super().S(int(token[1:]))
                     return 'serial_value_' + value if value == token else value
-                return self.word(token)
+                value = self.word(token)
+                return 'serial_value_' + value if value in VCC_REGISTERS.values() else value
             return super().u(tok, low16_only=low16_only)
 
         def S(self, n):
@@ -737,9 +738,11 @@ def lane_instruction(pipe, G, name, asm, lines):
     for line in lines:
         if name == 'exp' and not native:
             line = pipe.mesh_param_line(pipe.mesh_output_line(line))
-            line = line.replace('o.', 'vbuf[%s].' % LANE).replace('mesh_vertex = true;', '')
+            line = re.sub(r'\bo\.', 'vbuf[%s].' % LANE, line).replace('mesh_vertex = true;', '')
         text.append(line if native else stage.lane_words(line, masks).replace('serial_value_', ''))
-    # The shared VALU emitters predicate VGPR writes and calculate all destination mask bits.
+    # SerialMeshStage clears exec_known before VALU lowering. The shared carry
+    # emitters then assign exec & carry, including on inactive lanes. Assume the
+    # carry destination mask is replaced in full, as for VOPC.
     # Native vector work and memory accesses need an outer guard before their side effects.
     guard = native or name.startswith(('buffer_', 'tbuffer_', 'image_'))
     if guard:
