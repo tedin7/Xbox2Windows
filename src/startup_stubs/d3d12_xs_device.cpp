@@ -7916,6 +7916,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     if (render_mode() && frame % 300 == 0) {
+        log("x2w-render RTV variant totals: requested %ld, ready %ld, draws with base %ld",
+            InterlockedCompareExchange(&rtv_variants_requested, 0, 0),
+            InterlockedCompareExchange(&rtv_variants_ready, 0, 0),
+            InterlockedCompareExchange(&rtv_base_draws, 0, 0));
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
         static long last[9];

@@ -606,7 +606,18 @@ def native_instructions(code):
     return out
 
 
+@functools.lru_cache(maxsize=8)
+def cached_decode(code):
+    return decode_instructions(code)
+
+
 def decode(code, refusals=None):
+    if refusals is None:
+        return list(cached_decode(code))
+    return decode_instructions(code, refusals)
+
+
+def decode_instructions(code, refusals=None):
     out, off = [], 0
     while off + 4 <= len(code):
         try:
@@ -13798,6 +13809,8 @@ def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=froze
     weights = weights or {}
     rows = []
     for order, key in enumerate(pending_keys(out_dir, False, None)):
+        if is_rtv_request(out_dir, key):
+            continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
             newer = since_translator is not None and os.path.getmtime(fail) >= since_translator
@@ -13935,13 +13948,14 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
 
 def retry_batch(out_dir, keys, jobs, clock, start, seconds):
     results = {}
+    followers = rtv_schedule(out_dir, pending_keys(out_dir, False, rtv_only=True), set(keys))[1]
     if keys:
         jobs = max(1, min(jobs or translation_jobs(), len(keys)))
         if jobs == 1:
             for key in keys:
                 if clock() - start >= seconds:
                     break
-                results[key] = translate_one(out_dir, key)
+                results[key] = translate_with_variants(out_dir, key, followers.get(key, ()))
         else:
             from concurrent.futures import FIRST_COMPLETED, wait
             queue, running = list(keys), {}
@@ -13949,7 +13963,7 @@ def retry_batch(out_dir, keys, jobs, clock, start, seconds):
                 while queue or running:
                     while queue and len(running) < jobs and clock() - start < seconds:
                         key = queue.pop(0)
-                        running[pool.submit(translate_one, out_dir, key)] = key
+                        running[pool.submit(translate_with_variants, out_dir, key, followers.get(key, ()))] = key
                     if not running:
                         break
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
@@ -13977,6 +13991,8 @@ def retry_families(out_dir, seconds, jobs, clock, weights):
     keys = sorted(set(pending_keys(out_dir, False)), key=lambda key: (-weights.get(key, 0), key))
     lifted = 0
     for key in keys:
+        if is_rtv_request(out_dir, key):
+            continue
         try:
             reason, family, written_by = read_failure(os.path.join(out_dir, '%016x.fail' % key))
         except OSError:
@@ -14161,31 +14177,93 @@ def request_order(stamps, since=None):
     return sorted(stamps, key=lambda key: (since is None or stamps[key] < since, stamps[key], key))
 
 
+BASE_REFUSED = 'base refused'
+
+
+def is_rtv_request(out_dir, key):
+    return os.path.isfile(os.path.join(out_dir, 'req_%016x.rtv' % key))
+
+
+def mark_base_refused(out_dir, key):
+    failure = Path(out_dir) / ('%016x.fail' % key)
+    with suppress(OSError):
+        if failure.read_text(encoding='utf-8', errors='replace') == BASE_REFUSED + '\n':
+            return
+    atomic_retry_text(failure, BASE_REFUSED + '\n')
+
+
+def rtv_schedule(out_dir, candidates, bases, active=()):
+    """Split variants of ready bases from the followers of pending bases."""
+    priority, followers, blocked = set(), {}, set()
+    for key in candidates:
+        try:
+            request, base, _, _ = request_source(out_dir, key)
+        except (Unsupported, OSError, UnicodeError):
+            continue  # translate normally to record the malformed request
+        if not request:
+            continue
+        if base in active:
+            blocked.add(key)
+            continue
+        base_result = os.path.join(out_dir, '%016x' % base)
+        if base in bases:
+            followers.setdefault(base, []).append(key)
+        elif os.path.isfile(base_result + '.txt'):
+            priority.add(key)
+            continue
+        refused = os.path.isfile(base_result + '.fail')
+        if refused:
+            mark_base_refused(out_dir, key)
+        if base in bases or refused or os.path.isfile(os.path.join(out_dir, 'req_%016x.a' % base)):
+            blocked.add(key)
+        # An orphaned variant retains the normal missing-source diagnostic.
+    return priority, followers, blocked
+
+
+def translate_with_variants(out_dir, key, variants, log_variants=False):
+    result = translate_one(out_dir, key)
+    if result == 'ok' and (variants or is_rtv_request(out_dir, key)):
+        clear_successful_failures(out_dir, {key: result})
+    for variant in variants:
+        if result == 'ok':
+            translated = translate_one(out_dir, variant)
+            clear_successful_failures(out_dir, {variant: translated})
+            if log_variants:
+                print('%016x: %s' % (variant, translated), flush=True)
+        else:
+            mark_base_refused(out_dir, variant)
+    return result
+
+
 def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None,
                       monitor=None, recycle=False, clock=None):
     """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
     the ready markers last.
 
-    Requests are independent (each writes only its own <key>.* files), so several run in parallel
-    processes; X2W_TRANSLATE_JOBS (default: the processor count, at most 61 on Windows) sets how many.
-    Each worker gets one request at a time. With rescan (--watch), the pending list is read again at most every
+    Ready-base variants are prioritized. Each pending base and its variants use the same worker, so the variants
+    can reuse decoded stages and run as soon as the base succeeds. X2W_TRANSLATE_JOBS sets the parallelism. With rescan (--watch), the pending list is read again at most every
     RESCAN_SECONDS between results, so a request published during the pass is queued in its order instead of
     waiting for the next pass; a request already handled in this pass is queued again only when its marker is
     rewritten. Results are printed as they finish.
     """
-    stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
-    queue = request_order(stamps, since)
+    handled = {}  # key -> marker time it was queued with in this pass
+    followers = {}
+
+    def scan(skip, cutoff=None, active=(), retained=()):
+        variants = []
+        candidates = set(pending_keys(out_dir, skip, cutoff, variants=variants)) | set(retained)
+        scanned = request_stamps(out_dir, [key for key in candidates if key not in active])
+        stamps = {key: stamp for key, stamp in scanned.items() if handled.get(key) != stamp}
+        priority, following, blocked = rtv_schedule(out_dir, variants, stamps, active)
+        followers.clear()
+        followers.update(following)
+        queue = [key for key in request_order(stamps, since) if key not in blocked]
+        queue.sort(key=lambda key: key not in priority)
+        return stamps, queue
+
+    stamps, queue = scan(skip_failed, since_translator)
     if not queue:
         return
-    handled = {}  # key -> marker time it was queued with in this pass
-
-    def refill(queue):
-        # A failure written during this pass is final for the pass (skip_failed), as on the next pass.
-        queued = set(queue)
-        fresh = request_stamps(out_dir, [key for key in pending_keys(out_dir, True) if key not in queued])
-        stamps.update((key, t) for key, t in fresh.items() if handled.get(key) != t)
-        return request_order({key: stamps[key] for key in queued | {k for k in fresh if handled.get(k) != fresh[k]}},
-                             since)
 
     jobs = jobs or translation_jobs()
     if not rescan:
@@ -14201,9 +14279,10 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 key = queue.pop(0)
                 handled[key] = stamps[key]
                 if pool is None:
-                    print('%016x: %s%s' % (key, translate_one(out_dir, key), clock() if clock else ''), flush=True)
+                    result = translate_with_variants(out_dir, key, followers.get(key, ()), True)
+                    print('%016x: %s%s' % (key, result, clock() if clock else ''), flush=True)
                     break
-                running[pool.submit(translate_one, out_dir, key)] = key
+                running[pool.submit(translate_with_variants, out_dir, key, followers.get(key, ()), True)] = key
             if running:
                 done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -14212,7 +14291,7 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 monitor.tick(pool, len(running or ()))
             idle = not queue and not running
             if rescan and (idle or time.monotonic() - last_scan >= RESCAN_SECONDS):
-                queue = refill(queue)
+                stamps, queue = scan(True, active=set((running or {}).values()), retained=queue)
                 last_scan = time.monotonic()
                 idle = not queue and not running
             if idle:
@@ -14222,16 +14301,17 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
             pool.shutdown()
 
 
-def pending_keys(out_dir, skip_failed, since_translator=None):
+def pending_keys(out_dir, skip_failed, since_translator=None, *, rtv_only=False, variants=None):
     """Keys whose request has no finished result. A key with a .fail is skipped when the .fail is newer than its
     request and stream description. Outside watch mode it must also match the translator content fingerprint,
-    or postdate the legacy translator timestamp. With neither cutoff, every failure is tried again."""
+    or postdate the legacy translator timestamp. With neither cutoff, every failure is tried again.
+    If supplied, variants also receives unfinished RTV keys whose refusal is current."""
     keys = []
     version = since_translator if isinstance(since_translator, str) and not skip_failed else None
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
-        if not m:
+        if not m or (rtv_only and m.group(2) != 'rtv'):
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
@@ -14260,6 +14340,8 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
                 with suppress(OSError), open(manifest, 'rb') as published:
                     if b'ps none' in published.read().splitlines():
                         continue
+        if variants is not None and m.group(2) == 'rtv':
+            variants.append(key)
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
         # still published without its recorded description is checked even with an older .fail, which a success on
@@ -14272,9 +14354,17 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         cutoff = inputs if skip_failed or version else (
             None if since_translator is None else max(inputs, since_translator))
         if cutoff is not None and not recheck:
-            with suppress(OSError):
-                if os.path.getmtime(fail) >= cutoff and (version is None or read_failure(fail)[2] == version):
-                    continue
+            with suppress(OSError, Unsupported, UnicodeError):
+                if os.path.getmtime(fail) >= cutoff:
+                    if m.group(2) == 'rtv':
+                        with open(fail, encoding='utf-8', errors='replace') as diagnostic:
+                            if diagnostic.readline().rstrip() == BASE_REFUSED:
+                                _, base, _, _ = request_source(out_dir, key)
+                                if os.path.isfile(os.path.join(out_dir, '%016x.txt' % base)):
+                                    keys.append(key)
+                                continue
+                    if version is None or read_failure(fail)[2] == version:
+                        continue
         keys.append(key)
     return keys
 

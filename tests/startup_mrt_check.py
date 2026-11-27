@@ -39,6 +39,20 @@ def pixel(values, unorm=False):
     return container(0, words + [0xbf810000])
 
 
+GBUFFER_COLOUR = (0.25, 0.5, 0.75, 1.0)
+
+
+def gbuffer_pixel(identifier=None):
+    words = []
+    for index, channel in enumerate(GBUFFER_COLOUR):
+        words += [vop1(1, index, 255), struct.unpack('<I', struct.pack('<f', channel))[0]]
+    # Export the four colour channels, then one integer word in target 1.
+    words += [0xf800000f if identifier is not None else 0xf800180f, 0x03020100]
+    if identifier is not None:
+        words += [vop1(1, 4, 255), identifier, 0xf8001811, 4]
+    return container(0, words + [0xbf810000])
+
+
 def compile_shader(compiler, kind, stage, source, blob, listing, unoptimized=False):
     profile = stage + ('_5_1' if kind == 'fxc' else '_6_0')
     if kind == 'fxc':
@@ -71,6 +85,8 @@ def check(work, consumer, backend, kind, dxc, fxc):
         root, output = cache / 'root', cache / 'pixels'
         env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
                    X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc if kind == 'fxc' else '')
+        env.pop('X2W_RTV_BASE_FALLBACK', None)
+        env.pop('X2W_TEST_GBUFFER_TARGETS', None)
         args = [consumer, vs, ps, root, backend, output]
 
         def draw(fmt, word=0, wanted_draw=True):
@@ -107,7 +123,17 @@ def check(work, consumer, backend, kind, dxc, fxc):
                                cache / f'{key}.{stage}.asm')
             return signature(cache / f'{key}.ps.asm')
 
+        def create_only():
+            result = subprocess.run(args[:5] + ['create-only'], env=env)
+            if result.returncode == 77:
+                raise SystemExit(77)
+            result.check_returncode()
+
+        def base_key():
+            return f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'
+
         return SimpleNamespace(cache=cache, root=root, output=output, env=env, draw=draw,
+                               create_only=create_only, base_key=base_key,
                                queue_request=queue_request, request=request, compile_pair=compile_pair)
 
     main = session('cache')
@@ -251,6 +277,66 @@ def check(work, consumer, backend, kind, dxc, fxc):
         pixels, _ = draw(fmt)
         assert pixels == struct.pack(f'<{channels}I', *narrow_words[:channels]), pixels.hex()
         print(f'{kind} {backend} FLOAT format {fmt} exact {pixels.hex()}')
+    # Creation alone must queue the mixed-format variant. Verify exact half-float colour and integer readback.
+    mixed = session('gbuffer')
+    mixed.env['X2W_TEST_GBUFFER_TARGETS'] = '1'
+    end = '    return o;'
+    for identifier in (0x01000001, 0x02000003):
+        ps.write_bytes(gbuffer_pixel(identifier))
+        mixed.create_only()
+        base = mixed.base_key()
+        record = f'rtv1 {int(base, 16)} 10 42'
+        key = f'{gfx2hlsl.fnv(record.encode("ascii")):016x}'
+        assert (mixed.cache / f'req_{key}.rtv').read_text() == record
+        subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', mixed.cache], env=mixed.env, check=True)
+        mixed.compile_pair(base)
+        variant = mixed.cache / f'{key}.txt'
+        pending = variant.with_suffix('.pending')
+        variant.rename(pending)
+        clear = struct.pack('<4eI', 0, 0, 1, 1, 0)
+        for fallback in ('0', '1'):
+            mixed.env['X2W_RTV_BASE_FALLBACK'] = fallback
+            assert mixed.draw(10, wanted_draw=False)[0] == clear
+        pending.rename(variant)
+        assert mixed.compile_pair(key) == {'0': 'float', '1': 'uint'}
+        expected = struct.pack('<4eI', *GBUFFER_COLOUR, identifier)
+        assert mixed.draw(10)[0] == expected
+        source = (mixed.cache / f'{key}.ps.hlsl').read_text()
+        assert source.count(end) == 1
+        wrong = mixed.cache / f'{key}.rounded.hlsl'
+        wrong.write_text(source.replace(end, '    o.mrt1.x = (uint)(float)o.mrt1.x;\n' + end))
+        compile_shader(compiler, kind, 'ps', wrong, mixed.cache / f'{key}.ps.cso',
+                       mixed.cache / f'{key}.rounded.asm')
+        rounded = int(struct.unpack('<f', struct.pack('<f', identifier))[0])
+        mutant = mixed.draw(10)[0]
+        assert mutant == struct.pack('<4eI', *GBUFFER_COLOUR, rounded) and mutant != expected, mutant.hex()
+
+    scalar = session('fallback')
+    ps.write_bytes(gbuffer_pixel())
+    scalar.create_only()
+    subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', scalar.cache], env=scalar.env, check=True)
+    scalar.compile_pair(scalar.base_key())
+    assert scalar.draw(41, wanted_draw=False)[0] == struct.pack('<f', 0)
+    scalar.env['X2W_RTV_BASE_FALLBACK'] = '1'
+    base_pixel = struct.pack('<f', GBUFFER_COLOUR[0])
+    assert scalar.draw(41)[0] == base_pixel
+
+    # Publish a distinguishable variant between draws on the same guest pipeline.
+    subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', scalar.cache], env=scalar.env, check=True)
+    record = f'rtv1 {int(scalar.base_key(), 16)} 41'
+    key = f'{gfx2hlsl.fnv(record.encode("ascii")):016x}'
+    source = scalar.cache / f'{key}.ps.hlsl'
+    hlsl = source.read_text()
+    assert hlsl.count(end) == 1
+    source.write_text(hlsl.replace(end, '    o.mrt0.x = 0.75f;\n' + end))
+    scalar.compile_pair(key)
+    manifest = scalar.cache / f'{key}.txt'
+    manifest.rename(str(manifest) + '.pending')
+    scalar.env['X2W_TEST_PUBLISH_MANIFEST'] = str(manifest)
+    variant_pixel, _ = scalar.draw(41)
+    assert Path(str(scalar.output) + '.first').read_bytes() == base_pixel
+    assert variant_pixel == struct.pack('<f', 0.75), variant_pixel.hex()
+    print(f'{kind} {backend} G-buffer exact integer and colour, float-rounding mutant, and fallback controls')
     return 0
 
 
