@@ -51,6 +51,32 @@ int main(int argc, char** argv)
     check("half2 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R16G16_FLOAT), word) && word == (29u << 12 | identity));
     check("snorm2 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R16G16_SNORM), word) && word == (24u << 12 | identity));
     check("uint8 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R8_UINT), word) && word == (5u << 12 | identity));
+    constexpr struct {
+        DXGI_FORMAT format;
+        std::uint32_t code;
+    } identity_formats[] = {
+        {DXGI_FORMAT_R8_UNORM, 1},
+        {DXGI_FORMAT_R8G8_UNORM, 14},
+        {DXGI_FORMAT_R32_FLOAT, 22},
+        {DXGI_FORMAT_R16G16_UNORM, 23},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, 56},
+        {DXGI_FORMAT_R32G32_FLOAT, 64},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, 71},
+        {DXGI_FORMAT_R32G32B32_FLOAT, 74},
+    };
+    for (const auto& entry : identity_formats) {
+        auto view = typed(entry.format);
+        view.Buffer.FirstElement = 5;
+        if (x2w_startup::view_word3(view, word) || word != (entry.code << 12 | identity)) {
+            ++failures;
+            std::printf("FAIL identity word for DXGI %u\n", static_cast<UINT>(entry.format));
+        }
+    }
+    // Word 3 describes the format and selectors independently of the view range.
+    auto empty = typed(DXGI_FORMAT_R16G16_FLOAT);
+    empty.Buffer.NumElements = 0;
+    check("empty range still encodes word 3", !x2w_startup::view_word3(empty, word) &&
+                                             word == (29u << 12 | identity));
     // Mapping (w, 0, x, 1): DST_SEL 7, 0, 4, 1.
     const UINT swizzle = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, 0,
                                                                 D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
@@ -84,6 +110,10 @@ int main(int argc, char** argv)
     refused("structured view", x2w_startup::view_word3(structured, word), "not a typed buffer view");
     refused("texture view", x2w_startup::view_word3(D3D12_SHADER_RESOURCE_VIEW_DESC{}, word), "not a typed buffer view");
     refused("selector 6", x2w_startup::view_word3(typed(DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(6, 1, 2, 3)), word),
+            "invalid component mapping");
+    const UINT invalid_last = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 4, 0, 7);
+    refused("selector 7 in fourth component",
+            x2w_startup::view_word3(typed(DXGI_FORMAT_R16G16_FLOAT, invalid_last), word),
             "invalid component mapping");
     refused("bit 12 missing", x2w_startup::view_word3(typed(DXGI_FORMAT_R32G32B32A32_FLOAT, 0x688), word), "invalid component mapping");
 
