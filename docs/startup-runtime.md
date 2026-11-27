@@ -2080,6 +2080,24 @@ copies can capture named ranges before the window opens. The regular page and sc
 at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
 must match the original pictures with the switch enabled and differ when the switch is off.
 
+A window rescan reads only a few MiB per Present in a large title, so a per-frame ring the title fills after the base
+image can stay zero in the file, and the replay then draws from zero bytes. Draw pages close that gap. By default the
+recorder captures up to 64 KiB at each root descriptor setter (list slots 41 to 46; slot 44 copies its bytes then),
+and captures those root spans again with the bound vertex and index views (slots 47 and 48) before the list's next
+draw, dispatch or indirect execution. Only changed pages are written, stamped just before the call, so the player
+applies them before the call that reads them. Only spans inside the title ranges the page scans cover are captured
+(resources with title memory, and the named ranges of `X2W_REPLAY_TITLE_RANGES=1`). The recorder clips each span to
+4 MiB and to its containing title range. `X2W_REPLAY_DRAW_PAGES_MS` sets the time budget per Present (default 100 ms).
+The `x2w-replay draw pages` counters report captures, spans outside title memory, time skips, pending drops and
+time used. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
+
+The player applies MAP chunks in stamp order, and a Present rescan is stamped at the previous Present, before the draws
+captured since. So the page writer compares each page with the MAP of the newest stamp for it: a rescan with an older
+stamp is written when it differs but does not change that reference, and two different MAPs with the same stamp (two
+threads, file order unknown) make the next later capture write the page again. `startup_replay_draw_pages_warp` compares four live and replayed ring colours
+and checks that disabling draw pages changes the replay while leaving the live pictures identical.
+
 The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
 creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
 destination starts, destination sizes, source starts and source sizes of a `CopyDescriptors` call. Its header is the call

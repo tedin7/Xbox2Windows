@@ -6,6 +6,7 @@
 //   corrupt     one stored page has a byte flipped on the way
 #include "../src/startup_stubs/replay_pages.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -53,6 +54,58 @@ std::vector<Chunk> unframe(const std::string& in)
     }
     return chunks;
 }
+std::uint64_t map_stamp(const Chunk& chunk)
+{
+    MapHeader header{};
+    std::memcpy(&header, chunk.header.data(), sizeof(header));
+    return header.seq;
+}
+
+bool stamp_order_case(bool equal_stamp)
+{
+    constexpr std::uint64_t address = 0x10000;
+    const std::vector<unsigned char> a(page_bytes, 0x11), b(page_bytes, 0x22);
+    std::string stream;
+    PageWriter writer([&](const char* tag, const void* h, std::size_t hb, const void* d, std::size_t db) {
+        frame(stream, tag, h, hb, d, db);
+    });
+    if (equal_stamp) {
+        writer.capture(address, a.data(), a.size(), 40);
+        writer.capture(address, b.data(), b.size(), 40);
+        writer.capture(address, b.data(), b.size(), 41);
+    } else {
+        // A draw reads A (stamp 10), an older-stamped rescan sees B (5), a later draw reads B (30): the replay applies
+        // B@5 before A@10, so B@30 must be written although the last capture was B.
+        writer.capture(address, a.data(), a.size(), 10);
+        writer.capture(address, b.data(), b.size(), 5);
+        writer.capture(address, b.data(), b.size(), 30);
+    }
+
+    const auto chunks = unframe(stream);
+    std::vector<const Chunk*> maps;
+    for (const auto& chunk : chunks)
+        if (!std::memcmp(chunk.tag, "MAP ", 4)) maps.push_back(&chunk);
+    if (maps.size() < 2) return false;
+
+    for (int order = 0; order < (equal_stamp ? 2 : 1); ++order) {
+        if (order) std::swap(maps[0], maps[1]);
+        std::stable_sort(maps.begin(), maps.end(), [](const Chunk* lhs, const Chunk* rhs) {
+            return map_stamp(*lhs) < map_stamp(*rhs);
+        });
+        ImageReader reader;
+        const auto apply = [&](const Chunk& chunk) {
+            return reader.apply(chunk.tag, chunk.header.data(), chunk.header.size(), chunk.data.data(), chunk.data.size());
+        };
+        for (const auto& chunk : chunks)
+            if (!std::memcmp(chunk.tag, "PAGE", 4) && !apply(chunk)) return false;
+        for (const auto* map : maps)
+            if (!apply(*map)) return false;
+        std::vector<unsigned char> image(page_bytes);
+        if (!reader.read(address, image.data(), image.size()) || image != b) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -131,6 +184,8 @@ int main(int argc, char** argv)
     if (maps != 2) return fail("expected two MAP chunks");
     if (!reader.read(address, image.data(), image.size()) || std::memcmp(image.data(), memory.data(), memory.size()) != 0)
         return fail("the final image is not the memory after the second capture");
+    if (mode.empty() && !stamp_order_case(false)) return fail("back-stamped MAPs left the wrong image");
+    if (mode.empty() && !stamp_order_case(true)) return fail("equal-stamped MAPs left the wrong image");
     std::printf("startup_replay_pages: ok (first: %llu distinct %llu dup %llu zero; second: %llu unchanged, %llu new)\n",
                 static_cast<unsigned long long>(first.distinct), static_cast<unsigned long long>(first.duplicate),
                 static_cast<unsigned long long>(first.zero), static_cast<unsigned long long>(second.unchanged - first.unchanged),
