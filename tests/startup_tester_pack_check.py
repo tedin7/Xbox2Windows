@@ -670,6 +670,32 @@ def check_phase_table():
             assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
 
 
+def check_mirror_report():
+    details = (", created 2, evicted 1, blocks hashed 379, dirty blocks 123, bytes uploaded 8060928, "
+               "hashing 12.345 ms, fallback copied 16, fallback failed 4, validations 75, "
+               "cache hits 211, cache entries erased 4\n")
+    window = "x2w-render gpu mirror: window frame 40, frames 40, served 8, not owner 2, not idle 7" + details
+    total = "x2w-render gpu mirror: total frame 60, frames 60, served 19, not owner 3, not idle 9" + details
+    beat = "x2w-d3d12 heartbeat: 60 frames presented in 20.0 s (3.0 fps overall)\n"
+    cases = (
+        (beat + window + total, "mirror: served 19, not owner 3, not idle 9, fallback failed 4, validations per frame 1.25"),
+        (window, "mirror: served 8, not owner 2, not idle 7, fallback failed 4, validations per frame 1.88"),
+        (total, "mirror: served 19, not owner 3, not idle 9, fallback failed 4, validations per frame 1.25"),
+        (beat, None),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        for index, (stderr, expected) in enumerate(cases):
+            write(run, "stderr.txt", stderr.encode())
+            archive = Path(tmp) / f"mirror_{index}.zip"
+            T.pack(str(run), MANIFEST, str(archive))
+            with zipfile.ZipFile(archive) as z:
+                rows = z.read(T.PHASES_NAME).decode().splitlines()
+            assert [line for line in rows if line.startswith("mirror:")] == ([expected] if expected else [])
+
+
+
 def check_request_families():
     """The top refusal families each bring their 20 keys with the most uses, whatever their dispatch/draw weight (c20: the code of
     the top 20 'branch out of the block' keys), on top of the weight ranking; the byte cap still holds."""
@@ -877,6 +903,7 @@ if __name__ == "__main__":
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
+    check_mirror_report()
     check_request_families()
     check_combine()
     check_part_one_has_the_small_files()

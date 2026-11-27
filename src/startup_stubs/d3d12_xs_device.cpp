@@ -409,7 +409,7 @@ void log(const char* format, ...)
     line[n++] = '\r';
     line[n++] = '\n';
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
+    x2w_trap::append_log(line, static_cast<DWORD>(n), false, !x2w_startup::d3d12_process_terminating);
 }
 
 void guid_text(const GUID* g, char* out, std::size_t size)
@@ -1132,6 +1132,9 @@ bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 }
 ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 bool retire_unmaterialized_lazy_texture(Wrapper* w);
+void report_final_render_totals();
+void stop_render_totals_clock();
+
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
@@ -1158,8 +1161,11 @@ ULONG __stdcall release(Wrapper* self)
         const bool lazy_retired = self->own().kind == resource_kind && self->own().lazy_slot133_texture &&
             retire_unmaterialized_lazy_texture(self);
         if (self->own().retire_when_idle && !lazy_retired) retire_resource(self);
-        if (self->own().kind == device_kind)
+        if (self->own().kind == device_kind) {
+            if (self == the_device) stop_render_totals_clock();
+            report_final_render_totals();
             clear_unplaced_buffers(self);
+        }
     }
     return static_cast<ULONG>(refs);
 }
@@ -2766,6 +2772,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 
 volatile LONG64 upload_ring_reserved_bytes;
 volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled;
+volatile LONG upload_ring_chunks;
+volatile LONG64 upload_ring_capacity, upload_ring_oversize;
 
 struct UploadRingStats {
     unsigned long long reserved_bytes = 0, capacity = 0;
@@ -2775,14 +2783,12 @@ struct UploadRingStats {
 UploadRingStats upload_ring_stats()
 {
     UploadRingStats stats;
-    stats.reserved_bytes = static_cast<unsigned long long>(upload_ring_reserved_bytes);
-    stats.reservations = upload_ring_reservations;
-    stats.refusals = upload_ring_refusals;
-    stats.recycled = upload_ring_recycled;
-    AcquireSRWLockShared(&allocator_lock);
-    stats.chunks = upload_chunks.size();
-    for (const auto& chunk : upload_chunks) stats.capacity += chunk.capacity;
-    ReleaseSRWLockShared(&allocator_lock);
+    stats.reserved_bytes = InterlockedCompareExchange64(&upload_ring_reserved_bytes, 0, 0);
+    stats.reservations = InterlockedCompareExchange(&upload_ring_reservations, 0, 0);
+    stats.refusals = InterlockedCompareExchange(&upload_ring_refusals, 0, 0);
+    stats.recycled = InterlockedCompareExchange(&upload_ring_recycled, 0, 0);
+    stats.chunks = InterlockedCompareExchange(&upload_ring_chunks, 0, 0);
+    stats.capacity = InterlockedCompareExchange64(&upload_ring_capacity, 0, 0);
     return stats;
 }
 
@@ -2803,7 +2809,12 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;
-    if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
+    if (bytes == 0) return reservation;
+    if (bytes > max_alloc_bytes) {
+        InterlockedIncrement64(&upload_ring_oversize);
+        InterlockedIncrement(&upload_ring_refusals);
+        return reservation;
+    }
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
     auto& chunks = upload_chunks;
@@ -2850,6 +2861,8 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
+                        InterlockedAdd64(&upload_ring_capacity, static_cast<LONG64>(chunk_bytes));
+                        InterlockedIncrement(&upload_ring_chunks);
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
                         return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
@@ -7736,6 +7749,104 @@ void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
     }
 }
 
+// Keep this snapshot independent of rendering locks and D3D12 calls. On process
+// detach another thread may have been stopped while it held a rendering lock.
+void log_render_totals(LONG frame)
+{
+    LONG null_total = 0, null_causes[x2w_local::null_cause_count]{};
+    for (int c = 0; c < x2w_local::null_cause_count; ++c) {
+        null_causes[c] = InterlockedCompareExchange(&null_by_cause[c], 0, 0);
+        null_total += null_causes[c];
+    }
+    log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
+        "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+        "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
+        "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
+        render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
+        translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
+        null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
+        texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
+        heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
+        heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
+        heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
+        heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
+        compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    UploadRingStats ring = upload_ring_stats();
+    log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld, oversize refusals %lld",
+        ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled,
+        InterlockedCompareExchange64(&upload_ring_oversize, 0, 0));
+    log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+    log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
+    for (int size_class = 0; size_class < 2; ++size_class) {
+        const auto& step = buffer_step_stats[size_class];
+        log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
+            size_class ? "64 KiB and larger" : "under 64 KiB", step.calls, step.bytes >> 20, step.trim_us / 1000, step.copy_us / 1000,
+            step.copy_over_1ms, step.copy_max_us / 1000);
+    }
+    log_gpu_mirror(frame, frame, true);
+    log_buffer_copy_failures();
+}
+
+void report_final_render_totals()
+{
+    const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
+    if (the_device && render_mode()) log_render_totals(frame);
+}
+
+constexpr LONG64 wall_census_ms = 10000;
+volatile LONG64 render_census_started, last_wall_census;
+
+// The present path and the existing background worker share one deadline. The
+// worker can take a wall tick even when there are no presents.
+void report_due_render_totals(LONG frame, LONG64 now, bool census_frames)
+{
+    const LONG64 started = InterlockedCompareExchange64(&render_census_started, 0, 0);
+    if (!started) return;
+    LONG64 last = InterlockedCompareExchange64(&last_wall_census, 0, 0);
+    do {
+        if (!last || now <= last || (!census_frames && now - last < wall_census_ms)) {
+            if (census_frames && last) log_render_totals(frame);
+            return;
+        }
+        const LONG64 seen = InterlockedCompareExchange64(&last_wall_census, now, last);
+        if (seen == last) break;
+        last = seen;
+    } while (true);
+    log("x2w-render census tick at %.1f s, frame %ld (%s)", (now - started) / 1000.0, frame,
+        census_frames ? "every 300 frames" : "10 s of wall time");
+    log_render_totals(frame);
+}
+
+HANDLE render_totals_stop_event()
+{
+    static const HANDLE event = [] {
+        wchar_t name[64];
+        swprintf(name, sizeof(name) / sizeof(*name), L"Local\\x2w-render-totals-%lu", GetCurrentProcessId());
+        return CreateEventW(nullptr, TRUE, FALSE, name);
+    }();
+    return event;
+}
+
+void poll_render_totals()
+{
+    if (!InterlockedCompareExchange64(&render_census_started, 0, 0)) return;
+    const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
+    const HANDLE stop = render_totals_stop_event();
+    if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
+        stop_render_totals_clock();
+        log("x2w-render census tick: stop requested at frame %ld", frame);
+        log_render_totals(frame);
+        ResetEvent(stop);  // The launcher can now terminate the job.
+        return;
+    }
+    report_due_render_totals(frame, GetTickCount64(), false);
+}
+
+void stop_render_totals_clock()
+{
+    InterlockedExchange64(&last_wall_census, 0);
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -7752,11 +7863,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_FRAME_MARK;
     static LONG frames;
     static ULONGLONG started, last_report;
+    static LONG last_mirror_report_frame;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
-    frame_number = frame;
+    InterlockedExchange(&frame_number, frame);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
@@ -7844,37 +7956,20 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
-    // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
-    LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
-    if (render_mode() && frame % 300 == 0) {
-        draw_lock_acquire_exclusive();
-        null_total = null_bindings;
-        for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
-        draw_lock_release_exclusive();
-    }
-    if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
+    const bool census_frames = render_mode() && frame % 300 == 0;
+    if (census_frames && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
-    if (render_mode() && frame % 300 == 0)
-        log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
-            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
-            render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
-            texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
-            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
-    if (render_mode() && frame % 300 == 0) {
+    if (render_mode()) report_due_render_totals(frame, now, census_frames);
+    if (census_frames) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
         static long last[9];
         const UploadRingStats ring_now = upload_ring_stats();
-        const long now_values[9] = {ring_now.refusals, null_total, null_causes[5], untranslated_draws, translated_draws,
+        draw_lock_acquire_exclusive();
+        const LONG null_total = null_bindings, null_ring = null_by_cause[5];
+        draw_lock_release_exclusive();
+        const long now_values[9] = {ring_now.refusals, null_total, null_ring, untranslated_draws, translated_draws,
                                     compute_dispatches_translated, compute_dispatches_refused, textures_unreadable, list_copies_refused};
         char text[360];
         std::snprintf(text, sizeof(text),
@@ -7885,18 +7980,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         std::memcpy(last, now_values, sizeof(last));
         log("%s", text);
     }
-    if (render_mode() && frame % 300 == 0) {
-        UploadRingStats ring = upload_ring_stats();
-        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
-            ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
-        log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
-        log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
-        for (int size_class = 0; size_class < 2; ++size_class) {
-            const auto& step = buffer_step_stats[size_class];
-            log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
-                size_class ? "64 KiB and larger" : "under 64 KiB", step.calls, step.bytes >> 20, step.trim_us / 1000, step.copy_us / 1000,
-                step.copy_over_1ms, step.copy_max_us / 1000);
-        }
+    if (census_frames) {
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
@@ -7965,6 +8049,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             char line[500];
             if (draw_phase_line(line, sizeof(line))) log("%s", line);
         }
+        log_gpu_mirror(frame, frame - last_mirror_report_frame, false);
+        last_mirror_report_frame = frame;
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
@@ -8211,6 +8297,13 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 
+namespace x2w_startup {
+void report_render_process_exit()
+{
+    report_final_render_totals();
+}
+}  // namespace x2w_startup
+
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
     static const bool ready = (build_tables(), true);
@@ -8223,6 +8316,14 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     }
     the_device = candidate;
     removal_device = device;
+    if (render_mode()) {
+        render_totals_stop_event();
+        const LONG64 now = GetTickCount64();
+        InterlockedExchange64(&render_census_started, now);
+        InterlockedExchange64(&last_wall_census, now);
+        // Reuse the manifest worker even if the run stalls before its first draw.
+        manifest_source();
+    }
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,

@@ -564,6 +564,32 @@ HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
 
 
+MIRROR_RE = re.compile(
+    r"^x2w-render gpu mirror: (total|window) frame (\d+), frames (\d+), served (\d+), "
+    r"not owner (\d+), not idle (\d+), [^\n]*?fallback failed (\d+), validations (\d+)(?:,|$)",
+    re.M,
+)
+
+
+def mirror_summary(stderr_text):
+    windows = {}
+    total = None
+    for report, frame, frames, served, not_owner, not_idle, failed, validations in MIRROR_RE.findall(stderr_text):
+        counts = tuple(map(int, (frames, served, not_owner, not_idle, failed, validations)))
+        if report == "total":
+            total = counts
+        else:
+            windows[int(frame)] = counts
+    if total is None:
+        if not windows:
+            return None
+        total = tuple(map(sum, zip(*windows.values())))
+    frames, served, not_owner, not_idle, failed, validations = total
+    per_frame = f"{validations / frames:.2f}" if frames else "-"
+    return (f"mirror: served {served}, not owner {not_owner}, not idle {not_idle}, "
+            f"fallback failed {failed}, validations per frame {per_frame}")
+
+
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
     """One row per `window` seconds: frames presented and fps in that window (from the cumulative 'heartbeat' lines of the
     stand-in) and the mean level of the last window picture inside it, so the phases of a run read in one place instead of
@@ -586,6 +612,9 @@ def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
             presents, fps = "-", "-"
         lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
         start = stop
+    mirror = mirror_summary(stderr_text)
+    if mirror:
+        lines.append(mirror)
     return "\n".join(lines) + "\n"
 
 
@@ -823,8 +852,9 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 texts[name] = handle.read()
-    if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
-        add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
+    stderr = texts.get("stderr.txt", "")
+    if HEARTBEAT_RE.search(stderr) or MIRROR_RE.search(stderr):
+        add(PHASES_NAME, phase_table(stderr, texts.get("timeline.txt", "")).encode("utf-8"))
     files = log_files(logdir)
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:

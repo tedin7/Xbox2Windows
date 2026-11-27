@@ -420,6 +420,7 @@ bool read_text(const wchar_t* path, std::string& out);
 // the thread has not read yet counts as absent and is asked for again soon; the thread lists the cache directory about
 // four times a second while any key is waiting.
 constexpr ULONGLONG manifest_retry_ms = 250;
+void poll_render_totals();
 x2w_startup::ManifestPrefetch::Io manifest_io()
 {
     x2w_startup::ManifestPrefetch::Io io;
@@ -453,6 +454,7 @@ x2w_startup::ManifestSource& manifest_source()
     static x2w_startup::ManifestSource source(manifest_io());
     static const HANDLE worker = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
         for (;;) {
+            poll_render_totals();
             const std::size_t loaded = manifest_source().prefetch().has_wanted() ? manifest_source().prefetch().scan() : 0;
             Sleep(loaded ? 50 : 250);
         }
@@ -1586,6 +1588,96 @@ struct BigBindingCounts {
 };
 BigBindingCounts big_binding_counts;
 
+enum class MirrorStat {
+    served, not_owner, not_idle, created, evicted, hashed, dirty, uploaded, hash_ticks,
+    fallback_copied, fallback_failed, validations, hits, erased, count
+};
+
+struct MirrorCounter {
+    volatile LONG64 total = 0, window = 0;
+};
+MirrorCounter mirror_counters[static_cast<unsigned>(MirrorStat::count)];
+
+void count_mirror(MirrorStat stat, LONG64 amount = 1)
+{
+    if (!amount) return;
+    auto& counter = mirror_counters[static_cast<unsigned>(stat)];
+    InterlockedAdd64(&counter.total, amount);
+    InterlockedAdd64(&counter.window, amount);
+}
+
+void log_gpu_mirror(LONG frame, LONG frames, bool cumulative)
+{
+    LONG64 values[static_cast<unsigned>(MirrorStat::count)];
+    bool any = false;
+    for (unsigned i = 0; i < static_cast<unsigned>(MirrorStat::count); ++i) {
+        auto& counter = mirror_counters[i];
+        values[i] = cumulative ? InterlockedCompareExchange64(&counter.total, 0, 0)
+                               : InterlockedExchange64(&counter.window, 0);
+        any |= values[i] != 0;
+    }
+    if (!any) return;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const auto get = [&values](MirrorStat stat) { return values[static_cast<unsigned>(stat)]; };
+    log("x2w-render gpu mirror: %s frame %ld, frames %ld, served %lld, not owner %lld, not idle %lld, "
+        "created %lld, evicted %lld, blocks hashed %lld, dirty blocks %lld, bytes uploaded %lld, hashing %.3f ms, "
+        "fallback copied %lld, fallback failed %lld, validations %lld, cache hits %lld, cache entries erased %lld",
+        cumulative ? "total" : "window", frame, frames, get(MirrorStat::served), get(MirrorStat::not_owner),
+        get(MirrorStat::not_idle), get(MirrorStat::created), get(MirrorStat::evicted), get(MirrorStat::hashed),
+        get(MirrorStat::dirty), get(MirrorStat::uploaded), 1000.0 * get(MirrorStat::hash_ticks) / frequency.QuadPart,
+        get(MirrorStat::fallback_copied), get(MirrorStat::fallback_failed), get(MirrorStat::validations),
+        get(MirrorStat::hits), get(MirrorStat::erased));
+}
+
+// Writers hold draw_lock. Once published, a key stays in its slot for the process lifetime.
+struct BufferCopyFailure {
+    u64 key = 0;
+    volatile LONG64 calls = 0;
+    struct Request {
+        volatile LONG64 bytes = 0;
+        volatile LONG slot = 0;
+    } last[2];
+};
+BufferCopyFailure buffer_copy_failures[64];
+volatile LONG64 untracked_buffer_copy_failures;
+
+void note_buffer_copy_failure(u64 key, UINT slot, std::size_t bytes)
+{
+    for (auto& failure : buffer_copy_failures) {
+        const LONG64 calls = failure.calls;
+        if (calls && failure.key != key) continue;
+        if (!calls) failure.key = key;
+        auto& request = failure.last[(calls + 1) & 1];
+        InterlockedExchange(&request.slot, static_cast<LONG>(slot));
+        InterlockedExchange64(&request.bytes, static_cast<LONG64>(bytes));
+        InterlockedIncrement64(&failure.calls);
+        if (!calls) log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", key, slot);
+        return;
+    }
+    InterlockedIncrement64(&untracked_buffer_copy_failures);
+}
+
+void log_buffer_copy_failures()
+{
+    for (auto& failure : buffer_copy_failures) {
+        LONG64 calls, bytes;
+        LONG slot;
+        // Read the last published pair even if shutdown interrupted a newer write.
+        do {
+            calls = InterlockedCompareExchange64(&failure.calls, 0, 0);
+            auto& request = failure.last[calls & 1];
+            slot = InterlockedCompareExchange(&request.slot, 0, 0);
+            bytes = InterlockedCompareExchange64(&request.bytes, 0, 0);
+        } while (calls != InterlockedCompareExchange64(&failure.calls, 0, 0));
+        if (calls)
+            log("x2w-render buffer copy failures: key %016llx, slot %ld, requested bytes %lld, calls %lld",
+                failure.key, slot, bytes, calls);
+    }
+    const LONG64 untracked = InterlockedCompareExchange64(&untracked_buffer_copy_failures, 0, 0);
+    if (untracked) log("x2w-render buffer copy failures overflow: calls %lld", untracked);
+}
+
 bool gpu_mirror_enabled()
 {
     static const bool on = [] {
@@ -1690,6 +1782,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         const auto recording = gpu_mirror_recordings.find(self);
         const bool owner = recording != gpu_mirror_recordings.end() && recording->second == found->second.recording;
         ReleaseSRWLockShared(&allocator_lock);
+        count_mirror(owner ? MirrorStat::served : MirrorStat::not_owner);
         return owner ? found->second.resource.Get() : nullptr;
     }
 
@@ -1699,7 +1792,10 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
     if (idle && found != gpu_mirrors.end() && found->second.recording)
         valid = found->second.recording->submitted;
     ReleaseSRWLockShared(&allocator_lock);
-    if (!idle) return nullptr;
+    if (!idle) {
+        count_mirror(MirrorStat::not_idle);
+        return nullptr;
+    }
     const auto recording = gpu_mirror_recording(self);
     if (!recording) return nullptr;
 
@@ -1711,6 +1807,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
                 if (gpu_mirror_idle(it->second)) {
                     gpu_mirror_bytes -= it->first.second.second;
                     it = gpu_mirrors.erase(it);
+                    count_mirror(MirrorStat::evicted);
                 } else {
                     ++it;
                 }
@@ -1727,6 +1824,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
             x2w_budget::committed(device, created.resource.Get(), D3D12_HEAP_TYPE_DEFAULT);
             found = gpu_mirrors.emplace(key, std::move(created)).first;
             gpu_mirror_bytes += full_bytes;
+            count_mirror(MirrorStat::created);
         }
 
         auto& mirror = found->second;
@@ -1739,13 +1837,28 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         std::vector<u64> hashes((bytes + gpu_mirror_block_bytes - 1) / gpu_mirror_block_bytes);
         const auto* title = reinterpret_cast<const unsigned char*>(address);
         static const bool skip_updates = x2w_local::env_on("X2W_TEST_GPU_MIRROR_STALE");
+        struct HashWork {
+            LONG64 blocks = 0, dirty = 0, ticks = 0;
+            ~HashWork()
+            {
+                count_mirror(MirrorStat::hashed, blocks);
+                count_mirror(MirrorStat::dirty, dirty);
+                count_mirror(MirrorStat::hash_ticks, ticks);
+            }
+        } hash_work;
         for (std::size_t i = 0; i < hashes.size(); ++i) {
             const std::size_t offset = i * gpu_mirror_block_bytes;
             const std::size_t length = (std::min)(bytes - offset, gpu_mirror_block_bytes);
+            LARGE_INTEGER start, end;
+            QueryPerformanceCounter(&start);
             hashes[i] = gpu_mirror_hash(title + offset, length);
+            QueryPerformanceCounter(&end);
+            hash_work.ticks += end.QuadPart - start.QuadPart;
+            ++hash_work.blocks;
             if (valid && offset < mirror.bytes &&
                 length == (std::min)(mirror.bytes - offset, gpu_mirror_block_bytes) &&
                 (skip_updates || hashes[i] == mirror.hashes[i])) continue;
+            ++hash_work.dirty;
             const auto padded = (length + 3) & ~std::size_t{3};
             auto slice = reserve_upload_ring(self, padded);
             if (!slice.mapped) return nullptr;
@@ -1758,13 +1871,16 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         auto& states = pass_of(self).states;
         states.reserve(states.size() + 1);
         if (!dirty.empty()) {
+            LONG64 uploaded = 0;
             require_state(self, resource, D3D12_RESOURCE_STATE_COPY_DEST);
             auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
             for (const auto& block : dirty) {
                 const auto padded = (block.bytes + 3) & ~std::size_t{3};
                 list->CopyBufferRegion(resource, block.offset, block.slice.resource, block.slice.offset, padded);
                 big_binding_counts.copied_bytes += block.bytes;
+                uploaded += block.bytes;
             }
+            count_mirror(MirrorStat::uploaded, uploaded);
             big_binding_counts.copies += static_cast<unsigned>(dirty.size());
             InterlockedIncrement64(&big_copies_made);
         }
@@ -1773,6 +1889,7 @@ ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_byt
         mirror.bytes = bytes;
         mirror.recording = recording;
         mirror.frame = frame_number;
+        count_mirror(MirrorStat::served);
         return resource;
     } catch (const std::bad_alloc&) {
         return nullptr;
@@ -3504,9 +3621,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
             if (readable_range && !target) {
                 // The guest memory is there; only the copy failed. A null binding would read zeros as if the title had bound nothing.
-                static LONG copy_refused;
-                if (first_calls(copy_refused, 6))
-                    log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+                note_buffer_copy_failure(tr->key, i, padded);
                 count_null_binding(x2w_local::NullCause::ring_full);
                 draw_lock_release_exclusive();
                 return not_drawn(buffer_copy_failed_site);
@@ -3577,6 +3692,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = cached->bytes;
             readable_range = cached->readable;
             ++big_binding_counts.hits;
+            count_mirror(MirrorStat::hits);
         } else {
             if (address && large_raw) {
                 bool extent_ok = false;
@@ -3592,11 +3708,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 cached->bytes = bytes;
                 cached->readable = readable_range;
                 ++big_binding_counts.trims;
+                count_mirror(MirrorStat::validations);
             }
         }
         const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
         bool have = false;
-        if (readable_range && cached && mirror_candidate) {
+        const bool mirror_attempt = readable_range && cached && mirror_candidate;
+        if (mirror_attempt) {
             chunk = bind_gpu_mirror(self, address, full_bytes, bytes, cache_hit);
             if (chunk) {
                 offset = 0;
@@ -3624,7 +3742,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             } else {
                 // A retry needs a fresh readability check before it can read title memory.
                 big_bindings.erase(bigbind_key(address, full_bytes));
+                count_mirror(MirrorStat::erased);
             }
+            // A cached ring slice also serves the fallback without a second copy.
+            if (mirror_attempt) count_mirror(have ? MirrorStat::fallback_copied : MirrorStat::fallback_failed);
         } else if (readable_range && !have) {
             have = frame_copy(self, address, bytes, &offset, &chunk);
         }
@@ -3655,9 +3776,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (readable_range && !have) {
             // The guest memory is readable and only the frame copy failed (upload ring full): refuse the draw instead of
             // binding null, which would read zeros as if the title had bound nothing.
-            static LONG copy_refused;
-            if (first_calls(copy_refused, 6))
-                log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+            note_buffer_copy_failure(tr->key, i, bytes);
             count_null_binding(x2w_local::NullCause::ring_full);
             draw_lock_release_exclusive();
             return not_drawn(buffer_copy_failed_site);

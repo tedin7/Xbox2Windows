@@ -74,7 +74,7 @@ constexpr ULONGLONG log_retry_ms = 250;
 // process next) always attempts the open and asks for FlushFileBuffers. A line for another path
 // than the kept one (the variable changed in-process) is appended the old way: open, write,
 // close. Nothing is written when the variable is unset or too long.
-inline void append_log(const char* line, DWORD size, bool flush) noexcept
+inline void append_log(const char* line, DWORD size, bool flush, bool allow_open = true) noexcept
 {
     struct Log {
         HANDLE handle;
@@ -83,12 +83,18 @@ inline void append_log(const char* line, DWORD size, bool flush) noexcept
     static Log* volatile kept = nullptr;
     static volatile LONG64 retry_at = 0;  // GetTickCount64 before which no ordinary line opens
 
+    Log* current = static_cast<Log*>(InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(&kept), nullptr, nullptr));
+    if (!allow_open) {
+        // Process detach can follow the termination of a thread holding a heap lock.
+        if (current) write_all(current->handle, line, size);
+        return;
+    }
+
     wchar_t path[MAX_PATH];
     const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
     if (!length || length >= MAX_PATH) return;
 
-    Log* current = static_cast<Log*>(InterlockedCompareExchangePointer(
-        reinterpret_cast<void* volatile*>(&kept), nullptr, nullptr));
     if (current && !std::wcscmp(current->path, path)) {
         write_all(current->handle, line, size);
         if (flush) FlushFileBuffers(current->handle);

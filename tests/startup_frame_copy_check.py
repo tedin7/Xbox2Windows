@@ -155,12 +155,40 @@ float4 main(float4 p : SV_Position) : SV_Target {
         for frame, (pixels, wanted) in enumerate(zip(actual, reference), 1):
             if pixels != wanted:
                 raise AssertionError(f"{name} frame {frame}: actual {pixels.hex()} expected {wanted.hex()}")
+        output = log.read_text(errors="replace")
         frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
-                            log.read_text(errors="replace"))
+                            output)
         counters = [tuple(map(int, record)) for record in frames]
         wanted = [(frame, 1, copies[frame - 1], 1, uploaded[frame - 1]) for frame in range(1, 4)]
         if counters != wanted:
             raise AssertionError(f"{name}: actual counters {counters}, expected {wanted}")
+        totals = re.findall(
+            r"^x2w-render gpu mirror: total frame 3, frames 3, served (\d+), not owner (\d+), not idle (\d+), "
+            r".*?blocks hashed (\d+), dirty blocks (\d+), bytes uploaded (\d+), "
+            r".*?fallback copied (\d+), fallback failed (\d+), validations (\d+), cache hits (\d+), cache entries erased (\d+)",
+            output, re.M)
+        if not totals:
+            raise AssertionError(f"{name}: missing three-frame cumulative mirror diagnostics")
+        stats = tuple(map(int, totals[-1]))
+        hashed = 3 * size // block if enabled == "1" else 0
+        mirror_bytes = sum(uploaded) if enabled == "1" else 0
+        expected_stats = (6 if enabled == "1" else 0, 0, 0, hashed, mirror_bytes // block,
+                          mirror_bytes, 0, 0, 3, 3, 0)
+        if stats != expected_stats:
+            raise AssertionError(f"{name}: actual mirror totals {stats}, expected {expected_stats}")
+        if stale == "1" and actual == expected:
+            raise AssertionError("mirror: the stale mutant still matches the CPU reference")
+        if name == "mirror":
+            if len(totals) < 2:
+                raise AssertionError("mirror: expected three-frame totals for both the stop request and process exit")
+            if "x2w-render census tick: stop requested at frame 3" not in output:
+                raise AssertionError("mirror: the launcher stop request produced no totals tick")
+            if not re.search(r"^x2w-render census tick at .* frame 2 \(10 s of wall time\)$", output, re.M):
+                raise AssertionError("mirror: missing wall-time totals tick during the pause after present 2")
+            if not re.search(r"^x2w-render gpu mirror: total frame 2, frames 2,", output, re.M):
+                raise AssertionError("mirror: missing cumulative diagnostics during the pause")
+            if not re.search(r"^x2w-render gpu mirror: window frame [1-3], frames [1-3],", output, re.M):
+                raise AssertionError("mirror: missing heartbeat window diagnostics")
         print(f"{backend} {name}: upload bytes {uploaded}, "
               + ("stale pixels detected in frames 2 and 3" if stale == "1" else "all frames match CPU"))
     return 0

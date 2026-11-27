@@ -22,6 +22,10 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
+k32.OpenEventW.restype = wt.HANDLE
+k32.SetEvent.argtypes = [wt.HANDLE]
+k32.SetEvent.restype = wt.BOOL
 k32.SuspendThread.restype = wt.DWORD
 nt_dll = ctypes.WinDLL("ntdll")
 nt_dll.NtSuspendThread.restype = ctypes.c_ulong
@@ -29,6 +33,7 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
 
+RENDER_TOTALS_GRACE_SECONDS = 1.0
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
 from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes, shape_note  # noqa: E402
@@ -886,7 +891,8 @@ def main():
     # that may call WaitForDebugEvent, keeps serving events with the same handlers (breakpoints, offline
     # refusals). Without that, a child thread held on an unserved event leaves the capture waiting for ever.
     ending, end_time, final_thread, final_result = False, None, None, []
-    final_deadline = 0.0
+    final_deadline = totals_deadline = 0.0
+    totals_request = None
     while True:
         now = time.time()
         if not ending and timeout and now - start >= timeout:
@@ -913,10 +919,17 @@ def main():
             if end_time is None:
                 end_time = now
                 if exit_code is None:
+                    if stop is None:  # A pending fatal debug event holds every title thread.
+                        # SYNCHRONIZE | EVENT_MODIFY_STATE. The shim resets the event after writing the totals.
+                        totals_request = k32.OpenEventW(0x100002, False, f"Local\\x2w-render-totals-{pi.dwProcessId}")
+                        if totals_request and k32.SetEvent(wt.HANDLE(totals_request)):
+                            totals_deadline = time.monotonic() + RENDER_TOTALS_GRACE_SECONDS
                     final_thread = threading.Thread(target=run_capture, args=(final_result,), daemon=True)
                     final_thread.start()
                     final_deadline = now + CAPTURE_LIMIT
-            if final_thread is None or not final_thread.is_alive() or now >= final_deadline:
+            totals_pending = (totals_request and exit_code is None and time.monotonic() < totals_deadline
+                              and k32.WaitForSingleObject(wt.HANDLE(totals_request), 0) == 0)
+            if (final_thread is None or not final_thread.is_alive() or now >= final_deadline) and not totals_pending:
                 break
         if dump_at and time.time() - start >= dump_at[0]:
             dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
@@ -1113,6 +1126,8 @@ def main():
             log_exception(disposition)
         k32.ContinueDebugEvent(pid, tid, status)
 
+    if totals_request:
+        k32.CloseHandle(wt.HANDLE(totals_request))
     window.abandon()
     elapsed = (end_time or time.time()) - start
     if stop and stop_at:

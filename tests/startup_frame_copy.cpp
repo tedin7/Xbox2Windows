@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cwchar>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -96,6 +97,10 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(target.rtv_heap, 9))};
         const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
         const UINT edits[]{0, (11u << 20) / sizeof(float), large_words - 2};
+        char enabled[2]{}, stale[2]{};
+        const bool check_wall_tick = GetEnvironmentVariableA("X2W_GPU_MIRROR", enabled, sizeof(enabled)) == 1 &&
+            enabled[0] == '1' && GetEnvironmentVariableA("X2W_TEST_GPU_MIRROR_STALE", stale, sizeof(stale)) == 1 &&
+            stale[0] == '0';
         for (UINT frame = 0; frame < 3; ++frame) {
             if (frame) {
                 if (FAILED(static_cast<HRESULT>(invoke(target.allocator, 8))) ||
@@ -127,6 +132,20 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
             const std::string path = frame == 2 ? pixels : std::string(pixels) + "." + std::to_string(frame);
             if (const int result = read_stream_target(desktop, target, path.c_str())) return result;
             invoke(target.queue, 32, 0, 0, 0);
+            // Keep the present count fixed for a full wall census interval.
+            if (frame == 1 && check_wall_tick) Sleep(11000);
+        }
+        if (check_wall_tick) {
+            wchar_t name[64];
+            swprintf(name, sizeof(name) / sizeof(*name), L"Local\\x2w-render-totals-%lu", GetCurrentProcessId());
+            const HANDLE stop = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name);
+            if (!stop) return 50;
+            const bool signalled = SetEvent(stop);
+            const auto deadline = GetTickCount64() + 5000;
+            while (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0 && GetTickCount64() < deadline) Sleep(1);
+            const bool acknowledged = WaitForSingleObject(stop, 0) == WAIT_TIMEOUT;
+            CloseHandle(stop);
+            if (!signalled || !acknowledged) return 51;
         }
         VirtualFree(large, 0, MEM_RELEASE);
         return 0;
