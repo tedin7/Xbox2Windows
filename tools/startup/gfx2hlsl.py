@@ -11449,6 +11449,32 @@ class Stage:
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
+    def op_image_gather4_l_o(self, ops, mods):
+        # AMD RDNA 2 ISA, section 8.2: offset precedes coordinates and explicit LOD.
+        name = 'image_gather4_l_o'
+        regs = []
+        dst, _, words, (_, channel), tex = self.gather_2d_setup(
+            name, ops, mods, 4, 'four address registers', mip_preclamp=False, regs_out=regs)
+        if tex is None:
+            return self.null_image_read(dst, 15)
+        # Arbitrary normalized coordinates can lie on a sampler fixed-point rounding boundary.
+        # At 0 or 1 the footprint is exactly half a texel from the edge at every mip.
+        for reg in regs[1:3]:
+            try:
+                coordinate = self.constant_vgpr_word(reg, name)
+            except Unsupported as error:
+                raise Unsupported('%s requires literal 0.0 or 1.0 coordinates for exact footprint' % name) from error
+            if coordinate not in (0, 0x3f800000):
+                raise Unsupported('%s requires literal 0.0 or 1.0 coordinates for exact footprint' % name)
+        self.pipe.uses_gather_2d_lod_offset = True
+        max_lod = ((words[1] >> 12) & 0xfff) / 256.0
+        off = self.u('v%d' % regs[0])
+        u, v, lod = (self.f('v%d' % i) for i in regs[1:])
+        self.emit('t = gather_2d_lod_offset(%s, float2(%s, %s), %s, %s, %d, %sf);' %
+                  (tex, u, v, lod, off, channel, repr(max_lod)))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
     def op_image_gather4_l(self, ops, mods):
         """image_gather4_l on a 2D texture with explicit LOD and a validated constant sampler."""
         dst, addr, words, (_, channel_index), tex = self.gather_2d_setup(
@@ -14879,6 +14905,7 @@ class Pipeline:
     uses_dynamic_heap = False
     uses_pack16_rne = False
     uses_gather_2d_lod = False
+    uses_gather_2d_lod_offset = False
     uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
@@ -14922,6 +14949,7 @@ class Pipeline:
         self.uses_sampler_heap = False
         self.uses_pack16_rne = False
         self.uses_gather_2d_lod = False
+        self.uses_gather_2d_lod_offset = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
         self.uses_store_format_xyzw = False
@@ -15350,6 +15378,31 @@ class Pipeline:
                 '            int2 edge = int2(width, height) - 1;',
                 '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
                 '            int2 origin = int2(floor(clamp(scaled, float2(-1.0f, -1.0f), float2(width, height))));',
+                '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
+                '        }',
+                '    }',
+                '    return result;',
+                '}',
+            ))
+        if self.uses_gather_2d_lod_offset:
+            out.extend((
+                'float4 gather_2d_lod_offset(Texture2D<float4> tex, float2 uv, float lod, uint packed_offset, uint component, float max_lod) {',
+                '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
+                '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
+                '        uint width, height, levels;',
+                '        tex.GetDimensions(0u, width, height, levels);',
+                '        if (levels != 0u) {',
+                '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
+                '            tex.GetDimensions(mip, width, height, levels);',
+                '            int2 edge = int2(width, height) - 1;',
+                '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
+                '            int2 offset = int2(asint(packed_offset << 26u) >> 26, asint(packed_offset << 18u) >> 26);',
+                '            int2 origin = int2(floor(clamp(scaled, float2(-33.0f, -33.0f), float2(width + 32u, height + 32u)))) + offset;',
                 '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
                 '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
                 '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
@@ -15852,6 +15905,7 @@ class ComputePipeline(Pipeline):
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.uses_gather_2d_lod = False
+        self.uses_gather_2d_lod_offset = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
