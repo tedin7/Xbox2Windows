@@ -8875,11 +8875,20 @@ class Stage:
 
     def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
         r = reg_range(token)
-        if (count != 4 or dst[2] > 105 or self.has_branches or len(self.sym[base[1]]) != 2 or not r or r[0] != 's'
-                or not self.uniform_source(token) or self.sym.get(base[2]) != ('const', 0)):
+        # A vertex stage may load the record inside a branch arm: the index lives in a temporary that is declared at
+        # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
+        # it. Only the vertex stage does this; the pixel and compute stages keep refusing the load in a branch.
+        in_branch = self.has_branches
+        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) != 'vs')
+                or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
+                or self.sym.get(base[2]) != ('const', 0)):
             raise Unsupported(refusal)
         name = 'heap_index_%x' % self.pc
-        self.emit('uint %s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
+        if in_branch:
+            self.uniform_load_temps.add(name)
+            self.emit('%s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
+        else:
+            self.emit('uint %s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name), 0, i)
 
