@@ -538,11 +538,12 @@ bool extended_buffer_formats()
 {
     static const bool enabled = [] {
         const DWORD saved = GetLastError();
+        // Default on: typed buffer views such as R32_UINT decode in translated draws. Only "0" opts out.
         char value[2]{};
-        const bool on = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
-                        value[0] == '1';
+        const bool off = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
+                         value[0] == '0';
         SetLastError(saved);
-        return on;
+        return !off;
     }();
     return enabled;
 }
@@ -550,7 +551,7 @@ bool extended_buffer_formats()
 u64 shader_cache_seed(const char* revision, std::size_t bytes)
 {
     const u64 seed = fnv_bytes(revision, bytes);
-    // Keep graphics bytecode with extended cases out of the default request namespace.
+    // Translations with and without the extended cases (X2W_EXTENDED_BUFFER_FORMATS=0) never share a request key.
     constexpr char feature[] = "extended-buffer-formats1";
     return extended_buffer_formats() ? fnv_bytes(feature, sizeof(feature) - 1, seed) : seed;
 }
