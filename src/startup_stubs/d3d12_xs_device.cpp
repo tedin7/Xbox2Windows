@@ -103,6 +103,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <new>
 #include <map>
@@ -215,6 +216,7 @@ struct alignas(16) WrapperOwn {
     ComputeManifest* compute_manifest; // PipelineState: shared manifest state for its request key
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
+    volatile LONG query_gpu_written; // Placed buffer: whole-buffer resolve guard when ranges are unavailable.
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
@@ -578,10 +580,17 @@ bool is_base_iid(REFIID iid)
            iid == __uuidof(ID3D12Pageable);
 }
 
-// Traps. The kind is a template argument so a trap never dereferences its arguments.
+bool observe_query_slot(u64 list, int slot, u64 heap, UINT type, UINT start, UINT count, u64 destination, u64 offset);
+
+// Traps. The kind is a template argument so a trap never dereferences unknown pointers.
 template <int K, int N>
-__declspec(noinline) u64 trap_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
+__declspec(noinline) u64 trap_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0 = 0, u64 s1 = 0, u64 s2 = 0)
 {
+    if constexpr (K == list_kind && N >= 28 && N <= 30) {
+        if (observe_query_slot(rcx, N, rdx, static_cast<UINT>(r8), static_cast<UINT>(r9),
+                               N == 30 ? static_cast<UINT>(s0) : 1, N == 30 ? s1 : 0, N == 30 ? s2 : 0))
+            return 0;
+    }
     char name[64];
     std::snprintf(name, sizeof(name), "%s::slot%d", kind_names[K], N);
     x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, (0x80 | N) & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
@@ -668,6 +677,11 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     }
     if constexpr (K == list_kind && (N == 14 || N == 35 || N == 37 || N == 39 || N == 41 || N == 43 || N == 45)) {
         if (compute_binding_trace_enabled()) trace_compute_binding(reinterpret_cast<Wrapper*>(rcx), N, rdx, r8, r9, s0);
+    }
+    if constexpr (K == list_kind && N >= 28 && N <= 30) {
+        if (observe_query_slot(rcx, N, rdx, static_cast<UINT>(r8), static_cast<UINT>(r9),
+                               N == 30 ? static_cast<UINT>(s0) : 1, N == 30 ? s1 : 0, N == 30 ? s2 : 0))
+            return 0;
     }
     if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
     // Register arguments only: stale caller stack words often still point at an IID. The probe
@@ -3045,34 +3059,48 @@ std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>>& placed_gpu_writes()
     static std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>> m;
     return m;
 }
+bool visible_query_results();
+
 void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
 {
     if (!buffer || !buffer->own().title_memory || !bytes) return;
     const auto* info = resource_info(buffer);
-    if (!info || info->placement != Placement::copied_buffer) return;
+    if (!info || info->placement == Placement::none) return;
+    const bool visible = visible_query_results();
+    if (info->placement == Placement::aliased_buffer && !visible) return;
+    x2w_startup::ExclusiveNoteLock guard(placed_gpu_writes_lock);
+    if (info->placement == Placement::aliased_buffer) {
+        InterlockedExchange(&buffer->own().query_gpu_written, 1);
+        return;
+    }
     const u64 address = reinterpret_cast<u64>(buffer->own().title_memory);
-    AcquireSRWLockExclusive(&placed_gpu_writes_lock);
     try {
         auto& writes = placed_gpu_writes()[buffer];
         if (!writes.empty() && writes.front().address != address) writes.clear();  // a new buffer at a reused wrapper
         if (writes.size() < 64) writes.push_back({address, offset, bytes});
+        else if (visible) InterlockedExchange(&buffer->own().query_gpu_written, 1);
         placed_gpu_write_buffers = static_cast<LONG>(placed_gpu_writes().size());
     } catch (const std::bad_alloc&) {
+        if (visible) InterlockedExchange(&buffer->own().query_gpu_written, 1);
     }
-    ReleaseSRWLockExclusive(&placed_gpu_writes_lock);
 }
+
+bool placed_gpu_written_locked(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    const auto found = placed_gpu_writes().find(buffer);
+    if (found == placed_gpu_writes().end() || found->second.empty() || !buffer->own().title_memory ||
+        found->second.front().address != reinterpret_cast<u64>(buffer->own().title_memory)) return false;
+    for (const auto& write : found->second)
+        if (offset < write.offset + write.bytes && write.offset < offset + bytes) return true;
+    return false;
+}
+
 // True when a recorded copy wrote any byte of [offset, offset + bytes) of the buffer.
 bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
 {
     if (!InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) return false;
-    bool written = false;
     AcquireSRWLockShared(&placed_gpu_writes_lock);
-    const auto found = placed_gpu_writes().find(buffer);
-    if (found != placed_gpu_writes().end() && buffer->own().title_memory &&
-        found->second.front().address == reinterpret_cast<u64>(buffer->own().title_memory)) {
-        for (const auto& write : found->second)
-            if (offset < write.offset + write.bytes && write.offset < offset + bytes) written = true;
-    }
+    const bool written = placed_gpu_written_locked(buffer, offset, bytes);
     ReleaseSRWLockShared(&placed_gpu_writes_lock);
     return written;
 }
@@ -3301,12 +3329,150 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
     return TRUE;
 }
 
-// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
-// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
-// desktop desc. Only occlusion queries are
-// forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
-// heap it names is refused and logged with its values instead of reaching the desktop list.
+// Argument shape is evidence for the proposed ABI. It is independent of forwarding and write eligibility.
 enum QueryMethod { begin_query, end_query, resolve_query };
+enum class QueryResults { off, visible, forward };
+
+QueryResults query_results_mode()
+{
+    static const auto mode = [] {
+        wchar_t value[16]{};
+        const auto length = GetEnvironmentVariableW(L"X2W_QUERY_RESULTS", value, 16);
+        if (length == 7 && std::wcscmp(value, L"visible") == 0) return QueryResults::visible;
+        if (length == 7 && std::wcscmp(value, L"forward") == 0) return QueryResults::forward;
+        wchar_t legacy[4]{};
+        if (GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", legacy, 4) && legacy[0] == L'1')
+            return QueryResults::forward;
+        return QueryResults::off;
+    }();
+    return mode;
+}
+
+bool visible_query_results() { return query_results_mode() == QueryResults::visible; }
+
+volatile LONG64 query_calls[3], query_fits[3], query_heaps[3];
+
+// Bytes per desktop result record. Zero means the type does not belong to this heap kind.
+size_t query_result_size(D3D12_QUERY_HEAP_TYPE heap, UINT type)
+{
+    switch (heap) {
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+        return type == D3D12_QUERY_TYPE_OCCLUSION || type == D3D12_QUERY_TYPE_BINARY_OCCLUSION ? sizeof(u64) : 0;
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+    case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP:
+        return type == D3D12_QUERY_TYPE_TIMESTAMP ? sizeof(u64) : 0;
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+        return type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) : 0;
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1:
+        return type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1 ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) : 0;
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+        return type >= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 && type <= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3
+            ? sizeof(D3D12_QUERY_DATA_SO_STATISTICS) : 0;
+    case D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS:
+        // Video query calls use a different command-list ABI.
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+void query_census_line(char* line, size_t capacity)
+{
+    const auto read = [](volatile LONG64& counter) {
+        return static_cast<long long>(InterlockedCompareExchange64(&counter, 0, 0));
+    };
+    std::snprintf(line, capacity,
+        "x2w-d3d12 query slots: begin %lld (fit %lld), end %lld (fit %lld), resolve %lld (fit %lld), "
+        "heaps by type: occlusion %lld, timestamp %lld, statistics %lld",
+        read(query_calls[0]), read(query_fits[0]), read(query_calls[1]), read(query_fits[1]),
+        read(query_calls[2]), read(query_fits[2]), read(query_heaps[0]), read(query_heaps[1]), read(query_heaps[2]));
+}
+
+// Resolve is recorded before submission identifies the queue. Use the last frequency returned by slot 18.
+volatile LONG64 query_frequency, last_query_tick;
+u64 next_query_tick()
+{
+    LARGE_INTEGER counter{}, frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    const auto reported = InterlockedCompareExchange64(&query_frequency, 0, 0);
+    const auto scaled = static_cast<LONG64>(static_cast<long double>(counter.QuadPart) *
+        (reported ? reported : frequency.QuadPart) / frequency.QuadPart);
+    auto prior = InterlockedCompareExchange64(&last_query_tick, 0, 0);
+    for (;;) {
+        const auto tick = (std::max)(scaled, prior + 1);
+        const auto observed = InterlockedCompareExchange64(&last_query_tick, tick, prior);
+        if (observed == prior) return static_cast<u64>(tick);
+        prior = observed;
+    }
+}
+
+void write_visible_query_results(Wrapper* list, Wrapper* buffer, const ResourceInfo* info,
+                                 UINT type, UINT count, size_t stride, u64 offset)
+{
+    if (!info || info->placement == Placement::none || !buffer->own().title_memory ||
+        (info->console.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return;
+    const u64 bytes = u64{count} * stride;
+    const u64 width = info->console.Width;
+    const u64 base = reinterpret_cast<u64>(buffer->own().title_memory);
+    if ((offset & 7) || offset > width || bytes > width - offset || offset > UINT64_MAX - base) return;
+    auto* output = reinterpret_cast<unsigned char*>(base + offset);
+    x2w_startup::ExclusiveNoteLock guard(placed_gpu_writes_lock);
+    if (InterlockedCompareExchange(&buffer->own().query_gpu_written, 0, 0) ||
+        placed_gpu_written_locked(buffer, offset, bytes) || !x2w_local::writable(output, bytes)) return;
+
+    if (type == D3D12_QUERY_TYPE_TIMESTAMP) {
+        for (UINT i = 0; i < count; ++i) {
+            const u64 tick = next_query_tick();
+            std::memcpy(output + i * stride, &tick, sizeof(tick));
+        }
+    } else if (type == D3D12_QUERY_TYPE_OCCLUSION || type == D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
+        u64 samples = type == D3D12_QUERY_TYPE_BINARY_OCCLUSION ? 1 : 0x10000;
+        if (type == D3D12_QUERY_TYPE_OCCLUSION && list->own().pass) {
+            const auto& pass = pass_of(list);
+            auto* target = pass.bound_targets[0] ? pass.bound_targets[0] : pass.bound_depth;
+            if (target) {
+                const auto desc = target->GetDesc();
+                samples = desc.Width * desc.Height;
+            }
+        }
+        static const bool zero_mutant = x2w_local::env_on("X2W_TEST_QUERY_ZERO_MUTANT");
+        if (zero_mutant) samples = 0;
+        for (UINT i = 0; i < count; ++i) std::memcpy(output + i * stride, &samples, sizeof(samples));
+    } else {
+        std::memset(output, 0, bytes);
+    }
+}
+
+bool observe_query_slot(u64 list, int slot, u64 heap_address, UINT type, UINT start, UINT count,
+                        u64 destination, u64 offset)
+{
+    const int method = slot - 28;
+    InterlockedIncrement64(&query_calls[method]);
+    const bool visible = visible_query_results();
+    const auto* heap = as_wrapper(reinterpret_cast<const void*>(heap_address));
+    if (!heap || heap->own().kind != query_heap_kind) return visible;
+    const auto& desc = heap->own().query_heap;
+    const auto stride = query_result_size(desc.Type, type);
+    if (!stride || start >= desc.Count || !count || count > desc.Count - start) return visible;
+    if (method == begin_query && type == D3D12_QUERY_TYPE_TIMESTAMP) return visible;
+    if (method == resolve_query) {
+        auto* buffer = as_wrapper(reinterpret_cast<const void*>(destination));
+        if (!buffer || buffer->own().kind != resource_kind) return visible;
+        const auto* info = resource_info(buffer);
+        if (info) {
+            if (info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return visible;
+        } else {
+            auto* real = static_cast<ID3D12Resource*>(buffer->own().real);
+            if (!real || real->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return visible;
+        }
+        if (visible) write_visible_query_results(reinterpret_cast<Wrapper*>(list), buffer, info, type, count, stride, offset);
+    }
+    InterlockedIncrement64(&query_fits[method]);
+    return visible;
+}
+
+// Forward mode preserves the original occlusion-only diagnostic.
 void refuse_query(QueryMethod method, const char* reason, UINT type, UINT index, UINT count)
 {
     static const char* const names[] = {"BeginQuery", "EndQuery", "ResolveQueryData"};
@@ -3415,8 +3581,19 @@ HRESULT __stdcall device_create_query_heap(Wrapper* self, const D3D12_QUERY_HEAP
     const auto hr = static_cast<HRESULT>(create_slot<device_kind, 39, 1>(self, reinterpret_cast<u64>(desc),
                                                                          reinterpret_cast<u64>(iid), reinterpret_cast<u64>(out),
                                                                          0, 0, 0, 0, 0));
-    if (Wrapper* w = SUCCEEDED(hr) && desc && out ? as_wrapper(*out) : nullptr; w && w->own().kind == query_heap_kind)
+    if (Wrapper* w = SUCCEEDED(hr) && desc && out ? as_wrapper(*out) : nullptr; w && w->own().kind == query_heap_kind) {
         w->own().query_heap = *desc;
+        switch (desc->Type) {
+        case D3D12_QUERY_HEAP_TYPE_OCCLUSION: InterlockedIncrement64(&query_heaps[0]); break;
+        case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+        case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP: InterlockedIncrement64(&query_heaps[1]); break;
+        case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+        case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1:
+        case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+        case D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS: InterlockedIncrement64(&query_heaps[2]); break;
+        default: break;
+        }
+    }
     return hr;
 }
 
@@ -4631,6 +4808,8 @@ volatile LONG64* __stdcall fence_completed_address(Wrapper* self, u64 value, u64
 HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
 {
     const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->GetTimestampFrequency(frequency);
+    if (query_results_mode() == QueryResults::visible && SUCCEEDED(hr) && frequency && *frequency)
+        InterlockedExchange64(&query_frequency, static_cast<LONG64>(*frequency));
     static LONG calls;
     if (first_calls(calls, 2))
         log("x2w-d3d12 CommandQueue::slot18(GetTimestampFrequency) -> 0x%08lx %llu", static_cast<unsigned long>(hr),
@@ -7947,6 +8126,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
+        char query_line[384];
+        query_census_line(query_line, sizeof(query_line));
+        log("%s", query_line);
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
@@ -8026,6 +8208,9 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
         for (std::size_t i = 0; i <= bytes; ++i, ++length)
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
+    char query_line[384];
+    query_census_line(query_line, sizeof(query_line));
+    emit(query_line);
     memory_srv_census.report(emit, false);
     token_null_census.report(emit, false);
     memory_srv_writes.report(emit, false);
@@ -8165,9 +8350,7 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
-        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
-        // bindings are opt-in. Unset, the slots stay no-ops.
-        if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
+        if (query_results_mode() == QueryResults::forward) {
             list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
             list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);
             list_typed[30] = reinterpret_cast<ListTyped>(&list_resolve_query);

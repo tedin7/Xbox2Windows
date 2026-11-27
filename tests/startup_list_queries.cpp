@@ -1,35 +1,6 @@
-// Occlusion queries recorded on a console command list (slots 28, 29 and 30).
-//
-//   startup_list_queries <warp|hardware> [default]
-//
-// The probe sets X2W_D3D12_QUERY_SLOTS=1, the opt-in that binds the three slots, unless "default" is given.
-// Through D3D12XboxCreateDevice it creates an occlusion query heap of 8 (device slot 39) and a readback buffer
-// in COPY_DEST (device slot 27), fills the buffer with a sentinel, and records on a DIRECT console list:
-//
-//   query 0: BeginQuery / EndQuery (slots 28, 29) around a draw that covers an 8x8 target   -> 64 samples
-//   query 1: BeginQuery / EndQuery around nothing                                           -> 0 samples
-//   query 2: BeginQuery / EndQuery with the pipeline-statistics type on the occlusion heap   -> refused
-//   query 3: EndQuery without a BeginQuery                                                  -> refused
-//   query 4: BeginQuery / EndQuery with the binary-occlusion type                           -> forwarded
-//   queries 5 and 7: BeginQuery / EndQuery; query 6 never begun                             -> forwarded
-//   query 2: BeginQuery (occlusion) without an EndQuery                                     -> ended at Close
-//   ResolveQueryData (slot 30) of queries 0 and 1 (occlusion) to word 0                     -> forwarded
-//   Resolves that must leave their words untouched (refused): query 3 (never begun), queries 5 to 7 (a
-//   hole at 6), query 4 as occlusion (ended with the other type), queries 1 and 2 (2 still open), a range
-//   past the heap's count, and one past the buffer's end.
-//
-// Which console methods sit at slots 28 to 30 is a hypothesis: the probe calls those slots directly, so it
-// checks the forwarding, the refusals and the end at Close, not the numbering.
-//
-// The list is submitted and signalled through the console queue. The buffer, read through the console
-// resource's Map, must hold 64 and 0 in its first two words and the sentinel everywhere else, and the D3D12
-// debug layer must store no errors. A refused call that reached the desktop list would add one or make the
-// desktop Close fail (an EndQuery without its BeginQuery does: exit code 3).
-//
-// With "default" the opt-in is not set and the three slots stay no-ops, the behaviour before this change:
-// the buffer keeps its sentinel and the probe fails with exit code 1.
-//
-// Exit codes: 0 pass, 1 wrong query results, 2 usage, 3 setup failure, 4 debug-layer error, 77 no physical adapter.
+// Synthetic query-slot coverage on D3D12 WARP, with an optional hardware run of forward mode.
+// The fixture exercises the proposed ABI directly and compares GPU readback with a CPU pixel table.
+// Visible mode checks title memory and stages those bytes through a GPU copy for readback.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -43,8 +14,11 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <memory>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char*, std::size_t);
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -58,12 +32,14 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
 
 constexpr UINT side = 8;
 constexpr std::uint64_t sentinel = 0xa5a5a5a5a5a5a5a5ull;
-constexpr UINT heap_count = 8, buffer_words = 12;
+constexpr UINT heap_count = 8, buffer_words = 20;
 
 constexpr char shader[] = R"(
-float4 vs(uint id : SV_VertexID) : SV_Position
+float4 vs(uint id : SV_VertexID, uint instance : SV_InstanceID) : SV_Position
 {
-    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.0, 1.0);
+    float x = (id & 1) ? 0.5 : -0.5;
+    float y = (id & 2) ? -0.25 : 0.75;
+    return float4(x + 3.0 * instance, y, 0.0, 1.0);
 }
 float4 ps() : SV_Target { return float4(1, 1, 1, 1); }
 )";
@@ -115,14 +91,20 @@ UINT64 debug_errors(ID3D12Device* device)
 
 int main(int argc, char** argv) try
 {
-    const bool default_slots = argc == 3 && std::strcmp(argv[2], "default") == 0;
-    if (argc != 2 && !default_slots) return 2;
+    if (argc < 2 || argc > 3) return 2;
+    const char* mode = argc == 3 ? argv[2] : "forward";
+    const bool default_slots = std::strcmp(mode, "default") == 0;
+    const bool legacy = std::strcmp(mode, "legacy") == 0;
+    const bool mutant = std::strcmp(mode, "visible-zero") == 0;
+    const bool visible = mutant || std::strcmp(mode, "visible") == 0;
+    if (!default_slots && !legacy && !visible && std::strcmp(mode, "forward") != 0) return 2;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
     const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
     if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
     if (debug) debug->EnableDebugLayer();
+    if (warp && !debug) check(E_FAIL, "WARP fixture requires the D3D12 debug layer");
     ComPtr<IDXGIFactory6> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
     ComPtr<IDXGIAdapter1> adapter;
@@ -141,7 +123,9 @@ int main(int argc, char** argv) try
     SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1");
     SetEnvironmentVariableA("X2W_D3D12_RENDER", "1");
-    SetEnvironmentVariableA("X2W_D3D12_QUERY_SLOTS", default_slots ? nullptr : "1");
+    SetEnvironmentVariableA("X2W_D3D12_QUERY_SLOTS", legacy ? "1" : nullptr);
+    SetEnvironmentVariableA("X2W_QUERY_RESULTS", visible ? "visible" : legacy || default_slots ? nullptr : "forward");
+    SetEnvironmentVariableA("X2W_TEST_QUERY_ZERO_MUTANT", mutant ? "1" : nullptr);
     const std::array<unsigned char, 64> parameters{};
     ComPtr<ID3D12Device> guest;
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
@@ -153,7 +137,7 @@ int main(int argc, char** argv) try
         std::printf("driver: %u.%u.%u.%u\n", HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart),
                     LOWORD(driver.LowPart));
 
-    // Desktop draw state: an empty root signature, a full-target triangle, and an 8x8 target with its view.
+    // Desktop draw state: an empty root signature, a partially covered target, and an 8x8 target with its view.
     const D3D12_ROOT_SIGNATURE_DESC root_desc{0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> serialized;
     check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr), "serialize root");
@@ -201,6 +185,28 @@ int main(int argc, char** argv) try
     for (UINT i = 0; i < buffer_words; ++i) static_cast<std::uint64_t*>(mapped)[i] = sentinel;
     results->Unmap(0, nullptr);
 
+    const auto free_pages = [](void* pages) { if (pages) VirtualFree(pages, 0, MEM_RELEASE); };
+    std::unique_ptr<void, decltype(free_pages)> title_pages(nullptr, free_pages);
+    ComPtr<ID3D12Resource> title_results;
+    ComPtr<ID3D12QueryHeap> timestamps, statistics_heap;
+    if (visible || default_slots) {
+        title_pages.reset(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!title_pages) check(E_OUTOFMEMORY, "allocate title memory");
+        // Use a non-64-KiB-aligned placement to exercise title memory independently of heap alias support.
+        check(static_cast<HRESULT>(invoke(guest.Get(), 133, arg(static_cast<char*>(title_pages.get()) + 16),
+            arg(&buffer_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+            arg(title_results.GetAddressOf()))), "place guest result buffer");
+        check(title_results->Map(0, nullptr, &mapped), "map title result buffer");
+        if (mapped != static_cast<char*>(title_pages.get()) + 16) check(E_FAIL, "verify title placement address");
+        for (UINT i = 0; i < buffer_words; ++i) static_cast<Word*>(mapped)[i] = sentinel;
+        title_results->Unmap(0, nullptr);
+
+        const D3D12_QUERY_HEAP_DESC timestamp_desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+        const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 1, 0};
+        check(guest->CreateQueryHeap(&timestamp_desc, IID_PPV_ARGS(&timestamps)), "create timestamp heap");
+        check(guest->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics_heap)), "create statistics heap");
+    }
+
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     void* queue = nullptr;
     void* fence = nullptr;
@@ -228,33 +234,98 @@ int main(int argc, char** argv) try
     desktop->RSSetScissorRects(1, &scissor);
     desktop->SetGraphicsRootSignature(root.Get());
     desktop->SetPipelineState(pso.Get());
-    desktop->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    desktop->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     const Word occlusion = D3D12_QUERY_TYPE_OCCLUSION, statistics = D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
     invoke(list, 28, arg(heap.Get()), occlusion, 0);
-    desktop->DrawInstanced(3, 1, 0, 0);
+    desktop->DrawInstanced(4, 1, 0, 0);
     invoke(list, 29, arg(heap.Get()), occlusion, 0);
     invoke(list, 28, arg(heap.Get()), occlusion, 1);
+    desktop->DrawInstanced(4, 1, 0, 1);
     invoke(list, 29, arg(heap.Get()), occlusion, 1);
-    invoke(list, 28, arg(heap.Get()), statistics, 2);  // refused: the heap holds occlusion queries
-    invoke(list, 29, arg(heap.Get()), statistics, 2);  // refused
-    invoke(list, 29, arg(heap.Get()), occlusion, 3);   // refused: query 3 was never begun
-    const Word binary = D3D12_QUERY_TYPE_BINARY_OCCLUSION;
-    invoke(list, 28, arg(heap.Get()), binary, 4);
-    invoke(list, 29, arg(heap.Get()), binary, 4);
-    invoke(list, 28, arg(heap.Get()), occlusion, 5);
-    invoke(list, 29, arg(heap.Get()), occlusion, 5);
-    invoke(list, 28, arg(heap.Get()), occlusion, 7);
-    invoke(list, 29, arg(heap.Get()), occlusion, 7);
-    invoke(list, 28, arg(heap.Get()), occlusion, 2);   // never ended: the stand-in ends it at Close
+    LARGE_INTEGER before{}, after{}, qpc_frequency{};
+    Word timestamp_frequency = 0;
+    ComPtr<ID3D12Resource> upload;
+    if (visible || default_slots) {
+        const Word binary = D3D12_QUERY_TYPE_BINARY_OCCLUSION, timestamp = D3D12_QUERY_TYPE_TIMESTAMP;
+        for (UINT i = 0; i < 2; ++i) {
+            invoke(list, 28, arg(heap.Get()), binary, i + 2);
+            desktop->DrawInstanced(4, 1, 0, i);
+            invoke(list, 29, arg(heap.Get()), binary, i + 2);
+        }
+        check(static_cast<HRESULT>(invoke(queue, 18, arg(&timestamp_frequency))), "get guest timestamp frequency");
+        if (!timestamp_frequency) check(E_FAIL, "zero guest timestamp frequency");
+        QueryPerformanceFrequency(&qpc_frequency);
+        invoke(list, 29, arg(timestamps.Get()), timestamp, 0);
+        invoke(list, 29, arg(timestamps.Get()), timestamp, 1);
+        invoke(list, 28, arg(statistics_heap.Get()), statistics, 0);
+        invoke(list, 29, arg(statistics_heap.Get()), statistics, 0);
+        QueryPerformanceCounter(&before);
+        invoke(list, 30, arg(timestamps.Get()), timestamp, 0, 2, arg(title_results.Get()), 32);
+        QueryPerformanceCounter(&after);
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(title_results.Get()), 0);
+        invoke(list, 30, arg(heap.Get()), binary, 2, 2, arg(title_results.Get()), 16);
+        invoke(list, 30, arg(statistics_heap.Get()), statistics, 0, 1, arg(title_results.Get()), 48);
+        // These resolves fit the ABI. The write guards must still leave both title words unchanged.
+        upload = resource(device.Get(), buffer_desc, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(upload->Map(0, nullptr, &mapped), "map upload for copy guard");
+        static_cast<Word*>(mapped)[17] = sentinel;
+        upload->Unmap(0, nullptr);
+        invoke(list, 15, arg(title_results.Get()), 17 * sizeof(Word), arg(upload.Get()), 17 * sizeof(Word), sizeof(Word));
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 1, arg(title_results.Get()), 17 * sizeof(Word));
+        DWORD old_protection = 0;
+        if (!VirtualProtect(title_pages.get(), 4096, PAGE_READONLY, &old_protection))
+            check(HRESULT_FROM_WIN32(GetLastError()), "protect title results");
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 1, arg(title_results.Get()), 18 * sizeof(Word));
+        DWORD ignored = 0;
+        if (!VirtualProtect(title_pages.get(), 4096, old_protection, &ignored))
+            check(HRESULT_FROM_WIN32(GetLastError()), "restore title result protection");
+
+        // Shape fits, but the output would overrun the buffer by one word.
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(title_results.Get()), (buffer_words - 1) * sizeof(Word));
+    } else {
+        invoke(list, 28, arg(heap.Get()), statistics, 2);  // refused: the heap holds occlusion queries
+        invoke(list, 29, arg(heap.Get()), statistics, 2);  // refused
+        invoke(list, 29, arg(heap.Get()), occlusion, 3);   // refused: query 3 was never begun
+        const Word binary = D3D12_QUERY_TYPE_BINARY_OCCLUSION;
+        invoke(list, 28, arg(heap.Get()), binary, 4);
+        invoke(list, 29, arg(heap.Get()), binary, 4);
+        invoke(list, 28, arg(heap.Get()), occlusion, 5);
+        invoke(list, 29, arg(heap.Get()), occlusion, 5);
+        invoke(list, 28, arg(heap.Get()), occlusion, 7);
+        invoke(list, 29, arg(heap.Get()), occlusion, 7);
+        invoke(list, 28, arg(heap.Get()), occlusion, 2);   // never ended: the stand-in ends it at Close
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 0);
+        // Each refused resolve below targets its own words, which must keep the sentinel.
+        invoke(list, 30, arg(heap.Get()), occlusion, 3, 1, arg(results.Get()), 16);  // word 2: query 3 never begun
+        invoke(list, 30, arg(heap.Get()), occlusion, 5, 3, arg(results.Get()), 24);  // words 3-5: hole at query 6
+        invoke(list, 30, arg(heap.Get()), occlusion, 4, 1, arg(results.Get()), 48);  // word 6: query 4 is binary
+        invoke(list, 30, arg(heap.Get()), occlusion, 1, 2, arg(results.Get()), 56);  // words 7-8: query 2 still open
+        invoke(list, 30, arg(heap.Get()), occlusion, 7, 2, arg(results.Get()), 72);  // words 9-10: past the heap's count
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), (buffer_words - 1) * sizeof(Word));  // past the buffer's end
+    }
+    // A resource wrapper is not a query heap even when the remaining arguments match.
+    auto* destination = title_results ? title_results.Get() : results.Get();
+    invoke(list, 30, arg(destination), occlusion, 0, 1, arg(destination), (buffer_words - 1) * sizeof(Word));
+    if (default_slots) {
+        invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 0);
+        invoke(list, 28, arg(heap.Get()), occlusion, 7);
+    }
+
+    std::array<Word, buffer_words> title_observed{};
+    if (title_results) {
+        check(title_results->Map(0, nullptr, &mapped), "read title results");
+        std::memcpy(title_observed.data(), mapped, sizeof(title_observed));
+        title_results->Unmap(0, nullptr);
+    }
+    if (visible) {
+        const D3D12_RANGE no_read{0, 0};
+        check(upload->Map(0, &no_read, &mapped), "map upload for title results");
+        std::memcpy(mapped, title_observed.data(), sizeof(title_observed));
+        upload->Unmap(0, nullptr);
+        const auto native_results = native_object<ID3D12Resource>(device.Get(), guest.Get(), results.Get());
+        desktop->CopyBufferRegion(native_results.Get(), 0, upload.Get(), 0, sizeof(title_observed));
+    }
     transition(desktop, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
-    invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 0);
-    // Each refused resolve below targets its own words, which must keep the sentinel.
-    invoke(list, 30, arg(heap.Get()), occlusion, 3, 1, arg(results.Get()), 16);  // word 2: query 3 never begun
-    invoke(list, 30, arg(heap.Get()), occlusion, 5, 3, arg(results.Get()), 24);  // words 3-5: hole at query 6
-    invoke(list, 30, arg(heap.Get()), occlusion, 4, 1, arg(results.Get()), 48);  // word 6: query 4 is binary
-    invoke(list, 30, arg(heap.Get()), occlusion, 1, 2, arg(results.Get()), 56);  // words 7-8: query 2 still open
-    invoke(list, 30, arg(heap.Get()), occlusion, 7, 2, arg(results.Get()), 72);  // words 9-10: past the heap's count
-    invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 88);  // past the buffer's end
     check(static_cast<HRESULT>(invoke(list, 9)), "close guest list");
 
     void* lists[] = {list};
@@ -278,18 +349,46 @@ int main(int argc, char** argv) try
     results->Unmap(0, &untouched);
     std::uint64_t expected[buffer_words];
     for (auto& word : expected) word = sentinel;
-    expected[0] = side * side;
-    expected[1] = 0;
-    std::printf("samples: query 0 = %llu (expected %llu), query 1 = %llu (expected 0)\n",
-                static_cast<unsigned long long>(observed[0]), static_cast<unsigned long long>(expected[0]),
-                static_cast<unsigned long long>(observed[1]));
+    if (debug_errors(device.Get())) return 4;
+    if (visible) {
+        expected[0] = expected[1] = 0x10000; // No target bound through the shim.
+        expected[2] = expected[3] = 1;
+        const auto scale = [&](LONGLONG tick) {
+            return static_cast<Word>(static_cast<long double>(tick) * timestamp_frequency / qpc_frequency.QuadPart);
+        };
+        if (observed[4] < scale(before.QuadPart) || observed[5] <= observed[4] ||
+            observed[5] > scale(after.QuadPart) + 2) {
+            std::fprintf(stderr, "timestamps are outside the scaled QPC interval or out of order\n");
+            return 1;
+        }
+        expected[4] = observed[4];
+        expected[5] = observed[5];
+        for (UINT i = 0; i < sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) / sizeof(Word); ++i) expected[6 + i] = 0;
+    } else if (!default_slots) {
+        constexpr std::array<unsigned, side> covered_pixels_per_row{0, 4, 4, 4, 4, 0, 0, 0};
+        expected[0] = 0;
+        for (const auto pixels : covered_pixels_per_row) expected[0] += pixels;
+        expected[1] = 0;
+    }
+
+    const char* census = visible
+        ? "begin 5 (fit 5), end 7 (fit 7), resolve 8 (fit 7), heaps by type: occlusion 1, timestamp 1, statistics 1"
+        : default_slots
+        ? "begin 6 (fit 6), end 7 (fit 7), resolve 9 (fit 8), heaps by type: occlusion 1, timestamp 1, statistics 1"
+        : "begin 7 (fit 6), end 7 (fit 6), resolve 8 (fit 6), heaps by type: occlusion 1, timestamp 0, statistics 0";
+    std::array<char, 8192> report{};
+    x2w_d3d12_census_report(report.data(), report.size());
+    if (!std::strstr(report.data(), census)) {
+        std::fprintf(stderr, "expected query census: %s\nreport: %s\n", census, report.data());
+        return 1;
+    }
+    std::printf("query census: %s\n", census);
     for (UINT i = 0; i < buffer_words; ++i) {
-        if (observed[i] == expected[i]) continue;
+        if (observed[i] == expected[i] && (!title_results || title_observed[i] == expected[i])) continue;
         std::fprintf(stderr, "word %u: got 0x%016llx, expected 0x%016llx\n", i, static_cast<unsigned long long>(observed[i]),
                      static_cast<unsigned long long>(expected[i]));
         return 1;
     }
-    if (debug_errors(device.Get())) return 4;
     return 0;
 }
 catch (const std::exception&) {

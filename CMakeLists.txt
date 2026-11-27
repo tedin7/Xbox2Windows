@@ -1702,18 +1702,23 @@ endforeach()
 set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware
                      startup_indirect_count_split_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
-# Occlusion queries recorded through command-list slots 28 to 30 reach the readback buffer (#870).
+# Exercise the query-slot hypothesis with real GPU readback and an independent CPU reference.
 add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_list_queries PRIVATE cxx_std_17)
 target_link_libraries(startup_list_queries PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(backend IN ITEMS warp hardware)
-    add_test(NAME startup_list_queries_${backend} COMMAND startup_list_queries ${backend})
-    set_tests_properties(startup_list_queries_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
-    # Negative control: without X2W_D3D12_QUERY_SLOTS=1 the slots stay no-ops and the buffer keeps its sentinel.
+    add_test(NAME startup_list_queries_${backend} COMMAND startup_list_queries ${backend} forward)
     add_test(NAME startup_list_queries_default_${backend}_control COMMAND startup_list_queries ${backend} default)
-    set_tests_properties(startup_list_queries_default_${backend}_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
-        PASS_REGULAR_EXPRESSION "word 0: got 0xa5a5a5a5a5a5a5a5")
+    set_tests_properties(startup_list_queries_${backend} startup_list_queries_default_${backend}_control
+        PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
+add_test(NAME startup_list_queries_visible_warp COMMAND startup_list_queries warp visible)
+add_test(NAME startup_list_queries_legacy_warp COMMAND startup_list_queries warp legacy)
+add_test(NAME startup_list_queries_visible_zero_warp_control COMMAND startup_list_queries warp visible-zero)
+set_tests_properties(startup_list_queries_visible_warp startup_list_queries_legacy_warp
+    startup_list_queries_visible_zero_warp_control PROPERTIES TIMEOUT 30)
+set_tests_properties(startup_list_queries_visible_zero_warp_control PROPERTIES
+    PASS_REGULAR_EXPRESSION "word 0: got 0x0000000000000000, expected 0x0000000000010000")
 
 add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)

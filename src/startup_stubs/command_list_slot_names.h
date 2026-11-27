@@ -12,9 +12,12 @@
 // - Slot 26 accepts the UAV form of ResourceBarrier. Slots 27 to 31 are not named here. The slots
 //   that follow are the desktop ones moved up by four
 //   (32 is SetDescriptorHeaps, desktop 28), so four console methods sit somewhere in 26 to 31.
-//   As a hypothesis, d3d12_xs_device.cpp binds 28, 29 and 30 as BeginQuery, EndQuery and
-//   ResolveQueryData, only with the diagnostic X2W_D3D12_QUERY_SLOTS=1. No fixture here establishes
-//   which console methods sit there.
+//   Slots 28, 29 and 30 are BeginQuery, EndQuery and ResolveQueryData candidates. The census
+//   counts calls that name a wrapped heap from device slot 39 with a compatible type and in-range
+//   indices. Resolve additionally needs a buffer wrapper. Fits measure compatibility with the
+//   proposed argument layout. The counts alone cannot establish slot identities or semantics.
+//   X2W_QUERY_RESULTS=forward (also X2W_D3D12_QUERY_SLOTS=1) opts into desktop occlusion queries.
+//   X2W_QUERY_RESULTS=visible opts into synthetic results in writable placed buffer memory.
 // - Slots 32 to 59 are named as the desktop slots 28 to 55 plus four. Implemented and checked
 //   against the desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52. Past 52 the rule is not
 //   checked: ExecuteIndirect (desktop 59) is at 61, desktop plus two, so the run of four has ended
