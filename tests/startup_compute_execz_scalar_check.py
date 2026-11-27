@@ -91,7 +91,7 @@ def controls(llvm_mc):
         assert hlsl.count('WaveActiveAnyTrue(') == 1, (label, hlsl)
         reasons = []
         assert translate(label, code, refusals=reasons) == hlsl and not reasons, reasons
-        refused('live where the block joins', lambda: translate(label, code, (5, 1, 1)))
+        refused('live where the block joins', lambda: translate(label, code, (65, 1, 1)))
         shaders[label] = hlsl
         print(f'{label}: wave vote and wide-group refusal verified')
     return shaders

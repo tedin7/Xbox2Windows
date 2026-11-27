@@ -31,6 +31,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent / 'tools'
@@ -371,7 +372,12 @@ def controls(module=G, quiet=False):
         reason = refusal(name, module)
         verdict('fixture %s translates (%s)' % (name, reason), reason is None)
     for name, (_, _, fragment, why) in VARIANTS.items():
-        reason = refusal(name, module)
+        if name == 'written-in-region-read-outside':
+            # The legacy EXECZ proof rejects cross-lane writes in blocks skipped per lane.
+            with patch.object(module.ComputePipeline, 'retry_group_vote_for', return_value=False):
+                reason = refusal(name, module)
+        else:
+            reason = refusal(name, module)
         verdict('refused: %s (%s)' % (why, reason), reason is not None and fragment in reason, reason)
     return red
 

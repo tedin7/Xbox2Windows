@@ -44,7 +44,7 @@ def controls(llvm_mc):
     for rows in (program(after=(LEAK,)),
                  program(step=('s_add_u32 s23, s23, 2', '17821780'))):
         bytecode(rows, llvm_mc)
-        refused(REFUSAL, lambda: fixture.translate(rows))
+        refused(REFUSAL, lambda: fixture.translate(rows, (65, 1, 1)))
     print('EXEC-guarded scalar loop translation and refusal checks passed')
 
 
