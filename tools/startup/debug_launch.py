@@ -33,6 +33,7 @@ CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
 from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes, shape_note  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
+from log_tail import tail_text  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 
@@ -239,12 +240,10 @@ def main():
     k32.ResumeThread(wt.HANDLE(pi.hThread))
     if opts.get("--console", "1") == "1":
         # Live debug console in its own window: follows this run's logs (live_view.py).
-        import subprocess
-        try:
-            subprocess.Popen([sys.executable, "-B", os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_view.py"),
-                              logdir, cwd], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
-        except OSError as error:
-            builtins.print(f"live console not started: {error}")
+        # Minimized and not activated by default, so it does not cover the game or show in window screenshots
+        # (X2W_LIVE_LOG=normal: in front as before, off: no window; tools/startup/live_log.py).
+        import live_log
+        live_log.start(os.path.dirname(os.path.abspath(__file__)), logdir, cwd)
 
     modules = {}  # base -> name
     main_base = None
@@ -999,7 +998,24 @@ def main():
             raw = read(addr, length * (2 if unicode else 1))
             text = raw.decode("utf-16-le" if unicode else "latin-1", errors="replace").rstrip("\0\r\n")
             # One record per message, whole: line breaks are escaped (a CRLF used to split the record in two) and nothing is cut.
-            log(f"{time.time() - start:7.3f} debug-output {text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
+            # Who printed it: the event's thread id, and the first return address on its stack that is not in a system DLL
+            # (the thread is stopped at this event, so its context can be read). "-" when none can be resolved.
+            caller = "-"
+            thread, ctx = get_ctx(tid)
+            if thread:
+                try:
+                    rsp = struct.unpack_from("<Q", ctx, 0x98)[0]
+                    stack = read_stack(read, rsp, 64)
+                    for word in struct.unpack_from("<64Q", stack):
+                        if any(b <= word < b + 0x10000000 for b in modules):
+                            where_word = where(word)
+                            if not where_word.lower().startswith(("ntdll", "kernelbase", "kernel32", "ucrtbase", "msvcp", "vcruntime")):
+                                caller = where_word
+                                break
+                finally:
+                    k32.CloseHandle(wt.HANDLE(thread))
+            log(f"{time.time() - start:7.3f} debug-output thread {tid} from {caller}: "
+                f"{text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
         elif code == EXCEPTION:
             ex_code, ex_flags, _, ex_addr, nparams = struct.unpack_from("<IIQQI", event, 16)
             params = struct.unpack_from("<" + "Q" * min(nparams, 15), event, 16 + 32) if nparams else ()
@@ -1245,10 +1261,11 @@ def main():
     print(f"modules loaded: {len(modules)}")
     with open(os.path.join(logdir, "finished.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(summary) + "\n")
+    # The end of each log, with the newest complete storage heartbeat kept whole even when draw output follows it.
     for name in ("stderr.txt", "trap.log"):
-        path = os.path.join(logdir, name)
-        if os.path.exists(path) and os.path.getsize(path):
-            print(f"--- {name}\n" + open(path, encoding="utf-8", errors="replace").read()[-3000:])
+        text = tail_text(os.path.join(logdir, name))
+        if text:
+            print(f"--- {name}\n" + text)
     return 0
 
 

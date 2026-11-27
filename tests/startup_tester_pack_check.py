@@ -711,7 +711,7 @@ def check_combine():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         runs = []
-        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "0"})):
+        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "1"})):
             run = tmp / ("run_" + label)
             run.mkdir()
             make_run(run, 2)
@@ -733,11 +733,12 @@ def check_combine():
         top = json.loads(seen["matrix_manifest.json"])
         assert top["matrix"] == "gray" and sorted(top["runs"]) == ["a", "b", "c"] and top["parts"] == len(out), top
         assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and top["runs"]["b"]["env"]["X2W_TEST_ADDRESS_UPLOAD_RING"] == "1"
-        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "0" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
+        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "1" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
         for label in "abc":
             assert seen["run_%s/stderr.txt" % label].startswith(("stderr of " + label).encode()), label
             assert json.loads(seen["run_%s/manifest.json" % label])["env"] == top["runs"][label]["env"]
         assert all(top["files"][n]["part"] == 1 for n in top["files"] if n.endswith("manifest.json") and n.startswith("run_")), "manifests in part 1"
+
 
 
 def check_record_spec():
@@ -904,7 +905,57 @@ def check_symbols():
             assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
 
 
+def check_producer_report():
+    config = "x2w-red auto configured floor=40 frames=2 rearm=3\n"
+    waiting = config + "x2w-red auto waiting present=33\n"
+    assert "floor not reached: last present 33, floor 40" in T.producer_report(waiting)
+    assert "floor not reached: last present 33, floor 40s" in T.producer_report(waiting.replace("floor=40", "floor=40s"))
+    reached = waiting + "x2w-red auto floor reached present=40\n"
+    assert "no flat onset seen" in T.producer_report(reached)
+    capture = "x2w-red auto armed sampled_present={} published_at={} target=123 capture={}..{} rgb={} ordinal={}\n"
+    armed = reached + capture.format(45, 46, 47, 48, "255,255,255", 1) + capture.format(55, 56, 57, 58, "0,0,0", 2)
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        log = tmp / "stderr.txt"
+        log.write_text(waiting, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "waiting.zip"))
+        with zipfile.ZipFile(tmp / "waiting.zip") as z:
+            assert "floor not reached: last present 33, floor 40" in z.read(T.PRODUCER_NAME).decode()
+        log.write_text(armed, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "report.zip"))
+        with zipfile.ZipFile(tmp / "report.zip") as z:
+            report = z.read(T.PRODUCER_NAME).decode()
+    assert report.splitlines()[1:] == [
+        "capture 1: RGB 255,255,255, onset present 45, frames 47..48",
+        "capture 2: RGB 0,0,0, onset present 55, frames 57..58",
+    ]
+    assert not T.producer_report("unrelated log\n")
+
+
+def check_null_inputs():
+    row = ("x2w-render null input: key 0000000000000123 input 1 (2D) cause token calls {} "
+           "frames 1..{} target format 28 depth format 0 words 56573258 ffffffff")
+    other = row.format(1, 2).replace("input 1", "input 2")
+    target = "x2w-render target abc (4x2 format 28): draws 2, with a null input 1 frames 1..2"
+    clean = "x2w-render target abc (4x2 format 28): draws 3, with a null input 0 frames 3..5"
+    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean])
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        (run / "stderr.txt").write_text(stderr, encoding="utf-8")
+        archive = Path(tmp) / "report.zip"
+        T.pack(str(run), MANIFEST, str(archive))
+        with zipfile.ZipFile(archive) as report:
+            section = report.read(T.NULL_INPUTS_NAME).decode("utf-8")
+    assert section.splitlines()[:3] == ["null inputs", row.format(2, 5), other]
+    assert row.format(1, 1) not in section
+    assert f"{target} (50.0% poisoned)" in section
+    assert f"{clean} (0.0% poisoned)" in section
+    assert not T.null_inputs_section("unrelated log")
+
+
 if __name__ == "__main__":
+    check_null_inputs()
     check_symbols()
     check_seed_cache()
     check_cache_results()
@@ -922,6 +973,7 @@ if __name__ == "__main__":
     check_manifest()
     check_first_poll()
     check_end_cause()
+    check_producer_report()
     check_cache_stats()
     check_cache_tag()
     check_memory_gib()

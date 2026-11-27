@@ -63,7 +63,7 @@ param(
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
-    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
+    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=1, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
     [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = "slow": a 10 s window opened by the first slowdown (a present with a >= 500 ms gap after 120 s, fallback 180 s), 400 MiB cap, "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
     [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 400 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
     [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
@@ -73,6 +73,7 @@ param(
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
+    [int]$MemoryLeftSeconds = 10,              # after the title exits: wait this long, then log the memory left (memory_left_after_exit)
     [int]$FinishTranslateSeconds = 300,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
     [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
@@ -146,7 +147,7 @@ if ($Matrix) {
     $legs = @(
         @{ Label = "a"; Name = "default";                          Env = [ordered]@{} },
         @{ Label = "b"; Name = "X2W_TEST_ADDRESS_UPLOAD_RING=1";   Env = [ordered]@{ X2W_TEST_ADDRESS_UPLOAD_RING = "1" } },
-        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } })
+        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=1";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "1" } })
     $skipOwn = @("Matrix", "Seconds", "OutDir", "FinishTranslateSeconds")
     $childArgs = @()
     foreach ($key in $PSBoundParameters.Keys) {
@@ -281,13 +282,18 @@ $anyFailure = Get-ChildItem -LiteralPath $cache -Filter "*.fail" -File -ErrorAct
 # cache holds a .fail, and its line goes into the manifest as pre_run_retry.
 $preRunRetry = "pre-run retry skipped: no refusal in the cache"
 if ($anyFailure) { try {
-    # The last run's stderr.txt ranks the retry by draws/dispatches (the per-key census lines), when there is one.
     $runsRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
-    $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | ForEach-Object { Join-Path $_.FullName "stderr.txt" } |
-        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     $retryArgs = @("--retry-lifted", $cache, "180", "--jobs", "$backgroundJobs")
-    if ($lastStderr) { $retryArgs += @("--weights", $lastStderr) }
+    # On unless X2W_PRE_RUN_FAMILY_RETRY=0 (the translator child processes inherit it).
+    if ($env:X2W_PRE_RUN_FAMILY_RETRY -ne "0") {
+        $env:X2W_PRE_RUN_FAMILY_RETRY = "1"
+        $retryArgs += @("--weights", $runsRoot)
+    } else {
+        $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | ForEach-Object { Join-Path $_.FullName "stderr.txt" } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($lastStderr) { $retryArgs += @("--weights", $lastStderr) }
+    }
     $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") @retryArgs } | Out-String).Trim()
     $preRunRetry = if ($retryLine) { $retryLine } else { "pre-run retry: no output (translator exit code $LASTEXITCODE)" }
 } catch {
@@ -355,6 +361,9 @@ if ($Record) {
     Remove-Item Env:X2W_REPLAY_RECORD, Env:X2W_REPLAY_DIR, Env:X2W_REPLAY_MAX_MIB -ErrorAction SilentlyContinue
 }
 $env:X2W_D3D12_BUDGET = "1"
+# translate.txt lines end with [t=N s], seconds since the title started: the --watch translator run.ps1 starts reads
+# the time of the title.pid debug_launch writes into the run folder.
+$env:X2W_TITLE_START_FILE = Join-Path $logDir "title.pid"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
@@ -465,7 +474,19 @@ if (Test-Path -LiteralPath $stallFile) {
 $endCause = ((Invoke-Native { & $python -B $pack end-cause $logDir }) -join " ").Trim()
 Write-Host "tester_run: the run ended: $endCause"
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
-Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
+# What our run leaves behind: -MemoryLeftSeconds (10) after the title exits, the system commit and the commit no process
+# holds against the run's first memory.txt line (a leak until reboot shows here run after run). With 0 the "end" line
+# itself is compared.
+$memoryLeft = $null
+try {
+    if ($MemoryLeftSeconds -gt 0) {
+        Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
+        Start-Sleep -Seconds $MemoryLeftSeconds
+    }
+    $leftLabel = if ($MemoryLeftSeconds -gt 0) { "$MemoryLeftSeconds s after exit" } else { "end" }
+    $memoryLeft = (Invoke-Native { & $python -B $memoryTop $memoryFile --once $leftLabel --top 8 --left } | Out-String).Trim()
+    if ($memoryLeft) { Write-Host "tester_run: $memoryLeft" }
+} catch { Write-Warning "tester_run: memory left after exit not measured ($($_.Exception.Message))" }
 
 # Files written during this run outside the save folder (first 60, at most 20 s of searching, 4 levels deep): where the title keeps
 # what it saves by itself, e.g. the privacy acceptance.
@@ -498,6 +519,7 @@ $manifest = [ordered]@{
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
     thread_snapshots = $dumpAt; record = $recordReport; pretranslate = $preTranslate; pre_run_retry = $preRunRetry; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    memory_left_after_exit = $memoryLeft
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"

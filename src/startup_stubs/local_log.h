@@ -3,6 +3,7 @@
 #pragma once
 
 #include "startup_stubs/trap.h"
+#include "startup_stubs/read_cache.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -20,6 +21,73 @@ inline bool env_on(const char* name) noexcept
     const bool on = GetEnvironmentVariableA(name, value, sizeof(value)) && value[0] == '1';
     SetLastError(saved);
     return on;
+}
+
+inline bool read_cache_on() noexcept
+{
+    static const bool enabled = env_on("X2W_READ_CACHE");
+    return enabled;
+}
+
+inline const ReadCacheApi* read_cache() noexcept
+{
+    if (!read_cache_on()) return nullptr;
+    // xmem owns the one process-wide table. Keep its API and table alive for all shims.
+    static const ReadCacheApi* api = [] {
+        const DWORD error = GetLastError();
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(0, L"xmem.dll", &module)) module = LoadLibraryExW(L"xmem.dll", nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        using GetApi = const ReadCacheApi* (WINAPI*)() noexcept;
+        const auto get = module ? reinterpret_cast<GetApi>(GetProcAddress(module, "x2w_xmem_read_cache")) : nullptr;
+        SetLastError(error);
+        return get ? get() : nullptr;
+    }();
+    return api;
+}
+
+inline void record_read_span(const void* address, SIZE_T bytes, DWORD protect = PAGE_READWRITE) noexcept
+{
+    if (const auto* cache = read_cache()) cache->record(address, bytes, protect);
+}
+
+inline void erase_read_span(const void* address, SIZE_T bytes) noexcept
+{
+    if (const auto* cache = read_cache()) cache->erase(address, bytes);
+}
+
+// MEM_RELEASE takes a size of zero. Determine the allocation extent before releasing
+// it, on the allocator path, so adjacent allocations in a merged span survive.
+inline SIZE_T read_span_release_size(const void* address) noexcept
+{
+    if (!read_cache_on()) return 0;
+    const DWORD error = GetLastError();
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    auto at = begin;
+    MEMORY_BASIC_INFORMATION info{};
+    while (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) &&
+           info.AllocationBase == address) {
+        const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (end <= at) break;
+        at = end;
+    }
+    SetLastError(error);
+    return at - begin;
+}
+
+inline BOOL release_read_span(void* address) noexcept
+{
+    const auto bytes = read_span_release_size(address);
+    const BOOL released = VirtualFree(address, 0, MEM_RELEASE);
+    if (released && bytes) erase_read_span(address, bytes);
+    return released;
+}
+
+// Scratch facts describe readable commits only. They never grant permission to dereference
+// title memory: keep the actual read under SEH, since an unobserved unmap can race a cache hit.
+inline bool query_read_span(const void* address, MEMORY_BASIC_INFORMATION* info) noexcept
+{
+    if (const auto* cache = read_cache()) return cache->query(address, info);
+    return VirtualQuery(address, info, sizeof(*info)) == sizeof(*info);
 }
 
 inline void logf(const char* format, ...) noexcept
@@ -72,13 +140,35 @@ struct MappedCache {
 };
 inline thread_local MappedCache mapped_cache;
 // Forgets the spans this thread has found (a span can be freed later; a failed touch or copy calls this).
+inline void forget_mapped_spans(std::uintptr_t start, std::size_t bytes) noexcept
+{
+    if (const auto* cache = read_cache()) cache->erase(reinterpret_cast<const void*>(start), bytes);
+    else mapped_cache = MappedCache{};
+}
+
+// Forgets every span this thread cached (the shared read cache keeps its own spans; erase them by range above).
 inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
 
-inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexcept
+inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes, bool* committed = nullptr) noexcept
 {
     if (bytes == 0 || start + bytes < start) return bytes;
     const std::uintptr_t end = start + bytes;
     std::uintptr_t at = start;
+    if (const auto* cache = read_cache()) {
+        bool all_committed = true;
+        while (at < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!cache->query(reinterpret_cast<const void*>(at), &info)) return bytes;
+            if (info.State == MEM_FREE) return static_cast<std::size_t>(at - start);
+            all_committed = all_committed && info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) &&
+                            (info.Protect & 0xff) != PAGE_NOACCESS && (info.Protect & 0xff) != 0;
+            const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            if (next <= at) return bytes;
+            at = next;
+        }
+        if (committed) *committed = all_committed;
+        return bytes;
+    }
     while (at < end) {
         bool hit = false;
         for (const MappedSpan& span : mapped_cache.spans) {
@@ -129,7 +219,8 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     DWORD code = 0;
     std::uintptr_t at = start;
     // Free address space is refused without touching it; the touch below only sees mapped pages.
-    const std::size_t mapped = mapped_prefix(start, bytes);
+    bool committed = false;
+    const std::size_t mapped = mapped_prefix(start, bytes, &committed);
     const bool refused_tail = mapped < bytes;
     if (mapped == 0) {
         if (refused_tail) InterlockedIncrement(&faults_avoided);
@@ -141,7 +232,7 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     __try {
         volatile unsigned char sink = 0;
         while (at < end) {
-            if (at >= window_end) {
+            if (!committed && at >= window_end) {
                 window_end = end - at > probe_commit_window ? at + probe_commit_window : end;
                 if (at < committed_from || window_end > committed_to) {
                     commit_lazy(reinterpret_cast<const void*>(at), static_cast<std::size_t>(window_end - at));
@@ -163,11 +254,62 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
                 VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
         }
     }
-    if (done < mapped) forget_mapped_spans();  // the span was cached, then freed or protected
+    if (done < mapped) forget_mapped_spans(at, 1);  // the span was cached, then freed or protected
     // A free tail only counts as an avoided fault when the mapped prefix was walked without one: a protected page
     // inside the prefix faults exactly as it did before the free tail was refused.
     else if (refused_tail) InterlockedIncrement(&faults_avoided);
     return done;
+}
+
+inline LONG title_read_exception(const EXCEPTION_POINTERS* exception, const void* address,
+                                 std::size_t bytes) noexcept
+{
+    const auto& record = *exception->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && record.ExceptionCode != EXCEPTION_IN_PAGE_ERROR &&
+        record.ExceptionCode != 0x80000001u) return EXCEPTION_CONTINUE_SEARCH;
+    if (record.NumberParameters >= 2) {
+        const auto fault = record.ExceptionInformation[1];
+        if (fault - reinterpret_cast<std::uintptr_t>(address) < bytes) {
+            erase_read_span(reinterpret_cast<const void*>(fault), 1);
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+    }
+    erase_read_span(address, bytes);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// For callers that already probed the range. The off path retains the original
+// read. Under the cache, SEH also covers the interval between probe and actual use.
+template<class Read>
+inline bool guarded_title_read(const void* address, std::size_t bytes, const Read& read)
+{
+    if (!read_cache_on()) {
+        read();
+        return true;
+    }
+    __try {
+        read();
+        return true;
+    } __except (title_read_exception(GetExceptionInformation(), address, bytes)) {
+        return false;
+    }
+}
+
+inline bool copy_probed_title(void* to, const void* from, std::size_t bytes)
+{
+    return guarded_title_read(from, bytes, [&] { std::memcpy(to, from, bytes); });
+}
+
+inline LONG guarded_copy_exception(const EXCEPTION_POINTERS* exception, const void* from,
+                                   std::size_t bytes, bool any_exception) noexcept
+{
+    const DWORD code = exception->ExceptionRecord->ExceptionCode;
+    if (read_cache() && title_read_exception(exception, from, bytes) == EXCEPTION_EXECUTE_HANDLER)
+        return EXCEPTION_EXECUTE_HANDLER;
+    if (!any_exception && code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR)
+        return EXCEPTION_CONTINUE_SEARCH;
+    forget_mapped_spans(reinterpret_cast<std::uintptr_t>(from), bytes);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 // memcpy from title memory that may have been freed or unmapped since it was probed. A source that is in free
@@ -181,10 +323,7 @@ inline bool guarded_memcpy(void* to, const void* from, std::size_t bytes, bool a
     }
     __try {
         std::memcpy(to, from, bytes);
-    } __except (any_exception || GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
-                        GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
-                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        forget_mapped_spans();
+    } __except (guarded_copy_exception(GetExceptionInformation(), from, bytes, any_exception)) {
         return false;
     }
     return true;

@@ -11,6 +11,7 @@ must each be caught. The GPU half of the proof (WARP readback of the same cases)
 import itertools
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools' / 'startup'))
@@ -134,10 +135,66 @@ def join_checks():
             if 'Barrier' in line or 'Interlocked' in line], [])
 
 
+def compare_program(encoding):
+    from startup_compute_lds_dual_atomics_check import (
+        G, PREAMBLE_LINES, USER7, le32, mubuf_store, root_blob, sopp, v_mov_imm, vop2, vopc,
+    )
+
+    code = b''.join(raw for _, raw in PREAMBLE_LINES)
+    code += vop2(0x1a, 1, 0x9f, 0)             # sign bit from lane parity
+    code += vop2(0x1d, 1, 256, 1)              # v1 = lane XOR sign bit
+    code += v_mov_imm(2, 16)
+    code += vop2(0x1a, 3, 0x82, 0)             # output address
+    if encoding == 'e32':
+        compare = vopc(0xd1, 257, 2)
+    else:
+        compare = le32(0xd4d10000) + le32(257 | (258 << 9))
+    (_, _, name, asm), = G.decode(compare)
+    assert name == 'v_cmpx_lt_u32_' + encoding
+    assert G.scalar_effects(name, asm)[1] == {'exec'}
+    code += compare + mubuf_store(0x1c, 1, 3) + sopp(0x01)
+    return G.ComputePipeline(code, root_blob(), USER7, (32, 1, 1)).hlsl_cs()
+
+
+def compare_gpu(dxc, runner, adapter):
+    from startup_compute_lds_dual_atomics_check import (
+        SENTINEL, WORDS, check_debug_layer, renderer_diagnostics, run_shader,
+    )
+
+    values = [lane ^ ((lane & 1) << 31) for lane in range(32)]
+    expected = [value if value < 16 else SENTINEL for value in values]
+    expected += [SENTINEL] * (WORDS - 32)
+    hlsl = compare_program('e32')
+    assert hlsl.count('v1 < v2') == 1
+    variants = {
+        'e32': hlsl,
+        'e64': compare_program('e64'),
+        'signed': hlsl.replace('v1 < v2', 'asint(v1) < asint(v2)'),
+    }
+    out = Path(__file__).resolve().parent.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        for mode, source in variants.items():
+            run = run_shader(mode, dxc, runner, adapter, Path(tmp), source, expected)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                return 77
+            check_debug_layer(mode, run.stdout, run.stderr)
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
+            if mode == 'signed':
+                assert run.returncode == 1 and diagnostics, (mode, run.returncode, run.stderr)
+                assert diagnostics[0] == 'word=1 expected=c5c5c5c5 actual=80000001', diagnostics
+                print('signed control rejected at ' + diagnostics[0])
+            else:
+                assert not run.returncode and not diagnostics, (mode, run.returncode, run.stderr)
+    return 0
+
+
 def main():
     range_checks()
     dpp_checks()
     join_checks()
+    expect('e32 and e64 lower the same unsigned predicate', compare_program('e32'), compare_program('e64'))
     if FAILED:
         print('FAILED: %d' % len(FAILED))
         return 1
@@ -146,4 +203,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(compare_gpu(*sys.argv[2:]) if sys.argv[1:2] == ['dispatch'] else main())

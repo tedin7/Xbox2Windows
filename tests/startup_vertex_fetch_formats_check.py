@@ -217,15 +217,25 @@ def snorm_boundaries(components):
 IDENTITY = 4 | 5 << 3 | 6 << 6 | 7 << 9  # DST_SEL X, Y, Z, W: the four components in order
 
 
-def pipeline_mubuf(offset, op=2):
+# How the descriptor reaches the load: straight from the table pointer, through a copy of that pointer made in an
+# earlier block, or loaded in an earlier block than the formatted load.
+LAYOUTS = {
+    'plain': ((), (0xf4080404, 0xfa000000), ()),
+    'pointer copy': ((0xbe8a0308, 0xbf820000), (0xf4080405, 0xfa000000), ()),  # s_mov_b32 s10, s8; s_branch +0; load via s[10:11]
+    'split blocks': ((), (0xf4080404, 0xfa000000), (0xbf820000,)),  # s_branch +0 between the load and the formatted load
+}
+
+
+def pipeline_mubuf(offset, op=2, layout='plain'):
     """A source-built vertex stage: buffer_load_format_xyz (op 2; 0 is _x, 1 is _xy) from a hardware table descriptor."""
     # s_load_dwordx4 s[16:19], s[8:9], 0
     # buffer_load_format_xyz v[4:6], v0, s[16:19], 0 idxen offset:<offset>
     # exp pos0 v4, v5, v6, v7 done
-    words = (0xf4080404, 0xfa000000, 0xe0002000 | op << 18 | offset, 0x80040400,
+    before, load, between = LAYOUTS[layout]
+    words = (*before, *load, *between, 0xe0002000 | op << 18 | offset, 0x80040400,
              0xf80008cf, 0x07060504, 0xbf810000)
     ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
-    result = gfx2hlsl.Pipeline(struct.pack('<7I', *words), ps, root_blob(flags=0))
+    result = gfx2hlsl.Pipeline(struct.pack('<%dI' % len(words), *words), ps, root_blob(flags=0))
     assert 'srv 0 buf table 0 0' in result.manifest().splitlines()
     assert 'udsrc 5 descword3 0' in result.manifest().splitlines()
     return result
@@ -407,13 +417,22 @@ def controls():
         assert 'local table load' in str(error) or 'joined at a branch target' in str(error), error
     else:
         raise AssertionError('formatted load accepted after a possibly clobbered root pointer')
-    # A copy of the table pointer made in a block above the load is proven for compute stages only.
-    try:
-        stage((0xbe8a0308, 0xbf820000, 0xf4080405, 0xfa000000, *formatted_tail))
-    except gfx2hlsl.Unsupported as error:
-        assert 'local table load' in str(error), error
-    else:
-        raise AssertionError('graphics formatted load accepted through a pointer copy in another block')
+    # A copy of the table pointer made in a block above the load is proven, for graphics as for compute stages.
+    copied = stage((0xbe8a0308, 0xbf820000, 0xf4080405, 0xfa000000, *formatted_tail))
+    assert 'srv 0 buf table 0 0' in copied.manifest().splitlines()
+    # The descriptor loaded in an earlier block than the formatted load is proven the same way.
+    split = stage((*load, 0xbf820000, *formatted_tail))
+    assert 'srv 0 buf table 0 0' in split.manifest().splitlines()
+    # Control: a copy of something that is not the table pointer, a rewritten copy, and a word rewritten after the load.
+    for words in ((0xbe8a0314, 0xbf820000, 0xf4080405, 0xfa000000, *formatted_tail),      # s_mov_b32 s10, s20
+                  (0xbe8a0308, 0xbf820000, 0xbe8a0380, 0xf4080405, 0xfa000000, *formatted_tail),  # copy, then s_mov_b32 s10, 0
+                  (*load, 0xbf820000, 0xbe900380, *formatted_tail)):                        # s_mov_b32 s16, 0 before the use
+        try:
+            stage(words)
+        except gfx2hlsl.Unsupported:
+            pass
+        else:
+            raise AssertionError('formatted load accepted without a proven descriptor: %r' % (words,))
     source = pipeline_mubuf(0).hlsl_vs()
     for label, old, new in DESC_MUTATIONS:
         assert old in source, label
@@ -540,6 +559,23 @@ def check(directory, compiler, consumer, adapter):
             raise RuntimeError('descriptor %s: %s%s' % (label, result.stdout, result.stderr))
         print('descriptor %s: %s' % (label, [l for l in result.stdout.splitlines() if 'mismatches=' in l][0]))
         mubuf_runs += 1
+    # The descriptor reached through a pointer copy or loaded in an earlier block reads the same bytes.
+    for layout in ('pointer copy', 'split blocks'):
+        for label, name, word3, words in mubuf_cases():
+            if 'xyz' not in label and 'as' not in label:
+                continue
+            translated = pipeline_mubuf(FORMATS[name][2], 2, layout)
+            result = run(directory, compiler, consumer, adapter, name, translated.hlsl_vs(), words, translated, word3)
+            if result.returncode:
+                raise RuntimeError('%s, descriptor %s: %s%s' % (layout, label, result.stdout, result.stderr))
+            mubuf_runs += 1
+        translated = pipeline_mubuf(FORMATS['BUF_FMT_32_32_32_32_FLOAT'][2], 2, layout)
+        # Control: the descriptor word is really read through this layout, so another format must fail the reference.
+        bad = run(directory, compiler, consumer, adapter, 'BUF_FMT_32_32_32_32_FLOAT', translated.hlsl_vs(),
+                  mubuf_expected('BUF_FMT_32_32_32_32_FLOAT', 3), translated, descriptor_word3('BUF_FMT_32_32_FLOAT'))
+        if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
+            raise AssertionError('%s: another descriptor format passed the reference\n%s' % (layout, bad.stderr))
+        print('%s: matches the reference, another format fails' % layout)
     # The same translated body must fail when the descriptor word names another format, or when it is mutated.
     name = 'BUF_FMT_32_32_32_32_FLOAT'
     translated = pipeline_mubuf(FORMATS[name][2])

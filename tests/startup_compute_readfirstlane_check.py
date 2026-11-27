@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch as mock_patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -139,8 +140,8 @@ PATCHES = (
 )
 
 
-def translate(code=None):
-    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL)
+def translate(code=None, *, group=LOCAL):
+    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, group)
 
 
 def expected():
@@ -262,14 +263,14 @@ def log_ceil_controls(llvm_mc=None):
             (vop1('v_log_f32_e32', 'v7', 'v7'), vop1('v_log_f32_e32', 'v7', 'v0')),
             (vop1('v_ceil_f32_e32', 'v9', 'v7'), vop1('v_ceil_f32_e32', 'v9', 'v0'))):
         refused('v_readfirstlane_b32 requires a proven uniform source',
-                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code))
-    saved = G.UNIFORM_VALU
-    try:
+                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code, group=(8, 1, 1)))
+    # Isolate the original proof's opcode dependencies from the new retry.
+    retry = G.ComputePipeline.retry_readfirstlane
+    with mock_patch.object(G.ComputePipeline, 'retry_readfirstlane',
+                           lambda pipe: not pipe.retry_entry_exec and retry(pipe)):
         for removed in ('v_log_f32', 'v_ceil_f32'):
-            G.UNIFORM_VALU = saved - {removed}
-            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(LOG_CEIL_WORDS))
-    finally:
-        G.UNIFORM_VALU = saved
+            with mock_patch.object(G, 'UNIFORM_VALU', G.UNIFORM_VALU - {removed}):
+                refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(LOG_CEIL_WORDS))
     if llvm_mc:
         decoded = G.decode(LOG_CEIL_WORDS)
         lines = [asm for _, _, _, asm in decoded]

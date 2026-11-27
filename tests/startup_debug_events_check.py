@@ -34,10 +34,18 @@ def main(probe):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         _, events = run(probe, work, "message", {"STARTUP_WINDOW_PROBE_MESSAGE": "1"})
-        records = [line for line in events if "debug-output" in line]
+        records = [line for line in events if "debug-output" in line and "probe-worker-message" not in line]
         assert len(records) == 1, records
         record = records[0]
-        assert re.match(r" *\d+\.\d{3} debug-output probe-msg-start ", record), record
+        # thread id of the title's main thread and the first non-system caller on its stack (the probe itself)
+        match = re.match(r" *\d+\.\d{3} debug-output thread (\d+) from (\S+): probe-msg-start ", record)
+        assert match, record
+        assert match.group(2) == "-" or "startup_window_probe" in match.group(2).lower(), record
+        threads = {m.group(1) for m in (re.match(r" *\d+\.\d{3} thread (\d+) created", line) for line in events) if m}
+        worker = [line for line in events if "probe-worker-message" in line]
+        assert len(worker) == 1, worker
+        found = re.match(r" *\d+\.\d{3} debug-output thread (\d+) from (\S+): probe-worker-message", worker[0])
+        assert found and found.group(1) in threads and found.group(1) != match.group(1), (worker, threads, record[:60])
         assert "\\r\\nsecond line\\r\\n" in record and record.endswith("\\r\\nprobe-msg-suffix-7f3a"), record[-80:]
         assert len(record) > 400, len(record)
         assert not any(line.startswith("second line") or line.startswith("probe-msg-suffix") for line in events), "message was split"

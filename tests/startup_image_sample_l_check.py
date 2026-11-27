@@ -10,11 +10,13 @@ v2, the NSA form from v3 (so it is not just "the third register"), and the 3D an
 takes the slice from v2, where a volume takes z). Forms the lowering does
 not model are refused with their own message instead of being sampled at a wrong level.
 """
+import os
 import re
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
@@ -221,6 +223,13 @@ def check_address_count():
 
 def controls():
     check_address_count()
+    # Retarget the fixture's final export to position to exercise the same table access in the vertex stage.
+    ps = WORDS['plain']
+    vs = ps.replace(bytes.fromhex('0f1800f8'), bytes.fromhex('cf1800f8'))
+    assert vs != ps
+    for vertex, pixel, stages in ((VS_WORDS, ps, 'pixel'), (vs, None, 'nonpixel'), (vs, ps, 'both')):
+        manifest = G.Pipeline(vertex, pixel, root_blob(flags=0)).manifest()
+        assert f'srv 0 tex2d table 0 0\nsrvstage 0 {stages}\n' in manifest, manifest
     plain = level_register(stage('plain'), '2d')
     assert plain == ('v0', 'v1', None, 'v2'), plain
     assert 'Texture2D' in stage('plain')
@@ -243,7 +252,11 @@ def controls():
     refused('offset', 'image_sample_l_o')
     refused('compare', 'image_sample_c_l')
     refused('gather', 'image_gather4_l')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    cube = G.Pipeline(VS_WORDS, WORDS['cube'], root_blob(flags=0))
+    source = cube.hlsl_ps()
+    assert 'TextureCube<float4> r0' in source
+    assert 'SampleLevel(q0, x2w_cube_dir(F(v0), F(v1), F(v2)), F(v3))' in source
+    assert 'srv 0 texcube table 0 0\nsrvstage 0 pixel' in cube.manifest()
     refused('unorm', 'image_sample_l modifier unorm')
     refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
@@ -259,7 +272,7 @@ def controls():
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):

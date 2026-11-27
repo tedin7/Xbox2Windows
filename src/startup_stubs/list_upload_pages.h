@@ -89,19 +89,30 @@ struct FreePages {
 };
 
 struct Allocation { uintptr_t cpu; UINT64 gpu, bytes; ID3D12Resource* resource; UINT64 offset; };
+struct DescriptorSnapshot {
+    ComPtr<ID3D12DescriptorHeap> heap;
+    std::vector<ComPtr<ID3D12Resource>> resources;
+};
 struct Arena {
+    std::vector<DescriptorSnapshot> descriptor_snapshots;
     std::vector<std::unique_ptr<Page>> pages;
     std::vector<Allocation> allocations;
     // The queue fences the recording was submitted behind (per fence, the last value), whether one of its submits
     // could not be tracked, and whether its list has moved on (Reset or destroyed), so it can never be submitted again.
     std::vector<std::pair<ID3D12Fence*, UINT64>> submits;
     bool untracked = false, retired = false;
+    // Taken when the recording is retired: for every queue, its fence, the last value it had signalled then and where its
+    // current last value lives. A list of another allocator that recorded a read of these pages before the retire may be
+    // submitted after it, and its submits are not this recording's own: the pages wait for later submits of every queue.
+    struct QueueGuard { ID3D12Fence* fence; UINT64 at_retire; const UINT64* last; };
+    std::vector<QueueGuard> guards;
 
     // The caller must retire all recordings and GPU submissions before releasing their pages.
-    void reset() { allocations.clear(); pages.clear(); }
+    void reset() { descriptor_snapshots.clear(); allocations.clear(); pages.clear(); }
 
     // The recording's pages go to `free` (or are released past its limits). The same precondition as reset().
     void recycle(FreePages& free) {
+        descriptor_snapshots.clear();
         allocations.clear();
         for (auto& page : pages) free.give(std::move(page));
         pages.clear();
@@ -115,20 +126,28 @@ struct Arena {
 
     // A retired recording whose every submit the GPU has passed. A recording never submitted is not finished: it may
     // be a bundle another list ran, and that list's submits are not its own.
-    bool finished() const {
+    // `global`: also every queue has passed two submits made after the retire (or has nothing left to run).
+    bool finished(bool global = true) const {
         if (!retired || untracked || submits.empty()) return false;
         for (const auto& submit : submits)
             if (submit.first->GetCompletedValue() < submit.second) return false;
+        if (!global) return true;
+        for (const auto& guard : guards) {
+            const UINT64 done = guard.fence->GetCompletedValue();
+            if (done == UINT64_MAX) return false;
+            const UINT64 newest = *guard.last;
+            if (done < newest && done < guard.at_retire + 2) return false;
+        }
         return true;
     }
 
-    Allocation range(UINT64 cpu, UINT64 bytes) const {
+    Allocation range(UINT64 cpu, UINT64 bytes, bool remaining = false) const {
         if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
             if (offset < it->bytes && bytes <= it->bytes - offset)
-                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, remaining ? it->bytes - offset : bytes, it->resource, it->offset + offset};
         }
         return {};
     }

@@ -51,6 +51,7 @@ and Y group IDs at entry, drop the store, drop case B's immediate offset, drop c
 scalar statement inside case J's block; each must change the readback.
 """
 import itertools
+import math
 import struct
 import subprocess
 import sys
@@ -674,6 +675,38 @@ WORDS_S = bytes.fromhex(
     '1b191b881c1a1c891c811c8f1b020a7e001070e0040504808408084a1c020a7e001070e004050480000081bf'
 )
 
+# Select sparse lanes and compact their group indices into separate 16-word wave segments.
+# Slot zero in each segment is reserved, exercising the additive base.
+MBCNT_COMPACT_MASK = 0x85241249
+SOURCE_MBCNT_COMPACT = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx4 s[16:19], s[10:11], 0
+s_mov_b32 s20, 0x85241249
+v_mad_u32_u24 v3, v2, 8, v1
+v_mad_u32_u24 v3, v3, 8, v0
+v_and_b32 v5, 31, v3
+v_lshrrev_b32 v5, v5, s20
+v_and_b32 v5, 1, v5
+v_mbcnt_lo_u32_b32 v8, s20, 1
+v_mbcnt_hi_u32_b32 v8, -1, v8
+v_lshrrev_b32 v4, 5, v3
+v_mad_u32_u24 v4, v4, 16, v8
+v_lshlrev_b32 v4, 2, v4
+s_waitcnt lgkmcnt(0)
+s_mov_b32 s21, exec_lo
+v_cmp_ne_u32 vcc_lo, 0, v5
+s_mov_b32 exec_lo, vcc_lo
+buffer_store_dword v3, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_MBCNT_COMPACT = bytes.fromhex(
+    '06038abe80038bbe050408f4000000faff0394be49122485030043d502110504030043d5031101049f060a36'
+    '050016d505290000810a0a36080065d714020100080066d7c11002008506082c040043d50421210482080834'
+    '7fc08cbf7e0395be800a8a7d6a03febe001070e0040304801503febe000081bf')
+
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -682,6 +715,8 @@ CASES = {
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'mbcnt-64': (SOURCE_MBCNT_COMPACT, WORDS_MBCNT_COMPACT, USER7 | tidig(3), (8, 8, 1), (1, 1, 1)),
+    'mbcnt-256': (SOURCE_MBCNT_COMPACT, WORDS_MBCNT_COMPACT, USER7 | tidig(3), (8, 8, 4), (1, 1, 1)),
     'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
     'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     'F-two-fills': (SOURCE_F2, WORDS_F2, USER7 | TGID_X | (2 << 15), (64, 1, 1), (2, 1, 1)),
@@ -867,6 +902,57 @@ WORDS_JOIN_LOAD = bytes.fromhex(OFF_PROLOGUE_WORDS + '078006bf 010084bf 000080bf
 CASES['join-load'] = (SOURCE_JOIN_LOAD, WORDS_JOIN_LOAD, USER7 | TGID_X, (8, 1, 1), (2, 1, 1))
 
 
+# Every lane reads two distinct input halves and writes the four instruction results.
+SOURCE_F16_UNARY = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+v_lshlrev_b32_e32 v4, 2, v0
+buffer_load_dword v5, v4, s[12:15], 0 offen
+s_waitcnt vmcnt(0)
+v_exp_f16_e32 v6, v5
+v_rcp_f16_e32 v7, v5
+v_mov_b32_e32 v8, v5
+v_mov_b32_e32 v9, v5
+v_exp_f16_sdwa v8, v5 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1
+v_rcp_f16_sdwa v9, v5 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1
+v_lshlrev_b32_e32 v4, 4, v0
+buffer_store_dwordx4 v[6:9], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_F16_UNARY = bytes.fromhex(
+    '06038abe 80038bbe 05030cf4000000fa 7fc08cbf 82000834 001030e004050380 703f8cbf '
+    '05b10c7e 05a90e7e 0503107e 0503127e f9b0107e05140500 f9a8127e05150500 84000834 '
+    '001078e004060480 000081bf')
+CASE_F16_UNARY = 'f16-unary'
+F16_UNARY_CONTROLS = ('f16-word0-source', 'f16-drop-preserve', 'f16-natural-exp')
+HALVES_F16_UNARY = (
+    0x0000, 0x8000, 0x0001, 0x83ff, 0x0400, 0x3c00, 0x4000, 0x4200,
+    0xc200, 0xce40, 0x4800, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00,
+)
+CASES[CASE_F16_UNARY] = (SOURCE_F16_UNARY, WORDS_F16_UNARY, USER7,
+                         (len(HALVES_F16_UNARY), 1, 1), (1, 1, 1))
+INPUT_F16_UNARY = tuple(
+    hi << 16 | HALVES_F16_UNARY[(lane + 5) % len(HALVES_F16_UNARY)]
+    for lane, hi in enumerate(HALVES_F16_UNARY)
+)
+
+
+def f16_unary_reference(bits, exp):
+    value, = struct.unpack('<e', struct.pack('<H', bits))
+    if math.isnan(value):
+        return 0x7e00  # The fixture supplies a positive canonical quiet NaN.
+    if exp:
+        result = math.inf if value >= 16 else 2.0 ** value
+    else:
+        result = 1.0 / value if value else math.copysign(math.inf, value)
+    try:
+        return int.from_bytes(struct.pack('<e', result), 'little')
+    except OverflowError:
+        return (bits & 0x8000) | 0x7c00
+
+
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
 
@@ -922,6 +1008,16 @@ def expected(name):
     if name in ('I', 'I-raw', 'I-raw-mask'):
         return expected('A')
     out = [SENTINEL] * WORDS
+    if name == CASE_F16_UNARY:
+        for lane, word in enumerate(INPUT_F16_UNARY):
+            hi, lo = word >> 16, word & 0xffff
+            out[4 * lane:4 * lane + 4] = (
+                f16_unary_reference(lo, exp=True),
+                f16_unary_reference(lo, exp=False),
+                (hi << 16) | f16_unary_reference(hi, exp=True),
+                (f16_unary_reference(hi, exp=False) << 16) | lo,
+            )
+        return out
     if name == 'join-load':
         for i in range(16):
             out[i] = input_word(i // 8)
@@ -936,6 +1032,12 @@ def expected(name):
             out[4 * group:4 * group + 4] = [group, pair & MASK, pair >> 32, 0]
         return out
     _, _, _, local, groups = CASES[name]
+    if name in ('mbcnt-64', 'mbcnt-256'):
+        for wave in range(local[0] * local[1] * local[2] // 32):
+            selected = [wave * 32 + lane for lane in range(32) if MBCNT_COMPACT_MASK >> lane & 1]
+            start = wave * 16 + 1
+            out[start:start + len(selected)] = selected
+        return out
     if name in ('masked-tid', 'extracted-tid'):
         for lane in range(local[0]):
             out[lane] = (((lane & 3) | KEY) >> 2 if name == 'masked-tid' else (((lane >> 2) & 7) >> 1))
@@ -1137,13 +1239,23 @@ def check_mbcnt():
         # an incorrectly accepted _hi when testing a group whose wave size is unknown.
         word = '0a0065d7c1000100' if op == 'lo' else '0b0066d7c1060200'
         single = bytes.fromhex(word + '000081bf')
-        refused('at most 32 threads', lambda: translate('D', code=single, group=(3, 11, 1)))
+        refused('requires a proven wave32 program', lambda: translate('D', code=single, group=(3, 11, 1)))
         stage = translate('D', code=single, group=(3, 5, 2)).cs
         emit = getattr(stage, f'op_v_mbcnt_{op}_u32_b32')
         refused('three unmodified operands', lambda: emit(['v0', '-1', '0'], ['clamp']))
         refused('destination', lambda: emit(['v[0:1]', '-1', '0'], []))
         stage.kind = 'ps'
         refused(f'v_mbcnt_{op}_u32_b32', lambda: emit(['v0', '-1', '0'], []))
+    for name in ('mbcnt-64', 'mbcnt-256'):
+        _, words, rsrc2, group, _ = CASES[name]
+        hlsl = translate(name).hlsl_cs()
+        assert 'countbits(0x85241249u & ((1u << ((tid.x + 8u * (tid.y + 8u * tid.z)) & 31u)) - 1u))' in hlsl
+        assert 'v8 = v8;' in hlsl
+        assert G.ComputePipeline(words, root_blob(), rsrc2, group, wave_size=32).hlsl_cs() == hlsl
+        refused('requires a proven wave32 program',
+                lambda: G.ComputePipeline(words, root_blob(), rsrc2, group, wave_size=64))
+        for _, old, new, _ in MBCNT_COMPACTION_CONTROLS:
+            assert hlsl.count(old) == 1 and old != new
     assert 'uav 0 table 1 0' in translate('D').manifest()
 
 
@@ -1505,8 +1617,10 @@ def check_formatted_loads():
         assert hlsl.count(' = ((ud3 >> ') == width
     # Word 3 is overwritten in an otherwise intact native descriptor.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
-    # At a branch target, there is no local descriptor load to prove.
-    refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
+    # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
+    assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end).hlsl_cs()
+    # A word rewritten after that load, with the target between, is not the loaded descriptor any more.
+    refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe000082bf') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
     check_formatted_pointer_copy()
@@ -1638,6 +1752,13 @@ def check_execz_mask_exact():
 
 
 def check_controls():
+    f16_unary = translate(CASE_F16_UNARY).hlsl_cs()
+    assert 'v6 = f16rn(exp2(f16tof32(v5 & 0xffffu)));' in f16_unary
+    assert 'v7 = f16rn(1.0 / f16tof32(v5 & 0xffffu));' in f16_unary
+    assert 'f16rn(1.0 / f16tof32((v5 >> 16u)))' in f16_unary
+    assert 'asuint(v9) & 0xffffu' in f16_unary
+    for mutation in F16_UNARY_CONTROLS:
+        assert mutate(f16_unary, mutation) != f16_unary
     for name in ('masked-tid', 'extracted-tid'):
         translate(name).hlsl_cs()
     # Shift by one to retain masked bit 1, or enable extracted bit 3 in a larger group.
@@ -2064,10 +2185,14 @@ def check_controls():
         refused('%s: read by %s after the join (cause: %s' % (live, name, cause), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
     # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
-    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
+    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted. The caller's
+    # statement that the program is wave64 keeps that refusal; a program whose exec writes are all 32-bit forms is wave32
+    # (G.wave32_exec_proof), vcc_hi is then an ordinary scalar register and the read is accepted.
+    wave64_read = lambda size: G.ComputePipeline(  # noqa: E731
+        splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo'), root_blob(), CASES['A'][2], CASES['A'][3], wave_size=size)
     refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
-            'joins: read by s_and_b32 after the join',
-            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+            'joins: read by s_and_b32 after the join', lambda: wave64_read(64).hlsl_cs())
+    assert 'vcc_hi' not in wave64_read(None).hlsl_cs() and 'vcc_hi' not in wave64_read(32).hlsl_cs()
     assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
     for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
@@ -2295,6 +2420,9 @@ def check_binary(llvm_mc):
 MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
+    'f16-word0-source': (CASE_F16_UNARY, 'exp2(f16tof32((v5 >> 16u)))', 'exp2(f16tof32(v5 & 0xffffu))'),
+    'f16-drop-preserve': (CASE_F16_UNARY, '(asuint(v8) & 0xffff0000u)', '0u'),
+    'f16-natural-exp': (CASE_F16_UNARY, 'exp2(f16tof32(v5 & 0xffffu))', 'exp(f16tof32(v5 & 0xffffu))'),
     'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
     # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
     's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
@@ -2361,19 +2489,36 @@ def mutate(hlsl, control):
     return hlsl.replace(old, new)
 
 
+MBCNT_COMPACTION_CONTROLS = (
+    ('mbcnt-base-dropped', ')) + 0x00000001u);', ')) + 0x00000000u);', 0),
+    ('mbcnt-hi-adds-one', 'v8 = v8;', 'v8 = v8 + 1u;', 1),
+    # Shift the compacted segment by one slot after wave zero, keeping writes distinct.
+    ('mbcnt-wave-offset', ')) + 0x00000001u);',
+     ')) + 0x00000001u + (tid.y >= 4u || tid.z != 0u ? 1u : 0u));', 17),
+)
+
+
 def run_case(name, dxc, runner, adapter, directory, control=None):
     hlsl = translate(name).hlsl_cs()
     if control:
-        hlsl = mutate(hlsl, control)
+        if control in CONTROLS:
+            hlsl = mutate(hlsl, control)
+        else:
+            _, old, new, _ = next(item for item in MBCNT_COMPACTION_CONTROLS if item[0] == control)
+            assert hlsl.count(old) == 1, (name, control)
+            hlsl = hlsl.replace(old, new)
     src, cso, case = (directory / ('%s.%s' % (name, ext)) for ext in ('hlsl', 'cso', 'case'))
     src.write_text(hlsl, encoding='ascii')
-    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
+    strict = ['-Gis'] if name == CASE_F16_UNARY else []
+    subprocess.run([dxc, *strict, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
     groups = CASES[name][4]
     constants = [KEY, STRIDE] + [0] * 14
     source = b''
     if name in L_WORD3:
         constants[2:4] = [L_STRIDE, L_WORD3[name]]
         source = formatted_input()
+    if name == CASE_F16_UNARY:
+        source = struct.pack('<%dI' % WORDS, *INPUT_F16_UNARY, *([0] * (WORDS - len(INPUT_F16_UNARY))))
     case.write_bytes(struct.pack('<I', groups[0] | groups[1] << 8 | groups[2] << 16)
                      + struct.pack('<%dI' % WORDS, *expected(name)) + struct.pack('<16I', *constants) + source)
     return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
@@ -2397,11 +2542,15 @@ def check_dispatch(dxc, runner, adapter, control=None):
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         if control == 'mbcnt':
             runs = [('D', mutation) for mutation, (case, _, _) in CONTROLS.items() if case == 'D']
+        elif control == 'mbcnt-compaction':
+            runs = [(name, mutation) for name in ('mbcnt-64', 'mbcnt-256')
+                    for mutation in (None, *(label for label, *_ in MBCNT_COMPACTION_CONTROLS))]
         elif control:
             runs = [(CONTROLS[control][0], control)]
         else:
             runs = [(name, None) for name in CASES]
             runs.append(('join-load', 'join-load-zero'))
+            runs += [(CASE_F16_UNARY, mutation) for mutation in F16_UNARY_CONTROLS]
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
             runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
@@ -2415,6 +2564,9 @@ def check_dispatch(dxc, runner, adapter, control=None):
                 if (run.returncode != 1 or not any('expected=' in line for line in diagnostics) or
                         mutation in CONTROL_MISMATCH and first != [CONTROL_MISMATCH[mutation]]):
                     raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
+                for label, _, _, word in MBCNT_COMPACTION_CONTROLS:
+                    if mutation == label and not first[0].startswith(f'word={word} expected='):
+                        raise AssertionError(f'{name} {mutation}: expected first mismatch at word {word}, got {first}')
                 print('control %s: rejected at %s' % (mutation, first[0]))
             elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))

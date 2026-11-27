@@ -128,13 +128,15 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     if extra_path:
         env["PATH"] = str(extra_path) + os.pathsep + env["PATH"]
-    env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
+    env.update(extra_env or {})
     if "-ScanRoots" not in args:
         args = (*args, "-ScanRoots", str(tree / "scan_none"))  # no search of the real AppData during the checks
     if "-FinishTranslateSeconds" not in args:
         args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
+    if "-MemoryLeftSeconds" not in args:
+        args = (*args, "-MemoryLeftSeconds", "0")  # measured at once: the stall check times the whole run
     script = str(tree / "tools" / "startup" / "tester_run.ps1")
     if merge_stderr:
         # A caller that merges the script's error stream into its output (`... 2>&1`, as a tester's wrapper or a log pipe
@@ -178,7 +180,8 @@ def check_shell(shell):
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
             memory = z.read("memory.txt").decode("utf-8").splitlines()
-        # The end line after the run: the system commit and the top processes by commit (this shell is one of them).
+        # The end line after the run: the system commit and the top processes by commit (this shell is one of them);
+        # with -MemoryLeftSeconds 0 the memory left after exit is measured on it.
         assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
@@ -187,6 +190,8 @@ def check_shell(shell):
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
         assert manifest["build_check"] == "same commit", manifest
+        # What the run leaves behind, against the run's first memory.txt line (the real reader on this host).
+        assert str(manifest.get("memory_left_after_exit", "")).startswith("memory left after exit: "), manifest
         assert manifest["title_input_snapshot"] is True and manifest["env"].get("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT") == "1" \
             and manifest["env"].get("X2W_TRANSLATED_INDIRECT_COPY_RANGES") == "1", manifest["env"]
         assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
@@ -431,9 +436,8 @@ def check_shell(shell):
         # the earlier runs left their stderr.txt: the newest ranks the retry by draws/dispatches
         retry_args = (tree.parent / "retry_args.txt").read_text().splitlines()
         assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
-        weights_file = Path(retry_args[4])
-        assert weights_file.name == "stderr.txt" and weights_file.parent.name.startswith("run_") and weights_file.is_file(), \
-            retry_args
+        # on by default: the runs folder, so the retry reads the newest run that has census lines
+        assert Path(retry_args[4]) == tree / "out" / "tester", retry_args
         assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
@@ -441,6 +445,14 @@ def check_shell(shell):
         with zipfile.ZipFile(newest) as z:
             retried = json.loads(z.read("manifest.json").decode("utf-8-sig"))["pre_run_retry"]
         assert retried.startswith("pre-run retry: 1 keys (1 in lifted families)"), retried
+        family_args = tree.parent / "family_retry_args.txt"
+        family_run = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", extra_env={
+            "X2W_PRE_RUN_FAMILY_RETRY": "1", "STUB_RETRY_ARGS": str(family_args),
+        })
+        assert family_run.returncode == 0, (family_run.stdout, family_run.stderr)
+        retry_args = family_args.read_text().splitlines()
+        assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
+        assert Path(retry_args[4]) == tree / "out" / "tester", retry_args
         (fresh_cache / "dddddddddddddddd.fail").unlink()
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
@@ -503,6 +515,23 @@ def check_shell(shell):
         assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
         assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
         assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
+        # -Matrix gray: three runs back to back (child processes), one combined report, each leg with its own env switch
+        matrix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "gray", "-Seconds", "200")
+        assert matrix.returncode == 0, (matrix.stdout[-2000:], matrix.stderr[-1000:])
+        combined = sorted((tree / "out" / "tester").glob("report_matrix_gray_*.zip"), key=os.path.getmtime)
+        assert combined and "Send this file" in matrix.stdout, matrix.stdout[-1500:]
+        for leg in ("a", "b", "c"):
+            assert ("matrix gray leg %s" % leg) in matrix.stdout, leg
+        with zipfile.ZipFile(combined[-1]) as z:
+            names = z.namelist()
+            top = json.loads(z.read("matrix_manifest.json").decode("utf-8-sig"))
+        assert sorted(top["runs"]) == ["a", "b", "c"], top["runs"].keys()
+        assert all(top["runs"][l]["seconds"] == 200 for l in "abc"), top["runs"]
+        assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and "X2W_BIG_COPY_REUSE" not in top["runs"]["a"]["env"], top["runs"]["a"]["env"]
+        assert top["runs"]["b"]["env"].get("X2W_TEST_ADDRESS_UPLOAD_RING") == "1" and "X2W_BIG_COPY_REUSE" not in top["runs"]["b"]["env"]
+        assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "1" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
+        assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
+        assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 

@@ -9,6 +9,79 @@
 
 LONG list_buffer_copies, list_resource_copies, list_resolves, list_copies_refused, list_title_memory_copies;
 
+enum Copy15Phase { copy15_endpoints, copy15_validation, copy15_sync, copy15_title,
+                   copy15_probes, copy15_move, copy15_desktop, copy15_bookkeeping, copy15_phase_count };
+
+struct Copy15Totals {
+    volatile LONG64 calls{}, slow_locks{};
+    volatile LONG64 ticks[copy15_phase_count]{}, peak[copy15_phase_count]{};
+} copy15_totals;
+
+struct Copy15Timer {
+    x2w_phase::LockWaitScope locks;
+    u64 start = x2w_phase::now_ticks();
+    Copy15Phase phase = copy15_endpoints;
+    u64 ticks[copy15_phase_count]{};
+
+    void enter(Copy15Phase next)
+    {
+        const u64 now = x2w_phase::now_ticks();
+        ticks[phase] += now - start;
+        start = now;
+        phase = next;
+    }
+
+    ~Copy15Timer()
+    {
+        enter(phase);
+        for (int i = 0; i < copy15_phase_count; ++i) {
+            if (!ticks[i]) continue;
+            InterlockedAdd64(&copy15_totals.ticks[i], static_cast<LONG64>(ticks[i]));
+            draw_lock_note_max(copy15_totals.peak[i], static_cast<LONG64>(ticks[i]));
+        }
+        if (locks.over_one_ms) InterlockedIncrement64(&copy15_totals.slow_locks);
+        InterlockedIncrement64(&copy15_totals.calls);
+    }
+};
+
+void log_copy15_phases()
+{
+    const auto calls = InterlockedExchange64(&copy15_totals.calls, 0);
+    if (!calls) return;
+    static constexpr const char* names[] = {"endpoints", "validation", "source-sync", "title-memory-checks",
+                                            "page-probes", "memmove", "desktop-copy", "bookkeeping"};
+    char text[512]{};
+    std::size_t used = 0;
+    const double per_us = x2w_phase::ticks_per_us();
+    for (int i = 0; i < copy15_phase_count; ++i) {
+        const auto ticks = InterlockedExchange64(&copy15_totals.ticks[i], 0);
+        const auto peak = InterlockedExchange64(&copy15_totals.peak[i], 0);
+        const int n = std::snprintf(text + used, sizeof(text) - used, " %s %.2f (%.2f)", names[i],
+                                    ticks / (per_us * calls), peak / per_us);
+        if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
+        used += static_cast<std::size_t>(n);
+    }
+    log("x2w-d3d12 CopyBufferRegion phases: calls %lld, us per call (max)%s; calls waiting over 1 ms on a lock %lld",
+        static_cast<long long>(calls), text,
+        static_cast<long long>(InterlockedExchange64(&copy15_totals.slow_locks, 0)));
+}
+
+// Fixture-only controls. Each process owns its own phase window and mutant.
+thread_local bool copy15_skip_probes;
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_copy15(BOOL skip_probes)
+{
+    copy15_skip_probes = skip_probes != FALSE;
+    log_copy15_phases();
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_hold_draw_lock(HANDLE acquired, DWORD milliseconds)
+{
+    draw_lock_acquire_exclusive();
+    SetEvent(acquired);
+    Sleep(milliseconds);
+    draw_lock_release_exclusive();
+}
+
 // One copy argument: the desktop resource, and its wrapper when the title passed one.
 struct CopyEndpoint {
     ID3D12Resource* resource = nullptr;
@@ -82,10 +155,10 @@ void require_copy_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_
 // aliasing the memory already is. False when the desktop copy cannot be trusted: a texture the upload could not
 // stage, or a title-backed buffer in a default or upload heap. An upload buffer is refused because refreshing it
 // would rewrite one backing that an earlier submission may still be reading.
-bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
+bool sync_title_source(Wrapper* self, const CopyEndpoint& source, const D3D12_RESOURCE_DESC* known_desc = nullptr)
 {
     if (!source.wrapper || !source.wrapper->own().title_memory) return true;
-    const D3D12_RESOURCE_DESC desc = source.resource->GetDesc();
+    const D3D12_RESOURCE_DESC desc = known_desc ? *known_desc : source.resource->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
         if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
@@ -127,7 +200,7 @@ std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_linear_write
 
 bool list_wrote(Wrapper* list, ID3D12Resource* resource)
 {
-    AcquireSRWLockShared(&pending_writes_lock);
+    x2w_phase::acquire_copy_lock(&pending_writes_lock);
     bool found = false;
     if (const auto it = pending_gpu_writes().find(list); it != pending_gpu_writes().end())
         found = std::find(it->second.begin(), it->second.end(), resource) != it->second.end();
@@ -137,7 +210,7 @@ bool list_wrote(Wrapper* list, ID3D12Resource* resource)
 
 void discard_list_gpu_writes(Wrapper* self)
 {
-    AcquireSRWLockExclusive(&pending_writes_lock);
+    x2w_phase::acquire_copy_lock(&pending_writes_lock, true);
     pending_gpu_writes().erase(self);
     pending_linear_writes().erase(self);
     ReleaseSRWLockExclusive(&pending_writes_lock);
@@ -146,7 +219,7 @@ void discard_list_gpu_writes(Wrapper* self)
 void commit_list_gpu_writes(Wrapper* self)
 {
     std::vector<ID3D12Resource*> linear;
-    AcquireSRWLockShared(&pending_writes_lock);
+    x2w_phase::acquire_copy_lock(&pending_writes_lock);
     if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) {
         for (ID3D12Resource* resource : it->second) {
             TextureUpload& state = texture_uploads()[resource];
@@ -165,7 +238,7 @@ void commit_list_gpu_writes(Wrapper* self)
 void mark_gpu_written(Wrapper* self, const CopyEndpoint& destination)
 {
     if (!destination.wrapper || !destination.wrapper->own().title_memory) return;
-    AcquireSRWLockExclusive(&pending_writes_lock);
+    x2w_phase::acquire_copy_lock(&pending_writes_lock, true);
     auto& writes = pending_gpu_writes()[self];
     if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
     ReleaseSRWLockExclusive(&pending_writes_lock);
@@ -184,7 +257,7 @@ void note_linear_gpu_write(Wrapper* self, const CopyEndpoint& destination)
         linear_buffers().note_gpu_write(destination.resource);
         return;
     }
-    AcquireSRWLockExclusive(&pending_writes_lock);
+    x2w_phase::acquire_copy_lock(&pending_writes_lock, true);
     auto& writes = pending_linear_writes()[self];
     if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
     ReleaseSRWLockExclusive(&pending_writes_lock);
@@ -221,21 +294,37 @@ bool copy_source_authoritative(Wrapper* self, const CopyEndpoint& from, u64 offs
 // title wrote). When the title wrote the source with the CPU (no recorded copy wrote it) and the destination is title-backed too,
 // the copy is made in title memory now, which is also when a draw in the same recording snapshots the destination. A source or
 // destination the GPU wrote keeps the refusal: its newer bytes are not in title memory.
-bool copy_in_title_memory(const CopyEndpoint& to, u64 to_offset, const CopyEndpoint& from, u64 from_offset, u64 bytes)
+bool copy_in_title_memory(const CopyEndpoint& to, u64 to_offset, const CopyEndpoint& from, u64 from_offset, u64 bytes,
+                         Copy15Timer& timer, const D3D12_RESOURCE_DESC* to_desc, const D3D12_RESOURCE_DESC* from_desc)
 {
     if (!to.wrapper || !from.wrapper || !to.resource || !from.resource || !bytes) return false;
     auto* const to_memory = static_cast<unsigned char*>(to.wrapper->own().title_memory);
     auto* const from_memory = static_cast<const unsigned char*>(from.wrapper->own().title_memory);
     if (!to_memory || !from_memory) return false;
-    const auto* from_info = resource_info(from.wrapper);
-    if (!from_info || from_info->placement != Placement::copied_buffer) return false;
-    if (placed_gpu_written(from.wrapper, from_offset, bytes) || placed_gpu_written(to.wrapper, to_offset, bytes)) return false;
-    const u64 to_width = to.resource->GetDesc().Width, from_width = from.resource->GetDesc().Width;
+    if (from_desc) {
+        // The fast candidate already established that the source is a copied placement.
+        if (InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) {
+            x2w_phase::acquire_copy_lock(&placed_gpu_writes_lock);
+            const bool written = placed_gpu_written_locked(from.wrapper, from_offset, bytes) ||
+                                 placed_gpu_written_locked(to.wrapper, to_offset, bytes);
+            ReleaseSRWLockShared(&placed_gpu_writes_lock);
+            if (written) return false;
+        }
+    } else {
+        const auto* from_info = resource_info(from.wrapper);
+        if (!from_info || from_info->placement != Placement::copied_buffer) return false;
+        if (placed_gpu_written(from.wrapper, from_offset, bytes) || placed_gpu_written(to.wrapper, to_offset, bytes)) return false;
+    }
+    const u64 to_width = to_desc ? to_desc->Width : to.resource->GetDesc().Width;
+    const u64 from_width = from_desc ? from_desc->Width : from.resource->GetDesc().Width;
     if (to_offset > to_width || bytes > to_width - to_offset || from_offset > from_width || bytes > from_width - from_offset)
         return false;
-    if (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
-        !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes)))
+    timer.enter(copy15_probes);
+    if ((!from_desc || !copy15_skip_probes) &&
+        (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
+         !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes))))
         return false;
+    timer.enter(copy15_move);
     std::memmove(to_memory + to_offset, from_memory + from_offset, static_cast<std::size_t>(bytes));
     return true;
 }
@@ -245,8 +334,11 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                                        u64 bytes)
 {
     if (!self->own().list_open) return;
+    Copy15Timer timer;
+    static const bool fast = x2w_local::env_on("X2W_COPY15_FAST");
     const CopyEndpoint to = copy_endpoint(destination, false);
     const CopyEndpoint from = copy_endpoint(source, false);
+    timer.enter(copy15_validation);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
     if (to.resource) to_desc = to.resource->GetDesc();
     if (from.resource) from_desc = from.resource->GetDesc();
@@ -254,13 +346,23 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                                                          from.resource ? &from_desc : nullptr, source_offset, bytes,
                                                          to.resource == from.resource);
     if (refusal == x2w_startup::CopyRefusal::none) refusal = check_endpoint_roles(to, from);
+    timer.enter(copy15_sync);
     const bool authoritative = refusal == x2w_startup::CopyRefusal::none && indirect_copy_ranges() &&
         copy_source_authoritative(self, from, source_offset, bytes);
-    if (refusal == x2w_startup::CopyRefusal::none && !authoritative && !sync_title_source(self, from))
+    const bool title_pair = fast && refusal == x2w_startup::CopyRefusal::none && !authoritative &&
+        to.wrapper && from.wrapper && to.wrapper->own().title_memory && from.wrapper->own().title_memory;
+    const auto* source_info = title_pair ? resource_info(from.wrapper) : nullptr;
+    const bool fast_title = source_info && source_info->placement == Placement::copied_buffer;
+    if (refusal == x2w_startup::CopyRefusal::none && !authoritative &&
+        (fast_title || !sync_title_source(self, from, fast ? &from_desc : nullptr)))
         refusal = x2w_startup::CopyRefusal::title_backed_source;
     if (refusal == x2w_startup::CopyRefusal::title_backed_source) {
+        timer.enter(copy15_title);
         static LONG logged_title_copies;
-        const bool made = !snapshot_placed_buffers_mutant() && copy_in_title_memory(to, destination_offset, from, source_offset, bytes);
+        const bool made = !snapshot_placed_buffers_mutant() &&
+            copy_in_title_memory(to, destination_offset, from, source_offset, bytes, timer,
+                                 fast_title ? &to_desc : nullptr, fast_title ? &from_desc : nullptr);
+        timer.enter(copy15_bookkeeping);
         if (first_calls(logged_title_copies, 16))
             log("x2w-d3d12 CopyBufferRegion from a placed buffer without title backing: destination %p+0x%llx source %p+0x%llx %llu bytes -> %s",
                 to.wrapper ? to.wrapper->own().title_memory : nullptr, destination_offset,
@@ -271,12 +373,17 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
             return;
         }
     }
-    if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyBufferRegion", refusal);
+    if (refusal != x2w_startup::CopyRefusal::none) {
+        timer.enter(copy15_bookkeeping);
+        return refuse_copy("CopyBufferRegion", refusal);
+    }
+    timer.enter(copy15_desktop);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
     replay_dump::note_copy(self, to.resource);
+    timer.enter(copy15_bookkeeping);
     if (mesh_xmem_tracking()) {
         D3D12_HEAP_TYPE source_heap;
         const bool upload = fixed_heap(from.resource, source_heap) && source_heap == D3D12_HEAP_TYPE_UPLOAD;

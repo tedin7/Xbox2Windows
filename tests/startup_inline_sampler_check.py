@@ -131,7 +131,7 @@ def check_copied_sampler_after_overwrite():
     try:
         translate(runtime)
     except G.Unsupported as error:
-        assert 'holds' in str(error), error
+        assert 'no proven resource binding' in str(error), error
     else:
         raise AssertionError('a sampler copied from a run-time register was accepted')
     # s28 = 0, then s28 = 1, then s27 = s28; s24..s26 stay literal zeros
@@ -165,7 +165,7 @@ def controls():
     try:
         translate(DYNAMIC_WORDS)
     except G.Unsupported as error:
-        assert str(error) == 'descriptor operand s[24:27] holds None', error
+        assert str(error) == 'descriptor operand s[24:27] has no proven resource binding for its first word', error
         print('root-constant mask width: inline sampler refused (%s)' % error)
     else:
         raise AssertionError('run-time write to s24 was accepted as an inline sampler')

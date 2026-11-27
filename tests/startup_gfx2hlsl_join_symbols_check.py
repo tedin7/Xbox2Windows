@@ -21,8 +21,8 @@ reaches while another edge never defined it (DESC_ONE_PATH).
 The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
 - PAIR_*, DESC_*: a 64-bit copy and descriptor loads around a join (pure Python); OUTSIDE: a loop whose path leaves the
   loop's textual range and comes back; CS_UNPLACED: a compute program writing an unplaced user SGPR on one path.
-- DESC_ONE_PATH, PTR_OFFSETS: refusal controls: the branch skips the only load of the descriptor, and two paths add
-  different offsets to one pointer.
+- DESC_ONE_PATH: the branch skips the only descriptor load (refused).
+- PTR_OFFSETS: two paths add different offsets to one pointer (two distinct bindings).
 - JOIN_SAME, DESC_SAME: the same constant (read at run time since #2279), or the same descriptor, on both paths of a forward join (kept).
 - CS_RELOAD: a compute loop that stores through its descriptor at the header and reloads it from the same table slot
   before the back edge (kept, and dispatched); CS_RELOAD_OTHER reloads another slot (refused).
@@ -182,8 +182,7 @@ SOURCES = {
                       'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
                       '80039ebe8002007e8002027e1e8006bf020085bf04040cf4000000fa7fc08cbf080f00f000040400703f8cbf'
                       '0f1800f804050607000081bf'),
-    # Two paths add different offsets to one pointer: the symbol keeps ('ptr', source) plus an 'added' mark, so the
-    # equal tuples must not be kept as one pointer (PTR_OFFSETS).
+    # Two different offsets into the same table must produce separate resource bindings.
     'PTR_OFFSETS': ('s_mov_b32 s30, 0\nv_mov_b32 v0, 0\nv_mov_b32 v1, 0\ns_cmp_eq_u32 s30, 0\ns_cbranch_scc1 2\n'
                     's_add_u32 s8, s8, 4\ns_branch 1\ns_add_u32 s8, s8, 8\n'
                     's_load_dwordx8 s[16:23], s[8:9], 0x0\ns_waitcnt lgkmcnt(0)\n'
@@ -306,9 +305,9 @@ def check_controls():
         assert "buffer store through s[16:19] holding ('joined at a branch target',)" in str(reason), str(reason)
     else:
         raise AssertionError('CS_RELOAD_OTHER accepted')
-    # Refusal controls: no definition on the skipping edge, and different offsets added to one pointer.
     refused('DESC_ONE_PATH', "descriptor operand s[16:23] holds ('joined at a branch target',)")
-    refused('PTR_OFFSETS', "s_load through s8 holding ('joined at a branch target',)")
+    assert [line for line in translate('PTR_OFFSETS').manifest().splitlines() if line.startswith('srv ')] == [
+        'srv 0 tex2d table 0 8', 'srv 1 tex2d table 0 4']
     user = lines('USER_ONE_PATH')
     assert '        v0 = s12;' in user and not any('v0 = 0x00000002u' in l for l in user), user
     # LOOP_RFL reads a uniform loop counter via v_readfirstlane_b32 dynamically (not constant-folded);

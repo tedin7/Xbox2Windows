@@ -28,7 +28,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             bool one_dimensional = false, bool two_dimensional = false,
                             UINT first_mip = 0, UINT view_levels = 0);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64], bool array = false);
+                                  bool depth16, std::uint32_t words[64], bool array, bool sampled);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
@@ -37,7 +37,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               UINT vertices = 3, const std::uint32_t* constants = nullptr);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width = 1, UINT height = 1);
+                               UINT width = 1, UINT height = 1, bool dynamic_heap = false);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
@@ -52,7 +52,8 @@ struct ComputeReadbackProgram {
 };
 ComputeReadbackProgram load_compute_store_program(ID3D12Device* device, const char* shader);
 void check_compute_store_reference(ID3D12Device* device, const ComputeReadbackProgram& program, const char* reference);
-void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference,
+                                const char* sampler_manifest = nullptr);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
 bool check_compute_texture_store_file(ID3D12Device* device, const char* path, const char* reference);
@@ -84,7 +85,7 @@ void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const c
                               const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
                               const MeshTextureProducers* = nullptr);
 void check_texture_mips(ID3D12Device* device);
-void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
+void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool, bool color = false);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
 struct ReadbackMismatch : std::runtime_error {

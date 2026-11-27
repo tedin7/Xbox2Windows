@@ -29,15 +29,20 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_list_copy_stats(unsigned* buffer_copies, unsigned* resource_copies,
                                                                 unsigned* resolves, unsigned* refused);
+
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_copy15(BOOL skip_probes);
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_hold_draw_lock(HANDLE acquired, DWORD milliseconds);
 
 namespace {
 using Word = std::uint64_t;
@@ -168,11 +173,105 @@ struct Probe {
         return bits;
     }
 };
+// Catch only the intended mutation fault. An unrelated exception still fails the child.
+int copy15_source_fault(EXCEPTION_POINTERS* exception, const void* source)
+{
+    const auto& record = *exception->ExceptionRecord;
+    return record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2 &&
+        record.ExceptionInformation[0] == 0 && record.ExceptionInformation[1] >= arg(source) &&
+        record.ExceptionInformation[1] - arg(source) < 64
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool copy15_protected_source(void* list, void* to, void* from, const void* source)
+{
+    __try {
+        invoke(list, 15, arg(to), 0, arg(from), 0, 64);
+    } __except (copy15_source_fault(GetExceptionInformation(), source)) {
+        return false;
+    }
+    return true;
+}
+
+int check_copy15(void* device, Probe& probe, void* list, ID3D12Resource* upload, bool mutate)
+{
+    // The 4 KiB offset cannot be aliased by slot 133. Give each placement its
+    // own allocation and leave the first page outside the buffer.
+    constexpr std::size_t page = 4096, payload = 256, chunk = 64;
+    auto* source = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* destination = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!source || !destination) return 90;
+    source += page;
+    destination += page;
+    void *from = nullptr, *to = nullptr;
+    const auto place = [&](void* memory, const D3D12_RESOURCE_DESC& desc, void** out) {
+        return ok(invoke(device, 133, arg(memory), arg(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                         arg(&__uuidof(ID3D12Resource)), arg(out))) && *out;
+    };
+    if (!place(source, buffer(payload), &from) || !place(destination, buffer(payload), &to))
+        return 90;
+
+    std::array<std::uint8_t, payload> expected{};
+    for (std::size_t i = 0; i < payload; ++i)
+        expected[i] = source[i] = static_cast<std::uint8_t>(i * 13 + (i >> 3) + 1);
+
+    HANDLE acquired = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!acquired) return 90;
+    Counts seen = Counts::read();
+    x2w_d3d12_fixture_copy15(FALSE);
+    double elapsed_us = 0;
+    for (unsigned batch = 0; batch < 20; ++batch) {
+        std::thread holder;
+        if (batch % 2) {
+            holder = std::thread(x2w_d3d12_fixture_hold_draw_lock, acquired, 50);
+            if (WaitForSingleObject(acquired, 5000) != WAIT_OBJECT_0) {
+                holder.join();
+                CloseHandle(acquired);
+                return 90;
+            }
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (unsigned i = 0; i < 100; ++i) {
+            const Word offset = (i % 4) * chunk;
+            invoke(list, 15, arg(to), offset, arg(from), offset, chunk);
+        }
+        elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        if (holder.joinable()) holder.join();
+    }
+    CloseHandle(acquired);
+    x2w_d3d12_fixture_copy15(mutate);
+    std::printf("copy15 record us %.3f\n", elapsed_us);
+    if (!step("copy15 CPU copies", {}, seen)) return 91;
+
+    // Change protection after successful copies warmed the same page.
+    DWORD previous = 0;
+    if (!VirtualProtect(source, page, PAGE_NOACCESS, &previous)) return 90;
+    if (!copy15_protected_source(list, to, from, source)) {
+        std::puts("copy15 unreadable source fault");
+        return 92;
+    }
+    if (!step("copy15 unreadable source", {0, 0, 0, 1}, seen)) {
+        std::puts("copy15 missing unreadable source refusal");
+        return 93;
+    }
+    if (!VirtualProtect(source, page, previous, &previous)) return 90;
+
+    invoke(list, 15, arg(from), 0, arg(upload), 0, chunk);
+    if (!step("copy15 GPU producer", {1, 0, 0, 0}, seen)) return 94;
+    invoke(list, 15, arg(to), 0, arg(from), 0, chunk);
+    if (!step("copy15 GPU-written source", {0, 0, 0, 1}, seen)) return 95;
+
+    if (std::memcmp(destination, expected.data(), expected.size())) return 97;
+    if (!ok(invoke(list, 9)) || !probe.submit(list)) return 96;
+    return probe.desktop->GetDeviceRemovedReason() == S_OK && !probe.debug_errors() ? 0 : 98;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) return 2;
+    const bool copy15 = argc == 3 && (!std::strcmp(argv[2], "copy15") || !std::strcmp(argv[2], "copy15-mutant"));
+    if (argc != 2 && !copy15) return 2;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -299,6 +398,7 @@ int main(int argc, char** argv)
         !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))))
         return 7;
     if (!ok(invoke(list, 139, arg(allocator), 0))) return 8;
+    if (copy15) return check_copy15(device, probe, list, upload_u.Get(), !std::strcmp(argv[2], "copy15-mutant"));
 
     invoke(list, 52, view_a.ptr, arg(red));
     invoke(list, 52, view_c.ptr, arg(blue));

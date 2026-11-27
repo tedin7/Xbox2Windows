@@ -36,10 +36,12 @@ record = [sys.argv[1:], os.environ.get("X2W_TRACE_API")]
 Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
 watch = Path(__file__).with_name("watch.json")
-deadline = time.monotonic() + 30
-while Path(__file__).with_name("translate.flag").exists() and not watch.exists() \\
-        and time.monotonic() < deadline:
-    time.sleep(0.05)
+deadline = time.monotonic() + 45
+if Path(__file__).with_name("translate.flag").exists():
+    while not watch.is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("watcher did not publish watch.json")
+        time.sleep(0.05)
 if {early_exit}:
     # The watcher has published its PID. Wait for the OS to confirm it is gone before returning.
     pid = json.loads(watch.read_text(encoding="utf-8"))[0]
@@ -64,6 +66,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -74,10 +77,10 @@ k32 = ctypes.windll.kernel32
 k32.GetCurrentProcess.restype = ctypes.c_void_p
 k32.GetPriorityClass.argtypes = [ctypes.c_void_p]
 k32.OpenProcess.restype = ctypes.c_void_p
-wait_until = time.monotonic() + 5
+wait_until = time.monotonic() + 30
 while k32.GetPriorityClass(k32.GetCurrentProcess()) != 0x4000 and time.monotonic() < wait_until:
     time.sleep(0.02)
-child = None if {early_exit} else subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+child = None if {early_exit} else subprocess.Popen([sys.executable, "-c", "from threading import Event; Event().wait(180)"])
 classes = [k32.GetPriorityClass(k32.GetCurrentProcess())]
 if child:
     classes.append(k32.GetPriorityClass(k32.OpenProcess(0x1000, False, child.pid)))
@@ -87,13 +90,14 @@ temp = record.with_suffix(".tmp")
 temp.write_text(json.dumps([os.getpid(), child.pid if child else None] + sys.argv[1:]), encoding="utf-8")
 temp.replace(record)
 if child:
-    time.sleep(120)
+    threading.Event().wait(180)
 """
 STOP = "taskkill.exe /T /F /PID $translator.Id"
 # Text-only hosts check that the native command is inside both the live-watcher
 # guard and the child scope that handles Windows PowerShell's native stderr.
 WATCH_CLEANUP = re.compile(
-    r"if\s*\(\s*\$translator\s+-and\s+-not\s+\$translator\.HasExited\s*\)\s*\{\s*&\s*\{\s*"
+    r"if\s*\(\s*\$translator\s+-and\s+-not\s+\$translator\.HasExited\s*\)\s*\{\s*"
+    r"(?:\$treeIds\s*=\s*@\(&\s+\$treeOf\s+\$translator\.Id\)\s*)?&\s*\{\s*"
     r"""\$ErrorActionPreference\s*=\s*['"]Continue['"]\s+&\s+taskkill\.exe\b[^|#\n]*\s/T\b""", re.I)
 CAPTURE = re.compile(r"\$(?:script:)?(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
@@ -132,12 +136,12 @@ def warning_prefix(shell, env):
     Windows), so it is read from the shell under test with the same environment as run.ps1.
     """
     if shell not in WARNING_PREFIXES:
-        out = subprocess.run([shell, "-NoProfile", "-Command", f"Write-Warning '{WARNING_PROBE}'"],
+        out = subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", f"Write-Warning '{WARNING_PROBE}'"],
                              env=env, capture_output=True, text=True, errors="replace", timeout=60)
         lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-        if len(lines) != 1 or not lines[0].endswith(WARNING_PROBE) or lines[0] == WARNING_PROBE:
-            raise SystemExit(f"{shell}: cannot read the Write-Warning prefix from {lines!r} "
-                             f"(stderr: {out.stderr.strip()!r})")
+        if out.returncode or len(lines) != 1 or not lines[0].endswith(WARNING_PROBE) or lines[0] == WARNING_PROBE:
+            raise ValueError(f"Write-Warning prefix probe exited {out.returncode}\n"
+                             f"stdout:\n{out.stdout}\nstderr:\n{out.stderr}")
         WARNING_PREFIXES[shell] = lines[0][:-len(WARNING_PROBE)]
     return WARNING_PREFIXES[shell]
 
@@ -176,7 +180,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     if real_log_error:
-        for name in ("debug_launch.py", "launch.py", "host_cpu.py", "window_capture.py", "commit_headroom.py", "hook_window.py"):
+        for name in ("debug_launch.py", "launch.py", "host_cpu.py", "window_capture.py", "commit_headroom.py", "hook_window.py",
+                     "log_tail.py"):
             shutil.copyfile(RUN_PS1.parent / name, startup / name)
     else:
         (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit, emit_stderr=emit_stderr), encoding="utf-8")
@@ -214,40 +219,66 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     build_arg = str(build) if absolute_build else "bld"
     if missing_build:
         build_arg = str(root / "missing build")
-    command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
+    command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(startup / "run.ps1"),
                "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log),
                "-BuildDir", build_arg,
                "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
     if translate:
         command += ["-Render", "-Translate", "-ShaderCache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
+    step = f"debugger exit {code}, args {command[command.index('-File') + 2:]!r}"
+    for option, enabled in (
+        ("early watcher exit", early_exit), ("stale cache", cache_files is not None),
+        ("debugger stderr", emit_stderr), ("missing Python", missing_python),
+        ("real debugger log error", real_log_error), ("FakeUser environment", fake_user_env),
+        (f"TraceApi environment={trace_api_env}", trace_api_env is not None),
+    ):
+        if enabled:
+            step += f", {option}"
+    summary = Path(str(log) + ".out")
+
+    def report(problems):
+        if not problems:
+            return []
+        log_output = decode(summary.read_bytes()) if summary.is_file() else "(missing)"
+        return [f"{step}\n" + "\n".join(problems) +
+                f"\nrun.ps1 stdout:\n{output}\nrun.ps1 stderr:\n{error_text}"
+                f"\ndebugger summary:\n{log_output}"]
+
     # A surviving watcher can keep a capture pipe open after PowerShell exits.
     # Capture to files so we can check the watcher's PID as soon as the shell exits.
     with (tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stdout,
           tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stderr):
         try:
             out = subprocess.run(command, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=120)
-        except subprocess.TimeoutExpired:
-            return [f"stub exit {code}: run.ps1 did not finish in 120 s"]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            out = None
+            launch_failure = str(exc)
         stdout.seek(0)
         stderr.seek(0)
-        printed = [line.strip() for line in stdout if line.strip()]
-        error_text = stderr.read().strip()
+        output = stdout.read()
+        error_text = stderr.read()
+    printed = [line.strip() for line in output.splitlines() if line.strip()]
+    if out is None:
+        return report([launch_failure])
     if missing_python:
-        return (["missing Python returned success"] if out.returncode == 0 else []) + (
-            ["missing Python launched debugger"] if (startup / "debugger.json").exists() else [])
+        return report((["missing Python returned success"] if out.returncode == 0 else []) + (
+            ["missing Python launched debugger"] if (startup / "debugger.json").exists() else []))
+    if missing_build:
+        return report((["missing build directory returned success"] if out.returncode == 0 else []) + (
+            ["missing build directory launched debugger"] if (startup / "debugger.json").exists() else []))
     if real_log_error:
-        summary = Path(str(log) + ".out")
         text = decode(summary.read_bytes()) if summary.is_file() else ""
-        return ([f"real debugger log error returned {out.returncode}, expected 1"] if out.returncode != 1 else []) + (
-            ["real debugger log error was not captured in the summary"] if "PermissionError" not in text else [])
+        return report(([f"real debugger log error returned {out.returncode}, expected 1"]
+                       if out.returncode != 1 else []) +
+                      (["real debugger log error was not captured in the summary"]
+                       if "PermissionError" not in text else []))
     found = []
     for dll in DLLS:
         if not (exe.parent / f"{dll}.dll").is_file():
             found.append(f"stand-in {dll}.dll was not copied")
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
-    summary = Path(str(log) + ".out")
     summary_lines = [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] if summary.is_file() else []
     want_output = summary_lines[:HEAD_LINES] if emit_stderr else STUB_LINES[:HEAD_LINES]
     if cache_files is not None:
@@ -258,11 +289,15 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             found.append(f"stale shader cache: no single revision warning with {missing} (printed {printed})")
         printed = [line for line in printed if line in STUB_LINES]  # the case runs with -FakeUser: no other warning
     if not fake_user_env and "-FakeUser" not in switches:
-        want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
-        printed = unwrap_first_line(printed, want_output[0])
+        try:
+            prefix = warning_prefix(shell, env)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            found.append(f"warning prefix probe: {exc}")
+        else:
+            want_output = [prefix + FAKE_USER_WARNING, *want_output]
+            printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
-        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
-                     f"(stderr: {error_text!r})")
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output}")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
     elif emit_stderr and ([line for line in summary_lines if line in STUB_LINES] != STUB_LINES or
@@ -294,7 +329,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
                     found.append(f"-Translate: the {what} was still running after run.ps1 exited")
     elif watch.is_file():
         found.append(f"stub exit {code}: the translator started without -Translate")
-    return found
+    return report(found)
 
 
 def run_problems(shell, script, work, first_only):
@@ -409,9 +444,14 @@ def shell_failures(shell, script, tmp):
     if shell:
         failures += [f"{name}: {item}" for item in run_case(shell, script, 7, tmp, real_log_error=True)]
         failures += [f"{name}: {item}" for item in run_case(shell, script, 7, tmp, missing_python=True)]
-        missing = run_case(shell, script, 7, tmp, missing_build=True)
-        if not any("debugger [argv" in item and "was None" in item for item in missing):
-            failures.append(f"{name}: missing build directory did not prevent debugger startup")
+        failures += [f"{name}: {item}" for item in run_case(shell, script, 7, tmp, missing_build=True)]
+        wrong_arg = script.replace("--continue-asserts $ContinueAsserts", "--continue-asserts 19")
+        if wrong_arg == script:
+            failures.append(f"{name}: could not inject the wrong debugger argument")
+        else:
+            problems = run_case(shell, wrong_arg, 7, tmp)
+            if not any("debugger [argv, X2W_TRACE_API]" in item and "'19'" in item for item in problems):
+                failures.append(f"{name}: wrong debugger argument was not detected: {problems}")
         # Expire the live fixture tree after HasExited has been read. The launcher's
         # own taskkill then hits the missing PID and writes native stderr.
         kill = f"& {STOP} 2>&1 | Out-Null"
@@ -426,7 +466,8 @@ def shell_failures(shell, script, tmp):
         parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
         for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
             problems = run_case(shell, mutant, 7, tmp, translate=True)
-            if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
+            if not any(f"-Translate: the {who} was still running after run.ps1 exited" in item
+                       for item in problems):
                 failures.append(f"{name}: expected a surviving {who}, got {problems}")
     else:
         for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
