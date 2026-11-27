@@ -4,6 +4,7 @@ import argparse
 import math
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 
 from compute_gather4_l_check import HEIGHT, ORDER, SENTINEL, WIDTH, first_mismatch, run_case, texel
@@ -162,7 +163,40 @@ def controls(llvm_mc):
     pipe = linear_mip_pipeline(llvm_mc)
     assert 'r0.GatherGreen(q0, float2(F(v0), F(v1)))' in pipe.hlsl_cs()
     assert 'smp 0 0x12 0x0 0x8500000 0x0\n' in pipe.manifest()
+    array_controls(llvm_mc)
     print('Four compute gather channels, manifest bindings and refusal controls passed')
+
+
+# 2D array: the slice is the third address register v2 (1.0), so the output offset moves to v8 as in SHADER_O.
+ARRAY_MOVS = bytes.fromhex('f002007ef002027ef202047e8002107e') + WAIT
+ARRAY_SOURCE = ('image_gather4_lz v[4:7], v[0:2], s[16:23], s[24:27] dmask:{mask:#x} dim:SQ_RSRC_IMG_2D_ARRAY{extra}\n')
+
+
+def shader_array(mask, prefix=PREFIX_O, word0=0xf11c0028, address=b'', suffix=SUFFIX_O):
+    return prefix + ARRAY_MOVS + struct.pack('<II', word0 | (mask << 8), 0x00c40400) + address + suffix
+
+
+def array_controls(llvm_mc):
+    for channel, name in enumerate(CHANNELS):
+        mask = 1 << channel
+        code = shader_array(mask)
+        if llvm_mc:
+            assert code[len(PREFIX_O) + len(ARRAY_MOVS):-len(SUFFIX_O)] == assemble(
+                llvm_mc, ARRAY_SOURCE.format(mask=mask, extra='')), name
+        pipe = pipeline(code)
+        hlsl = pipe.hlsl_cs()
+        assert f'r0.Gather{name}(q0, float3(F(v0), F(v1), F(v2)))' in hlsl, name
+        assert 'Texture2DArray<float4> r0' in hlsl, name
+        lines = pipe.manifest().splitlines()
+        assert 'srvtypes 1' in lines and 'srv 0 tex2da table 1 0' in lines, lines
+    # The unnormalized-coordinate modifier scales x and y only; the slice stays a layer index.
+    code = shader_array(2, word0=0xf11c0028 | (1 << 12))
+    hlsl = pipeline(code).hlsl_cs()
+    assert 'r0.GetDimensions(gw, gh, gn);' in hlsl and 'float3(float2(F(v0), F(v1)) / float2(gw, gh), F(v2))' in hlsl, hlsl
+    # The 2D form keeps its manifest: no typed-SRV line and no array view.
+    plain = pipeline(shader(2)).manifest()
+    assert 'srvtypes' not in plain and 'tex2da' not in plain, plain
+    refused('requires a 2D texture', lambda: pipeline(shader_array(2, word0=0xf15c0028)))  # image_gather4_lz_o
 
 
 def check_image_provenance(llvm_mc):
@@ -381,6 +415,67 @@ def dispatch(directory, compiler, renderer, adapter):
     return 0
 
 
+def array_texel(layer, x, y, channel):
+    # Distinct normal binary32 values for every slice, coordinate and channel.
+    return 0x3F000000 + layer * 0x00800000 + y * 0x1000 + x * 0x20 + channel * 2
+
+
+def array_texels():
+    """Two base-level slices, one after the other: the harness reads them as a two-slice 2D array."""
+    return [array_texel(layer, x, y, channel) for layer in range(2) for y in range(HEIGHT)
+            for x in range(WIDTH) for channel in range(4)]
+
+
+def array_reference(layer, channel):
+    # At (0.5, 0.5) the footprint straddles the four centre texels of the chosen slice.
+    x, y = WIDTH // 2 - 1, HEIGHT // 2 - 1
+    taps = [array_texel(layer, x + dx, y + dy, channel) for dx, dy in ORDER]
+    return taps + [SENTINEL] * (WORDS - len(taps))
+
+
+def run_array_case(directory, compiler, renderer, adapter, name, hlsl_source, expected, manifest):
+    hlsl, cso, case, path = (directory / f'{name}.{ext}' for ext in ('hlsl', 'cso', 'case', 'manifest'))
+    payload = expected + array_texels()
+    # GROUPS | float texture flag (tests/compute_check.cpp texture_rgba32_float_flag), no view mip.
+    case.write_bytes(struct.pack(f'<I{len(payload)}I', 1 | (1 << 30), *payload))
+    hlsl.write_text(hlsl_source, encoding='ascii')
+    subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'main', '-Fo', cso, hlsl], check=True)
+    path.write_text(manifest, encoding='ascii')
+    result = subprocess.run([renderer, adapter, '--compute-texture-case', cso, case, path],
+                            capture_output=True, text=True, timeout=30)
+    print(f'{name}:\n{result.stdout}{result.stderr}', end='', flush=True)
+    if 'debug_layer=enabled' in result.stdout:
+        assert 'debug_errors=0 debug_warnings=0' in result.stdout, name
+    return result
+
+
+def dispatch_array(directory, compiler, renderer, adapter):
+    """Slice 1.0 of a two-slice 2D array: every channel, then mutants that read the wrong slice or tap."""
+    for channel in range(4):
+        pipe = pipeline(shader_array(1 << channel))
+        result = run_array_case(directory, compiler, renderer, adapter, f'array_{CHANNELS[channel]}', pipe.hlsl_cs(),
+                                array_reference(1, channel), pipe.manifest())
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout, channel
+    pipe = pipeline(shader_array(2))
+    source, manifest, want = pipe.hlsl_cs(), pipe.manifest(), array_reference(1, 1)
+    gather = 't = r0.GatherGreen(q0, float3(F(v0), F(v1), F(v2)));'
+    assert source.count(gather) == 1
+    swapped = want.copy()
+    swapped[0], swapped[3] = want[3], want[0]
+    for name, text, actual in (
+        ('array_slice_dropped', source.replace(gather, gather.replace('F(v2)', '0.0')), array_reference(0, 1)),
+        ('array_wrong_component', source.replace('.GatherGreen(', '.GatherRed('), array_reference(1, 0)),
+        ('array_wrong_tap_order', source.replace('uint4(v4, v5, v6, v7)', 'uint4(v7, v5, v6, v4)'), swapped),
+    ):
+        result = run_array_case(directory, compiler, renderer, adapter, name, text, want, manifest)
+        mismatches = sum(a != b for a, b in zip(want, actual))
+        assert mismatches and result.returncode == 1 and first_mismatch(want, actual) in result.stderr, name
+        assert f'compared_words={WORDS} mismatches={mismatches}' in result.stdout, name
+    return 0
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -392,7 +487,7 @@ if __name__ == '__main__':
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
             code = (dispatch(Path(tmp), *args.dispatch) or dispatch_addresses(Path(tmp), *args.dispatch)
-                    or dispatch_o(Path(tmp), *args.dispatch))
+                    or dispatch_o(Path(tmp), *args.dispatch) or dispatch_array(Path(tmp), *args.dispatch))
             raise SystemExit(code)
     controls(args.llvm_mc)
     controls_o(args.llvm_mc)

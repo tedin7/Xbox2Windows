@@ -101,7 +101,10 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
     const bool one_dimensional = dimension == D3D12_UAV_DIMENSION_TEXTURE1D;
     const UINT height = one_dimensional ? 1 : texture_height;
     const UINT base_words = texture_width * height * words_per_texel;
-    const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
+    // Two base-level images in a row are the slices of a 2D array (a compute gather case), with one mip each.
+    const bool two_slices = !writable && !one_dimensional && dimension == D3D12_UAV_DIMENSION_TEXTURE2D &&
+        texels.size() == 2 * static_cast<std::size_t>(base_words);
+    const UINT mips = texels.size() == base_words || two_slices ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
         : dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
@@ -109,7 +112,7 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
     desc.Width = texture_width;
     desc.Height = height;
     desc.DepthOrArraySize = dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY ||
-        dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? texture_layers : 1;
+        dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? texture_layers : two_slices ? 2 : 1;
     desc.SampleDesc.Count = 1;
     desc.MipLevels = static_cast<UINT16>(mips);
     desc.Format = format;
@@ -492,15 +495,23 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
     std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
-    // Older cases stop after the base image. A mip case appends levels one and two.
-    if (source && source.peek() != std::char_traits<char>::eof()) {
+    // Older cases stop after the base image. A mip case appends levels one and two; an array case appends
+    // the second slice (the file's remaining size tells them apart).
+    const auto here = source.tellg();
+    source.seekg(0, std::ios::end);
+    const auto remaining = static_cast<std::size_t>(source.tellg() - here);
+    source.seekg(here);
+    if (source && remaining == base_words * sizeof(UINT)) {
+        texels.resize(2 * static_cast<std::size_t>(base_words));
+        source.read(reinterpret_cast<char*>(texels.data() + base_words), base_words * sizeof(UINT));
+    } else if (source && source.peek() != std::char_traits<char>::eof()) {
         const UINT extra_words = base_words / 4 + base_words / 16;
         texels.resize(base_words + extra_words);
         source.read(reinterpret_cast<char*>(texels.data() + base_words), extra_words * sizeof(UINT));
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
         store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5 || (rgba8 && rgba32_float) ||
-        (view_mip1 && texels.size() == base_words))
+        (view_mip1 && texels.size() <= base_words * 2 && texels.size() % base_words == 0))
         throw std::runtime_error("Invalid compute image load reference");
     const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
         : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
