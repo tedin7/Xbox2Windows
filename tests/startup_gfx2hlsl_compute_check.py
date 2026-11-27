@@ -1720,9 +1720,13 @@ def check_off_stores():
     hlsl = lines(*guard, 's_cbranch_execz 4', 'v_lshrrev_b64 v[5:6], 4, s[20:21]',
                  'buffer_store_dwordx2 v[5:6], off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
     assert 'if (exec & 1) u0.Store2(a, uint2(v5, v6));' in [line.strip() for line in hlsl], hlsl
-    # The saveexec between the definition and the store ends the proof (conservative: these lanes are a subset).
-    refused('buffer store off with data not proven wave-uniform', lambda: lines(
-        'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
+    # The saveexec between the definition and the store only narrows EXEC: every lane still active ran the definition,
+    # so the recomputable expression keeps the proof. An EXEC write that can widen the mask ends it.
+    hlsl = lines('v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
+                 'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
+    assert 'if (exec & 1) u0.Store(a, v5);' in [line.strip() for line in hlsl], hlsl
+    refused('exec write', lambda: lines(
+        'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 4', 's_waitcnt lgkmcnt(0)', 's_mov_b32 exec_lo, s21',
         'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0'))
     # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
     # before an EXEC change, where the entry-block proof no longer knows which lanes store.

@@ -5418,7 +5418,8 @@ class Stage:
             self.uniform_mask = {}    # proven VGPR -> EXEC mask id when its expression was defined
             self.exec_mask = 0        # id of the current EXEC mask; each narrowing starts a child, a restore returns to a copy's
             self.exec_mask_parent = {0: None}
-            self.exec_copies = {}     # SGPR -> (EXEC mask id, offset) it was set to a copy of EXEC at (until written)
+            self.exec_copies = {}     # SGPR -> (EXEC mask id, offset, may be empty) of the EXEC it copied (until written)
+            self.exec_may_be_empty = False  # EXEC was narrowed and no s_cbranch_execz has shown a live lane since
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
@@ -6792,9 +6793,9 @@ class Stage:
             return None
         ids = {copies[r][0] for r in range(reg[1], reg[2] + 1)}
         saved_at = {copies[r][1] for r in range(reg[1], reg[2] + 1)}
-        if len(ids) != 1 or len(saved_at) != 1 or not self.entered_only_from_inside(saved_at.pop(), self.pc):
+        if len(ids) != 1 or len(saved_at) != 1 or not self.entered_only_from_inside(saved_at.pop(), getattr(self, 'pc', 0)):
             return None
-        return ids.pop(), kind
+        return ids.pop(), kind, any(copies[r][2] for r in range(reg[1], reg[2] + 1))
 
     def entered_only_from_inside(self, start, end):
         """No branch from outside [start, end] lands inside (start, end] (and no computed jump exists): every path that
@@ -6837,6 +6838,9 @@ class Stage:
             r = reg_range(tok)
             if r and r[0] == 's':
                 regs.update(range(r[1], r[2] + 1))
+        if not hasattr(self, 'exec_copies'):  # unit probes build a Stage without the tracking state
+            self.exec_copies, self.exec_mask, self.exec_mask_parent, self.uniform_mask = {}, 0, {0: None}, {}
+            self.exec_may_be_empty = False
         copies = self.exec_copies
         restore = self.exec_restore_copy(name, ops)
         narrows = self.exec_write_only_narrows(name, ops)
@@ -6863,16 +6867,20 @@ class Stage:
             copies.pop(r, None)
         copy_of_exec = (name in ('s_mov_b32', 's_mov_b64') and len(ops) == 2 and ops[1] in ('exec', 'exec_lo')
                         or name in ('s_and_saveexec_b32', 's_and_saveexec_b64'))
-        if copy_of_exec:
+        if copy_of_exec and ops:
             dst = reg_range(ops[0])
             if dst and dst[0] == 's' and dst[2] <= 105:
-                copies.update({r: (self.exec_mask, self.pc) for r in range(dst[1], dst[2] + 1)})
+                copies.update({r: (self.exec_mask, getattr(self, 'pc', 0), getattr(self, 'exec_may_be_empty', False)) for r in range(dst[1], dst[2] + 1)})
+        if name == 's_cbranch_execz':
+            self.exec_may_be_empty = False  # the fall-through only runs with a live lane
         if narrows or (restore is not None and restore[1] == 'else'):
+            self.exec_may_be_empty = True
             child = len(self.exec_mask_parent)
             self.exec_mask_parent[child] = restore[0] if restore is not None else self.exec_mask
             self.exec_mask = child
         elif restore is not None:
             self.exec_mask = restore[0]
+            self.exec_may_be_empty = restore[2]
         if not regs:
             return set()
         if drop_since and self.since_join is not None:
@@ -11473,7 +11481,12 @@ class Stage:
             return False
         # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
         if getattr(self, 'past_entry', True):
-            return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
+            if n not in getattr(self, 'uniform_expr', {}) or not getattr(self, 'has_branches', False):
+                return False
+            # EXEC narrowed since the definition and may now be empty: RDNA 2 then reads lane 0 as it was, which need not
+            # have run the definition. A taken-when-empty s_cbranch_execz before the read rules that out.
+            return (getattr(self, 'exec_mask', 0) == getattr(self, 'uniform_mask', {}).get(n, 0) or
+                    not getattr(self, 'exec_may_be_empty', True))
         return self.uniform_entry_exec()
 
     def firstlane_source(self, token, base):
