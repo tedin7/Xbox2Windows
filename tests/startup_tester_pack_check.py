@@ -228,7 +228,7 @@ def check_zip():
         assert all(("part %d of %d" % (i, len(parts2))) in first_note for i in range(1, len(parts2) + 1)), first_note
         assert "(this one)" in first_note and "events.txt" in first_note, first_note
         assert json.loads(seen.pop("manifest.json"))["parts"] == len(parts2)
-        for name in ("events.txt", "window.png", "window_180s.png", "stdout.txt"):
+        for name in ("events.txt", "window.png", "window_180s.png", "stdout.txt", "REPORT.txt"):
             assert name in seen, name
         on_disk = sorted(n for n in os.listdir(run2) if (run2 / n).is_file() and not n.endswith(".dmp"))
         assert seen.pop("REPORT.txt").startswith(b"manifest:")
@@ -707,6 +707,108 @@ def check_phase_table():
             assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
 
 
+def check_producer_report():
+    def diagnostic(payload):
+        return f"x2w-red {payload}"
+
+    def heartbeat(frame, seconds):
+        return f"x2w-d3d12 heartbeat: {frame} frames presented in {seconds:.1f} s"
+
+    def picture(present, mean, spread):
+        return (f"x2w-render presented surface 32x24 format 28, present={present}, readback 3, "
+                f"mean level {mean:.2f}/255, spread {spread:.2f}")
+
+    def producer(frame, order, target, key, rgba, before, op="translated-draw"):
+        return diagnostic(f"producer order={order} ordinal={order} record={frame} submit={frame} "
+                          f"queue=0090 target={target} op={op} key={key} rt=0 rgba={rgba} before={before}")
+
+    def attachments(frame, key, *targets):
+        bindings = " ".join(f"rt{i}={target}" for i, target in enumerate(targets))
+        return diagnostic(f"attachments record={frame} list=0060 op=translated-draw key={key} "
+                          f"dsv=0070/40 targets={len(targets)} {bindings}")
+
+    black, lit = "0,0,0,0", "9,3,2,0"
+    log = [
+        heartbeat(20, 2), picture(29, 35, 8),
+        diagnostic("present target=0010 size=32x24 format=28"),
+        diagnostic("present target=0020 size=32x24 format=28"),
+        diagnostic("input record=28 target=0010 source=0030 key=K1"),
+        diagnostic("input record=30 target=0010 source=0040 key=K1"),
+        diagnostic("auto armed sampled_present=28 published_at=29 target=0010 capture=30..35 rgb=0,0,0"),
+        diagnostic(f"flat onset previous_present=27 sampled_present=28 previous_rgba={lit}"),
+        diagnostic("history record=29 list=0060 target=0010 op=translated-draw key=K1 rt=0"),
+        diagnostic(f"sample present=28 published_at=29 target=0010 rgba={black}"),
+        producer(30, 1, "0050", "0", black, lit, "clear-rtv"),
+        picture(30, 0, 0),
+    ]
+    for frame in range(30, 36):
+        target = "0010" if frame % 2 == 0 else "0020"
+        order = 10 * frame
+        log.extend([
+            producer(frame, order + 2, target, "K2", black, black),
+            producer(frame, order + 1, target.upper(), "K1", black, lit),
+            attachments(frame, "K1", f"{target}/28"),
+            attachments(frame, "K2", f"{target}/28"),
+            diagnostic(f"sample present={frame} published_at={frame} target={target} rgba={black}"),
+        ])
+        if frame >= 32:
+            log.append(attachments(frame, "K3", "0030/87", "0050/28"))
+    tree = diagnostic("tree branch=0010  source=0030")
+    log.extend([
+        picture(33, 8, 5), picture(34, 0, 0), picture(35, 0, 0),
+        attachments(36, "outside", "0040/28"), heartbeat(40, 4),
+        picture(245, 96, 0), picture(250, 97, 0), heartbeat(260, 26),
+        tree,
+    ])
+    stderr = "\n".join(log)
+    expected = [
+        "capture: presents 30..35 = seconds 3.00..3.50; picture before it: mean 35; "
+        "pictures inside it: 0, 8; the run's last picture phase starts at present 245 (mean 96) : "
+        "capture is BEFORE it by 210 presents",
+        "presents 30..35: back buffer written by K1 (centre 0,0,0), then K2 (centre unchanged)",
+        "other targets written: 0050 by clear x1",
+        "input for K1 target 0010 source 0030: K3 (4 rows, first present 32)",
+        "input for K1 target 0010 source 0040: no draw wrote it inside the capture",
+        "passes: 3 distinct pipeline keys; 4 draws with more than one colour target",
+        "pass K1: 6 rows, 6 frames, colour formats 28, depth format 40",
+        "pass K2: 6 rows, 6 frames, colour formats 28, depth format 40",
+        "pass K3: 4 rows, 4 frames, colour formats 87+28, depth format 40",
+        "first op that wrote the target colour (any target): op clear-rtv key 0 rt 0 target 0050, "
+        "record 30 submit 30 -> rgba 0,0,0,0",
+        "first present turning: 28 (previous present 27, rgba 9,3,2,0)",
+        "before: rgba 9,3,2,0", "tree:", tree,
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        write(run, "stderr.txt", stderr.encode())
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "capture.zip"))
+        with zipfile.ZipFile(Path(tmp) / "capture.zip") as archive:
+            rows = archive.read("REPORT.txt").decode().splitlines()
+        for line in expected:
+            assert line in rows, (line, rows)
+        assert [line for line in rows if line.startswith("presents ")] == [expected[1]]
+
+    # An unnumbered readback between heartbeats can bound an onset but cannot
+    # establish an exact present, even when the readback itself has a counter.
+    sparse = stderr.replace("present=245, ", "").replace("present=250, ", "")
+    assert "starts at present 40..260 (mean 96) : capture is BEFORE it by 5..225 presents" in T.producer_report(sparse)
+    # A publish and a heartbeat on the same present pin the intervening
+    # readback to that present. The sampled present may be older.
+    anchored = sparse.replace(picture(245, 96, 0).replace("present=245, ", ""), "\n".join([
+        diagnostic("sample present=243 published_at=245 target=0020 rgba=96,96,96,0"),
+        picture(245, 96, 0).replace("present=245, ", ""), heartbeat(245, 24.5),
+    ]))
+    assert expected[0] in T.producer_report(anchored)
+
+    control = T.producer_report(heartbeat(20, 2))
+    assert "capture: nothing armed — no auto armed line" in control
+    assert not any(line in control for line in expected)
+    assert "Producer capture" in rows, "the run-log summary follows the launch-time capture lines in one REPORT.txt"
+    for reason in ("not armed: no matching sample", "WARNING readback failed"):
+        assert f"capture: nothing armed — x2w-red {reason}" in T.producer_report(diagnostic(reason))
+
+
 def check_request_families():
     """The top refusal families each bring their 20 keys with the most uses, whatever their dispatch/draw weight (c20: the code of
     the top 20 'branch out of the block' keys), on top of the weight ranking; the byte cap still holds."""
@@ -960,6 +1062,7 @@ if __name__ == "__main__":
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
+    check_producer_report()
     check_request_families()
     check_combine()
     check_part_one_has_the_small_files()
