@@ -2598,11 +2598,19 @@ class Stage:
         self.used_s.add(n)
         return 's%d' % n
 
+    @staticmethod
+    def odd_d16_read_error(reg, asm):
+        return Unsupported('whole-word read of v%d after odd d16 image_load: upper half used by %s' % (reg, asm))
+
     def note_whole_read(self, reg):
+        asm = getattr(self, 'current_asm', '<unknown instruction>')
         if reg in self.low16_only_v:
-            raise Unsupported('whole-word read of v%d after odd d16 image_load' % reg)
+            raise self.odd_d16_read_error(reg, asm)
         if isinstance(self.whole_read_v, set):
             self.whole_read_v.add(reg)
+            sites = getattr(self, 'whole_read_sites', None)
+            if sites is not None:
+                sites.setdefault(reg, (self.pc, asm))
 
     def scc_refusal(self, text, path):
         """`text` plus the path that refused and the instruction's opcode and destination class, so a census of one SCC
@@ -3884,6 +3892,8 @@ class Stage:
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
+            self.whole_read_sites = {}  # first upper-half consumer per VGPR
+            self.low16_copies = {}      # source VGPR -> copy destinations for the block-boundary guard
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
             self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
@@ -4220,7 +4230,15 @@ class Stage:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
         self.resolve_plain_samples()
-        self.pinned_low16_v.update(self.low16_only_v)
+        # A tail live at a block boundary can reach copies earlier in the
+        # instruction stream through a back edge. Keep the same conservative
+        # guard for their destinations so a join cannot hide an upper-half use.
+        pending = list(self.pinned_low16_v) if self.has_branches else []
+        while pending:
+            src = pending.pop()
+            aliases = self.low16_copies.get(src, set()) - self.pinned_low16_v
+            self.pinned_low16_v.update(aliases)
+            pending.extend(aliases)
         try:
             self.check_vcc_paths()
         except Unsupported as reason:
@@ -4229,10 +4247,11 @@ class Stage:
             refusals.append((str(reason), self.kind))
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
-            reason = 'whole-word read of v%d after odd d16 image_load' % min(leak)
+            reg = min(leak, key=lambda n: (self.whole_read_sites[n][0], n))
+            reason = self.odd_d16_read_error(reg, self.whole_read_sites[reg][1])
             if refusals is None:
-                raise Unsupported(reason)
-            refusals.append((reason, self.kind))
+                raise reason
+            refusals.append((str(reason), self.kind))
 
     def descriptor_scc_reads(self, branches, effects):
         """Find reads reachable with an elided SCC write, including through joins and back edges."""
@@ -5232,6 +5251,9 @@ class Stage:
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
+            elif base == 'v_lshlrev_b32':
+                shift = self.const_u32(ops[1])
+                args = [self.u(ops[1]), self.u(ops[2], low16_only=shift is not None and (shift & 31) >= 16)]
             elif base == 'v_mad_u32_u16':
                 # S0 and S1 read only bits [15:0] (or [31:16] with op_sel); S2 reads all 32 bits.
                 args = [self.u(ops[1], low16_only=not high[0]),
@@ -9293,7 +9315,13 @@ class Stage:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
         self.reject_lane_mask_data('v_mov_b32', ops[1])
         align4 = not mods and self.operand_align4(ops[1])
-        self.set_v(reg_range(ops[0])[1], self.u(ops[1]), align4=align4)
+        dst = reg_range(ops[0])[1]
+        src = reg_range(ops[1])
+        copy = not mods and src and src[0] == 'v' and src[1] == src[2]
+        if copy and getattr(self, 'has_branches', False) and hasattr(self, 'low16_copies'):
+            self.low16_copies.setdefault(src[1], set()).add(dst)
+        self.set_v(dst, self.u(ops[1], low16_only=copy),
+                   low16_only=copy and src[1] in self.low16_only_v, align4=align4)
 
     def op_v_swap_b32(self, ops, mods):
         # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
@@ -10260,8 +10288,12 @@ class Stage:
             if mask != 0xF and not name.startswith('mrt'):
                 raise Unsupported('partial compressed export to %s' % name)
             pairs = []
-            for v in (vals[0], vals[2]):
-                r = self.u(v) if v != 'off' else None
+            # R32_FLOAT uses R only. G cannot contribute to R through blending, and A
+            # is handled separately. Require the explicit format of the primary target.
+            red_only = name == 'mrt0' and tuple(self.pipe.rtv_formats[:1]) == (41,)  # DXGI_FORMAT_R32_FLOAT
+            for c in (0, 2):
+                v = vals[c]
+                r = self.u(v, low16_only=red_only and c == 0) if v != 'off' else None
                 pairs += ['f16tof32(%s)' % r, 'f16tof32(%s >> 16)' % r] if r else ['0.0', '0.0']
             exprs = pairs
             words = ['0u' if e == '0.0' else 'U(%s)' % e for e in exprs]

@@ -290,7 +290,9 @@ def controls():
         s2_reason = str(exc)
     else:
         s2_reason = None
-    check('low16_only refused on S2', s2_reason == 'whole-word read of v7 after odd d16 image_load', repr(s2_reason))
+    check('low16_only refused on S2',
+          s2_reason == ('whole-word read of v7 after odd d16 image_load: '
+                        'upper half used by v_mad_u32_u16 v6, v4, v5, v7'), repr(s2_reason))
 
     # 5. Refusal controls from synthetic VOP3A bytes and malformed operand counts.
     byte_refusals = [
