@@ -68,8 +68,11 @@ samples. The loop fixture loads two view indices from a root-table buffer and
 adds their red texels under narrowed EXEC. The loop proof runs after a heap
 load refusal and checks all back edges. Separate fixtures exercise numeric
 reads of fixed root-table descriptor words and low-half mixed-FMA constants.
-The WARP fixture binds texture SRVs directly. The runtime's dynamic-heap
-snapshot still creates raw buffer SRVs.
+The translator adds `dynamic_heap_images` when a stage emits a dynamic heap
+texture view. Draw snapshots with that flag mirror recognized texture SRV
+records. The dimensions WARP fixture binds its SRVs directly. A record that
+the runtime cannot identify as a texture, such as an all-zero entry, still
+gets a raw buffer SRV.
 
 Image dimensions use the complete shift-and-clamp calculation for the view's
 top mip. The fixtures use 37 × 11 at mip 0 and 43 × 15 at mip 1. A separate
@@ -97,9 +100,10 @@ nice -n 15 python3 -B tests/startup_gfx2hlsl_getpc_refusal_check.py
 nice -n 15 python3 -B tests/startup_gfx2hlsl_fma_mix_check.py
 ```
 
-Run the six new WARP draw modes and the existing mixed-FMA WARP dispatch on
-Windows. The draws require a readback mismatch from each modified shader.
+Run the six shader draw modes, the runtime heap texture draw on both backends,
+and the existing mixed-FMA WARP dispatch on Windows. The shader mutants and
+the WARP runtime mirror mutant must change the readback.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_(resheap_(vertex_image|vertex_loop|descriptor_word|image_dimensions|fma_mix|embedded_scalar)_warp|fma_mix_dispatch_warp)$'
+ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_(resheap_(vertex_image|vertex_loop|descriptor_word|image_dimensions|fma_mix|embedded_scalar)_warp|fma_mix_dispatch_warp)|heap_texture_draw_(warp|hardware))$'
 ```

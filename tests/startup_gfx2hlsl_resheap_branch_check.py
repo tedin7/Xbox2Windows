@@ -225,6 +225,7 @@ def image_dimensions_control():
     head, image = bytes.fromhex(IMAGE_HEAD), bytes.fromhex(IMAGE_LOAD)
     body = DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_CLAMP
     pipe, vs, ps = translate(VS_WORDS, head + body + image + DIM_EXPORT)
+    assert 'dynamic_heap\ndynamic_heap_images\n' in pipe.manifest()
     assert pipe.ps.retry_heap_dimensions and ps.count('.GetDimensions(0u,') == 2
     assert re.search(r'v4 = U\(float\(heap_w_\w+\)\);', ps)
     assert re.search(r'v5 = U\(float\(heap_h_\w+\)\);', ps)
@@ -371,7 +372,8 @@ def main(dxc=None):
     expect('fixture decodes', [re.sub(r'label_0x[0-9a-f]+', 'label_0x%x', asm) for asm in decoded[start:start + 10]] == tail,
            str(decoded[start:start + 10]))
     pipe, vs_source, ps_source = translate(vs)
-    expect('manifest names the dynamic heap', 'dynamic_heap\n' in pipe.manifest())
+    manifest = pipe.manifest()
+    expect('manifest names the buffer heap', 'dynamic_heap\n' in manifest and 'dynamic_heap_images\n' not in manifest)
     lines = vs_source.splitlines()
     names = sorted(set(re.findall(r'heap_index_[0-9a-f]+', vs_source)))
     expect('one index temporary', len(names) == 1, str(names))
@@ -455,7 +457,7 @@ def mutate(source, old, new):
 
 def vertex_image_control():
     pipe, vs, ps = translate(vertex_image())
-    assert 'dynamic_heap\n' in pipe.manifest()
+    assert 'dynamic_heap\ndynamic_heap_images\n' in pipe.manifest()
     assert re.search(r'uint [^;]*\bheap_index_\w+\b[^;]*;', vs)
     assert 'Texture2D<float4> heap_tex_' in vs and '.Load(int3(' in vs
     bad = vertex_image(record=sop1(S_MOV_B32, 12, VCC_LO) + smem(0x03, S_RECORD, S_HEAP, 12))

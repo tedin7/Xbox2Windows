@@ -25,10 +25,15 @@ def translate(code, root):
     vs, ps = pipe.hlsl_vs(), pipe.hlsl_ps()
     manifest = pipe.manifest()
     assert "dynamic_heap\n" in manifest and pipe.ps_profile() == "ps_6_6", manifest
+    lines = manifest.splitlines()
+    if code == IMAGE_PS:
+        assert lines[lines.index("dynamic_heap") + 1] == "dynamic_heap_images", manifest
+    else:
+        assert "dynamic_heap_images" not in lines, manifest
     assert "udsrc 1 rootconst 0 0\n" in manifest, manifest
     assert "(ud1 + 0u) >> 5;" in ps and "ResourceDescriptorHeap[" in ps, ps
     assert ("Texture2D<float4> heap_tex_" in ps) == (code == IMAGE_PS), ps
-    return vs, "vs_6_0", ps, pipe.ps_profile(), manifest
+    return vs, "vs_6_6", ps, pipe.ps_profile(), manifest
 
 
 def mismatches(actual, expected):

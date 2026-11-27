@@ -3716,6 +3716,7 @@ class Stage:
         first_refusal = len(refusals) if refusals is not None else 0
         while True:
             self.lines = []           # body statements (per block)
+            self.uses_dynamic_heap_images = False
             self.sym = {}             # scalar register -> symbolic value
             self.used_s, self.used_v = set(), set()
             self.used_atomic = set()
@@ -9789,6 +9790,7 @@ class Stage:
         # An index past the logical heap reads slot 0 instead of an out-of-range descriptor (a title's index is in range).
         self.emit('%s %s = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];'
                   % (HEAP_IMAGE_TYPES[kind][0], name, key[0][1], key[0][1]))
+        self.uses_dynamic_heap_images = True
         return name
 
     def dynamic_heap_load(self, key, address):
@@ -16093,6 +16095,8 @@ class Pipeline:
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+            if any(getattr(stage, 'uses_dynamic_heap_images', False) for stage in (getattr(self, 'vs', None), self.ps)):
+                lines.append('dynamic_heap_images')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())
