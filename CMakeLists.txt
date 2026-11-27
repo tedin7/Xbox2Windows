@@ -4885,6 +4885,14 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    add_test(NAME startup_compute_permlanex16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlanex16_cs_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_permlanex16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlanex16_cs_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_permlanex16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops (Refs #1541).
     add_test(NAME startup_compute_lds_b128_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b128_check.py")
