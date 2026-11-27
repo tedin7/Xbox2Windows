@@ -61,11 +61,23 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 }
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
+// Linear mip alignment is unknown: only bind a live resource with the same address and description.
+// Slot 70 does not publish its bytes from the supplied address.
+bool console_linear_texture_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && static_cast<UINT>(r.Layout) == 0x100 &&
+           r.Width && r.Height && r.DepthOrArraySize && r.MipLevels && r.MipLevels <= x2w_startup::gfx10::max_mips &&
+           r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
+           !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !x2w_startup::address_depth_format(r.Format) &&
+           v.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING &&
+           x2w_startup::address_view_fits(r, v);
+}
+
 // The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
 // addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
-    if (supports_placed_memory_srv(r, v)) return true;
+    if (supports_placed_memory_srv(r, v) || console_linear_texture_srv(r, v)) return true;
     return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
 }
 
