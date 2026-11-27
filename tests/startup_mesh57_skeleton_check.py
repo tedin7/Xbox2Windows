@@ -38,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -371,7 +372,7 @@ def guarded_position_mesh(case, setup):
     count_copy = mesh.index('be8e0309', mesh.index('be8d0308'))
     mesh.pop(count_copy)
     if case == 'rewritten bound':
-        mesh.insert(count_copy, 'beaa0384')  # s42 = 4
+        mesh[count_copy:count_copy] = ['beaa0384', 'be8e032a']  # V reads the replacement B, s42 = 4
     if case == 'unsigned export':
         mesh = mutate('7d28000e', '7da8000e', mesh=mesh)
     return mutate('13121110', '35343332', mesh=mesh)  # position uses v[50:53]
@@ -380,6 +381,86 @@ def guarded_position_mesh(case, setup):
 GUARDED_POSITIONS = {case: guarded_position_mesh(case, setup) for case, setup in GUARDED_POSITION_SETUP}
 GUARDED_REFUSAL = ('unsupported: slot 57 mesh: v50 is read where it is not defined for every lane '
                    '(an entry value, or left different per wave by an exchange)')
+
+
+def count_guard_mesh(case='select'):
+    """Two paths to a scalar buffer offset, then separately guarded positions and primitive indices."""
+    before = MESH.index('be8d0308')
+    prefix = 'bf0c8008'.split()                    # s_bitcmp0_b32 s8, 0
+    scalar = ['8f298409']                         # s_lshl_b32 s41, s9, 4 (s9 is the supplied group index)
+    vector = '7e020209 e00021c0 80040101 bf8c3f70 7e520501'.split()
+    # v_mov v1, s9; buffer_load_format_x v1, v1, s[16:19], 0 idxen offset:448;
+    # s_waitcnt vmcnt(0); v_readfirstlane s41, v1
+    if case == 'narrowed first lane':
+        # Initialize v1 for all lanes, then overwrite it under a lane predicate.
+        # The reset restores full EXEC, but that does not prove v1 uniform.
+        vector = '7e020280 7d860086 bea4246a 7e020209 befe04c1'.split() + vector[1:]
+    if case == 'different VCC arms':
+        prefix = ['7d860086']                     # v_cmp_gt_u32 vcc, 6, v0
+    branch_op = 0xbf86 if case == 'different VCC arms' else 0xbf84
+    prefix += [branch(branch_op, 0, len(scalar) + 2)] + scalar + [branch(0xbf82, 0, len(vector) + 1)] + vector
+    # Descriptor reload and scalar buffer read. P is the next byte, B is the low six bits.
+    table = 'f4080405 fa000000 bf8cc07f'.split()
+    bounds = 'f4240a88 520001d0 bf8cc07f 93abff2a 00080008 872abf2a 802a812a 802b812b'.split()
+    if case == 'wave address':
+        bounds[1] = '0c0001d0'                   # use s6 (wave index) as the offset
+    if case == 'wave bound':
+        bounds += ['beaa0306']                    # s_mov_b32 s42, s6
+    if case == 'system bound':
+        bounds += ['beaa0302']                    # s_mov_b32 s42, s2
+    if case == 'memory store':
+        bounds += 'e0701000 80040000'.split()    # buffer_store_dword v0, v0, s[16:19], 0 offen
+    # Address calculation for the position block; s42 = B and s43 = P.
+    # As in the guest, the output counts s13 and s14 are selected after the narrowing.
+    limit = '3608008f 34080884 befe04c1 7da8002a 83ac2b2a bf00802c 850d2b80 850e2a80'.split()
+    if case == 'same':
+        limit[-1] = 'be8e032a'                    # s_mov_b32 s14, s42
+    if case == 'plus one':
+        limit[-1] = '800e812a'                    # s_add_u32 s14, s42, 1
+    if case == 'different SGPR':
+        limit[-1] = 'be8e0309'                    # s_mov_b32 s14, s9
+    # An inner scalar if/else with an EXEC-predicated position load in each arm.
+    left = GUARDED_POSITION_LOAD.split()
+    right = ['bf800000'] if case == 'one arm' else GUARDED_POSITION_LOAD.split()
+    positions = ('f4200a08 fa0001e0 bf8cc07f bf0c8008'.split()
+                 + [branch(0xbf84, 0, len(left) + 2)] + left
+                 + [branch(0xbf82, 0, len(right) + 1)] + right)
+    if case in ('bound overwritten in block', 'count overwritten in block'):
+        positions += ['beaa0384' if case == 'bound overwritten in block' else 'be8e0384']
+    if case == 'bound overwritten in block':
+        # Make the count observe the post-join ID of B.
+        limit[-1] = 'be8e0380'
+    position_block = limit + [branch(0xbf88, 0, len(positions) + 1)] + positions + ['befe04c1']
+    if case == 'bound overwritten in block':
+        position_block += ['be8e032a']
+    # Load three separate indices per primitive. P is at most two in the draw.
+    prim_load = 'f4200a08 fa0001e0 bf8cc07f 34080084 e03c1180 80043604 bf8c3f70'.split()
+    if case == 'different guard rewrites position':
+        prim_load += GUARDED_POSITION_LOAD.split()
+    primitive_block = ['7da8002b', branch(0xbf88, 0, len(prim_load) + 1)] + prim_load + ['befe04c1']
+    exchange = MESH[before + 2:POST_COUNT]
+    pos = ('7da8000e' if case == 'unsigned export' else '7d28000e').split() + (
+        '3608008f 34080884 e03810c0 80041404 bf8c3f70 f80008cf 35343332 f800020f 17161514 befe04c1'.split())
+    # After narrowing by P, replace V by V - 1, clamp each index, then pack the triplet.
+    clamp = ('7d28000d 800ec10e 266c6c0e 266e6e0e 2670700e 346e6e8a 34707094'
+             ' 386c6d37 386c6d38 f8000941 00000036 bf810000').split()
+    if case == 'compare overwritten count':
+        pos.insert(0, '800ec10e')
+    if case == 'rewrite under the same mask':
+        pos.insert(1, '800ec10e')
+    if case == 'rewrite primitive count':
+        clamp.insert(1, '800dc10d')               # s_add_u32 s13, s13, -1
+    if case == 'keep count':
+        clamp[1] = '802cc10e'                     # write V - 1 to s44 instead
+        clamp[2:5] = [word[:-2] + '2c' for word in clamp[2:5]]
+    return MESH[:before] + prefix + table + bounds + position_block + primitive_block + exchange + pos + clamp
+
+
+def rewritten_guarded_position():
+    """Overwriting v50 under the primitive mask invalidates its older position definition."""
+    mesh = GUARDED_POSITIONS['select']
+    at = mesh.index('7d28000e')
+    return mesh[:at] + '7d28000d 7e640280 befe04c1'.split() + mesh[at:]
 
 
 WAVE_LOAD_MESH = wave_load_mesh()
@@ -868,6 +949,72 @@ def depth_only_controls():
             expect(what + ' (depth-only pair)', request(tmp, mesh, DEPTH_PIXEL)[1], 'unsupported: ' + reason)
 
 
+COUNT_GUARD_ACCEPTED = ('select', 'same', 'unsigned export', 'keep count', 'rewrite under the same mask',
+                        'rewrite primitive count')
+COUNT_GUARD_REFUSED = ('wave bound', 'system bound', 'wave address', 'memory store', 'bound overwritten in block',
+                       'count overwritten in block', 'narrowed first lane', 'different VCC arms', 'plus one',
+                       'different SGPR', 'one arm', 'different guard rewrites position')
+COUNT_COMPARE_REFUSAL = ('unsupported: slot 57 mesh: an EXEC compare other than output count > thread index under '
+                         'exec = -1 is not covered')
+
+
+def count_guard_mutants(tmp):
+    """Make the wave-bound and later-write controls translate by breaking their respective proof."""
+    number = G.mesh_value_numbers
+
+    def ignore_wave_variance(*args):
+        at, uniform, selects = number(*args)
+        instructions = args[0]
+        compare = next(i for i, ins in enumerate(instructions) if ins[3] == 'v_cmpx_gt_u32_e32 s42, v0')
+        return at, uniform | {at[compare]['s42']}, selects
+
+    with patch.object(G, 'mesh_value_numbers', ignore_wave_variance):
+        expect('m1 ignoring uniformity fails the wave-index control', request(tmp, count_guard_mesh('wave bound'))[1], 'ok')
+
+    writes = G.mesh_vector_writes
+
+    def miss_later_write(name, asm):
+        return set() if asm == 'v_mov_b32_e32 v50, 0' else writes(name, asm)
+
+    with patch.object(G, 'mesh_vector_writes', miss_later_write):
+        expect('m2 keeping stale tags fails the later-write control', request(tmp, rewritten_guarded_position())[1], 'ok')
+
+
+def count_guard_controls(tmp):
+    for label in COUNT_GUARD_ACCEPTED:
+        key, result = request(tmp, count_guard_mesh(label))
+        expect('count guard ' + label, result, 'ok')
+        if result != 'ok':
+            continue
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        vert = 's14' if label == 'keep count' else 'mesh_vertex_count'
+        prim = 'mesh_primitive_count' if label == 'rewrite primitive count' else 's13'
+        expect(label + ' allocates using the published counts', f'SetMeshOutputCounts({vert}, {prim});' in source, True)
+        expect(label + ' clamps using the published vertex count', f'max({vert}, 1u) - 1u' in source, True)
+        if label == 'select':
+            expect('m3 rewritten count changes primitive-clamp HLSL', clamp_with_rewritten_count(source) != source, True)
+    for label in COUNT_GUARD_REFUSED:
+        expect('count guard ' + label, request(tmp, count_guard_mesh(label))[1], GUARDED_REFUSAL)
+    expect('write under a later primitive mask', request(tmp, rewritten_guarded_position())[1], GUARDED_REFUSAL)
+    expect('compare the rewritten count', request(tmp, count_guard_mesh('compare overwritten count'))[1],
+           COUNT_COMPARE_REFUSAL)
+
+    # Isolate the count-write rule with the old fully-defined output shape.
+    at = MESH.index('7d28000d') + 1
+    key, result = request(tmp, MESH[:at] + ['800ec10e'] + MESH[at:])
+    expect('count rewrite in the old output shape', result, 'ok')
+    if result == 'ok':
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        expect('legacy shape clamps with the saved count', 'max(mesh_vertex_count, 1u) - 1u' in source, True)
+
+    pixel = PIXEL[:-3] + 'e0701000 80040000'.split() + PIXEL[-3:]  # memory store in the paired stage
+    expect('paired-stage store blocks the mesh load proof', request(tmp, count_guard_mesh(), pixel)[1], GUARDED_REFUSAL)
+    for bit in (0, 1):
+        _, guest, wrong = count_guard_reference(bit)
+        expect('m3 rewritten clamp changes the CPU image, prefix arm %d' % bit, guest != wrong, True)
+    count_guard_mutants(tmp)
+
+
 def lane_mask_controls(tmp):
     for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
         key, result = request(tmp, mesh)
@@ -887,6 +1034,7 @@ def lane_mask_controls(tmp):
             expect('export count mutant changes its source', widen_position_count(source) != source, True)
             _, good, bad = guarded_position_reference()
             expect('export count mutant changes the CPU image', good != bad, True)
+    count_guard_controls(tmp)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
     for label, mesh, reason in MASK_CONTROLS:
@@ -1009,8 +1157,6 @@ def controls():
                        (block[1].count('.Load('), bool(re.search(r'\bs45 = ', block[1]))), (2, True))
         # The accepted mesh opcodes cannot produce a lane-varying numeric SGPR here.
         # Inject that analysis fact at the Stage boundary to exercise the uniformity refusal.
-        from unittest.mock import patch
-
         uniform_source = G.Stage.uniform_source
         with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's42' and uniform_source(stage, token)):
             expect('non-uniform wave load bound', refusal_head(request(tmp, WAVE_LOAD_MESH)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
@@ -1347,7 +1493,11 @@ def draw_lane_masks(dxc, renderer, adapter):
                 if status:
                     return status
     with tempfile.TemporaryDirectory() as tmp:
-        return draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+        status = draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+        if status:
+            return status
+    with tempfile.TemporaryDirectory() as tmp:
+        return draw_count_guard(Path(tmp), dxc, renderer, adapter)
 
 
 def guarded_position_reference():
@@ -1399,6 +1549,69 @@ def draw_guarded_positions(tmp, dxc, renderer, adapter):
             expect(name + ' differs from the guest image', run.returncode == 1 and got is not None and got > 0, True)
         else:
             expect(name + ' matches the guest image', (run.returncode, got), (0, 0))
+    return 0
+
+
+def count_guard_reference(bit):
+    """Build the two synthetic prefix inputs and model the guest index clamp."""
+    points, colours, _ = geometry()
+    triangles = [(7, 2, 15)]
+    data = bytearray(buffer(points, colours, []))
+    struct.pack_into('<3I', data, 384, *triangles[0])
+    # s9 = 1 in both draws. Bit 0 clear computes 16 in the scalar arm.
+    # Bit 0 set obtains the byte offset 0 from the indexed R32_FLOAT formatted load.
+    struct.pack_into('<I', data, 452, 0)
+    struct.pack_into('<2I', data, 464, 9, 0)
+    struct.pack_into('<2I', data, 480, 8, 0)
+    offset = 464 if bit else 480
+    packed = struct.unpack_from('<I', data, offset)[0]
+    verts, prims = (packed & 63) + 1, ((packed >> 8) & 255) + 1
+    guest = [tuple(min(i, verts - 1) for i in tri) for tri in triangles]
+    wrong = [tuple(min(i, verts - 2) for i in tri) for tri in guest]
+    return data, rasterise(points, colours, guest, verts, prims), rasterise(points, colours, wrong, verts, prims)
+
+
+def clamp_with_rewritten_count(source):
+    """m3 substitutes the decremented SGPR for the published vertex count in the exporter."""
+    old, new = 'max(mesh_vertex_count, 1u) - 1u', 'max(s14, 1u) - 1u'
+    assert source.count(old) == 1
+    return source.replace(old, new)
+
+
+def draw_count_guard(tmp, dxc, renderer, adapter):
+    mesh = count_guard_mesh()
+    key, result = request(tmp, mesh)
+    expect('two wave-load guards compile', result, 'ok')
+    if result != 'ok':
+        return 1
+    base = tmp / ('%016x' % key)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+    for key, value in ((('rootconst', 0, 1), 1), (('stride', 0), 4), (('descword3', 0), (22 << 12) | 4)):
+        struct.pack_into('<I', constants, 4 * uds.index(key), value)
+    source = base.with_suffix('.ms57.hlsl').read_text()
+    mutant = tmp / 'rewritten-clamp.cso'
+    mutant_text = mutant.with_suffix('.hlsl')
+    mutant_text.write_text(clamp_with_rewritten_count(source), encoding='ascii')
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutant_text], check=True)
+    path = tmp / 'count-guard.bin'
+    for bit in (0, 1):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), bit)
+        data, guest, wrong = count_guard_reference(bit)
+        differences = sum(a != b for a, b in zip(guest, wrong))
+        expect('the index clamp affects the image', differences > 0, True)
+        cases = (('guest', base.with_suffix('.ms57.cso'), guest, 0),
+                 ('m3 against guest', mutant, guest, differences), ('m3 against mutant', mutant, wrong, 0))
+        for label, shader, image, mismatches in cases:
+            path.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), path],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            expect(f'prefix arm {bit}, {label}',
+                   (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout),
+                   (int(mismatches != 0), True))
     return 0
 
 

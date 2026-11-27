@@ -187,3 +187,73 @@ reference pixels. The mesh, compute and pixel controls, the mesh and
 compute LLVM 19 assembly checks, and docs links passed on Linux. A
 before/after check against `cf0e0c388` matched 517 legacy HLSL and manifest
 outputs across seven scripts. Windows readback remains pending.
+
+
+## Group-uniform values and guarded exports
+
+Forward value numbering tracks reaching SGPR words, SCC, VGPRs and known
+full EXEC between the exchanges. The GS ES+GS entry layout places per-draw
+user data in s8–s39. The proof uses these values only before any program
+write to their word. Uniform SALU operands yield uniform results. Uniform
+addresses, descriptors and offsets preserve uniformity through read-only
+scalar loads. A full-EXEC buffer load with an all-lane uniform address can
+establish an all-lane uniform VGPR, which a first-lane read can turn into a
+group-uniform scalar. The exchanged group index is also group-uniform when
+the original v5 reaches the read. The numeric entry value of v5 still
+requires a runtime source. The synthetic draw supplies the scalar arm's
+index as draw data. [RDNA 2 Instruction Set Architecture, §3.12.2 p. 24,
+ch. 7 p. 51 and V_READFIRSTLANE_B32 p. 137](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+A join can merge distinct uniform values under group-uniform SCC. A join
+at or inside the post-dominator interval of a divergent branch provides no
+such proof. EXEC-zero and VCC branches are conservative divergent edges.
+A backward edge disables value numbering for the entire pre-count region.
+A memory write in either shader disables the load-based proof. [Convergence
+And Uniformity, Uniformity](https://llvm.org/docs/ConvergenceAndUniformity.html)
+[RDNA 2 Instruction Set Architecture, S_CBRANCH_EXECZ p. 125](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+At a wave block's full EXEC reset, the walk tags the partially defined
+VGPRs that all lanes of the guard wrote along every path. Joins retain
+only agreeing tags on incomplete definitions. A later VGPR write or
+exchange clobber drops the tag. The export can use a tagged VGPR when the
+published count is the same bound or zero, including an SCC select between
+them. With a signed compare, a bound with the high bit set admits no
+non-negative thread index before the host clamp, and its unsigned
+defining guard covers every thread. Different bounds, incomplete
+definitions and wave-derived values keep the existing refusals. [RDNA 2
+Instruction Set Architecture, S_CSELECT_B32 and S_MIN_U32 pp. 101–102 and
+V_CMPX_GT_U32 / V_CMPX_GT_I32 p. 160](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+Reusing a published count's SGPR preserves the active EXEC mask. A later
+compare of that register loses its count provenance. Allocation and
+primitive clamping use the published snapshot for each reused count. The
+emitter keeps the original register expressions when the program leaves
+the counts intact.
+
+### Synthetic controls and draw
+
+`python3 -B tests/startup_mesh57_skeleton_check.py` exercises the scalar
+diamond, both wave-load blocks, signed and unsigned export guards, and
+count-register reuse. The controls include a wave-dependent bound or load
+address, a system entry word, a store in either stage, a first-lane source
+written under narrowed EXEC, a divergent VCC diamond, a divergent bound or
+count at a wave-load join, a different or widened count, a missing position
+write, a later position overwrite, and a compare of an overwritten count.
+
+`ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton(_lanemask_warp)?$' -V`
+also draws both prefix arms through the mesh path. The CPU reference
+models partial wave 0, empty wave 1, and an index that the guest clamps to
+the last published vertex. The offline mutations mark the wave-derived
+bound uniform (m1) and retain a tag across the later masked write (m2).
+The draw compiles a mutant with the exporter using the decremented count
+(m3) and tests it against both the guest and mutant CPU images. The
+existing widened-export draw runs m4. Windows readback is pending.
+
+
+On Linux, the no-argument check passed. Against `4955e24fb`, the later
+masked write changed from accepted to the existing undefined-VGPR refusal.
+The former dead overwrite of the bound register now passes because the
+count already holds the old value. The bound-rewrite control now feeds the
+replacement value into the count and retains the refusal. The rewritten
+clamp changed 72 CPU pixels in the scalar arm and 38 in the formatted-load
+arm. The widened export changed 80 CPU pixels.
