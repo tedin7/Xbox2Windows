@@ -10210,7 +10210,7 @@ class Stage:
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
-        extended = self.kind != 'cs' and extended_buffer_formats()
+        extended = extended_buffer_formats()
         for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
             if fmt not in DESC_LEGACY_FORMATS:
                 if extended:
@@ -15849,10 +15849,10 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     """The runtime key of a device slot 67 compute request (req_<key>.c67, .data, .root, .desc, .sa, .sb): the
-    graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
-    the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
-    state blocks."""
-    key = fnv(b'x2w-startup-shader-28cs')
+    graphics revision followed by "cs" and the enabled feature tag, then each part preceded by its length
+    as a little-endian u64: the code, words 7-8 blob, root signature, 12 description words with their
+    pointers zeroed, and two state blocks."""
+    key = shader_cache_seed(b'x2w-startup-shader-28cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
