@@ -875,6 +875,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         if (!views[i].resource) continue;  // a null view wrote nothing
+        replay_dump::note(self, views[i].resource);
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;

@@ -671,6 +671,12 @@ def check_phase_table():
     assert rows[2].split() == ["0", "30", "900", "30.0", "0.0"], rows[2]
     assert rows[3].split() == ["30", "60", "100", "3.3", "36.0"], rows[3]
     assert rows[4].split() == ["60", "90", "10", "0.3", "-"], rows[4]
+    assert rows[-1].startswith("# credits movie: no window pictures after 250 s"), rows[-1]
+    late = timeline + "  300.0 s  picture window_300s.png mean 0.0  unchanged\n  384.0 s  picture window_384s.png mean 72.3  changed\n  400.0 s  picture window_400s.png mean 0.0  changed\n"
+    note = T.movie_note(late)
+    assert note.startswith("# credits movie: content in 1 of 3 of OUR pictures after 250 s (384 s mean 72); capture interval 50 s"), note
+    black = T.movie_note("  300.0 s  picture window_300s.png mean 0.0  first\n  315.0 s  picture window_315s.png mean 1.0  unchanged\n")
+    assert black.startswith("# credits movie: NOT seen in our 2 pictures after 250 s") and "tester's own captures" in black, black
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "run"
         run.mkdir()
@@ -748,6 +754,36 @@ def check_combine():
             assert seen["run_%s/stderr.txt" % label].startswith(("stderr of " + label).encode()), label
             assert json.loads(seen["run_%s/manifest.json" % label])["env"] == top["runs"][label]["env"]
         assert all(top["files"][n]["part"] == 1 for n in top["files"] if n.endswith("manifest.json") and n.startswith("run_")), "manifests in part 1"
+
+
+def check_record_spec():
+    """-Record values for the replay recorder and the size report of a recording folder."""
+    assert T.parse_record_spec("140,60") == {"spec": "140,60", "by": "time", "start": 140, "length": 60}
+    assert T.parse_record_spec(" F4000,24 ")["spec"] == "f4000,24" and T.parse_record_spec("f4000,24")["by"] == "frame"
+    assert T.parse_record_spec("auto")["spec"] == T.RECORD_DEFAULT_SPEC == "slow" and T.parse_record_spec("Default")["by"] == "slow" and T.parse_record_spec("SLOW")["spec"] == "slow"
+    assert T.RECORD_DEFAULT_MAX_MIB == 400 < T.RECORD_EXPLICIT_MAX_MIB and T.parse_record_spec("140,20")["by"] == "time"
+    for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1"):
+        try:
+            T.parse_record_spec(bad)
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % bad)
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), "a.bin", b"x" * 1000)
+        (Path(tmp) / "sub").mkdir()
+        write(Path(tmp) / "sub", "b.bin", b"y" * 5000)
+        report = T.folder_report(tmp)
+        assert report["files"] == 2 and report["bytes"] == 6000 and report["largest"][0] == ("sub/b.bin", 5000), report
+        assert T.folder_report(str(Path(tmp) / "none")) == {"files": 0, "bytes": 0, "largest": []}
+        # A run whose log says the cap stopped the recording before its window opened: the file is a prefix, not a recording.
+        logs = Path(tmp) / "logs"
+        logs.mkdir()
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "no stderr: nothing to say"
+        write(logs, "stderr.txt", b"x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, 20 calls\n")
+        assert T.folder_report(tmp, str(logs))["unusable"] == "prefix only"
+        assert "unusable" not in T.folder_report(tmp), "no log folder given"
+        write(logs, "stderr.txt", b"x2w-replay record: stopped after 900 calls, 3 blobs\n")
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "a window that opened is usable"
 
 
 def make_old_cache(folder):
@@ -951,6 +987,7 @@ if __name__ == "__main__":
     check_phase_table()
     check_request_families()
     check_combine()
+    check_record_spec()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
