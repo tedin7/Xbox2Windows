@@ -4583,6 +4583,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) {
         note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
+        debug_present::note_draw(pass.bound_targets, pass.target_count, pass.bound_depth);  // X2W_DEBUG_PRESENT_TARGET
         if (tr->placeholder) note_placeholder_draw(tr->key, pass);
     }
     if (drawn && replay_dump_enabled()) {

@@ -21,12 +21,14 @@ struct Tracker {
         ID3D12Resource* resource = nullptr;  // holds a reference
         x2w_debug_present::Candidate info;
         unsigned sequence = 0;
+        unsigned long long draws = 0;  // translated draws that wrote it since the last take
     };
     SRWLOCK lock = SRWLOCK_INIT;
     x2w_debug_present::Spec spec;
     std::vector<Entry> entries;  // distinct targets bound since the last take
     Entry kept;                  // the last choice, shown again when no pass bound a target since
     unsigned counter = 0;
+    unsigned long long total_draws = 0;  // every translated draw seen while enabled (X2W_DEBUG_PRESENT_FROM_DRAWS)
 
     explicit Tracker(const x2w_debug_present::Spec& s = {}) : spec(s) {}
     Tracker(const Tracker&) = delete;
@@ -55,8 +57,9 @@ struct Tracker {
         } else if (!slot) {
             // Full: replace the smallest entry if this one is bigger.
             Entry* smallest = &entries[0];
-            for (Entry& e : entries) if (e.info.area() < smallest->info.area()) smallest = &e;
-            if (next.area() > smallest->info.area()) {
+            for (Entry& e : entries)
+                if (e.draws < smallest->draws || (e.draws == smallest->draws && e.info.area() < smallest->info.area())) smallest = &e;
+            if (smallest->draws == 0 && next.area() > smallest->info.area()) {
                 smallest->resource->Release();
                 *smallest = Entry{};
                 slot = smallest;
@@ -73,19 +76,46 @@ struct Tracker {
         ReleaseSRWLockExclusive(&lock);
     }
 
-    // The choice with its own reference, or null. Prefers the entry whose size equals (want_w x want_h), then the biggest,
-    // then the latest. The entries are cleared; the choice is kept for a frame with no new binds.
-    ID3D12Resource* take(unsigned long long want_w, unsigned want_h, x2w_debug_present::Candidate& out)
+    // A translated draw wrote these targets: count it for each one that is a candidate.
+    void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth)
+    {
+        if (!enabled()) return;
+        AcquireSRWLockExclusive(&lock);
+        ++total_draws;
+        for (Entry& e : entries) {
+            if (!e.resource) continue;
+            bool hit = e.resource == depth;
+            for (UINT i = 0; i < count && !hit; ++i) hit = e.resource == targets[i];
+            if (hit) ++e.draws;
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    unsigned long long draws_seen()
+    {
+        AcquireSRWLockShared(&lock);
+        const unsigned long long total = total_draws;
+        ReleaseSRWLockShared(&lock);
+        return total;
+    }
+
+    // The choice with its own reference, or null. The most draws in the interval wins; then the entry whose size equals
+    // (want_w x want_h), then the biggest, then the latest. The entries are cleared; the choice is kept for an interval
+    // with no new binds.
+    ID3D12Resource* take(unsigned long long want_w, unsigned want_h, x2w_debug_present::Candidate& out,
+                         unsigned long long* draws_out = nullptr)
     {
         AcquireSRWLockExclusive(&lock);
         Entry* best = nullptr;
         for (Entry& e : entries) {
             const bool match = e.info.width == want_w && e.info.height == want_h;
             const bool best_match = best && best->info.width == want_w && best->info.height == want_h;
-            if (!best || (match && !best_match) ||
-                (match == best_match && (e.info.area() > best->info.area() ||
-                                         (e.info.area() == best->info.area() && e.sequence > best->sequence))))
-                best = &e;
+            bool better = !best || e.draws > best->draws;
+            if (best && e.draws == best->draws)
+                better = (match && !best_match) ||
+                         (match == best_match && (e.info.area() > best->info.area() ||
+                                                  (e.info.area() == best->info.area() && e.sequence > best->sequence)));
+            if (better) best = &e;
         }
         if (best) {
             if (kept.resource) kept.resource->Release();
@@ -96,6 +126,7 @@ struct Tracker {
         entries.clear();
         ID3D12Resource* resource = kept.resource;
         out = kept.info;
+        if (draws_out) *draws_out = kept.draws;
         if (resource) resource->AddRef();
         ReleaseSRWLockExclusive(&lock);
         return resource;
@@ -109,6 +140,7 @@ struct Painter {
     ID3D12Resource* upload = nullptr;
     UINT64 upload_bytes = 0;
     std::vector<unsigned char> rgba;
+    x2w_debug_present::DepthStats stats;  // of the last depth picture
 
     bool setup(ID3D12Device* device, UINT64 bytes)
     {
@@ -206,9 +238,10 @@ bool show(Painter& p, ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Res
         return false;
     }
     unsigned ow = 0, oh = 0;
+    p.stats = {};
     const bool read = x2w_debug_present::to_rgba(static_cast<const unsigned char*>(mapped) + from_fp.Offset, from_fp.Footprint.RowPitch,
                                                  static_cast<UINT>(sdesc.Width), sdesc.Height,
-                                                 x2w_debug_present::step_for(static_cast<unsigned>(sdesc.Width)), info.format, p.rgba, ow, oh);
+                                                 x2w_debug_present::step_for(static_cast<unsigned>(sdesc.Width)), info.format, p.rgba, ow, oh, &p.stats);
     const D3D12_RANGE none{0, 0};
     c.readback->Unmap(0, &none);
     if (!read) {
@@ -276,6 +309,21 @@ void note_bound(ID3D12Resource* const* targets, const x2w_startup::TargetDrawCen
     if (depth) tracker.note(depth, depth_surface.width, depth_surface.height, depth_surface.format, true);
 }
 
+// A translated draw wrote the targets of the current pass.
+void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth)
+{
+    Tracker& tracker = global_tracker();
+    if (tracker.enabled()) tracker.note_draw(targets, count, depth);
+}
+
+// The depth statistics line text: "spread 0.25..0.75 covered 75.0%".
+std::string stats_text(const x2w_debug_present::DepthStats& stats)
+{
+    char text[96];
+    std::snprintf(text, sizeof(text), "spread %.4g..%.4g covered %.1f%%", stats.low, stats.high, stats.covered_percent());
+    return text;
+}
+
 // At a title Present, before the picture is read: replace plane 0's surface content by the chosen target. `picture_due`:
 // a timed picture (the report's window pictures) is due on this present.
 void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
@@ -291,8 +339,18 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
         const long n = GetEnvironmentVariableA("X2W_DEBUG_PRESENT_EVERY", value, sizeof(value)) ? std::atol(value) : 6;
         return static_cast<LONG>(n > 0 ? n : 1);
     }();
-    // Before FROM nothing happens: no copy, and the candidates are dropped so that none is held.
+    static const unsigned long long from_draws = [] {
+        char value[32]{};
+        return GetEnvironmentVariableA("X2W_DEBUG_PRESENT_FROM_DRAWS", value, sizeof(value)) ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    // Before FROM (seconds) or FROM_DRAWS (translated draws seen) nothing happens: no copy.
     if (static_cast<double>(GetTickCount64() - gray_t0) < from_seconds * 1000.0) return;
+    static bool draws_reached;
+    if (from_draws && !draws_reached) {
+        if (tracker.draws_seen() < from_draws) return;
+        draws_reached = true;
+        log("x2w-render debug present: started at frame %ld, %llu translated draws seen", frame, tracker.draws_seen());
+    }
     if (!picture_due && frame % every != 0) return;
     static SRWLOCK lock = SRWLOCK_INIT;
     static Painter painter;
@@ -303,17 +361,27 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
     ID3D12Resource* real_surface = surface && surface->own().kind == resource_kind
                                        ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const D3D12_RESOURCE_DESC surface_desc = real_surface ? real_surface->GetDesc() : D3D12_RESOURCE_DESC{};
-    ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info);
+    unsigned long long interval_draws = 0;
+    ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info, &interval_draws);
     const char* reason = !source ? "no pass has bound a matching target yet" : "no presented surface";
     bool ok = false;
     if (source && real_surface) {
         AcquireSRWLockExclusive(&lock);
         ok = show(painter, device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), source, info, real_surface, reason);
         if (ok && (source != last_shown || info.width != last_info.width || info.format != last_info.format)) {
-            log("x2w-render debug present: showing %s (presented surface %llux%u)", describe(info).c_str(),
-                static_cast<unsigned long long>(surface_desc.Width), surface_desc.Height);
+            log("x2w-render debug present: showing %s (presented surface %llux%u, %llu draws in the interval)", describe(info).c_str(),
+                static_cast<unsigned long long>(surface_desc.Width), surface_desc.Height, interval_draws);
             last_shown = source;
             last_info = info;
+        }
+        // The automatic first silhouette: what the chosen depth holds, about every 10 s, so geometry shows without a picture.
+        static ULONGLONG last_stats_tick;
+        const ULONGLONG now_tick = GetTickCount64();
+        if (ok && painter.stats.valid && now_tick - last_stats_tick >= 10000) {
+            last_stats_tick = now_tick;
+            log("x2w-render debug present: depth %s (%s, %llu draws in the interval, %zu of %zu sampled pixels are geometry%s)",
+                stats_text(painter.stats).c_str(), describe(info).c_str(), interval_draws, painter.stats.geometry,
+                painter.stats.sampled, painter.stats.reversed ? ", reversed Z" : "");
         }
         ReleaseSRWLockExclusive(&lock);
     }
@@ -325,11 +393,12 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
 }  // namespace debug_present
 
 // WARP fixture (tests/startup_debug_present.cpp): the production selection, copy and conversion on desktop objects. `spec`
-// is the setting's text; the colour target and the two depth buffers are "bound" in that order. Returns 0 and the log text in
-// `what` when a picture was written, 1 when nothing matched, 2 when the picture could not be made (`what` has the reason).
+// is the setting's text; the colour target and the two depth buffers are "bound" in that order, and `draws` / `draws2` translated
+// draws are counted for the depth buffers. Returns 0 and the log text in `what` (and the depth statistics text in `stats`) when a
+// picture was written, 1 when nothing matched, 2 when the picture could not be made (`what` has the reason).
 extern "C" __declspec(dllexport) int x2w_d3d12_fixture_debug_present(ID3D12Device* device, ID3D12CommandQueue* queue, const char* spec,
         ID3D12Resource* color, int color_format, ID3D12Resource* depth, int depth_format, ID3D12Resource* depth2,
-        ID3D12Resource* surface, char* what, std::size_t capacity)
+        unsigned draws, unsigned draws2, ID3D12Resource* surface, char* what, std::size_t capacity, char* stats, std::size_t stats_capacity)
 {
     debug_present::Tracker tracker(x2w_debug_present::parse_spec(spec));
     const auto note = [&](ID3D12Resource* resource, int format, bool is_depth) {
@@ -340,9 +409,12 @@ extern "C" __declspec(dllexport) int x2w_d3d12_fixture_debug_present(ID3D12Devic
     note(color, color_format, false);
     note(depth, depth_format, true);
     note(depth2, depth_format, true);
+    for (unsigned i = 0; i < draws; ++i) tracker.note_draw(nullptr, 0, depth);
+    for (unsigned i = 0; i < draws2; ++i) tracker.note_draw(nullptr, 0, depth2);
     const D3D12_RESOURCE_DESC surface_desc = surface->GetDesc();
     x2w_debug_present::Candidate info;
     ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info);
+    if (stats && stats_capacity) stats[0] = 0;
     if (!source) {
         std::snprintf(what, capacity, "no match");
         return 1;
@@ -352,5 +424,7 @@ extern "C" __declspec(dllexport) int x2w_d3d12_fixture_debug_present(ID3D12Devic
     const bool ok = debug_present::show(painter, device, queue, source, info, surface, reason);
     source->Release();
     std::snprintf(what, capacity, "%s", ok ? debug_present::describe(info).c_str() : reason);
+    if (ok && painter.stats.valid && stats && stats_capacity)
+        std::snprintf(stats, stats_capacity, "%s", debug_present::stats_text(painter.stats).c_str());
     return ok ? 0 : 2;
 }

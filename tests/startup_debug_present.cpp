@@ -21,7 +21,8 @@
 using Microsoft::WRL::ComPtr;
 
 extern "C" __declspec(dllimport) int x2w_d3d12_fixture_debug_present(ID3D12Device*, ID3D12CommandQueue*, const char*, ID3D12Resource*, int,
-                                                                      ID3D12Resource*, int, ID3D12Resource*, ID3D12Resource*, char*, std::size_t);
+                                                                      ID3D12Resource*, int, ID3D12Resource*, unsigned, unsigned, ID3D12Resource*, char*, std::size_t,
+                                                                      char*, std::size_t);
 
 namespace {
 
@@ -242,10 +243,11 @@ int main(int argc, char** argv)
         !clear_rects(s, colour.Get(), black, red, D3D12_RECT{0, 0, 8, 8}, green, D3D12_RECT{8, 8, 16, 16}))
         return fail("the scene could not be drawn"), 23;
 
-    char what[128];
-    const auto show_on = [&](ID3D12Resource* target_surface, const char* spec, ID3D12Resource* with_depth, ID3D12Resource* second_depth) {
+    char what[128], stats[96];
+    const auto show_on = [&](ID3D12Resource* target_surface, const char* spec, ID3D12Resource* with_depth, ID3D12Resource* second_depth,
+                             unsigned draws = 0, unsigned draws2 = 0) {
         return x2w_d3d12_fixture_debug_present(s.device.Get(), s.queue.Get(), spec, colour.Get(), dxgi_rgba16f, with_depth, dxgi_d32,
-                                               second_depth, target_surface, what, sizeof(what));
+                                               second_depth, draws, draws2, target_surface, what, sizeof(what), stats, sizeof(stats));
     };
     const auto show = [&](const char* spec, ID3D12Resource* with_depth) { return show_on(surface.Get(), spec, with_depth, nullptr); };
 
@@ -253,6 +255,7 @@ int main(int argc, char** argv)
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("depth", depth.Get()) != 0 || std::strcmp(what, "depth 16x16 fmt 40")) return fail(what), 30;
     if (!expect(s, surface.Get(), "depth", wrong_target ? colour_pixel : depth_pixel)) return 31;
+    if (std::strcmp(stats, "spread 0.25..0.75 covered 75.0%")) return fail(stats), 40;  // the automatic first-silhouette numbers
     // Two depth buffers are bound. With no size match the biggest wins (24x24, one value: every pixel is geometry at the floor
     // grey 40); a presented surface of exactly the 16x16 depth's size prefers that depth over the bigger one.
     if (!fill_depth_all(s, big.Get(), 0.3f)) return 23;
@@ -264,9 +267,21 @@ int main(int argc, char** argv)
     if (show_on(small_surface.Get(), "depth", depth.Get(), big.Get()) != 0 || std::strcmp(what, "depth 16x16 fmt 40") ||
         !expect(s, small_surface.Get(), "depth matching the surface size", depth_pixel, 1, size))
         return fail(what), 39;
+    // The most draws in the interval decides, not the size: the 16x16 depth drawn 0 times loses to the 24x24 one drawn 5 times
+    // even when the surface has the 16x16 size; and a surface of any size shows the drawn scene depth over a bigger atlas.
+    if (!paint_magenta(s, small_surface.Get())) return 24;
+    if (show_on(small_surface.Get(), "depth", depth.Get(), big.Get(), 0, 5) != 0 || std::strcmp(what, "depth 24x24 fmt 40") ||
+        !expect(s, small_surface.Get(), "more draws beat the matching size", [](UINT, UINT) { return Pixel{40, 40, 40}; }, 1, size) ||
+        std::strcmp(stats, "spread 0.3..0.3 covered 100.0%"))
+        return fail(what), 41;
+    if (!paint_magenta(s, surface.Get())) return 24;
+    if (show_on(surface.Get(), "depth", depth.Get(), big.Get(), 7, 2) != 0 || std::strcmp(what, "depth 16x16 fmt 40") ||
+        !expect(s, surface.Get(), "the drawn scene depth over a bigger atlas", depth_pixel))
+        return fail(what), 42;
     // reversed Z
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("depth", reversed.Get()) != 0 || !expect(s, surface.Get(), "reversed Z", reversed_pixel)) return 32;
+    if (std::strcmp(stats, "spread 0.5..0.9 covered 75.0%")) return fail(stats), 43;
     // the colour target, by "largest-rt" and by its exact size and format; the depth buffer is also bound and must not win
     if (!paint_magenta(s, surface.Get())) return 24;
     if (show("largest-rt", depth.Get()) != 0 || std::strcmp(what, "colour 16x16 fmt 10")) return fail(what), 33;
