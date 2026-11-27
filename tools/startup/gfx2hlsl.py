@@ -13223,8 +13223,7 @@ class Stage:
         # array view keeps its slices). Pixel stages store to 2D and 2D-array images (#2830); 1D and 3D stay compute-only.
         shapes = {'SQ_RSRC_IMG_2D': (2, 'tex2d', 'x and y'), 'SQ_RSRC_IMG_2D_ARRAY': (3, 'tex2da', 'x, y and layer'),
                   'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z')}
-        if dims[0] not in shapes or (dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D') and self.kind != 'cs') or \
-                (d16 and dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D')):
+        if dims[0] not in shapes or (dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D') and self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
         address, image_kind, address_text = shapes[dims[0]]
         try:
@@ -13285,7 +13284,7 @@ class Stage:
             packed = self.u(cs[0])
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
-            index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
+            index = 'uint(%s)' % self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
         if sparse:
             # Selected components only, in VDATA order. No texel read.
             swizzle = ''.join(channel for bit, channel in enumerate('xyzw') if mask & (1 << bit))
@@ -15577,7 +15576,8 @@ class Stage:
                 # read the low half is accepted: that is the plain binary16 constant (LLVM prints `0x7bef op_sel_hi:[1,0]`); a read of
                 # the high half of a literal, and an inline constant (how it reaches each half is not proven), stay refused.
                 if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
-                    raise Unsupported('%s literal source %s read through its high half' % (base, tok))
+                    raise Unsupported('%s literal source %s read through its high half (operand %s is not a single VGPR)'
+                                      % (base, tok, tok))
                 literal[i - 1] = int(tok, 16) & 0xffff
                 continue
             if i >= 1 and tok in PK_INLINE_F16:
@@ -15618,11 +15618,22 @@ class Stage:
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
 
+    def pk_minmax_f16(self, base, maximum, ops, mods):
+        """v_pk_{min,max}_f16. The encoding-ordered form (bit select, numeric SGPR and hex word sources) is the
+        default. A source with neg_lo / neg_hi or an inline binary16 float constant needs the binary16 values, so
+        those take the exact binary32 images of the halves: minmax_zero32 (the helper v_min_f32 and v_max_f32 use)
+        orders -0 below +0 and passes a NaN to D3D min/max, and f16rn gives the result back its binary16 word."""
+        if any(m.startswith(('neg_lo', 'neg_hi')) for m in mods) or any(tok in PK_INLINE_F16 for tok in ops[1:]):
+            self.packed_half(base, 2, 'minmax_zero32({0}, {1}, %s)' % ('true' if maximum else 'false'), ops, mods)
+        else:
+            self.packed_half(base, 2, 'minmax16_bits({0}, {1}, %s)' % ('true' if maximum else 'false'), ops, mods,
+                             select_bits=True)
+
     def op_v_pk_max_f16(self, ops, mods):
-        self.packed_half('v_pk_max_f16', 2, 'minmax16_bits({0}, {1}, true)', ops, mods, select_bits=True)
+        self.pk_minmax_f16('v_pk_max_f16', True, ops, mods)
 
     def op_v_pk_min_f16(self, ops, mods):
-        self.packed_half('v_pk_min_f16', 2, 'minmax16_bits({0}, {1}, false)', ops, mods, select_bits=True)
+        self.pk_minmax_f16('v_pk_min_f16', False, ops, mods)
 
     def op_v_pk_max_u16(self, ops, mods):
         self.packed_half('v_pk_max_u16', 2, 'max({0}, {1})', ops, mods, select_bits=True)
@@ -17406,14 +17417,15 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
 
 def scalar_u64_words(stage, tok, name):
     """(low, high, descriptor) for one source of a 64-bit scalar compare: an SGPR pair holding data (no lane mask), or
-    an integer constant. An inline constant (-16..64) is sign-extended; a literal is taken only below 2^31, where its
-    zero and sign extensions agree."""
+    an integer constant. An inline constant (-16..64) is sign-extended; a 32-bit literal is zero-extended."""
     if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and tok not in FLOATS:
         value = int(tok, 0)
-        if not (-16 <= value <= 64 or 0 <= value < 0x80000000):
+        if not (-16 <= value <= 64 or 0 <= value <= 0xffffffff):
             raise Unsupported('%s with the literal %s' % (name, tok))
         value &= 0xffffffffffffffff
         return '0x%08xu' % (value & 0xffffffff), '0x%08xu' % (value >> 32), False
+    if tok == 'null':
+        return '0u', '0u', False
     r = reg_range(tok)
     if not r or r[0] != 's' or r[2] != r[1] + 1:
         raise Unsupported('%s source %s' % (name, tok))
@@ -17426,23 +17438,38 @@ def scalar_u64_words(stage, tok, name):
     return read('s%d' % r[1]), read('s%d' % r[2]), descriptor
 
 
-def _make_cmp_u64(equal, name):
-    def handler(self, ops, mods):
-        # RDNA 2 ISA SOPC S_CMP_EQ_U64 / S_CMP_LG_U64: SCC = (S0.u64 == S1.u64) / (S0.u64 != S1.u64).
-        if len(ops) != 2:
-            raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
-        if mods:
-            raise Unsupported('%s with modifiers' % name)
-        (a_lo, a_hi, a_desc), (b_lo, b_hi, b_desc) = (scalar_u64_words(self, t, name) for t in ops)
-        template = '(%s == %s && %s == %s)' if equal else '(%s != %s || %s != %s)'
-        self.set_scc(template % (a_lo, b_lo, a_hi, b_hi))
-        if a_desc or b_desc:
-            self.mark_descriptor_scc()
-    return handler
-
-
-Stage.op_s_cmp_eq_u64 = _make_cmp_u64(True, 's_cmp_eq_u64')
-Stage.op_s_cmp_lg_u64 = _make_cmp_u64(False, 's_cmp_lg_u64')
+# s_cmp_eq_u64 / s_cmp_lg_u64: SCC = (S0.u64 == S1.u64) / (S0.u64 != S1.u64).
+for _name, _op, _join in (('eq', '==', '&&'), ('lg', '!=', '||')):
+    def _make_cmp64(op=_op, join=_join, name='s_cmp_%s_u64' % _name):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('%s requires two unmodified operands' % name)
+            if any(self.is_lane_mask(tok) for tok in ops):
+                raise Unsupported('%s on a lane mask' % name)
+            masks = getattr(self, 'masks', ())
+            mask_high = getattr(self, 'mask_high', ())
+            words = []
+            descriptor = False
+            for tok in ops:
+                r = reg_range(tok)
+                if r:
+                    if r[0] != 's':
+                        raise Unsupported('%s source %s' % (name, tok))
+                    if any(w in masks or w in mask_high for w in range(r[1], r[2] + 1)):
+                        raise Unsupported('%s on a lane mask' % name)
+                    if r[2] == r[1] + 1 and any(
+                            (self.sym.get(w) or ('',))[0] in ('desc', 'descnum') for w in (r[1], r[2])):
+                        lo, hi, is_descriptor = scalar_u64_words(self, tok, name)  # a descriptor pair keeps its symbols
+                        words.append((lo, hi))
+                        descriptor = descriptor or is_descriptor
+                        continue
+                words.append(('0u', '0u') if tok == 'null' else self.i64_words(tok, False, True))
+            (a0, a1), (b0, b1) = words
+            self.set_scc('((%s %s %s) %s (%s %s %s))' % (a0, op, b0, join, a1, op, b1))
+            if descriptor:
+                self.mark_descriptor_scc()
+        return handler
+    setattr(Stage, 'op_s_cmp_%s_u64' % _name, _make_cmp64())
 # Scalar bit counts and scans with a 32-bit result. `lo`/`hi` are the uint words of the source: a 32-bit source has only
 # `lo`. The scans return 0xffffffff (-1) when no bit qualifies. Only the counts set SCC (result != 0).
 def _clz64(lo, hi):
@@ -20809,7 +20836,7 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
         return request_order({key: stamps[key] for key in queued | {k for k in fresh if handled.get(k) != fresh[k]}},
                              since)
 
-    jobs = jobs or translation_jobs()
+    jobs = translation_jobs(jobs)
     if not rescan:
         jobs = min(jobs, len(queue))
     last_scan = time.monotonic()
@@ -20942,6 +20969,13 @@ def pending_keys(out_dir, skip_failed, since_translator=None, completed=None):
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
                 with suppress(OSError), open(manifest, 'rb') as published:
                     if b'ps none' in published.read().splitlines():
+                        if completed is not None:
+                            meta_names = [os.path.basename(manifest), os.path.basename(result + '.ms57.cso')]
+                            with suppress(OSError):
+                                meta = tuple((p, os.path.getsize(os.path.join(out_dir, p)),
+                                              os.path.getmtime(os.path.join(out_dir, p))) for p in meta_names)
+                                completed[key] = (os.path.getmtime(os.path.join(out_dir, name)), description,
+                                                  described, meta)
                         continue
         if completed is not None:
             completed.pop(key, None)

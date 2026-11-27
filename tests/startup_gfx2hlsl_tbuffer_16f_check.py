@@ -165,13 +165,13 @@ def check_formatted_heap():
     refused('hardware table descriptor (source: root)',
             lambda: stage.op_buffer_load_format_xyzw(['v[0:3]', 'off', 's[4:7]', '0'], []))
 
-    # The pinned table is the legacy format set; extended formats (default on) add cases.
+    # The pinned table is the legacy format set (plus the prelude helpers main added, e.g. ldexp32); extended formats (default on) add cases.
     os.environ['X2W_EXTENDED_BUFFER_FORMATS'] = '0'
     try:
         table = translate('L-uint').hlsl_cs().encode()
     finally:
         del os.environ['X2W_EXTENDED_BUFFER_FORMATS']
-    assert hashlib.sha256(table).hexdigest() == 'a37f185c55f3eb35550ecbd491a4d3077ef5a5d0954a5994cb98e7feac221c2c'
+    assert hashlib.sha256(table).hexdigest() == 'caf208eeba14c16771ec99e4fbf30d091614d9d82550ed681f32c66ab17a4c30'
     print('formatted heap manifest, rewritten-word refusal and byte-identical table HLSL: ok')
 
 

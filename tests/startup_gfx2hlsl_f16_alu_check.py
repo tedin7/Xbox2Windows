@@ -85,6 +85,18 @@ def stage():
     return s
 
 
+def minmax16_bits(a, b, maximum):
+    """The HLSL helper of the same name: binary16 minimum or maximum on encodings (-0 below +0, a NaN loses)."""
+    a_nan, b_nan = (a & 0x7fff) > 0x7c00, (b & 0x7fff) > 0x7c00
+    if a_nan:
+        return 0x7e00 if b_nan else b
+    if b_nan:
+        return a
+    a_key = a ^ (0xffff if a & 0x8000 else 0x8000)
+    b_key = b ^ (0xffff if b & 0x8000 else 0x8000)
+    return a if (a_key > b_key if maximum else a_key < b_key) else b
+
+
 def run(asm, regs):
     """Lower one instruction and evaluate its single statement over the register values in regs (v0, v1, ...)."""
     s = stage()
@@ -97,6 +109,7 @@ def run(asm, regs):
         mul16=lambda a, b: a * b,
         f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
         minmax_zero32=lambda a, b, mx: (max if mx else min)(a, b),
+        minmax16_bits=minmax16_bits,
         exp2=lambda x: 2.0 ** x, abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
@@ -299,7 +312,7 @@ for asm, regs, expected in PKLIT:
     got = run(asm, regs + [0] * (4 - len(regs)))[1]
     check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
 for asm in ('v_pk_add_f16 v3, v0, v1 clamp', 'v_pk_add_f16 v3, v0, v1 neg_lo:[1]',
-            'v_pk_mul_f16 v3, 2.0, v1', 'v_pk_mul_f16 v3, 2.0, v1 op_sel:[1,0] op_sel_hi:[0,1]', 'v_pk_add_f16 v3, 3, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 0x7bef', 'v_pk_min_f16 v3, v0, 0x7bef op_sel:[0,1] op_sel_hi:[1,0]', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
+            'v_pk_mul_f16 v3, 2.0, v1', 'v_pk_mul_f16 v3, 2.0, v1 op_sel:[1,0] op_sel_hi:[0,1]', 'v_pk_add_f16 v3, 3, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
             'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
             'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
     try:

@@ -131,10 +131,12 @@ with tempfile.TemporaryDirectory() as tmp:
         touch(d_cli / ('req_%016x%s' % (4, ext)))
     touch(d_cli / ('req_%016x.a' % 4), mtime=now - 10)
     touch(d_cli / ('%016x.fail' % 4), b'prior refusal\n', mtime=now - 5)
-    # Default one-shot --pending retries key 4 (failure is present but retried)
+    # One-shot --pending retries key 4 (failure is present but retried): the .fail is newer than its request and not
+    # older than the translator build, so only X2W_RETRY_FAILED=1 asks for the retry.
     out_default = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
                                   '--pending', str(d_cli), '--jobs=1'],
-                                 capture_output=True, text=True, timeout=30)
+                                 capture_output=True, text=True, timeout=30,
+                                 env=dict(os.environ, X2W_RETRY_FAILED='1'))
     expect('default --pending retries failure', ('%016x:' % 4) in out_default.stdout, True)
     # With --skip-failed, key 4 is skipped and no translation is performed
     out_skip = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),

@@ -737,9 +737,7 @@ def refusals():
     yield ('branch target inside the chain', branch_program(op, True), 'branch target', None)
     yield ('branch target on the later readlane of the v_min_u32 chain', branch_into_later_readlane(),
            'branch target', None)
-    yield ('a program with branches', branch_program(op, False), 'program with branches', None)
     yield ('a non-uniform branch that changes EXEC inside the chain', exec_inside(op), 'non-uniform branch', None)
-    yield ('a non-uniform branch after the chain', nonuniform_after(op), 'program with branches', None)
     yield ('wave64 with a uniform branch before the chain', wave64_with_uniform_branch(op), 'wave64', None)
     yield ('after s_wqm exec_lo, exec_lo', program(WQM, START_MUL, chain(op), RESULT, END), 'helper lanes', None)
     yield ('the permlane VGPR read after the chain', program(START_MUL, chain(op), RESULT, END_READS_VP),
@@ -970,11 +968,24 @@ def controls():
         if text is None:
             continue
         single_op = channels[0] == ('reduce', input_op) and all(kind != 'lane' for kind, _arg in channels)
-        hows = ([(how, (lambda t, f=f, op=input_op: f(t, op))) for how, f in MUTATIONS.items()]
-                if single_op else list(PAIR_MUTATIONS.items()))
+        tagged = label == WAVE64
+        if label == WAVE64:
+            hows = [('lane-local input', lambda t: t.replace('WaveActiveSum(v1)', 'v1'))]
+        elif label == BRANCH_PAIR_LABEL:
+            hows = [('min/max swapped', PAIR_MUTATIONS['min and max swapped'])]
+        elif label in BRANCHED:
+            op, _ = BRANCHED[label]
+            hows = [('lane-local instead of a wave value', lambda t, op=op: t.replace(INTRINSIC[op], 'v1')),
+                    ('reversed wave vote', lambda t: t.replace('WaveActiveAnyTrue((vcc & 1u) != 0u)',
+                                                              '!WaveActiveAnyTrue((vcc & 1u) != 0u)'))]
+        elif single_op:
+            hows = [(how, (lambda t, f=f, op=input_op: f(t, op))) for how, f in MUTATIONS.items()]
+        else:
+            hows = list(PAIR_MUTATIONS.items())
         for how, mutate in hows:
-            changed = observed(mutate(text)) != observed(text)
-            expect = not (input_op == 'v_or_b32' and how == 'signed for unsigned')
+            changed = observed(mutate(text), tagged) != observed(text, tagged)
+            expect = not (input_op not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32')
+                          and how == 'signed for unsigned')
             check('%s %s %s the program' % (label, how, 'changes' if expect else 'leaves'), changed is expect)
     # Not a chain: s_or_saveexec_b32 with -1 and no mirror or permlane after it keeps its own handler.
     _source, words = program(START_MUL, [saveexec(0)], export('v1', 'v1', 'v1'))

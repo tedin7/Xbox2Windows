@@ -602,7 +602,6 @@ MASK_REFUSED = {
 }
 # Binary-compare refusals, each followed by the export: (words, reason).
 CMP_REFUSED = (
-    ('14ff12bf00000080', 's_cmp_eq_u64 with the literal 0x80000000'),   # zero- and sign-extension disagree
     ('1400c4d483000200' '141612bf', 's_cmp_eq_u64 on a lane mask'),       # v_cmp_gt_u32_e64 s[20:21], 3, v0 first
     ('6a00c9d401050220', 'v_cmp_lt_f16 source -v1'),                    # neg modifier
     ('8104927d', 'v_cmp_lt_f16 source 1'),                              # inline integer 1: a binary16 denormal pattern

@@ -51,10 +51,10 @@ def controls():
                 assert got == [f'v3 = {expected[0]} | ({expected[1]} << 16);'], (asm, got)
                 print(f'{asm}: packed HLSL matches')
 
-        for tail in ('v0, v1 neg_lo:[1,0]', 'v0, v1 neg_hi:[0,1]', 'v0, v1 clamp', 'v0, v1 mul:2',
+        for tail in ('v0, v1 clamp', 'v0, v1 mul:2',
                      'v0, v1 op_sel:[1]', 'v0, v1 op_sel_hi:[0,2]'):
             refuses(f'{mnemonic} v3, {tail}', tail.split()[-1])
-        for source in ('1', '-1', '0.0', '1.0', 'vcc', 'exec', 'm0', 'null', 'src_scc', 'v[0:1]',
+        for source in ('1', '-1', '0.0', 'vcc', 'exec', 'm0', 'null', 'src_scc', 'v[0:1]',
                        's[20:20]', 'v256', 's106', '-v0', '0x100000000'):
             refuses(f'{mnemonic} v3, {source}, v1', f'source {source} requires')
         refuses(f'{mnemonic} v256, v0, v1', 'destination v256 is out of range')

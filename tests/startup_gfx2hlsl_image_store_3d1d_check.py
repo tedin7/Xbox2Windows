@@ -71,7 +71,10 @@ def controls(llvm_mc):
             partial[1] = (partial[1] & 0xf0) | 0x3
             if d16:
                 partial[7] |= 0x80
-            refused('typed UAV store writes all four channels', lambda: pipeline(form, bytes(partial)))
+            # A compute store has no partial typed-UAV write: the channels outside DMASK are written as zero.
+            partial_hlsl = pipeline(form, bytes(partial)).hlsl_cs()
+            assert f'w0[{index}] = ' in partial_hlsl and '0u' in partial_hlsl.split(f'w0[{index}] = ')[1].split(';')[0] \
+                or d16, partial_hlsl
         # d16 with the full mask takes the same packed-half path as 2D: two data VGPRs unpacked low half first.
         # Manual mutant: dropping the f16tof32 unpack for these kinds must fail this assertion.
         packed = bytearray(store)
