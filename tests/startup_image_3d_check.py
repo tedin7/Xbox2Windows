@@ -107,13 +107,17 @@ def controls():
     assert 'Texture1D<float4> r0' in pipe.hlsl_ps()
     assert 'r0.Sample(q0, F(v0))' in pipe.hlsl_ps()
     assert 'srv 0 tex1d table 0 0' in pipe.manifest()
-    unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0'))
+    cube = translate(WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0')))
+    assert 'r0.Sample(q0, x2w_cube_dir(F(v0), F(v1), F(v2)))' in cube.hlsl_ps()
+    assert 'srv 0 texcube table 0 0' in cube.manifest()
+
+    unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('300f80f0'))
     try:
         translate(unsupported)
-    except G.Unsupported:
-        pass
+    except G.Unsupported as error:
+        assert 'image dimension SQ_RSRC_IMG_2D_MSAA' in str(error), str(error)
     else:
-        raise AssertionError('unverified image dimension accepted')
+        raise AssertionError('MSAA image dimension accepted')
 
 
 def assemble(llvm_mc, source):

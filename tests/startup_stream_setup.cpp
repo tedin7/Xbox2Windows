@@ -78,6 +78,13 @@ HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& 
     return D3D12SerializeVersionedRootSignature(&versioned, &blob, nullptr);
 }
 }
+UINT stream_joined_table_choices()
+{
+    wchar_t value[2]{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", value, 2) != 1) return 0;
+    return value[0] >= L'2' && value[0] <= L'4' ? static_cast<UINT>(value[0] - L'0') : 0u;
+}
+
 void* stream_root_signature() { return stream_root; }
 void* stream_alternate_root_signature() { return stream_alternate_root; }
 const std::vector<char>& stream_root_blob() { return stream_root_bytes; }
@@ -141,12 +148,16 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
     const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
-    D3D12_ROOT_PARAMETER textured_parameters[2]{};
+    const UINT choices = stream_joined_table_choices();
+    D3D12_DESCRIPTOR_RANGE choice_ranges[4]{};
+    D3D12_ROOT_PARAMETER textured_parameters[5]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+        table.ShaderVisibility = GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", nullptr, 0)
+            ? D3D12_SHADER_VISIBILITY_ALL
+            : vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = textured_parameters;
         if (joined_table || GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
@@ -155,6 +166,17 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             constant.Constants = {0, 0, 1};
             constant.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
             root_desc.NumParameters = 2;
+        }
+        if (choices) {
+            for (UINT i = 0; i < choices; ++i) {
+                const UINT parameter = i ? i + 1 : 0;
+                choice_ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 2 * i, 0, 0};
+                auto& choice = textured_parameters[parameter];
+                choice.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                choice.DescriptorTable = {1, &choice_ranges[i]};
+                choice.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            }
+            root_desc.NumParameters = choices + 1;
         }
     }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);

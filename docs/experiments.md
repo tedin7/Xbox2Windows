@@ -500,10 +500,10 @@ ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|
 
 
 In a graphics shader with only forward branches, a 32-bit root-table pointer
-can be advanced by a literal byte offset and copied with `s_mov_b32`. At a
-join the table and its offset must agree on every incoming path. A later
-write to the source register leaves the copy intact. A path that changes the
-copy to another address makes the subsequent descriptor load ambiguous.
+can be advanced by a literal byte offset and copied with `s_mov_b32`. A later
+write to the source register leaves the copy intact. When incoming addresses
+differ, a selector can preserve up to four proven addresses at the join.
+[Reproduce the joined-table readback](experiments/joined-table-pointer.md).
 
 The `startup_joined_table_pointer` checks use two R8 textures with distinct
 red values. The guest table stores their 32-byte records at offsets 0 and 32.

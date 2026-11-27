@@ -149,9 +149,27 @@ std::uint64_t process_ms()
     return GetTickCount64() - base;
 }
 
+bool sampled_state_stages_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_SAMPLED_STATE_STAGES", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+const D3D12_RESOURCE_STATES all_sampled_stages =
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube, 6 cube array; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
+    struct Srv {
+        int kind;    // 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube, 6 cube array
+        int source;  // 0 table (parameter a, byte b), 1 vertex stream a, 2 root parameter a
+        int a, b;
+        bool pointer_choice = false;
+        D3D12_RESOURCE_STATES shader_state = all_sampled_stages; // Legacy manifests have no stage metadata.
+    };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, table_word };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     KeyUse use;                              // when a draw first and last used this pipeline key
@@ -587,14 +605,16 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
-        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2" &&
+                   line != "x2w-manifest 3" && line != "x2w-manifest 4") {
             // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
             // so a translation whose stores would be silently skipped is never drawn (#1723).
+            // Version 3 adds table-word reads and mandatory texture choices. Version 4 adds cube SRVs.
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
-        } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
+        } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
             else if (!std::strcmp(source, "basevertex")) ud.kind = Translation::base_vertex;
@@ -603,16 +623,35 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
             else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
             else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
-            else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
+            else if (!std::strcmp(source, "tableword")) {
+                if (fields != 4 || x < 0 || x >= 16 || y < 0 || y % 4 ||
+                    static_cast<std::size_t>(i) != tr.uds.size()) return;
+                ud.kind = Translation::table_word;
+            } else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                               !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
-            if (!texture_kind && (!std::strcmp(kind, "texcube") || !std::strcmp(kind, "texcubea")) &&
-                cube_memory_srv_enabled())
-                texture_kind = !std::strcmp(kind, "texcube") ? 5 : 6;
+                               !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
+                               !std::strcmp(kind, "texcube") ? 5 : 0;
+            if (!texture_kind && !std::strcmp(kind, "texcubea") && cube_memory_srv_enabled()) texture_kind = 6;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (sampled_state_stages_enabled() && line.compare(0, 9, "srvstage ") == 0) {
+            if (std::sscanf(line.c_str(), "srvstage %d %15s", &i, kind) != 2 || i < 0 ||
+                static_cast<std::size_t>(i) >= tr.srvs.size() || tr.srvs[i].kind == 0) return;
+            if (!std::strcmp(kind, "pixel")) tr.srvs[i].shader_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            else if (!std::strcmp(kind, "nonpixel")) tr.srvs[i].shader_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            else if (!std::strcmp(kind, "both")) tr.srvs[i].shader_state = all_sampled_stages;
+            else return;
+        } else if (line.compare(0, 10, "srvchoice ") == 0) {
+            int used = 0;
+            if (std::sscanf(line.c_str(), "srvchoice %d%n", &i, &used) != 1 ||
+                static_cast<std::size_t>(used) != line.size() || i < 0 ||
+                static_cast<std::size_t>(i) >= tr.srvs.size() || tr.srvs[i].kind == 0 || tr.srvs[i].source != 0) {
+                log("x2w-draw invalid texture choice for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
+            tr.srvs[i].pointer_choice = true;
         } else if (std::sscanf(line.c_str(), "srvuse %d %15s", &i, kind) == 2) {
             if (i >= 0 && i < 32) {
                 if (tr.srv_use.size() <= static_cast<std::size_t>(i)) tr.srv_use.resize(static_cast<std::size_t>(i) + 1);
@@ -3435,6 +3474,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
+    std::uint32_t values[32] = {};
+    for (std::size_t i = 0; i < tr->uds.size(); ++i) {
+        const Translation::Ud& ud = tr->uds[i];
+        if (ud.kind == Translation::table_word) {
+            const u64 entry = pass.view_tables[ud.a].record(static_cast<u64>(ud.b), sizeof(values[i]));
+            const auto* word = reinterpret_cast<const void*>(entry);
+            if (!entry || !x2w_local::readable(word, sizeof(values[i])) ||
+                !copy_title_bytes(&values[i], word, sizeof(values[i]))) {
+                static LONG missing_table_word;
+                if (first_calls(missing_table_word, 6))
+                    log("x2w-draw %016llx table %d word at %d is unreadable", tr->key, ud.a, ud.b);
+                draw_lock_release_exclusive();
+                return not_drawn(8);
+            }
+        }
+    }
     const bool trace_inputs = red_producers().onset();
     ID3D12Resource* sampled_textures[32];
     unsigned sampled_count = 0;
@@ -3527,6 +3582,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
+    const bool stage_states = sampled_state_stages_enabled();
+    std::array<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>, 32> sampled_states;
+    UINT sampled_state_count = 0;
     UINT indexed_vertices = UINT_MAX;
     bool has_null_input = false;
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
@@ -3613,6 +3671,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
                 texture = sampled_address_texture(resource);
             }
+            bool wrong_cube = false;
+            if (texture && srv.kind == 5) {
+                wrong_cube = record.slot != 18 || record.desc_bytes < 40 ||
+                    title_view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE ||
+                    !cube_srv_resource(texture->GetDesc());
+                if (wrong_cube) {
+                    static LONG refused_cube;
+                    if (first_calls(refused_cube, 8)) {
+                        const char* reason = title_view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY
+                            ? "cube arrays are unsupported" : "a cube shader needs a TextureCube view of at least six square 2D faces";
+                        log("x2w-draw   %016llx srv %u: %s; binding null", tr->key, i, reason);
+                    }
+                    texture = nullptr;  // Keep the typed null descriptor initialized above.
+                }
+            }
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
@@ -3649,7 +3722,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (pass.bound_targets[t] == texture) return true;
                 return writable_depth_alias;
             };
-            if (indirect && (!texture || record.slot != 18 || aliases_writable_target())) {
+            if (indirect && !wrong_cube && (!texture || record.slot != 18 || aliases_writable_target())) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
@@ -3670,13 +3743,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                         x2w_dsv::move_plane(list, *planes, stencil_srv ? 1 : 0, state);
                     else
                         require_state(self, texture, state);
-                } else {
-                    require_state(self, texture, sampled_state(self, texture));
+                } else if (!stage_states) {
+                    auto state = sampled_state(self, texture);
+                    if (srv.kind == 5 || srv.kind == 6) state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    require_state(self, texture, state);
                 }
                 if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
             }
-            const bool had_texture = texture != nullptr;
-            bool mismatched = false;
+            const bool had_texture = texture != nullptr || wrong_cube;
+            bool mismatched = wrong_cube;
             static LONG shown;
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
@@ -3696,9 +3771,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 if (srv.kind == 6) desc.TextureCubeArray.NumCubes = 1;
             }
-            if (indirect && !texture) {
-                indirect->set_refusal("translated draw could not bind its sampled texture",
-                                      indirect_refusal_code::sampled_texture_unbindable);
+            if (!texture && ((indirect && !wrong_cube) || srv.pointer_choice)) {
+                if (indirect)
+                    indirect->set_refusal("translated draw could not bind its sampled texture",
+                                          indirect_refusal_code::sampled_texture_unbindable);
+                if (srv.pointer_choice) {
+                    static LONG unbound_choice;
+                    if (first_calls(unbound_choice, 6))
+                        log("x2w-draw %016llx texture choice %u cannot bind a view of dimension %d", tr->key, i, dimension);
+                }
                 draw_lock_release_exclusive();
                 return not_drawn(10);
             }
@@ -3721,6 +3802,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
+            if (stage_states && texture && !track_depth_plane) {
+                // Separate slots can resolve to the same desktop resource.
+                auto end = sampled_states.begin() + sampled_state_count;
+                auto state = std::find_if(sampled_states.begin(), end,
+                                          [texture](const auto& entry) { return entry.first == texture; });
+                if (state == end) sampled_states[sampled_state_count++] = {texture, srv.shader_state};
+                else state->second |= srv.shader_state;
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
@@ -4063,6 +4152,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 holder.reject, recorded_copy, indirect_copy_ranges());
         }
     }
+    for (UINT i = 0; i < sampled_state_count; ++i) {
+        const auto& [texture, state] = sampled_states[i];
+        require_state(self, texture, sampled_state(self, texture, state));
+    }
     phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
@@ -4082,9 +4175,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
-    std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
+        if (ud.kind == Translation::table_word) continue;
         values[i] = ud.kind == Translation::rect ? (rect && !indexed_rect ? 1u : 0u)
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance

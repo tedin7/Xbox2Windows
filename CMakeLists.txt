@@ -1255,10 +1255,10 @@ endif()
 # Input for tests/startup_host_cpu_debug_check.py.
 add_executable(startup_host_cpu_probe tests/startup_host_cpu_probe.cpp)
 target_compile_features(startup_host_cpu_probe PRIVATE cxx_std_17)
-# Samples a TextureCube from one translated compute shader (tests/startup_compute_cube_check.py drives it).
+# TextureCube readback for translated compute and stand-in draws.
 add_executable(startup_cube_sample_check tests/startup_cube_sample_check.cpp)
 target_compile_features(startup_cube_sample_check PRIVATE cxx_std_17)
-target_link_libraries(startup_cube_sample_check PRIVATE d3d12 dxgi)
+target_link_libraries(startup_cube_sample_check PRIVATE d3d12_xs_shim d3d12 dxgi)
 # Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
 add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
 target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
@@ -4401,6 +4401,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_cube_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_cube_sample_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:startup_cube_sample_check>" warp --sample)
+    set_tests_properties(startup_gfx2hlsl_cube_sample_warp PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     # gfx2hlsl v_interp_p1ll_f16 / v_interp_p2_f16 (#1996): translation controls with a high-half inversion
     # control, then a desktop draw of the translated pair with DXC 6_0.
     add_test(NAME startup_gfx2hlsl_interp_f16_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -5061,6 +5065,12 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    if(DXC_EXECUTABLE)
+        add_test(NAME startup_sampled_state_stages_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampled_state_stages_check.py"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_stream_consumer>")
+        set_tests_properties(startup_sampled_state_stages_warp PROPERTIES TIMEOUT 420)
+    endif()
     # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
     add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"
@@ -5213,6 +5223,12 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_joined_table_pointer_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")
             set_tests_properties(startup_joined_table_pointer_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            if(backend STREQUAL "warp")
+                add_test(NAME startup_joined_table_pointer_choice_${compiler}_warp COMMAND "${INTAKE_PYTHON}" -B
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_joined_table_pointer_check.py"
+                    "$<TARGET_FILE:startup_stream_consumer>" "warp" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}" choice)
+                set_tests_properties(startup_joined_table_pointer_choice_${compiler}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endif()
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")

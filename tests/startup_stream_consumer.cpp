@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <cstdio>
@@ -197,6 +198,39 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
     const HRESULT hr = reinterpret_cast<Create>((*static_cast<void***>(device))[127])(
         device, &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, nullptr, 0, nullptr, &__uuidof(ID3D12Resource), &resource);
     return SUCCEEDED(hr) ? resource : nullptr;
+}
+
+bool copy_vertex_sample_texture(void* device, void* list, bool cube, void*& texture)
+{
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const UINT height = cube ? 2 : 1;
+    const UINT16 slices = cube ? 6 : 1;
+    constexpr UINT slice_bytes = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    const D3D12_RESOURCE_DESC image{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, height, slices, 1, format, {1, 0}};
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slices * UINT64{slice_bytes}, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, image, D3D12_RESOURCE_STATE_COMMON);
+    void* upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* data = nullptr;
+    if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&data)))) || !data) return false;
+    for (UINT slice = 0; slice < slices; ++slice) {
+        for (UINT y = 0; y < height; ++y) {
+            const unsigned char texels[] = {17, 43, 91, 255,
+                static_cast<unsigned char>(201 - 20 * slice), static_cast<unsigned char>(119 + 30 * y), 57, 255};
+            std::memcpy(static_cast<unsigned char*>(data) + slice * slice_bytes + y * pitch, texels, sizeof(texels));
+        }
+    }
+    invoke(upload, 9, 0, 0);
+    for (UINT slice = 0; slice < slices; ++slice) {
+        D3D12_TEXTURE_COPY_LOCATION dst{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        dst.SubresourceIndex = slice;
+        D3D12_TEXTURE_COPY_LOCATION src{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        src.PlacedFootprint = {slice * UINT64{slice_bytes}, {format, 2, height, 1, pitch}};
+        invoke(list, 16, word(&dst), 0, 0, 0, word(&src), 0);
+    }
+    return true;
 }
 
 // Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (word 0 by slot
@@ -872,7 +906,18 @@ int main(int argc, char** argv)
     void* pso = nullptr;
     const bool hardware = (draw && std::strcmp(argv[4], "hardware") == 0) ||
                           GetEnvironmentVariableW(L"X2W_TEST_DISPATCH_HARDWARE", nullptr, 0) != 0;
-    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
+    const bool vertex_sample = GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", nullptr, 0) != 0;
+    if (vertex_sample) {
+        ComPtr<ID3D12Debug> debug;
+        ComPtr<ID3D12Debug1> gpu_debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            if (FAILED(debug.As(&gpu_debug))) return 79;
+            debug->EnableDebugLayer();
+            gpu_debug->SetEnableGPUBasedValidation(TRUE);
+        }
+        std::puts(gpu_debug ? "GPU validation enabled" : "debug layer unavailable");
+    }
+    const bool textured = vertex_sample || bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0 ||

@@ -3173,15 +3173,16 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
     pass.states.emplace_back(resource, state);
 }
 // State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
-D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
+D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource,
+                                   D3D12_RESOURCE_STATES shader_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
 {
     for (const auto& planes : pass_of(self).mixed)
         if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            return D3D12_RESOURCE_STATE_DEPTH_READ | shader_state;
     for (const auto& known : pass_of(self).states)
         if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            return D3D12_RESOURCE_STATE_DEPTH_READ | shader_state;
+    return shader_state;
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 
@@ -4549,6 +4550,12 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
+bool cube_srv_resource(const D3D12_RESOURCE_DESC& desc)
+{
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           desc.DepthOrArraySize >= 6 && desc.Width == desc.Height && desc.SampleDesc.Count == 1;
+}
+
 bool cube_memory_srv_enabled();
 #include "startup_stubs/d3d12_draw.inl"
 #include "startup_stubs/d3d12_compute_dispatch.inl"
@@ -5192,6 +5199,9 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                     log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
                         *reinterpret_cast<const UINT*>(described), dimension, resource_desc_for_check.Format,
                         default_view ? "default view" : "skipped");
+            } else if (N == 18 && view_dimension == D3D12_SRV_DIMENSION_TEXTURECUBE &&
+                       !cube_srv_resource(resource_desc_for_check)) {
+                skip = "cube SRV requires at least six square 2D faces with one sample per texel";
             } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
                 skip = "view dimension does not suit the resource";
                 static LONG mismatched;
@@ -8137,6 +8147,13 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
         for (std::size_t i = 0; i <= bytes; ++i, ++length)
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
+    const LONG dimension = InterlockedCompareExchange(
+        &null_by_cause[static_cast<int>(x2w_local::NullCause::dimension_mismatch)], 0, 0);
+    if (dimension) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "draw null bindings: dimension %ld", dimension);
+        emit(line);
+    }
     memory_srv_census.report(emit, false);
     token_null_census.report(emit, false);
     x2w_startup::NullInputCensus::Batch null_report;
