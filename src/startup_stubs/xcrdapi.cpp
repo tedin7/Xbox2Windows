@@ -569,6 +569,35 @@ struct DiskStats {
 DiskStats disk_stats;
 std::mutex disk_mutex;
 std::unordered_map<HANDLE, unsigned long long> disk_last_end;
+x2w_startup::ReadLatencyWindow disk_latency;
+
+bool adaptive_hdd_reads() noexcept
+{
+    static const bool on = [] {
+        char text[8];
+        const DWORD length = GetEnvironmentVariableA("X2W_STORAGE_HDD_ADAPTIVE", text, sizeof(text));
+        return length == 1 && text[0] == '1';
+    }();
+    return on;
+}
+
+LONG64 disk_frequency() noexcept
+{
+    static const LONG64 frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart;
+    }();
+    return frequency;
+}
+
+bool slow_disk_window()
+{
+    if (!adaptive_hdd_reads()) return false;
+    const std::lock_guard guard(disk_mutex);
+    return disk_latency.slow(disk_frequency());
+}
+
 void note_disk_read(HANDLE file, unsigned long long offset, unsigned long long count, LONG64 ticks, bool ok) noexcept
 {
     try {
@@ -579,6 +608,9 @@ void note_disk_read(HANDLE file, unsigned long long offset, unsigned long long c
             ++d.failed;
             return;
         }
+        // Only reads up to 1 MiB estimate seek cost. A merged prefetch of several MiB takes over 3 ms even on
+        // an SSD, and counting it would keep the wide limits on (bigger reads, slower mean, wider limits).
+        if (adaptive_hdd_reads() && count <= (1ull << 20)) disk_latency.record(ticks);
         d.bytes += static_cast<LONG64>(count);
         ++d.reads;
         unsigned bucket = 0;
@@ -600,10 +632,10 @@ DiskStats disk_snapshot()
     return disk_stats;
 }
 
-// HDD mode (X2W_STORAGE_HDD=1, off by default): the worker plans the file reads of its next 256 queue entries, a prefetch thread reads
-// them sorted and merged (dstorage_read_plan.h) into a bounded cache, and the worker's own file read asks the cache first. The
-// worker still runs its entries in order, so a miss only costs speed. Look-ahead: the next 1024 entries; reads within 64 KiB of
-// each other merge up to 4 MiB; at most 128 MiB cached, unused entries dropped after 20 s.
+// HDD mode (X2W_STORAGE_HDD=1, off by default): look ahead 1024 queue entries and
+// prefetch sorted merged ranges. The worker processes entries in submission order and
+// reads misses directly. The usual limits are a 64 KiB gap and a 4 MiB merged span.
+// The cache holds at most 128 MiB and drops unused entries after 20 s.
 bool hdd_mode() noexcept
 {
     static const bool on = [] {
@@ -650,8 +682,27 @@ void hdd_look_ahead(QueueWork& work)
         r.index = i;
         reads.push_back(r);
     }
-    if (!reads.empty()) hdd_cache().submit(reads);
+    if (!reads.empty()) hdd_cache().submit(reads, slow_disk_window());
 }
+// Include failed attempts in both the elapsed time and the denominator.
+double disk_mean_ms(const DiskStats& stats, double frequency) noexcept
+{
+    const double attempts = static_cast<double>(stats.reads) + stats.failed;
+    return attempts > 0 && frequency > 0 ? 1000.0 * stats.ticks / frequency / attempts : 0.0;
+}
+
+void log_disk_summary()
+{
+    DiskStats stats;
+    {
+        // DLL shutdown may run after another thread was stopped inside note_disk_read.
+        const std::unique_lock guard(disk_mutex, std::try_to_lock);
+        if (!guard.owns_lock()) return;
+        stats = disk_stats;
+    }
+    log("x2w-dstorage disk summary: mean %.6f ms/read since start", disk_mean_ms(stats, static_cast<double>(disk_frequency())));
+}
+
 // The disk line: MB/s while reading and the share of the window spent in reads (high share and low MB/s = seek-bound),
 // read sizes (<=4K <=16K <=64K <=256K <=1M >1M) and the offset order of the reads, all since the start.
 int format_disk(char* out, std::size_t size, int second, const DiskStats& now, const DiskStats& before, double seconds,
@@ -662,10 +713,11 @@ int format_disk(char* out, std::size_t size, int second, const DiskStats& now, c
     return std::snprintf(out, size,
                          "x2w-dstorage disk %d s: %ld reads (+%ld), %.1f MB/s while reading, reading %.0f%% of the window; "
                          "read sizes <=4K %ld <=16K %ld <=64K %ld <=256K %ld <=1M %ld >1M %ld; offsets sequential %ld "
-                         "forward %ld backward %ld first %ld; read failures %ld",
+                         "forward %ld backward %ld first %ld; read failures %ld; mean %.6f ms/read since start",
                          second, now.reads, now.reads - before.reads, busy > 0 ? megabytes / busy : 0.0,
                          seconds > 0 ? 100.0 * busy / seconds : 0.0, now.sizes[0], now.sizes[1], now.sizes[2], now.sizes[3],
-                         now.sizes[4], now.sizes[5], now.sequential, now.forward, now.backward, now.first, now.failed);
+                         now.sizes[4], now.sizes[5], now.sequential, now.forward, now.backward, now.first, now.failed,
+                         disk_mean_ms(now, ticks_per_second));
 }
 void note_written(bool compressed, std::size_t source_bytes, std::size_t written_bytes) noexcept
 {
@@ -1952,11 +2004,12 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     guid_text(riid, id, sizeof(id));
     log("x2w-dstorage DStorageGetFactory riid=%s", id);
     if (!out) return E_POINTER;
-    static const bool bcpack_summary = [] {
+    static const bool summaries = [] {
         std::atexit(log_bcpack_summary);
+        std::atexit(log_disk_summary);
         return true;
     }();
-    (void)bcpack_summary;
+    (void)summaries;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
     // what the run spends (#1199), including while requests are stalled. A second line splits the
@@ -1987,11 +2040,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                                 inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
                 log("%s", progress);
                 const DiskStats disk_now = disk_snapshot();
-                LARGE_INTEGER frequency{};
-                QueryPerformanceFrequency(&frequency);
+                const LONG64 frequency = disk_frequency();
                 char disk_line[512];
                 format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
-                            frequency.QuadPart > 0 ? static_cast<double>(frequency.QuadPart) : 1.0);
+                            frequency > 0 ? static_cast<double>(frequency) : 1.0);
                 log("%s", disk_line);
                 if (hdd_mode()) {
                     const x2w_startup::ReadCache::Counters c = hdd_cache().counters();

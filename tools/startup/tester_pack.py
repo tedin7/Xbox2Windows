@@ -739,6 +739,31 @@ def chunks(name, path, chunk_bytes):
             yield "%s.%03d" % (name, n), data
 
 
+DISK_MEAN_RE = re.compile(
+    r"^x2w-dstorage disk (summary:|[0-9]+ s:).*?mean ([0-9]+\.[0-9]+) ms/read since start\s*$"
+)
+
+
+def cold_disk_status(logdir):
+    """Prefer the exit total, with a cumulative heartbeat fallback for forced stops."""
+    latest = final = None
+    try:
+        with open(os.path.join(logdir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if match := DISK_MEAN_RE.match(line):
+                    if match[1] == "summary:":
+                        final = float(match[2])
+                    else:
+                        latest = float(match[2])
+    except FileNotFoundError:
+        return None
+    mean = final if final is not None else latest
+    if mean is None or mean <= 3.0:
+        return None
+    scope = "whole run" if final is not None else "through last disk heartbeat"
+    return f"cold disk ({mean:.3f} ms/read, {scope})"
+
+
 POLL_RE = re.compile(r"x2w-input script time base [\w-]+: first poll at ([0-9.]+) s, first entry at ([0-9.]+) s since process start")
 
 
@@ -997,6 +1022,8 @@ def main(argv):
     s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
+    d = sub.add_parser("disk-status")
+    d.add_argument("logdir")
     e = sub.add_parser("end-cause")
     e.add_argument("logdir")
     q = sub.add_parser("pack")
@@ -1046,6 +1073,10 @@ def main(argv):
         return 0
     if args.cmd == "end-cause":
         print(end_cause(args.logdir))
+        return 0
+    if args.cmd == "disk-status":
+        if status := cold_disk_status(args.logdir):
+            print(status)
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)
