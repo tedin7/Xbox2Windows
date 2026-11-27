@@ -3045,23 +3045,31 @@ std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>>& placed_gpu_writes()
     static std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>> m;
     return m;
 }
+bool compute_input_forms_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_INPUT_FORMS");
+    return enabled;
+}
+
 void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
 {
     if (!buffer || !buffer->own().title_memory || !bytes) return;
     const auto* info = resource_info(buffer);
-    if (!info || info->placement != Placement::copied_buffer) return;
+    if (!info || (info->placement != Placement::copied_buffer &&
+        !(compute_input_forms_enabled() && info->placement == Placement::aliased_buffer))) return;
     const u64 address = reinterpret_cast<u64>(buffer->own().title_memory);
     AcquireSRWLockExclusive(&placed_gpu_writes_lock);
     try {
         auto& writes = placed_gpu_writes()[buffer];
         if (!writes.empty() && writes.front().address != address) writes.clear();  // a new buffer at a reused wrapper
         if (writes.size() < 64) writes.push_back({address, offset, bytes});
+        else if (compute_input_forms_enabled()) writes.front() = {address, 0, info->bytes};
         placed_gpu_write_buffers = static_cast<LONG>(placed_gpu_writes().size());
     } catch (const std::bad_alloc&) {
     }
     ReleaseSRWLockExclusive(&placed_gpu_writes_lock);
 }
-// True when a recorded copy wrote any byte of [offset, offset + bytes) of the buffer.
+// True when a recorded GPU operation wrote any byte of [offset, offset + bytes) of the buffer.
 bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
 {
     if (!InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) return false;
@@ -4134,6 +4142,11 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
+    if (compute_input_forms_enabled()) {
+        const auto desc = target->GetDesc();
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            note_placed_gpu_write(as_wrapper(reinterpret_cast<const void*>(title_resource)), 0, desc.Width);
+    }
     InterlockedIncrement(&render_clears);
 }
 // List slot 55 (desktop 51 + 4), DiscardResource(resource, region). Discard is only a hint, so a resource
@@ -5060,7 +5073,9 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 || N == 19 ? 40
+            : N == 20 ? (compute_input_forms_enabled() ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : 20)
+                      : (compute_input_forms_enabled() ? sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC) : 16);
         note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
                   described_bytes, title_dest, args[D], materialized);
     };
@@ -7909,6 +7924,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
+        log_compute_input_forms();
         log_key_use_census();
         log_dispatch_phases();
         log_not_drawn_causes();

@@ -2450,6 +2450,7 @@ struct IndirectBufferView {
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
     bool null_token = false;
+    bool rounded = false;
 };
 
 bool unfilled_heap_slot(const std::uint32_t* words)
@@ -2545,6 +2546,17 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         return {zero_ring, zero_offset, 16, 0, true, 3};
     }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
+    bool rounded = false;
+    if (compute_input && compute_input_forms_enabled() && words[0] != view_token_magic && address &&
+        bytes % 4 && bytes <= limit) {
+        const u64 aligned = (bytes + 3) & ~u64{3};
+        if (aligned <= limit) {
+            const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
+            rounded = in_upload ? list_upload_range(self, address, aligned).resource != nullptr
+                                : placed_buffer_range(self->own().list_device, address, aligned).owner != nullptr;
+            if (rounded) bytes = aligned;
+        }
+    }
     if (bytes > limit || bytes % 4) {
         static LONG size_logged;
         if (first_calls(size_logged, 16))
@@ -2559,7 +2571,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
-            if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
+            if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true, 0, false, rounded};
             return refuse("an input buffer view token names the list's upload memory");
         }
         const auto placed = placed_buffer_range(device, address, bytes);
@@ -2589,7 +2601,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                     return refuse("an input range in title memory is not readable");
                 if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
                     return refuse("an input range could not be copied from title memory");
-                return {ring, ring_offset, bytes, stride, true, 2};
+                return {ring, ring_offset, bytes, stride, true, 2, false, rounded};
             } else {
                 return refuse("an input is in a placed buffer that does not alias title memory");
             }
@@ -2617,7 +2629,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload, input_source};
+    return {native, offset, bytes, stride, upload, input_source, false, rounded};
 }
 
 struct FormattedBufferDescriptor {

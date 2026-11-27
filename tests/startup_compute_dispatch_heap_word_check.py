@@ -26,7 +26,7 @@ import tempfile
 import startup_gfx2hlsl_compute_check as C
 import startup_gfx2hlsl_heap_record_check as H
 import startup_gfx2hlsl_heap_word_check as W
-from startup_compute_dispatch_check import dispatch, lines
+from startup_compute_dispatch_check import COPY_TEXTURE, check_input_form, dispatch, input_form_fixture, lines, texture_word
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
@@ -38,11 +38,26 @@ CONTROLS = (
 )
 
 
+def placed_index(directory, consumer, dxc):
+    mode = 'dispatch-form-index'
+    env, _ = input_form_fixture(directory, consumer, dxc, mode,
+                                'srv 0 tex2d heap word table 1 96 at 0', COPY_TEXTURE)
+    expected = check_input_form(directory, consumer, env, mode, (texture_word(7.5),),
+                                totals='target views 0, title heap words 1, rounded raw ranges 0')
+    check_input_form(directory, consumer, env, mode + '-plain', (texture_word(7.5),),
+                     totals='target views 0, title heap words 1, rounded raw ranges 0')
+    zero = check_input_form(directory, consumer, env, mode + '-zero', (texture_word(2.25),))
+    assert zero != expected, 'the zero-index mutant passed the second-texture comparison'
+    check_input_form(directory, consumer, env, mode + '-gpu', refusal='a heap index word is produced on the GPU',
+                     totals='target views 0, title heap words 0, rounded raw ranges 0')
+    print('WARP heap word: CPU index selected the second texture, zero differed, and GPU-written index was refused')
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
-        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
+        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_COMPUTE_INPUT_FORMS='0')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
         (directory / 'compute_root').write_bytes(H.root_blob(table_range=True))
@@ -91,6 +106,8 @@ def main(consumer, dxc, adapter):
         assert not wrong, 'null index buffer: word=%d got=%08x expected=%08x\n%s' % (
             wrong[0], got[wrong[0]], expected[wrong[0]], result.stderr[-3000:])
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused'), result.stderr[-3000:]
+        if adapter == 'warp':
+            placed_index(directory / 'placed_index', consumer, dxc)
         print(f'startup_compute_dispatch_heap_word: PASS on {adapter} (all {C.WORDS} words match through the index word; '
               f'untouched before translation and for {len(CONTROLS)} refused controls)')
 

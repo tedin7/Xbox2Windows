@@ -68,6 +68,78 @@ def prepare_case(directory, adapter):
     return cache, env
 
 
+def input_form_fixture(directory, consumer, dxc, mode, inputs, source):
+    """Publish a synthetic request and install its hand-written desktop translation."""
+    cache, env = prepare(directory)
+    env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_COMPUTE_INPUT_FORMS='1')
+    env.pop('X2W_TEST_DISPATCH_HARDWARE', None)
+    root = directory / 'compute_root'
+    root.write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(root)
+    (directory / 'program').write_bytes(struct.pack('<I', 0xbf810000))  # s_endpgm
+    (directory / 'data').write_bytes(bytes(16))
+    (directory / 'state').write_bytes(state_a((1, 1, 1), 0))
+    out, result = dispatch(directory, consumer, env, mode)
+    assert out == [C.SENTINEL] * C.WORDS
+    assert len(lines(result, 'Dispatch(1, 1, 1) refused: no translation')) == 1, result.stderr[-3000:]
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    manifest = cache / f'{key:016x}.txt'
+    header = f'x2w-manifest 2\nstage cs\ngroup 1 1 1\nud 0\n{inputs}\nuav 0 table 1 64\n'
+    hlsl = directory / 'copy.hlsl'
+    cso = cache / f'{key:016x}.cs.cso'
+
+    def install(extra_output=''):
+        hlsl.write_text(extra_output + '\n' + source, encoding='ascii')
+        subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', cso, hlsl], check=True)
+        manifest.write_text(header + ('uav 1 tex2d float table 1 96 channels 4\n' if extra_output else ''),
+                            encoding='ascii')
+
+    install()
+    return env, install
+
+
+def check_input_form(directory, consumer, env, mode, prefix=(), refusal=None, totals=None):
+    expected = list(prefix) + [C.SENTINEL] * (C.WORDS - len(prefix))
+    got, result = dispatch(directory, consumer, env, mode)
+    if got != expected:
+        i = next(i for i, (actual, want) in enumerate(zip(got, expected)) if actual != want)
+        raise AssertionError(f'{mode}: dword {i} got {got[i]:08x}, expected {expected[i]:08x}\n{result.stderr[-3000:]}')
+    refused = lines(result, 'Dispatch(1, 1, 1) refused:')
+    translated = lines(result, 'Dispatch(1, 1, 1) translated')
+    if refusal:
+        assert len(refused) == 1 and refused[0].endswith('refused: ' + refusal) and not translated, result.stderr[-3000:]
+    else:
+        assert len(translated) == 1 and not refused, result.stderr[-3000:]
+    if totals:
+        assert lines(result, 'compute input forms: ') == ['x2w-render compute input forms: ' + totals], result.stderr[-3000:]
+    errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+    assert not errors, errors[0]
+    return got
+
+
+COPY_TEXTURE = """
+Texture2D<float> input_texture : register(t0);
+RWByteAddressBuffer output_buffer : register(u0);
+#ifdef WRITE_OTHER_MIP
+RWTexture2D<float> output_texture : register(u1);
+#endif
+
+[numthreads(1, 1, 1)]
+void main()
+{
+    float value = input_texture.Load(int3(0, 0, 0));
+    output_buffer.Store(0, asuint(value));
+#ifdef WRITE_OTHER_MIP
+    output_texture[uint2(0, 0)] = value;
+#endif
+}
+"""
+
+
+def texture_word(value):
+    return struct.unpack('<I', struct.pack('<f', value))[0]
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)

@@ -24,11 +24,12 @@ from math import prod
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 
 import startup_gfx2hlsl_compute_check as C
-from startup_compute_dispatch_check import dispatch, lines
+from startup_compute_dispatch_check import check_input_form, dispatch, input_form_fixture, lines
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
@@ -43,12 +44,43 @@ CONTROLS = (
 )
 
 
+COPY_RAW = """
+ByteAddressBuffer input_buffer : register(t0);
+RWByteAddressBuffer output_buffer : register(u0);
+
+[numthreads(1, 1, 1)]
+void main()
+{
+    [unroll]
+    for (uint offset = 0; offset < 20; offset += 4)
+        output_buffer.Store(offset, input_buffer.Load(offset));
+}
+"""
+
+
+def raw_tail(directory, consumer, dxc):
+    mode = 'dispatch-form-tail'
+    refusal = 'an input buffer range is not a whole number of dwords'
+    env, _ = input_form_fixture(directory, consumer, dxc, mode, 'srv 0 buf table 1 0', COPY_RAW)
+    reference = struct.unpack('<5I', bytes(3 * i + 7 for i in range(20)))
+    check_input_form(directory, consumer, dict(env, X2W_COMPUTE_INPUT_FORMS='0'), mode, refusal=refusal)
+    expected = check_input_form(directory, consumer, env, mode, reference,
+                                totals='target views 0, title heap words 0, rounded raw ranges 1')
+    check_input_form(directory, consumer, env, mode + '-upload', reference,
+                     totals='target views 0, title heap words 0, rounded raw ranges 1')
+    down = check_input_form(directory, consumer, env, mode + '-down', reference[:4] + (0,))
+    assert down != expected, 'the rounded-down mutant passed the 20-byte comparison'
+    check_input_form(directory, consumer, env, mode + '-end', refusal=refusal,
+                     totals='target views 0, title heap words 0, rounded raw ranges 0')
+    print('WARP raw tail: all 20 bytes matched, the rounded-down dword differed, and the allocation end was refused')
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
         env.pop('X2W_NULL_TOKEN_ZERO', None)
-        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
+        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_COMPUTE_INPUT_FORMS='0')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
         (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
@@ -143,6 +175,8 @@ def main(consumer, dxc, adapter):
         rejected = lines(result, f'x2w-draw compute pipeline {key:016x} manifest line ')
         assert got == untouched and len(rejected) == 1 and ' rejected (a resource that is not a raw table buffer' in rejected[0] \
             and rejected[0].endswith(': ' + first[:120]), result.stderr[-3000:]
+        if adapter == 'warp':
+            raw_tail(directory / 'raw_tail', consumer, dxc)
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')

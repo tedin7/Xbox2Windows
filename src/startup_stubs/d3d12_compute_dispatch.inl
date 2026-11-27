@@ -69,8 +69,86 @@ bool float_output_format(DXGI_FORMAT format)
         return false;
     }
 }
+// The compute texture inputs model single-sample 2D views. An array remains an array even with one slice.
+bool compute_read_view(const ViewRecord& record, const D3D12_RESOURCE_DESC& resource, bool array,
+                       D3D12_SHADER_RESOURCE_VIEW_DESC& srv)
+{
+    if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
+        (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return false;
+
+    UINT mip = 0, first = 0, size = 1, plane = 0;
+    DXGI_FORMAT format = resource.Format;
+    const auto color_range = [&](const auto& view, auto single, auto layers) {
+        if (view.Format != DXGI_FORMAT_UNKNOWN) format = desktop_format(view.Format);
+        if (array && view.ViewDimension == layers) {
+            mip = view.Texture2DArray.MipSlice;
+            first = view.Texture2DArray.FirstArraySlice;
+            size = view.Texture2DArray.ArraySize;
+            plane = view.Texture2DArray.PlaneSlice;
+        } else if (!array && view.ViewDimension == single) {
+            mip = view.Texture2D.MipSlice;
+            plane = view.Texture2D.PlaneSlice;
+        } else return false;
+        return true;
+    };
+    if (record.slot == 19 && record.desc_bytes >= sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC)) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        std::memcpy(&view, record.desc, sizeof(view));
+        if (!color_range(view, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY)) return false;
+    } else if (record.slot == 20 && record.desc_bytes >= sizeof(D3D12_RENDER_TARGET_VIEW_DESC)) {
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        std::memcpy(&view, record.desc, sizeof(view));
+        if (!color_range(view, D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DARRAY)) return false;
+    } else if (record.slot == 21 && record.desc_bytes >= sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC)) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        std::memcpy(&view, record.desc, sizeof(view));
+        if (array && view.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
+            mip = view.Texture2DArray.MipSlice;
+            first = view.Texture2DArray.FirstArraySlice;
+            size = view.Texture2DArray.ArraySize;
+        } else if (!array && view.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
+            mip = view.Texture2D.MipSlice;
+        } else return false;
+
+        switch (resource.Format) {
+        case DXGI_FORMAT_R32_TYPELESS:
+            if (desktop_format(view.Format) != DXGI_FORMAT_D32_FLOAT) return false;
+            format = DXGI_FORMAT_R32_FLOAT; break;
+        case DXGI_FORMAT_R16_TYPELESS:
+            if (desktop_format(view.Format) != DXGI_FORMAT_D16_UNORM) return false;
+            format = DXGI_FORMAT_R16_UNORM; break;
+        case DXGI_FORMAT_R24G8_TYPELESS:
+            if (desktop_format(view.Format) != DXGI_FORMAT_D24_UNORM_S8_UINT) return false;
+            format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+            if (desktop_format(view.Format) != DXGI_FORMAT_D32_FLOAT_S8X24_UINT) return false;
+            format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        default: return false;
+        }
+    } else return false;
+
+    if (mip >= resource.MipLevels || first >= resource.DepthOrArraySize || !size ||
+        size > resource.DepthOrArraySize - first || (!array && resource.DepthOrArraySize != 1) ||
+        x2w_startup::packed_target_format(format) || x2w_view_dimension::typeless(format)) return false;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    D3D12_FEATURE_DATA_FORMAT_INFO planes{resource.Format};
+    if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) ||
+        !(support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) ||
+        FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) ||
+        plane >= planes.PlaneCount) return false;
+
+    srv.Format = format;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.ViewDimension = array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+    if (array) srv.Texture2DArray = {mip, 1, first, size, plane, 0};
+    else srv.Texture2D = {mip, 1, plane, 0};
+    return true;
+}
+
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_inputs_target_view, compute_inputs_title_index, compute_inputs_rounded;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
 // Both wrappers and the prefetch worker use stable entries, even after a wrapper is released.
@@ -188,6 +266,16 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().dimension = 3;
         }
+        else if (compute_input_forms_enabled() &&
+                 std::sscanf(line.c_str(), "srv %u tex2d heap word table %d %d at %u%n", &i, &a, &b, &x, &used) == 4 &&
+                 whole() && i == tr.srvs.size())
+            tr.srvs.push_back({-1, 0, true, true, a, b, x});
+        else if (compute_input_forms_enabled() &&
+                 std::sscanf(line.c_str(), "srv %u tex2da table %d %d%n", &i, &a, &b, &used) == 3 &&
+                 whole() && i == tr.srvs.size()) {
+            tr.srvs.push_back({a, b, true});
+            tr.srvs.back().array = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
         else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
@@ -278,6 +366,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
+        bool target_view, shared_output;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     x2w_phase::Timer timer;
@@ -311,6 +400,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    const bool input_forms = compute_input_forms_enabled();
+    LONG target_views = 0, title_indices = 0, rounded_inputs = 0;
     phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
@@ -322,8 +413,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
         if (slot.word_param >= 0) {
-            // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
-            // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
+            // Resolve the index while recording, at the same 32-bit byte offset the program uses.
             const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
             if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
                 reason = "a table descriptor is not bound";
@@ -338,9 +428,22 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
                 index = 0;
             } else {
-                if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                const u64 word_address = address + at;
+                const bool upload = list_upload_range(self, word_address, 4).resource != nullptr;
+                if (words[0] == view_token_magic || !upload) {
                     reason = "a heap index word is not in the list's upload memory";
-                    break;
+                    if (!input_forms || words[0] == view_token_magic) break;
+                    if (list_upload_range(self, word_address, 1).resource) break;
+                    const auto placed = placed_buffer_range(self->own().list_device, word_address, 4);
+                    if (placed.reject) break;
+                    if (placed.owner && placed_gpu_written(const_cast<Wrapper*>(placed.owner),
+                            word_address - reinterpret_cast<u64>(placed.owner->own().title_memory), 4)) {
+                        reason = "a heap index word is produced on the GPU";
+                        break;
+                    }
+                    if (readable_window(word_address, 4) < 4) break;
+                    reason = nullptr;
+                    ++title_indices;
                 }
                 if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
                     reason = "a heap index word is outside its table buffer";
@@ -351,9 +454,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
-            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
+        const u64 entry = slot.heap
+            ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, entry_bytes) : 0)
+            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), entry_bytes);
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
             break;
@@ -379,18 +483,38 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
             if (!output) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-                const bool described = record.desc_bytes >= sizeof(desc);
+                bool described = record.desc_bytes >= sizeof(desc);
                 if (described) std::memcpy(&desc, record.desc, sizeof(desc));
                 if (desc.Format) desc.Format = desktop_format(desc.Format);
+                const bool target_view = input_forms && known && record.slot != 18 && created && !slot.cube &&
+                    compute_read_view(record, resource, slot.array, desc);
+                if (target_view) {
+                    described = true;
+                    ++target_views;
+                }
                 words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
-                if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
+                if (!known || (record.slot != 18 && !target_view)) {
+                    reason = "an input texture entry is not the token of a shader resource view";
+                    if (input_forms && known) {
+                        switch (record.slot) {
+                        case 17: reason = "an input texture entry is not the token of a shader resource view (slot 17)"; break;
+                        case 19: reason = "an input texture entry is not the token of a shader resource view (slot 19)"; break;
+                        case 20: reason = "an input texture entry is not the token of a shader resource view (slot 20)"; break;
+                        case 21: reason = "an input texture entry is not the token of a shader resource view (slot 21)"; break;
+                        case 22: reason = "an input texture entry is not the token of a shader resource view (slot 22)"; break;
+                        case 70: reason = "an input texture entry is not the token of a shader resource view (slot 70)"; break;
+                        }
+                    }
+                }
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
                 else if (slot.cube && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
                     reason = "an input texture view is not a cube map";
                 else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
                     reason = "a cube map view's texture is not six 2D faces";
-                else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                else if (slot.array && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
+                    reason = "an input texture view is not a 2D array";
+                else if (!slot.cube && !slot.array && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
                                                   : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
                     reason = "an input texture view is not 2D";
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
@@ -398,6 +522,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 views[i] = {texture, 0, 0, true, true, described};
                 std::memcpy(views[i].desc, &desc, sizeof(desc));
                 views[i].wrapper = wrapper;
+                views[i].target_view = target_view;
                 continue;
             }
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
@@ -437,10 +562,29 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            // One state per resource here: a texture read and written by the same call is refused. Two outputs
-            // of one texture (two mips) share the unordered access state.
-            for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
+            for (std::size_t input = 0; input < inputs && !reason; ++input) {
+                auto& source = views[input];
+                if (source.wrapper != wrapper && (!input_forms || source.resource != texture)) continue;
+                if (source.target_view && source.resource == texture && (slot.array || slot.dimension == 0)) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    std::memcpy(&srv, source.desc, sizeof(srv));
+                    const bool array = srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    const UINT mip = array ? srv.Texture2DArray.MostDetailedMip : srv.Texture2D.MostDetailedMip;
+                    const UINT plane = array ? srv.Texture2DArray.PlaneSlice : srv.Texture2D.PlaneSlice;
+                    const UINT first_slice = array ? srv.Texture2DArray.FirstArraySlice : 0;
+                    const UINT slice_count = array ? srv.Texture2DArray.ArraySize : 1;
+                    const UINT output_mip = !described ? 0 : slot.array ? desc.Texture2DArray.MipSlice : desc.Texture2D.MipSlice;
+                    const UINT output_plane = !described ? 0 : slot.array ? desc.Texture2DArray.PlaneSlice : desc.Texture2D.PlaneSlice;
+                    const UINT output_first = slot.array ? desc.Texture2DArray.FirstArraySlice : 0;
+                    const UINT output_count = slot.array ? desc.Texture2DArray.ArraySize : 1;
+                    if (mip != output_mip || plane != output_plane ||
+                        first_slice >= output_first + output_count || output_first >= first_slice + slice_count) {
+                        source.shared_output = true;
+                        continue;
+                    }
+                }
+                reason = "an output texture is also an input of the dispatch";
+            }
             views[i] = {texture, 0, 0, true, true, described};
             std::memcpy(views[i].desc, &desc, sizeof(desc));
             views[i].wrapper = wrapper;
@@ -453,6 +597,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 tr->unfilled_heap_slot_logged = true;
                 log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
             }
+            if (view.rounded) ++rounded_inputs;
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
             if (view.source == 2) {
                 InterlockedIncrement(&compute_inputs_snapshot);
@@ -499,6 +644,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
+        if (input_forms) views[i].wrapper = const_cast<Wrapper*>(placed.owner);
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
     timer.resolved();
@@ -564,7 +710,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
-            require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            if (!view.shared_output) require_state(self, view.resource, view.target_view || type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
@@ -599,13 +745,46 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    // A shared texture is tracked as UAV for the whole list. Temporarily transition only the input
+    // subresources, then restore that tracked state before issuing the whole-resource UAV barrier.
+    std::vector<D3D12_RESOURCE_BARRIER> shared_inputs;
+    for (std::size_t i = 0; i < inputs; ++i) {
+        const View& view = views[i];
+        if (!view.shared_output) continue;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        std::memcpy(&srv, view.desc, sizeof(srv));
+        const bool array = srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        const UINT mip = array ? srv.Texture2DArray.MostDetailedMip : srv.Texture2D.MostDetailedMip;
+        const UINT plane = array ? srv.Texture2DArray.PlaneSlice : srv.Texture2D.PlaneSlice;
+        const UINT first_slice = array ? srv.Texture2DArray.FirstArraySlice : 0;
+        const UINT slice_count = array ? srv.Texture2DArray.ArraySize : 1;
+        const auto desc = view.resource->GetDesc();
+        for (UINT slice = first_slice; slice < first_slice + slice_count; ++slice) {
+            const UINT subresource = mip + (slice + plane * desc.DepthOrArraySize) * desc.MipLevels;
+            if (std::any_of(shared_inputs.begin(), shared_inputs.end(), [&](const auto& prior) {
+                    return prior.Transition.pResource == view.resource && prior.Transition.Subresource == subresource;
+                })) continue;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {view.resource, subresource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            shared_inputs.push_back(barrier);
+        }
+    }
+    if (!shared_inputs.empty()) list->ResourceBarrier(static_cast<UINT>(shared_inputs.size()), shared_inputs.data());
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
     } else {
         list->Dispatch(x, y, z);
     }
+    if (!shared_inputs.empty()) {
+        for (auto& barrier : shared_inputs) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        list->ResourceBarrier(static_cast<UINT>(shared_inputs.size()), shared_inputs.data());
+    }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+        if (input_forms && !views[i].texture)
+            note_placed_gpu_write(views[i].wrapper, views[i].offset, views[i].bytes);
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;
@@ -623,6 +802,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     draw_lock_release_exclusive();
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
+    if (target_views) InterlockedExchangeAdd(&compute_inputs_target_view, target_views);
+    if (title_indices) InterlockedExchangeAdd(&compute_inputs_title_index, title_indices);
+    if (rounded_inputs) InterlockedExchangeAdd(&compute_inputs_rounded, rounded_inputs);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
     if (!dispatch.signature && first_calls(logged, 8))
@@ -729,10 +911,20 @@ void log_key_use_census()
     report_key_use_census([](const char* line) { log("%s", line); }, true);
 }
 
+void log_compute_input_forms()
+{
+    if (compute_input_forms_enabled())
+        log("x2w-render compute input forms: target views %ld, title heap words %ld, rounded raw ranges %ld",
+            InterlockedCompareExchange(&compute_inputs_target_view, 0, 0),
+            InterlockedCompareExchange(&compute_inputs_title_index, 0, 0),
+            InterlockedCompareExchange(&compute_inputs_rounded, 0, 0));
+}
+
 // Fixtures: the census without waiting for the frame that logs it.
 extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
+    log_compute_input_forms();
     log_key_use_census();
 }
 

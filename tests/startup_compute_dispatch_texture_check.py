@@ -34,7 +34,7 @@ import tempfile
 
 import startup_compute_image_store_d16_check as S
 import startup_gfx2hlsl_compute_check as C
-from startup_compute_dispatch_check import lines
+from startup_compute_dispatch_check import COPY_TEXTURE, check_input_form, input_form_fixture, lines, texture_word
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
@@ -263,14 +263,33 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+def target_input(directory, consumer, dxc):
+    mode = 'dispatch-form-texture'
+    env, install = input_form_fixture(directory, consumer, dxc, mode, 'srv 0 tex2d table 1 0', COPY_TEXTURE)
+    check_input_form(directory, consumer, dict(env, X2W_COMPUTE_INPUT_FORMS='0'), mode,
+                     refusal='an input texture entry is not the token of a shader resource view')
+    expected = check_input_form(directory, consumer, env, mode, (texture_word(7.5),),
+                                totals='target views 1, title heap words 0, rounded raw ranges 0')
+    mip0 = check_input_form(directory, consumer, env, mode + '-mip0', (texture_word(2.25),))
+    assert mip0 != expected, 'the mip-zero mutant passed the mip-one comparison'
+    install('#define WRITE_OTHER_MIP')
+    check_input_form(directory, consumer, env, mode + '-overlap',
+                     refusal='an output texture is also an input of the dispatch',
+                     totals='target views 0, title heap words 0, rounded raw ranges 0')
+    check_input_form(directory, consumer, env, mode + '-disjoint', (texture_word(7.5),))
+    print('WARP target input: mip 1 matched, mip 0 differed, and only the overlapping output was refused')
+
+
 def main(consumer, dxc, adapter):
-    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
+    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_COMPUTE_INPUT_FORMS='0')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        if adapter == 'warp':
+            target_input(Path(temporary) / 'target_input', consumer, dxc)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
