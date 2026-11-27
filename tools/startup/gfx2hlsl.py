@@ -12963,12 +12963,13 @@ class Stage:
         if dest == 'f32':
             self.set_v(d, 'U(%s)' % expr)
             return
+        convert = 'f16rn'  # Default MODE.FP_ROUND for binary16 is round to nearest even.
         self.used_v.add(d)
         if dest == 'hi':
-            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
+            self.set_v(d, '(v%d & 0xffffu) | (%s(%s) << 16)' % (d, convert, expr))
         else:
             keep_low16 = d in self.low16_only_v
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr), low16_only=keep_low16)
+            self.set_v(d, '(v%d & 0xffff0000u) | %s(%s)' % (d, convert, expr), low16_only=keep_low16)
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
@@ -14386,6 +14387,11 @@ VEC_F = {
 }
 # v_fma_mix*: precise keeps the sign of a zero result; mad still lets a backend fuse or round the product.
 MIX32 = 'float mix32(float a, float b, float c) { precise float result = mad(a, b, c); return result; }'
+# Binary32 to binary16 rounded to nearest even. HLSL f32tof16 truncates (#1723).
+F16RN = ('uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
+         ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
+         ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
+         ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }')
 # 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
 # binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
 # i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
@@ -15207,11 +15213,7 @@ class Pipeline:
                '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
                '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
                '}',
-               # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
-               'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
-               ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
-               ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
-               ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
+               F16RN,
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
