@@ -8168,8 +8168,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static const bool caption_recent_fps = x2w_local::env_on("X2W_PRESENT_RECENT_FPS");
     static ULONGLONG previous_caption_tick;
     if (caption_recent_fps && frame % 30 == 0) {
-        // Measure each block even when the output window misses the caption frame.
-        if (shown_in_window) {
+        // The title bar is diagnostics: it is written at every 30th frame whether or not this frame's picture reached
+        // the window (a headless session may fail the swap chain and still own the window), and each block is measured.
+        {
             const ULONGLONG recent_ms = now - (frame == 30 ? started : previous_caption_tick);
             const ULONGLONG run_ms = now - started;
             const double recent_fps = (frame == 30 ? 29 : 30) * 1000.0 / (recent_ms ? recent_ms : 1);
