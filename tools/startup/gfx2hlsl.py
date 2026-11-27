@@ -3355,6 +3355,11 @@ class Stage:
         self.retry_wave_reduction = False
         # Both retries follow a refusal so the original lowering remains byte-identical.
         self.retry_paired_exec = False
+        # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
+        # incoming values are all known scalars becomes a run-time phi (see phi_capable).
+        self.retry_join_phi = False
+        self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
+        self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
         first_refusal = len(refusals) if refusals is not None else 0
         while True:
@@ -3377,16 +3382,24 @@ class Stage:
             self.defined_uniform_s = set()
             self.bad_sgprs = set()
             self._uniform_written = set()
+            self.phi_new = {}
             self.setup_entry()
             try:
                 self.translate()
             except Unsupported as reason:
-                if not self.retry_reduction_exec(str(reason)):
+                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))):
                     raise
                 continue
             if refusals is not None and any(
-                    stage == kind and self.retry_reduction_exec(reason) for reason, stage in refusals[first_refusal:]):
+                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason))
+                    for reason, stage in refusals[first_refusal:]):
                 del refusals[first_refusal:]
+                continue
+            if self.retry_join_phi and self.phi_new != self.phi_regs:
+                # The joins that became phis are known only now: translate again so every incoming edge assigns them.
+                self.phi_regs = {t: set(regs) for t, regs in self.phi_new.items()}
+                if refusals is not None:
+                    del refusals[first_refusal:]
                 continue
             grown = False
             for t, regs in self.back_force.items():
@@ -3398,6 +3411,45 @@ class Stage:
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
+
+    JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
+
+    def retry_join(self, reason):
+        if self.retry_join_phi or not self.JOINED_NUMERIC.fullmatch(reason):
+            return False
+        self.retry_join_phi = True
+        self.phi_regs, self.phi_new = {}, {}
+        return True
+
+    def phi_capable(self, sym):
+        """Whether a join may select this incoming value with a run-time variable: a known constant, an entry value, or
+        a fixed descriptor-table word that the manifest already delivers as an entry value."""
+        if not sym:
+            return False
+        if sym[0] == 'const':
+            return len(sym) == 2
+        if sym[0] == 'ud':
+            return True
+        if sym[0] == 'desc' and names_one_value(sym) and getattr(self, 'kind', None) in ('ps', 'vs'):
+            source, offset, word = sym[1:4]
+            return (source[0] == 'table' and 0 <= source[1] < 16 and offset is not None and offset % 4 == 0
+                    and 0 <= offset + 4 * word <= 0x7ffffffc)
+        return False
+
+    def phi_assign(self, regs):
+        """Emit, on one incoming edge, the register variables of the joins at its target."""
+        for reg in sorted(regs):
+            sym = self.sym.get(reg)
+            if not self.phi_capable(sym):
+                raise Unsupported('join of s%d: an incoming value is not a known scalar' % reg)
+            if sym[0] == 'const':
+                value = '0x%08xu' % (sym[1] & 0xffffffff)
+            elif sym[0] == 'ud':
+                value = 'ud%d' % sym[1]
+            else:
+                value = self.descriptor_number(sym[:4], fixed_only=True)
+            self.used_s.add(reg)
+            self.emit('s%d = %s;' % (reg, value))
 
     def retry_reduction_exec(self, reason):
         if self.kind != 'ps':
@@ -5388,6 +5440,8 @@ class Stage:
                 if self.exec_keep:
                     self.end_exec_keep(instruction_index, off, name, asm, targets)
                 if off in splits and off != start:
+                    if falls and getattr(self, 'phi_regs', {}).get(off):
+                        self.phi_assign(self.phi_regs[off])
                     self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.align4_v.clear()
@@ -5448,6 +5502,15 @@ class Stage:
                             # skipped. Until exec is written again only exec-masked reads can see it: keep the arm's symbol.
                             self.sym[reg] = paths[0]
                             self.exec_keep[reg] = paths[0]
+                            continue
+                        if (getattr(self, 'retry_join_phi', False) and force is None and off not in back_targets and isinstance(reg, int)
+                                and off not in execz_targets and reg not in self.masks and reg not in self.mask_high
+                                and len({repr(s.get(reg)) for s, _ in arriving}) > 1
+                                and any(p and not run_time_symbol(p) for p in paths + [s.get(reg) for s, _ in arriving])
+                                and all(self.phi_capable(s.get(reg)) for s, _ in arriving)):
+                            self.phi_new.setdefault(off, set()).add(reg)
+                            self.sym.pop(reg, None)
+                            self.used_s.add(reg)
                             continue
                         if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
                             self.sym[reg] = ('joined at a branch target',)
@@ -5536,6 +5599,8 @@ class Stage:
                     b_target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
                     there = joined.get(b_target, set())
                     if b_target > off:
+                        if getattr(self, 'phi_regs', {}).get(b_target):
+                            self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                         if self.firstlane_cfg and self.uniform_cf:
