@@ -175,6 +175,8 @@ def translator_cases(directory):
                 vertex([getpc[0], getpc[1], displacement, getpc[3], *table]), stage=1)
     refused("stage 1, 3 decoded exits: unreachable instruction at +0x18",
             vertex([*getpc, 0xbe921f00, *table]), stage=1)
+    refused("stage 1, 2 decoded exits: unreachable instruction at +0x14",
+            vertex([getpc[0], getpc[1], 24, getpc[3], END, 0xbe921f00, 7, END]), stage=1)
     # A reachable branch entering the supposed table cannot close the prefix graph.
     refused("stage 1, 2 decoded exits: unreachable instruction at +0x18",
             vertex([*getpc, branch(4, 2), END, 7, END]), stage=1)
