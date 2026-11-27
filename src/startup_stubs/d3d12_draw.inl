@@ -1045,7 +1045,8 @@ struct Slot57MeshRequest {
     std::vector<unsigned char> root_blob, mesh, pixel;
 };
 
-bool read_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, Slot57MeshRequest& request)
+bool read_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, Slot57MeshRequest& request,
+                              bool hash = true)
 {
     if (!bound_root) return false;
     const PipelineInfo* info = pipeline_info(pipeline);
@@ -1073,15 +1074,43 @@ bool read_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, request.mesh) || !copy_stage(5, false, request.pixel)) return false;
-    const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
-    request.key = fnv_part(request.root_blob, fnv_part(request.pixel, fnv_part(request.mesh, seed)));
+    if (hash) {
+        const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
+        request.key = fnv_part(request.root_blob, fnv_part(request.pixel, fnv_part(request.mesh, seed)));
+    }
+    return true;
+}
+
+// Cache successful reads only: an unavailable root blob or span can become readable later.
+// The pipeline owns this lock and entry; its descriptor and shader spans are fixed.
+bool slot57_mesh_key(Wrapper* pipeline, const std::vector<RootParameter>* root, u64& key, bool& pixel,
+                     Slot57MeshRequest* fresh = nullptr)
+{
+    if (!pipeline || !root) return false;
+    auto& state = pipeline->own();
+    x2w_startup::ExclusiveNoteLock guard(state.mesh57_key_lock);
+    if (state.mesh57_key_valid && state.mesh57_key_root == root) {
+        key = state.mesh57_key;
+        pixel = state.mesh57_key_pixel;
+        return true;
+    }
+    Slot57MeshRequest request;
+    if (!read_slot57_mesh_request(pipeline, root, request)) return false;
+    key = request.key;
+    pixel = !request.pixel.empty();
+    state.mesh57_key_root = root;
+    state.mesh57_key = key;
+    state.mesh57_key_pixel = pixel;
+    state.mesh57_key_valid = true;
+    if (fresh) *fresh = std::move(request);
     return true;
 }
 
 bool is_slot57_mesh_pipeline(Wrapper* pipeline, const std::vector<RootParameter>* root)
 {
-    Slot57MeshRequest request;
-    return read_slot57_mesh_request(pipeline, root, request);
+    u64 key;
+    bool pixel;
+    return slot57_mesh_key(pipeline, root, key, pixel);
 }
 
 u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
@@ -1089,24 +1118,27 @@ u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bou
     wchar_t marker[MAX_PATH];
     if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
     Slot57MeshRequest request;
-    if (!read_slot57_mesh_request(pipeline, bound_root, request)) return 0;
-    const auto& root_blob = request.root_blob;
-    const auto& mesh = request.mesh;
-    const auto& pixel = request.pixel;
-    const u64 key = request.key;
+    u64 key;
+    bool pixel;
+    if (!slot57_mesh_key(pipeline, bound_root, key, pixel, &request)) return 0;
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
     if (written.count(key)) return key;
+    // A cache hit has no payload. Read it only when publication is still needed.
+    if (request.root_blob.empty() && !read_slot57_mesh_request(pipeline, bound_root, request, false)) return 0;
+    const auto& root_blob = request.root_blob;
+    const auto& mesh = request.mesh;
+    const auto& pixel_bytes = request.pixel;
     const unsigned char none = 0;
-    if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
+    if (publish_shader_request(key, L".ps57", pixel_bytes.empty() ? &none : pixel_bytes.data(), pixel_bytes.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
         publish_shader_request(key, L".m57", mesh.data(), mesh.size())) {
         written.insert(key);
         static LONG logged;
         if (first_calls(logged, 12))
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
-                key, mesh.size(), pixel.size());
+                key, mesh.size(), pixel_bytes.size());
     }
     return key;
 }
@@ -1372,15 +1404,16 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             x2w_local::readable(b, b_bytes)) {
             result = cached_translation(a, a_bytes, b, b_bytes, root_blob);
         } else if (bound->guest_root) {
-            Slot57MeshRequest request;
-            if (read_slot57_mesh_request(pipeline, bound->guest_root, request)) {
+            u64 key;
+            bool pixel;
+            if (slot57_mesh_key(pipeline, bound->guest_root, key, pixel)) {
                 static std::unordered_map<u64, Translation*> mesh_translations;
-                auto& entry = mesh_translations[request.key];
+                auto& entry = mesh_translations[key];
                 if (!entry) {
                     entry = new Translation;
-                    entry->key = request.key;
+                    entry->key = key;
                     entry->mesh = true;
-                    entry->mesh_pixel = !request.pixel.empty();
+                    entry->mesh_pixel = pixel;
                     load_translation(*entry);
                 }
                 result = entry;
