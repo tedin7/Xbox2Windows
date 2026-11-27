@@ -43,7 +43,7 @@ The fill is one table, `Stage.WAVE_REDUCE_FILLS`, holding that form only. Everyt
 (an `s_or_saveexec` with -1 followed within 16 instructions by a mirror step or `v_permlanex16_b32`) is refused with
 its reason:
 
-- wave64; another fill (another constant, another saved mask, a copy, none); a wrong identity;
+- wave64 forms outside the sum described below; another fill (another constant, another saved mask, a copy, none); a wrong identity;
 - missing or reordered steps, another DPP control, partial row or bank masks, other or mixed operations;
 - lane selects other than 0, 0 or `op_sel` on the permlane; a readlane lane other than 31 or before the restore; EXEC
   not restored from `sS`;
@@ -92,8 +92,7 @@ python -B tests/startup_gfx2hlsl_wave_reduce_check.py binary <llvm-mc>
 The `binary` mode assembles every fixture and compares the words; the programs with a branch are assembled to an
 object (`-filetype=obj`) and compared with its `.text`, because `-show-encoding` prints a branch to a label with its
 offset still unresolved. WARP runs 4-lane waves (one quad per wave), so only
-a hardware adapter reduces across quads. This does not measure console behavior or a title, and wave64 chains are
-the next slice.
+a hardware adapter reduces across quads. The draw measures desktop wave behavior.
 
 The same WARP and hardware checks include eight branched draws. A backward VCC branch selects either a reduction
 of the desktop wave or a zero result. One max fixture narrows EXEC and restores it before voting. The CPU reference
@@ -104,3 +103,26 @@ its mutant swaps the min and max results.
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_wave_reduce_(controls|warp)$' -V
 ```
+
+
+## Wave64 sum and shift-add SCC
+
+The wave64 sum uses the same DPP steps with `s_or_saveexec_b64` and a two-word saved mask. The
+[V_PERMLANEX16_B32 definition in the RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+pairs rows 0 and 1 and rows 2 and 3. The two halves therefore produce separate unsigned sums.
+After the full EXEC restore, readlanes of 31 and 63 followed by `s_add_u32` produce the modulo-32-bit
+sum of the original active lanes. For a straight-line pixel stage at entry EXEC, the final scalar
+result lowers to `WaveActiveSum` over the desktop wave. The saved mask, partial sums, vector scratch
+and carry from the scalar add must be unobserved.
+
+The shift-add condition flag (SCC) can be calculated independently of an opaque descriptor addend
+when the shifted first source is zero or when that shift alone overflows 32 bits. In either case
+the descriptor-dependent destination stays symbolic. A first source whose shifted value is between
+1 and 2³²−1 requires the descriptor value to determine carry.
+
+`python -B tests/startup_gfx2hlsl_wave_reduce_check.py` checks both synthetic requests with the
+read-only refusal diagnostic. The 64-lane source model checks the sum on both isolated halves and
+mixed masks. A repeated low-half read is the negative control. The Windows
+`startup_gfx2hlsl_wave_reduce_warp` check draws both translations and compares each covered pixel
+with the CPU reference. It requires a pixel mismatch for a lane-local sum and for each flipped
+carry flag.
