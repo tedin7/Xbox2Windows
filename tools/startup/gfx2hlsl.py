@@ -10576,6 +10576,40 @@ class Stage:
             uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
+    def pixel_store_constant_index(self, position):
+        """Prove the last index write within this store's basic block."""
+        name = 'buffer_store_format_xyzw'
+        args = parse(self.ins[position][3])[1]
+        index = reg_range(args[1]) if len(args) > 1 else None
+        if not index or index[0] != 'v' or index[1] != index[2]:
+            raise Unsupported(name + ' index not proven constant in the same basic block')
+        bounds, block_of, _, _ = self.spill_cfg
+        lo, _ = bounds[block_of[position]]
+        for _, _, op, asm in reversed(self.ins[lo:position]):
+            _, operands, mods = parse(asm)
+            if writes_exec(op, operands) or op.startswith(('v_movrel', 'v_accvgpr_write')):
+                break
+            if op.startswith(INTERP_STORE_PREFIXES) or op.startswith(('v_cmp', 'exp')):
+                continue
+            dest = operands[:2] if op.startswith('v_swap_b32') else destinations(op, operands)
+            for token in dest:
+                reg = reg_range(token)
+                if not reg or reg[0] != 'v':
+                    continue
+                hi = reg[2]
+                if reg[1] == hi and re.search(r'(?:b|i|u|f)64(?:_|$)', op):
+                    hi += 1
+                if reg[1] <= index[1] <= hi:
+                    if (re.sub(r'_e(32|64)$', '', op) == 'v_mov_b32' and not mods
+                            and len(operands) == 2 and operands[0] == args[1]):
+                        literal = operands[1]
+                        if re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', literal):
+                            return int(literal, 0) & 0xffffffff
+                        if literal in FLOATS:
+                            return fbits(FLOATS[literal])
+                    raise Unsupported(name + ' index not proven constant in the same basic block')
+        raise Unsupported(name + ' index not proven constant in the same basic block')
+
     def op_buffer_store_format_xyzw(self, ops, mods):
         """Lower MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
 
@@ -10631,16 +10665,7 @@ class Stage:
             if int(ops[3], 0) or (imm_offset or 0):
                 raise Unsupported(name + ' pixel store requires zero offsets')
             stores = [i for i, item in enumerate(self.ins) if item[2] == name]
-            indices = []
-            for pos in stores:
-                prior = self.ins[pos - 1] if pos else None
-                args = parse(prior[3])[1] if prior else []
-                store_args = parse(self.ins[pos][3])[1]
-                if (not prior or len(store_args) < 2 or re.sub(r'_e(32|64)$', '', prior[2]) != 'v_mov_b32'
-                        or len(args) != 2 or args[0] != store_args[1]
-                        or not re.fullmatch(r'0x[0-9a-f]+|[0-9]+', args[1])):
-                    raise Unsupported(name + ' index is not an immediately preceding constant move')
-                indices.append(int(args[1], 0))
+            indices = [self.pixel_store_constant_index(pos) for pos in stores]
             if len(indices) != len(set(indices)):
                 raise Unsupported(name + ' pixel stores have overlapping indices')
             if (not self.firstlane_cfg or not self.uniform_cf or not self.uniform_entry_exec()

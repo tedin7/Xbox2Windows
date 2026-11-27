@@ -34,8 +34,10 @@ def load_desc(dest, offset, opcode):
     return words(0xf4000000 | opcode << 18 | dest << 6 | 4, 0xfa000000 | offset)
 
 
-def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=False, fixed=True, firstlane=True, real_shape=False, nonuniform=False, nonconstant=False, stores=True):
+def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=False, fixed=True, firstlane=True, real_shape=False, nonuniform=False, nonconstant=False, stores=True, spaced=False, index_change=None):
     def mov(dest, src):
+        if isinstance(src, int) and src > 64:
+            return words(0x7e000000 | dest << 17 | 1 << 9 | 255, src)
         return words(*vop1('v_mov_b32_e32', f'v{dest}', src))
 
     def arithmetic(op, dst, src, vector):
@@ -67,6 +69,9 @@ def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=Fals
                   *sopp('s_cbranch_scc1', len(arm) // 4)) + arm
     if fixed and real_shape:
         code += load_desc(56, 64, 2) + words(*sopp('s_waitcnt', 0xc07f))
+    if spaced:
+        code += mov(28, indices[0])
+        code += b''.join(mov(29, 0) for _ in range(90))
     code += mov(20, 's64')
     code += arithmetic('v_mul_f32', 21, '2.0', 20)
     code += arithmetic('v_add_f32', 22, 'v20', 21)
@@ -75,8 +80,22 @@ def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=Fals
         code += mov(24 + reg, f's{9 + reg}')
     if nonuniform:
         code += mov(20, 'v0')
-    for index, data in zip(indices, (20, 24) if stores else ()):
-        code += mov(28, 'v0' if nonconstant else index)
+    for position, (index, data) in enumerate(zip(indices, (20, 24) if stores else ())):
+        if not spaced or position:
+            code += mov(28, 'v0' if nonconstant else index)
+        if spaced and position:
+            code += mov(29, 'v20') + mov(30, 'v21')
+        if position == 0 and index_change == 'write':
+            code += mov(28, 'v0')
+        if position == 0 and index_change == 'swap':
+            code += words(0x7e000000 | 29 << 17 | 101 << 9 | (0x100 + 28))
+        if position == 0 and index_change == 'sdwa':
+            code += words((1 << 25) | (28 << 17) | (29 << 9) | 249,
+                          29 | (4 << 8) | (2 << 11) | (6 << 16) | (6 << 24))
+        if position == 0 and index_change == 'load':
+            code += encode_mimg(0, dmask=3, dim=1, vaddr=8, vdata=27, srsrc=40)
+        if position == 0 and index_change == 'block':
+            code += words(*sopp('s_branch', 0))
         code += encode_mubuf(7, data, 28, 56, 128, idxen=True, offen=offen)
     v20_all = int.from_bytes(bytes([20] * 4), 'little')
     return code + words(0xf800180f, v20_all, *sopp('s_endpgm'))
@@ -90,6 +109,21 @@ def translate(**options):
 def controls():
     pipeline = translate()
     assert translate(real_shape=True).hlsl_ps().count('store_format_xyzw(u0,') == 2
+    spaced = translate(real_shape=True, spaced=True)
+    assert spaced.hlsl_ps().count('store_format_xyzw(u0,') == 2
+    assert translate(spaced=True, indices=(0x1234, 1)).hlsl_ps().count('store_format_xyzw(u0,') == 2
+    assert translate(spaced=True, indices=('2.0', 1)).hlsl_ps().count('store_format_xyzw(u0,') == 2
+    stage = G.Stage.__new__(G.Stage)
+    stage.ins = [(0, 4, 'v_mov_b32_e32', 'v_mov_b32_e32 v28, 0'),
+                 (4, 8, 'v_writelane_b32', 'v_writelane_b32 v28, s20, 3'),
+                 (12, 8, STORE, STORE + ' v[20:23], v28, s[56:59], 0 idxen')]
+    stage.spill_cfg = ([(0, 3)], {0: 0, 1: 0, 2: 0}, [[]], {})
+    try:
+        stage.pixel_store_constant_index(2)
+    except G.Unsupported as error:
+        assert 'index not proven constant' in str(error)
+    else:
+        raise AssertionError('lane write retained index proof')
     unrelated = translate(stores=False, firstlane=False)
     assert hashlib.sha256((unrelated.hlsl_ps() + unrelated.manifest()).encode()).hexdigest() == 'ae24909241d38053647b5733d0a6b233779cf6c09da9f4a0cb57aa2c675738e1'
     # With indices 4 and 5, dropping NUM_RECORDS writes the otherwise untouched backing records.
@@ -120,9 +154,15 @@ def controls():
     assert {int(x) for x in re.findall(r'format == (\d+)', combined)} == set(G.STORE_FORMAT_XYZW_FORMATS)
     assert {int(x) for x in re.findall(r'format == (\d+)', legacy)} == set(G.STORE_FORMAT_XYZW_LEGACY_FORMATS)
     for options, fragment in (
+        ({'spaced': True, 'indices': (0, 0)}, STORE + ' pixel stores have overlapping indices'),
         ({'indices': (0, 0)}, STORE + ' pixel stores have overlapping indices'),
         ({'nonuniform': True}, STORE + ' data not proven wave-uniform'),
-        ({'nonconstant': True}, STORE + ' index is not an immediately preceding constant move'),
+        ({'spaced': True, 'index_change': 'swap'}, STORE + ' index not proven constant in the same basic block'),
+        ({'spaced': True, 'index_change': 'sdwa'}, STORE + ' index not proven constant in the same basic block'),
+        ({'spaced': True, 'index_change': 'load'}, STORE + ' index not proven constant in the same basic block'),
+        ({'spaced': True, 'index_change': 'write'}, STORE + ' index not proven constant in the same basic block'),
+        ({'spaced': True, 'index_change': 'block'}, STORE + ' index not proven constant in the same basic block'),
+        ({'nonconstant': True}, STORE + ' index not proven constant in the same basic block'),
         ({'offen': True}, STORE + ' offen address form'),
         ({'varying': True}, G.READFIRSTLANE_UNIFORM),
         ({'sample': 0x20}, G.READFIRSTLANE_UNIFORM),
