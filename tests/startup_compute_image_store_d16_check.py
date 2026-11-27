@@ -1,6 +1,7 @@
 """Check packed compute image stores from the startup translator on a three-mip RGBA16_FLOAT UAV."""
 import argparse
 from pathlib import Path
+import struct
 import tempfile
 
 import compute_mimg_float_store_d16_check as fixture
@@ -32,6 +33,38 @@ s_endpgm
 """
 
 
+# Three patterns exercise adjacent channels, a gap, and an odd number of halves across two VGPRs.
+PARTIAL_CHANNELS = {0x3: (0, 1), 0x9: (0, 3), 0x7: (0, 1, 2)}
+PARTIAL_HALVES = (0x4200, 0xbe00, 0x3400, 0x4600)
+PARTIAL_DATA = (bytes.fromhex('ff021c7e') + struct.pack('<2H', *PARTIAL_HALVES[:2])
+                + bytes.fromhex('ff021e7e') + struct.pack('<2H', *PARTIAL_HALVES[2:]))
+
+
+def partial_store(mask, store=STORE):
+    return store[:1] + bytes([(store[1] & 0xf0) | mask]) + store[2:]
+
+
+def partial_line(mask, template=LINE):
+    components = ['0.0'] * 4
+    for channel, value in zip(PARTIAL_CHANNELS[mask], PARTS):
+        components[channel] = value
+    return template.replace(', '.join(PARTS), ', '.join(components))
+
+
+def partial_reference(mask):
+    full = fixture.reference()
+    initial = full[:len(full) // 2]
+    expected = initial.copy()
+    texel = [0] * 4
+    for channel, half in zip(PARTIAL_CHANNELS[mask], PARTIAL_HALVES):
+        texel[channel] = half
+    for y in range(fixture.GROUP[1]):
+        for x in range(fixture.GROUP[0] * fixture.GROUPS):
+            start = 4 * (32 * y + x)
+            expected[start:start + 4] = texel
+    return initial + expected
+
+
 def array_program(layer, masked=False):
     return A.ARRAY_PROLOGUE + A.ARRAY_SLICE[layer] + ARRAY_DATA + (MASK if masked else b'') + ARRAY_STORE + A.ARRAY_END
 
@@ -56,7 +89,11 @@ def array_controls(llvm_mc):
     for addr in ('v[8:9]', 'v[8:11]'):
         refused('x, y and layer expected', lambda: pipe.cs.op_image_store(['v[14:15]', addr, 's[24:31]'], mods))
     refused('fixed table image descriptor', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[28:35]'], mods))
-    refused('a 16-bit store writes all four channels', lambda: pipe.cs.op_image_store(['v14', 'v[8:10]', 's[24:31]'], ['dmask:0x3', *mods[1:]]))
+    for mask in PARTIAL_CHANNELS:
+        code = array_program(1, masked=True).replace(ARRAY_STORE, partial_store(mask, ARRAY_STORE))
+        partial = G.ComputePipeline(code, root_blob(3), RSRC2, fixture.GROUP)
+        assert 'if (exec & 1) ' + partial_line(mask, ARRAY_LINE) in partial.hlsl_cs()
+        assert 'uavload 0' not in partial.manifest().splitlines()
     refused('modifier a16', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], mods + ['a16']))
     print('Compute packed D16 array translation and refusal checks passed' + ('; LLVM assembly matched' if llvm_mc else ''))
 
@@ -85,9 +122,23 @@ def controls(llvm_mc):
     refused('fixed table image descriptor',
             lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:9]', 's[28:35]'], mods))
 
+    assert G.lifted_family('image_store with dmask 0x3: a 16-bit store writes all four channels') == 'dmask'
+    partial_mods = ['dmask:0x3', *mods[1:]]
+    refused('one VGPRs expected',
+            lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:9]', 's[24:31]'], partial_mods))
+    for mask, channels in PARTIAL_CHANNELS.items():
+        data = 'v14' if len(channels) == 2 else 'v[14:15]'
+        asm = fixture.STORE.replace('v[14:15]', data).replace('dmask:0xf', f'dmask:{mask:#x}')
+        store = partial_store(mask)
+        if llvm_mc:
+            assert assemble(llvm_mc, asm + '\n') == store, asm
+        partial = pipeline(PARTIAL_DATA + store)
+        assert partial.hlsl_cs().count(partial_line(mask)) == 1
+        assert partial.hlsl_cs().count('w0[uint2(v8, v9)]') == 1
+        assert 'uavload 0' not in partial.manifest().splitlines()
+        assert 'if (exec & 1) ' + partial_line(mask) in pipeline(MASK + store).hlsl_cs()
+
     for asm, code, reason in (
-        (fixture.STORE.replace('v[14:15]', 'v14').replace('dmask:0xf', 'dmask:0x3'),
-         '080320f0080e0680', 'a 16-bit store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8').replace(' d16', ' a16 d16'), '080f20f0080e06c0', 'modifier a16'),
         (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
          '100f20f0080e0680', 'only 2D images'),
@@ -146,7 +197,24 @@ def dispatch(directory, compiler, renderer, adapter):
     assert masked.count(guard) == 1
     cases = (('partial EXEC', masked, 0, None),
              ('drop EXEC guard', masked.replace(guard, LINE), 32, 'mip=0 half=128 expected=5080 actual=3c08'))
-    return fixture.draw_cases(directory, compiler, renderer, adapter, payload, cases)
+    if fixture.draw_cases(directory, compiler, renderer, adapter, payload, cases) == 77:
+        return 77
+    for mask, channels in PARTIAL_CHANNELS.items():
+        source = pipeline(PARTIAL_DATA + partial_store(mask)).hlsl_cs()
+        line = partial_line(mask)
+        assert source.count(line) == 1
+        # Read-modify-write would retain nonzero sentinels and fail the zero-channel comparison.
+        first_zero = next(c for c in range(4) if c not in channels)
+        mismatches = (4 - len(channels)) * fixture.GROUP[0] * fixture.GROUP[1] * fixture.GROUPS
+        cases = (
+            (f'D16 mask {mask:#x}', source, 0, None),
+            (f'D16 mask {mask:#x}, fill unselected channels with one',
+             source.replace(line, line.replace('0.0', '1.0')), mismatches,
+             f'mip=0 half={first_zero} expected=0000 actual=3c00'),
+        )
+        if fixture.draw_cases(directory, compiler, renderer, adapter, partial_reference(mask), cases) == 77:
+            return 77
+    return 0
 
 
 if __name__ == '__main__':
