@@ -456,13 +456,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     if (view_tokens) {
         if (mode == "dispatch-input-view-tokens-wrong-kind") {
-            std::memcpy(reinterpret_cast<void*>(cpu + 32), reinterpret_cast<const void*>(cpu + 64), 32);
+            std::memcpy(reinterpret_cast<void*>(cpu), reinterpret_cast<const void*>(cpu + 64), 32);
         } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
             view.Buffer.FirstElement = mode == "dispatch-input-view-tokens-shifted" ? 12 : 8;
             view.Buffer.NumElements = 4;
             view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-            invoke(device, 19, word(placed[1]), 0, word(&view), cpu + 32);
+            invoke(device, 19, word(placed[1]), 0, word(&view), cpu);
         }
     }
     if (mode == "dispatch-input-null-token") {
