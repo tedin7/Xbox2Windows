@@ -5498,6 +5498,7 @@ class Stage:
             tentative_kept = set()
             materialize = {}
             incoming = {}
+            edge_since = {}   # forward branch target -> since_join at each branch to it (None: not tracked)
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -5616,6 +5617,14 @@ class Stage:
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
                     self.since_join = kept_u
+                    # One branch enters this block and the code above does not fall into it: the block starts with the
+                    # facts that held at that branch, not with what a sibling arm laid down in program order.
+                    entering = [pc for pc, to in branches if to == off]
+                    edge = edge_since.get(off, [None])[0] if len(entering) == 1 and not falls else None
+                    if (edge is not None and entering[0] < off and names[entering[0]].startswith('s_cbranch')
+                            and getattr(self, 'kind', None) == 'vs'):
+                        self.since_join |= edge
+                        self.varying_s.difference_update(edge)
                     self.scc_uniform = (self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
                                         and self.scc_def is not None)
                     self.scc_verified = self.scc_def is not None
@@ -5674,6 +5683,10 @@ class Stage:
                         if getattr(self, 'phi_regs', {}).get(b_target):
                             self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        # Only what is proven here: a register can be marked varying without leaving since_join.
+                        edge_since.setdefault(b_target, []).append(
+                            None if getattr(self, 'since_join', None) is None
+                            else self.since_join - self.varying_s - self.masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                         if self.firstlane_cfg and self.uniform_cf:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
