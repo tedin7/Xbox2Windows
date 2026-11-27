@@ -50,7 +50,7 @@ inline void log_console_format(const char* path, int slot, const D3D12_RESOURCE_
             static_cast<UINT>(desc.Format), static_cast<UINT>(mapped), path, slot, static_cast<UINT>(desc.Dimension),
             static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<UINT>(desc.DepthOrArraySize),
             static_cast<UINT>(desc.MipLevels), desc.SampleDesc.Count, static_cast<UINT>(desc.Flags),
-            static_cast<UINT>(clear != nullptr), static_cast<UINT>(mapped_clear && mapped_clear != clear));
+            static_cast<UINT>(clear != nullptr), static_cast<UINT>(clear && mapped_clear && mapped_clear->Format != clear->Format));
     if (summary)
         log("x2w-d3d12 console format %u -> desktop format %u count=%llu",
             static_cast<UINT>(desc.Format), static_cast<UINT>(mapped), static_cast<unsigned long long>(count));
