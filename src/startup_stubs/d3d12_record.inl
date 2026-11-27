@@ -366,6 +366,29 @@ void generic_memory(ArgumentCapture& capture, std::uint32_t arg, u64 address, u6
     }
 }
 
+// Device slots 57 and 67 (description, IID, out pipeline): the stand-in keeps 0x300 bytes of the description
+// (note_pipeline) and reads, inside it, (pointer, size) word pairs: state blocks, shader code, data blobs. Exactly those
+// are recorded, one level deep, without the generic capture's look into the blobs (which spent ~0.8 MB of unrelated
+// memory per creation on a title and then ran into the per-slot bound).
+constexpr std::size_t pipeline_desc_bytes = 0x300;
+constexpr u64 pipeline_part_limit = 1u << 20;
+
+void record_pipeline_desc(ArgumentCapture& capture)
+{
+    const auto desc = capture.prefix(0, capture.call.args[0], pipeline_desc_bytes, 1);
+    const std::size_t words = desc.size() / 8;
+    for (std::size_t i = 0; i + 1 < words; ++i) {
+        u64 address = 0, bytes = 0;
+        std::memcpy(&address, desc.data() + 8 * i, 8);
+        std::memcpy(&bytes, desc.data() + 8 * (i + 1), 8);
+        if (address < 0x10000 || address >= 0x7fffffffffffull || !bytes || bytes > pipeline_part_limit) continue;
+        if (as_wrapper(reinterpret_cast<const void*>(address))) continue;
+        if (!capture.memory(0x100u * static_cast<std::uint32_t>(i + 1), address, bytes).empty()) ++i;  // a size is no pointer
+    }
+    capture.arg(1, sizeof(GUID));
+    capture.output(2);
+}
+
 // Generic capture is bounded per device slot: past generic_slot_budget bytes a slot's calls are recorded without that
 // memory (logged once per slot), so one hot slot whose stack words look like pointers cannot fill the file.
 constexpr LONG64 generic_slot_budget = 32ll << 20;
@@ -447,6 +470,16 @@ void record_arguments(ArgumentCapture& capture)
             break;
         case 36: capture.create(2); break;
         case 39: capture.arg(0, sizeof(D3D12_QUERY_HEAP_DESC)); capture.create(1); break;
+        case 25:  // GetResourceAllocationInfo(mask, count, descs), returned by value: the descriptions
+            if (static_cast<UINT>(a[2]) <= 64) capture.arg(3, static_cast<u64>(static_cast<UINT>(a[2])) * sizeof(D3D12_RESOURCE_DESC));
+            break;
+        case 55:  // CreateDerivedPipelineStateX(base, patch count, patches, IID, out)
+            if (static_cast<UINT>(a[1]) <= 64) capture.arg(2, static_cast<u64>(static_cast<UINT>(a[1])) * x2w_derived_blend::record_size);
+            capture.arg(3, sizeof(GUID));
+            capture.output(4);
+            break;
+        case 57:
+        case 67: record_pipeline_desc(capture); break;
         case 1:   // AddRef and Release take no argument: the words are the caller's stack
         case 2:
         case 15:  // descriptor increment size: no memory

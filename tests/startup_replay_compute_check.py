@@ -57,6 +57,17 @@ def record(directory, consumer, env):
     assert live == compute.expected("A"), "live dispatch differs from the synthetic CPU reference"
     data = recording.read_bytes()
     recorded_calls = list(calls(data))
+    # The slot-67 description is recorded as the stand-in keeps it (0x300 bytes) with its (pointer, size) parts one
+    # level below: state blocks A and B, code and data (words 1, 3, 5 and 7).
+    [create] = [seq for seq, kind, slot, _ in recorded_calls if (kind, slot) == (0, 67)]
+    parts = {}
+    for tag, _, header, _ in chunks(data):
+        if tag == b"ARGM":
+            seq, arg, depth, _, length, _ = struct.unpack_from("<QIIQQQ", data, header)
+            if seq == create:
+                parts[arg] = (depth, length)
+    assert parts.get(0) == (1, 0x300), parts
+    assert {0x200, 0x400, 0x600, 0x800} <= set(parts) and all(d == 0 for a, (d, _) in parts.items() if a), parts
     # Case A creates the input and then the UAV with slot 133. Its first argument is the title address.
     placed = [struct.unpack_from("<Q", data, args)[0] for _, kind, slot, args in recorded_calls if (kind, slot) == (0, 133)]
     assert len(placed) == 2 and placed[0] != placed[1], placed
