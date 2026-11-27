@@ -30,7 +30,8 @@ int main(int argc, char** argv)
     const bool use_magenta = argc >= 2 && std::strcmp(argv[1], "auto-magenta") == 0;
     const bool default_cadence = argc >= 2 && std::strcmp(argv[1], "auto-default") == 0;
     const bool flat_onset = argc >= 2 && std::strcmp(argv[1], "auto-onset") == 0;
-    const bool automatic = use_magenta || default_cadence || flat_onset || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
+    const bool black_control = argc >= 2 && std::strcmp(argv[1], "auto-black-control") == 0;
+    const bool automatic = black_control || use_magenta || default_cadence || flat_onset || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
     const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
@@ -101,6 +102,7 @@ int main(int argc, char** argv)
     };
     constexpr float red[]{1, 0, 0, 1}, near_red[]{254.0f / 255.0f, 0, 0, 1}, green[]{0, 1, 0, 1}, blue[]{0, 0, 1, 1};
     constexpr float magenta[]{1, 0, 1, 1}, near_magenta[]{254.0f / 255.0f, 0, 1, 1};
+    static constexpr float black[]{0, 0, 0, 1}, gray[]{64.0f / 255.0f, 64.0f / 255.0f, 64.0f / 255.0f, 1};
     const float* chosen = use_magenta ? magenta : red;
     const auto emit = [&](const float* first, const float* last = nullptr, const D3D12_RECT* rect = nullptr) {
         if (!ok(call(list, 139, arg(allocator)))) return false;
@@ -131,6 +133,11 @@ int main(int argc, char** argv)
         void* lists[]{list};
         call(queue, 10, 1, arg(lists));
         if (!finish()) return 17;
+    } else if (black_control) {
+        // The black edge arrives after the floor. Two later clears give paired producer readbacks.
+        if (!emit(gray) || !present() || !present() || !present() || !present() ||
+            !emit(black) || !present() || !present() ||
+            !emit(gray, black) || !present() || !present()) return 19;
     } else if (!emit(automatic && !default_cadence && !flat_onset ? chosen : blue) || !present()) {
         return 8; // discover the title's present surface
     } else if (flat_onset) {

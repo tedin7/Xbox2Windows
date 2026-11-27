@@ -4,6 +4,7 @@
   tester_pack.py input-preset <accept|none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
+  tester_pack.py capture-warnings                             check the inherited capture switches
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
   tester_pack.py seed-cache <cache root> <new cache> [--jobs N]  copy the old caches' requests under the new keys (pre-translation backlog)
   tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
@@ -797,6 +798,93 @@ def part_note(index, count, groups, sizes_hint=None):
     return "\n".join(lines) + "\n"
 
 
+def capture_warnings(env):
+    """Check the producer switches before launch, including the queued onset modes."""
+    prefix = "X2W_RED_PRODUCER_"
+    frames, auto, rgb, onset = (env.get(prefix + name, "") for name in ("FRAMES", "AUTO", "RGB", "ONSET"))
+    if not (frames or auto):
+        return []
+    onset_enabled = onset in ("1", "black")
+
+    def pair(value, seconds_allowed=False):
+        # Match the runtime's scanf conversions. Only the seconds form checks for trailing text.
+        if not value or len(value.encode("utf-8")) >= 48:
+            return None
+        seconds = re.fullmatch(r"\s*([+-]?[0-9]+)s,\s*([+-]?[0-9]+)", value) if seconds_allowed else None
+        match = seconds or re.match(r"\s*([+-]?[0-9]+),\s*([+-]?[0-9]+)", value)
+        if not match:
+            return None
+        floor, count = map(int, match.groups())
+        if not (int(seconds is None) <= floor <= 2**31 - 1 and 1 <= count <= 2**31 - 1):
+            return None
+        return floor, count
+
+    window = pair(frames)
+    automatic = pair(auto, seconds_allowed=True)
+    auto_valid = automatic is not None and automatic[1] <= 120
+    target = (0, 0, 0) if onset == "black" else (255, 0, 0)
+    rgb_valid = True
+    if onset != "black" and rgb and auto_valid:
+        match = re.fullmatch(r"\s*([+-]?[0-9]+),\s*([+-]?[0-9]+),\s*([+-]?[0-9]+)", rgb)
+        if rgb == "any" and onset_enabled:
+            target = None
+        elif match and len(rgb.encode("utf-8")) < 48 and all(len(c) <= 3 and 0 <= int(c) <= 255 for c in match.groups()):
+            target = tuple(map(int, match.groups()))
+        else:
+            rgb_valid = False
+
+    warnings = []
+    if onset == "1" and not rgb:
+        warnings.append("onset is on but X2W_RED_PRODUCER_RGB is unset (default target is pure red)")
+    if onset_enabled and target is not None and max(target) - min(target) > 4:
+        warnings.append("onset target is not gray; a flat picture of this color is unlikely")
+    cadence = env.get("X2W_PRESENT_SIGNATURE_EVERY", "")
+    explicit = re.match(r"\s*([+-]?[0-9]+)", cadence, re.ASCII) if len(cadence.encode("utf-8")) < 16 else None
+    interval = (int(explicit[1]) if explicit else 0) if 0 < len(cadence.encode("utf-8")) < 16 else -1
+    if interval < 0:
+        interval = 1 if onset_enabled else 4
+    if ((window and window[1] >= window[0]) or (auto_valid and rgb_valid)) and (not cadence or interval != 1):
+        warnings.append("set X2W_PRESENT_SIGNATURE_EVERY=1 to explicitly sample every present")
+    if auto and not auto_valid:
+        warnings.append("X2W_RED_PRODUCER_AUTO could not be parsed")
+    return warnings
+
+
+def capture_report(manifest, logdir):
+    warnings = list(manifest.get("capture_warnings", []))
+    producer = []
+    auto_floor = None
+    outcome_logged = False
+    for name in ("stderr.txt", "trap.log"):
+        path = os.path.join(logdir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.rstrip()
+                if line.startswith("x2w-red WARNING: "):
+                    warnings.append(line.removeprefix("x2w-red WARNING: "))
+                elif line.startswith(("x2w-red config:", "x2w-red auto armed ", "x2w-red not armed:")):
+                    producer.append(line)
+                    if line.startswith("x2w-red not armed:"):
+                        warnings.append(line.removeprefix("x2w-red "))
+                    outcome_logged |= line.startswith(("x2w-red auto armed ", "x2w-red not armed:"))
+                elif line.startswith(("x2w-red producer waits for RGB ", "x2w-red auto configured ")):
+                    floor = re.search(r"(?:at or after present |floor=)([0-9]+s?)\b", line)
+                    if floor:
+                        auto_floor = floor[1]
+    if auto_floor is not None and not outcome_logged:
+        # The launcher can force-stop the process before the DLL exit callback runs.
+        reason = f"no automatic arm recorded before the log ended ({last_milestone(logdir)}, floor {auto_floor})"
+        warnings.append(reason)
+        producer.append(reason)
+    lines = [f"CAPTURE WARNING: {warning}" for warning in dict.fromkeys(warnings)]
+    lines.append(f'manifest: manifest.json (commit {manifest["commit"]}, build {manifest["build_commit"]})')
+    if producer:
+        lines.extend(["", "producer:", *dict.fromkeys(producer)])
+    return "\n".join(lines) + "\n"
+
+
 def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
@@ -814,6 +902,8 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         members[-1].append((member, data))
         listing[member] = {"bytes": len(data), "part": len(members)}
         used += packed
+
+    add("REPORT.txt", capture_report(manifest, logdir).encode("utf-8"))
 
     # Order = what a part 1 that arrives alone must still answer (Run Q: part 2 never came, with shader_results.txt, the debugger summary
     # and every small log; Run R: the request files of a key were split over two parts): the result text and the symbol table first,
@@ -944,6 +1034,7 @@ def main(argv):
     s.add_argument("new_cache")
     s.add_argument("--jobs", type=int, default=0)
     s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
+    sub.add_parser("capture-warnings")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
     e = sub.add_parser("end-cause")
@@ -995,6 +1086,10 @@ def main(argv):
         return 0
     if args.cmd == "end-cause":
         print(end_cause(args.logdir))
+        return 0
+    if args.cmd == "capture-warnings":
+        for warning in capture_warnings(os.environ):
+            print(warning)
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)
