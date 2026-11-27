@@ -4117,7 +4117,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 });
         }
         const bool mesh_entry = mesh && std::all_of(tr->uds.begin(), tr->uds.end(), [](const Translation::Ud& ud) {
-            return ud.kind != Translation::rect && ud.kind != Translation::base_vertex && ud.kind != Translation::start_instance;
+            // Every translated stage has the rectangle-list switch; a mesh dispatch fills it with 0 (no rectangle lists).
+            return ud.kind != Translation::base_vertex && ud.kind != Translation::start_instance;
         }) && std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) { return srv.source == 0; });
         if ((!mesh && !*entry) || (mesh && !mesh_entry) || tr->samplers.heap) {
             indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
