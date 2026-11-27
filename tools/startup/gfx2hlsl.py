@@ -1832,6 +1832,110 @@ def vertex_image_getpc_proof(code, ins):
     return start, table, (pc, add_pc, hi_pc), vector_pairs
 
 
+
+def vertex_image_address_proof(ins, getpc):
+    """Match indexed 64-bit GLOBAL addresses to a proven GETPC table base.
+
+    This proves address shape and range only; a lowering must additionally
+    prove the elided address words and carry masks cannot escape.
+    """
+    _, table, _, pairs = getpc
+    facts = vertex_image_range_facts(ins)
+    if not facts:
+        raise Unsupported('program image load index not proven in range')
+    targets = set()
+    for pc, _, name, asm in ins:
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            _, operands, _ = parse(asm)
+            match = re.fullmatch(r'label_0x([0-9a-f]+)', operands[0]) if len(operands) == 1 else None
+            if match:
+                targets.add(int(match.group(1), 16))
+    if targets & set(pairs.values()):
+        raise Unsupported('program image vector carry high half is a branch target')
+    signs, shifts, addresses, versions, loads = {}, {}, {}, {}, {}
+    used_pairs = set()
+    last_low = None
+    for pc, size, name, asm in ins:
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, mods = parse(asm)
+        if pc in targets or writes_exec(name, ops):
+            signs.clear()
+            shifts.clear()
+            addresses.clear()
+        if last_low is not None and pc != last_low[0]:
+            raise Unsupported('program image vector carry is not adjacent')
+        derived_sign = derived_shift = derived_address = None
+        if (base == 'v_ashrrev_i32' and len(ops) == 3 and not mods and pc_word(ops[1]) == 31
+                and re.fullmatch(r'v\d+', ops[0]) and re.fullmatch(r'v\d+', ops[2])
+                and int(ops[0][1:]) == int(ops[2][1:]) + 1):
+            derived_sign = ops[0], ops[2], versions.get(ops[2], 0)
+        elif base == 'v_lshlrev_b64' and len(ops) == 3 and not mods and pc_word(ops[1]) == 2:
+            dst, src = reg_range(ops[0]), reg_range(ops[2])
+            if dst and dst == src and dst[0] == 'v' and dst[2] == dst[1] + 1:
+                lo, hi = 'v%d' % dst[1], 'v%d' % dst[2]
+                sign = signs.get(hi)
+                bound = facts.get(pc, {}).get(lo)
+                if sign and sign == (lo, versions.get(lo, 0), versions.get(hi, 0)):
+                    if not bound or bound[0] != 'uint' or bound[1] < 0 or bound[2] >= len(table) or bound[2] > 0x3fffffff:
+                        raise Unsupported('program image load index not proven in range')
+                    derived_shift = lo, hi, pc, bound[2]
+        if pc in pairs:
+            next_pc = pairs[pc]
+            lo_sources = [op for op in ops[2:] if re.fullmatch(r'v\d+', op)]
+            shifted = shifts.get(lo_sources[0]) if len(lo_sources) == 1 else None
+            if not shifted or shifted[4:] != (versions.get(shifted[0], 0), versions.get(shifted[1], 0)):
+                raise Unsupported('program image address is not a proven index shifted by two')
+            last_low = next_pc, ops[0], shifted, pc
+        elif last_low is not None:
+            _, low_dst, shifted, low_pc = last_low
+            high_sources = [op for op in ops[2:4] if re.fullmatch(r'v\d+', op)]
+            if (len(high_sources) != 1 or high_sources[0] != shifted[1]
+                    or not re.fullmatch(r'v\d+', low_dst) or not re.fullmatch(r'v\d+', ops[0])
+                    or low_dst == shifted[1]
+                    or int(ops[0][1:]) != int(low_dst[1:]) + 1):
+                raise Unsupported('program image address high word does not match the shifted pair')
+            derived_address = low_dst, ops[0], shifted[2], shifted[3], low_pc
+            last_low = None
+        elif name == 'global_load_dword':
+            if len(ops) != 3 or ops[2] != 'off' or any(m not in ('glc', 'slc', 'dlc') for m in mods):
+                raise Unsupported('program image global load requires an unmodified VADDR pair')
+            address = reg_range(ops[1])
+            if not address or address[0] != 'v' or address[2] != address[1] + 1:
+                raise Unsupported('program image global load requires a VADDR pair')
+            lo, hi = 'v%d' % address[1], 'v%d' % address[2]
+            fact = addresses.get(lo)
+            if not fact or fact[0] != hi or fact[3:5] != (versions.get(lo, 0), versions.get(hi, 0)):
+                raise Unsupported('program image global load address is not proven')
+            destination = reg_range(ops[0])
+            if not destination or destination[0] != 'v' or destination[1] != destination[2]:
+                raise Unsupported('program image global load destination is not a VGPR')
+            used_pairs.add(fact[5])
+            loads[pc] = (ops[0], fact[1], fact[2])
+        written = set()
+        for op in destinations(base, ops):
+            reg = reg_range(op)
+            if reg and reg[0] == 'v':
+                written.update('v%d' % n for n in range(reg[1], reg[2] + 1))
+        if base.startswith('v_cmp'):
+            written.clear()
+        for reg in written:
+            versions[reg] = versions.get(reg, 0) + 1
+        if derived_sign:
+            hi, lo, lo_version = derived_sign
+            signs[hi] = (lo, lo_version, versions.get(hi, 0))
+        if derived_shift:
+            lo, hi, origin, maximum = derived_shift
+            shifts[lo] = (lo, hi, origin, maximum, versions.get(lo, 0), versions.get(hi, 0))
+        if derived_address:
+            lo, hi, origin, maximum, low_pc = derived_address
+            addresses[lo] = (hi, origin, maximum, versions.get(lo, 0), versions.get(hi, 0), low_pc)
+    if not loads:
+        raise Unsupported('program image has no matching global loads')
+    if used_pairs != set(pairs):
+        raise Unsupported('program image vector address has no matching load')
+    return loads
+
+
 def vertex_image_range_facts(ins):
     """Bounds immediately before decoded instructions; discard unmodelled joins.
 
