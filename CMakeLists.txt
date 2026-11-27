@@ -661,7 +661,6 @@ target_compile_features(startup_view_dimension PRIVATE cxx_std_17)
 add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
 add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
 set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
-
 add_executable(startup_view_desc tests/startup_view_desc_check.cpp)
 target_include_directories(startup_view_desc PRIVATE src)
 target_compile_features(startup_view_desc PRIVATE cxx_std_17)
