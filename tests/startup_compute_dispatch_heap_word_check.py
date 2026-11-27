@@ -104,7 +104,8 @@ def main(consumer, dxc, adapter):
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
         assert not wrong, 'index word in title memory: word=%d got=%08x expected=%08x\n%s' % (
             wrong[0], got[wrong[0]], expected[wrong[0]], result.stderr[-3000:])
-        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused'), result.stderr[-3000:]
+        # The title inputs switch also prints the dispatch totals line ('translated 1, refused 0'), so look for a refusal line.
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert lines(result, 'heap index word 00000002 at ') and lines(result, 'read from plain title memory'), result.stderr[-3000:]
         got, result = dispatch(directory, consumer, env_title, 'dispatch-heap-word-title-outside')
         refused = lines(result, 'refused: ')
