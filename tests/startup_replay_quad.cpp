@@ -198,6 +198,18 @@ int create_scene(void* device, Scene& s)
         invoke(device, 23, ranges, arg(destinations), 0, 1, arg(&s.rtv), arg(&source_size), type);
         s.fallback_rtv = s.rtv;
         s.rtv = destinations[ranges - 1];
+        // X2W_TEST_REPLAY_SLOT70_PREFIX=1: memory SRV writes (device slot 70) before the window, three to one destination
+        // (only the last one matters) and one to another. The stand-in refuses them (empty resource description); the
+        // recorder sees them either way.
+        if (GetEnvironmentVariableA("X2W_TEST_REPLAY_SLOT70_PREFIX", nullptr, 0)) {
+            const D3D12_RESOURCE_DESC resource{};
+            for (const Word address : {0x1000ull, 0x2000ull, 0x3000ull}) {
+                const struct { D3D12_SHADER_RESOURCE_VIEW_DESC view; Word address; } memory_view{{}, address};
+                invoke(device, 70, arg(&resource), arg(&memory_view), s.rtv + 3 * stride);
+            }
+            const struct { D3D12_SHADER_RESOURCE_VIEW_DESC view; Word address; } other{{}, 0x4000};
+            invoke(device, 70, arg(&resource), arg(&other), s.rtv + 4 * stride);
+        }
     } else {
         invoke(device, 20, arg(s.target), arg(&view), s.rtv);
     }

@@ -130,10 +130,17 @@ bool in_window()
     const double t = seconds_now();
     return t >= start_s && t < end_s;
 }
+// Opt-in (X2W_REPLAY_DESC_SNAPSHOT): a prefix CreateMemoryShaderResourceView (device slot 70) is held in memory by its
+// destination handle instead of being written, because a later write to the same handle supersedes it. The calls still
+// held when the window opens are written then, with their original sequence numbers, so the player (which plays by
+// sequence) restores the descriptors before the first window call.
+bool desc_snapshot_enabled;
+void emit_held_srvs();
 void update_window()
 {
     window_open = in_window();
     if (window_open) {
+        if (prefix_open && desc_snapshot_enabled) emit_held_srvs();
         if (!window_base_set) {
             window_base_bytes = prefix_open ? bytes_written : 0;
             window_base_set = true;
@@ -619,6 +626,77 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     ReleaseSRWLockExclusive(&b.lock);
 }
 
+struct HeldSrv {
+    u64 seq, object;
+    u64 args[call_args];
+    unsigned char resource[sizeof(D3D12_RESOURCE_DESC)];
+    unsigned char view[0x30];
+};
+SRWLOCK held_srv_lock = SRWLOCK_INIT;
+std::unordered_map<u64, HeldSrv>& held_srvs() { static std::unordered_map<u64, HeldSrv> m; return m; }
+
+// Writes one held call (its argument memory points into the entry, which stays alive for the call).
+void write_held_srv(HeldSrv& e)
+{
+    e.args[0] = reinterpret_cast<u64>(e.resource);
+    e.args[1] = reinterpret_cast<u64>(e.view);
+    record_call(device_kind, 70, e.seq, e.object, e.args, 0, false, HeapPlacement{});
+}
+bool hold_srv(u64 seq, u64 object, const u64 (&args)[call_args])
+{
+    HeldSrv e{seq, object};
+    std::memcpy(e.args, args, sizeof(e.args));
+    if (!args[2] || !copy_readable(args[0], e.resource, sizeof(e.resource)) || !copy_readable(args[1], e.view, sizeof(e.view)))
+        return false;
+    AcquireSRWLockExclusive(&held_srv_lock);
+    held_srvs()[args[2]] = e;
+    ReleaseSRWLockExclusive(&held_srv_lock);
+    return true;
+}
+// A prefix copy reads descriptors: the held writes it may read go to the file first (their sequence precedes the copy's).
+void flush_held_srvs(bool all, u64 first, u64 bytes)
+{
+    std::vector<HeldSrv> out;
+    AcquireSRWLockExclusive(&held_srv_lock);
+    for (auto it = held_srvs().begin(); it != held_srvs().end();) {
+        if (all || (it->first >= first && it->first - first < bytes)) {
+            out.push_back(it->second);
+            it = held_srvs().erase(it);
+        } else {
+            ++it;
+        }
+    }
+    ReleaseSRWLockExclusive(&held_srv_lock);
+    for (HeldSrv& e : out) write_held_srv(e);
+}
+// The heap is gone: a held write into it must never be played.
+void held_srv_drop_heap(Wrapper* heap)
+{
+    if (!desc_snapshot_enabled) return;
+    u64 first = 0, bytes = 0;
+    note_lock_acquire(false);
+    for (const HeapInfo& h : heap_infos())
+        if (h.wrapper == reinterpret_cast<u64>(heap) && h.title_cpu) {
+            first = h.title_cpu;
+            bytes = u64{h.count} * title_descriptor_stride(h.title_cpu, h.increment);
+        }
+    ReleaseSRWLockShared(&note_lock);
+    if (!bytes) return;
+    AcquireSRWLockExclusive(&held_srv_lock);
+    for (auto it = held_srvs().begin(); it != held_srvs().end();)
+        it = (it->first >= first && it->first - first < bytes) ? held_srvs().erase(it) : std::next(it);
+    ReleaseSRWLockExclusive(&held_srv_lock);
+}
+void emit_held_srvs()
+{
+    std::unordered_map<u64, HeldSrv> out;
+    AcquireSRWLockExclusive(&held_srv_lock);
+    out.swap(held_srvs());
+    ReleaseSRWLockExclusive(&held_srv_lock);
+    for (auto& [handle, e] : out) write_held_srv(e);
+    log("x2w-replay record: %llu prefix descriptor writes (slot 70) written at window open", static_cast<u64>(out.size()));
+}
+
 void stop(bool at_exit, bool from_present = false);
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
@@ -637,6 +715,19 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     if (!active.load(std::memory_order_relaxed) ||
         (!window_open.load(std::memory_order_relaxed) && !(prefix_slot(K, N) && prefix_open.load(std::memory_order_relaxed))))
         return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    if constexpr (K == device_kind && N == 70) {
+        if (desc_snapshot_enabled && !window_open.load(std::memory_order_relaxed)) {
+            const u64 held_seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+            const u64 held_ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+            const u64 held_args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
+            if (!hold_srv(held_seq, rcx, held_args))
+                record_call(K, N, held_seq, rcx, held_args, held_ret, false, HeapPlacement{});
+            return held_ret;
+        }
+    }
+    if constexpr (K == device_kind && (N == 23 || N == 24))
+        if (desc_snapshot_enabled && !window_open.load(std::memory_order_relaxed))
+            flush_held_srvs(N == 23, r9, u64{N == 24 ? rdx : 0} * 256);  // CopyDescriptorsSimple(count, dest, src, type)
     // CopyDescriptors takes no float arguments, so its counted arrays are read from the call's own registers.
     constexpr bool descriptor_copy = K == device_kind && N == 23;
     // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
@@ -1023,6 +1114,7 @@ void install()
     extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
         !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
     prefix_open = std::strcmp(value, "all") != 0;
+    desc_snapshot_enabled = x2w_local::env_on("X2W_REPLAY_DESC_SNAPSHOT");
     update_window();
     armed = true;
     active.store(true);
