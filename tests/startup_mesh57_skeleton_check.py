@@ -1473,9 +1473,19 @@ def controls():
         expect('advanced heap refused', request(tmp, advanced, root_blob=heap_root())[1],
                "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
         formatted = HEAP_MESH.copy()
-        formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
-        expect('formatted heap refused', request(tmp, formatted, root_blob=heap_root())[1],
-               'unsupported: dynamic resource heap views require a raw buffer load')
+        load = formatted.index('e03810c0', formatted.index('f408070d'))
+        formatted[load] = 'e00c10c0'
+        key, status = request(tmp, formatted, root_blob=heap_root())
+        expect('intact formatted heap translates', status, 'ok')
+        if status == 'ok':
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text()
+            expect('intact formatted heap uses the format metadata binding',
+                   'dynamic_heap_formats' in manifest.splitlines(), True)
+        # Rewrite one descriptor word and keep the conditional arm's target at the join.
+        formatted[load:load] = ['879fff1f', '0fffffff']  # s_and_b32 s31, s31, 0x0fffffff
+        formatted[formatted.index('bf840004')] = 'bf840006'
+        expect('rewritten formatted heap refused', request(tmp, formatted, root_blob=heap_root())[1],
+               'unsupported: dynamic resource heap descriptor requires four intact words')
     with tempfile.TemporaryDirectory() as group_tmp:
         key, group_result = request(group_tmp, GROUP_MESH)
         expect('numeric group index translates', group_result, 'ok')
@@ -2944,4 +2954,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     sys.exit(main(sys.argv))

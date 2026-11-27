@@ -4736,7 +4736,7 @@ class Stage:
         if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
             self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
         self.pixel_table = embedded_pixel_table(self.raw_code, self.ins) if kind == 'ps' else None
-        if kind == 'ms':
+        if kind == 'ms' and not getattr(self, 'serial_mesh', False):
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
@@ -16245,6 +16245,8 @@ class PixelImageConflict(Unsupported):
 
 
 class Pipeline:
+    stage_class = Stage
+
     vertex_kind = 'vs'
     uses_dynamic_heap = False
     uses_dynamic_heap_formats = False
@@ -16351,11 +16353,16 @@ class Pipeline:
             self.mesh_pixel_writes = ps_code is not None and mesh_pixel_memory_writes(
                 ps_code, decoded.get('ps') if decoded else None)
         if refusals is None:
-            self.vs = Stage(self, self.vertex_kind, vs_code)
+            try:
+                self.vs = self.stage_class(self, self.vertex_kind, vs_code)
+            except Unsupported as reason:
+                if self.vertex_kind == 'ms':
+                    reason.mesh_stage = True
+                raise
             self.ps = self._graphics_pixel_stage(ps_code, pixel_refusal)
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.vs = self.stage_class(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
             self.ps = self._pixel_stage(ps_code, refusals=refusals, decoded=decoded.get('ps'))
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
@@ -17453,12 +17460,18 @@ class MeshPipeline(Pipeline):
     def mesh_profile(self):
         return 'ms_6_6' if self.uses_dynamic_heap else 'ms_6_5'
 
+    def mesh_output_line(self, line):
+        return re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
+                      re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
+                             lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
+
+    def mesh_param_line(self, line):
+        # Drop writes to unread parameters but keep the EXEC guard and mesh_vertex assignment.
+        return re.sub(r' o\.param\d+ = [^;]*;', '', line) if self.ps is None else line
+
     def hlsl_ms(self):
         s = self.vs
-        lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
-                        re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
-                               lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
-                 for line in s.body()]
+        lines = [self.mesh_output_line(line) for line in s.body()]
         # Omit an unused group exchange, including its otherwise unused declaration.
         unused_group_regs = set()
         for index in range(len(lines) - 1, -1, -1):
@@ -17467,10 +17480,7 @@ class MeshPipeline(Pipeline):
                                  for other in lines[:index] + lines[index + 1:] + s.entry):
                 del lines[index]
                 unused_group_regs.add(int(match[1][1:]))
-        if self.ps is None:
-            # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
-            # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
-            lines = [re.sub(r' o\.param\d+ = [^;]*;', '', line) for line in lines]
+        lines = [self.mesh_param_line(line) for line in lines]
         mask_collectives = []
         if s.mesh_collect_masks:
             mask_collectives = [
@@ -18066,7 +18076,7 @@ def validate_mesh57_pixel(ps):
 
 
 def translate_mesh57(out_dir, key):
-    """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
+    """Translate a slot 57 mesh request through the proof path or serial fallback, or raise Unsupported.
 
     Writes <key>.ms57.hlsl and the compiled .ms57.cso, their .ps57 counterparts if present, and <key>.ms57.txt (last).
     No runtime path loads these names yet."""
@@ -18091,7 +18101,26 @@ def translate_mesh57(out_dir, key):
             if not placeholder_ps_enabled():
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
-    pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
+    mode = os.environ.get('X2W_MESH_WAVELOOP', '1')
+    proof_refusal = None
+    try:
+        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
+    except Unsupported as reason:
+        if mode not in ('1', 'force') or not getattr(reason, 'mesh_stage', False):
+            raise
+        from mesh_waveloop import proof_family
+        if not proof_family(sys.modules[__name__], str(reason)):
+            raise
+        proof_refusal = str(reason)
+    if proof_refusal is not None or mode == 'force':
+        from mesh_waveloop import translate_serial
+        try:
+            pipe = translate_serial(sys.modules[__name__], ms, ps or None, root, pixel_refusal)
+        except Unsupported as reason:
+            if proof_refusal is None or not getattr(reason, 'mesh_stage', False):
+                raise
+            raise Unsupported('slot 57 mesh wave loop: %s (proof path: %s)'
+                              % (reason, proof_refusal[:80])) from reason
     mesh_hlsl = pipe.hlsl_ms()
     sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
     if ps:
