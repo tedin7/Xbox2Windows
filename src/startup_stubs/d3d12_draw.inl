@@ -4061,7 +4061,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return not_drawn(pass, list, not_drawn_key, 2);
         }
         if ((indexed || mesh) && pass.compute_pipeline) {
-            indirect->set_refusal("indexed validation cannot replace a live guest compute pipeline",
+            indirect->set_refusal(mesh ? "slot57 mesh linearization cannot replace a live guest compute pipeline" :
+                                         "indexed validation cannot replace a live guest compute pipeline",
                                   indirect_refusal_code::live_compute_pipeline);
             draw_lock_release_exclusive();
             return not_drawn(pass, list, not_drawn_key, 3);
