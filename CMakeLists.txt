@@ -1548,6 +1548,14 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_BUDGET=1" PASS_REGULAR_EXPRESSION "sysmem fallback checks passed")
 endforeach()
 
+# WARP headroom probe: which allocations count as LOCAL or NON-LOCAL video memory (measures and prints, no pass/fail on the numbers).
+add_executable(startup_warp_heap_budget tests/startup_warp_heap_budget.cpp)
+target_compile_features(startup_warp_heap_budget PRIVATE cxx_std_17)
+target_link_libraries(startup_warp_heap_budget PRIVATE d3d12 dxgi)
+add_test(NAME startup_warp_heap_budget COMMAND startup_warp_heap_budget)
+set_tests_properties(startup_warp_heap_budget PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "warp heap budget probe done")
+
 add_executable(startup_resource_budget tests/startup_resource_budget.cpp)
 target_include_directories(startup_resource_budget PRIVATE src)
 target_compile_features(startup_resource_budget PRIVATE cxx_std_17)
