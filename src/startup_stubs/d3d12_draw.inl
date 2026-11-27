@@ -4027,7 +4027,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // What the shader does with this view (manifest srvuse; absent = unknown) and the view the title made decide
             // whether the texture may lose its top mip levels when it is materialized by this bind (texture_drop_mips.h).
             D3D12_SHADER_RESOURCE_VIEW_DESC title_view{};
-            if (record.desc_bytes >= 40) std::memcpy(&title_view, record.desc, 40);
+            if (record.desc_bytes >= sizeof(title_view)) std::memcpy(&title_view, record.desc, sizeof(title_view));
             x2w_startup::drop_mips::ViewFacts drop_view;
             drop_view.most_detailed_mip = title_view.Texture2D.MostDetailedMip;
             drop_view.min_lod_clamp = title_view.Texture2D.ResourceMinLODClamp;
@@ -4038,8 +4038,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
                 texture = sampled_address_texture(resource);
             }
-            if (texture && record.desc_bytes >= 40) {
-                std::memcpy(&desc, record.desc, 40);
+            if (texture && record.desc_bytes >= sizeof(desc)) {
+                std::memcpy(&desc, record.desc, sizeof(desc));
                 desc.Format = desktop_format(desc.Format);
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
@@ -4049,6 +4049,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const auto verdict = x2w_startup::packed_view(desc.Format, actual, x2w_startup::packed_stand_in_of(texture));
                 if (verdict == x2w_startup::PackedView::stand_in) desc.Format = actual;
                 if (verdict == x2w_startup::PackedView::refused) {
+                    log_srv_refusal(srv_check::Refusal::format);
                     static LONG refused;
                     if (first_calls(refused, 6))
                         log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
@@ -4085,18 +4086,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
-            const bool wrong_1d_resource = texture && srv.kind == 4 &&
-                (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
-            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
-                static LONG mismatch;
-                if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
-                texture = nullptr;
-                mismatched = true;
-                desc.ViewDimension = dimension;
-                desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                desc.Texture2DArray = {};
-                desc.Texture2D.MipLevels = 1;
-                if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+            auto* view = record.desc_bytes >= sizeof(desc) ? &desc : nullptr;
+            if (texture) {
+                const auto real_desc = texture->GetDesc();
+                if ((view && view->ViewDimension != dimension) ||
+                    (!view && srv_check::default_dimension(real_desc) != dimension)) {
+                    log_srv_refusal(srv_check::Refusal::dimension);
+                    texture = nullptr;
+                    mismatched = true;
+                } else if (!checked_texture_srv(device_of(the_device), view, real_desc,
+                                                resource ? resource->own().drop_levels : 0)) {
+                    texture = nullptr;
+                }
             }
             if (indirect && !texture) {
                 indirect->set_refusal("translated draw could not bind its sampled texture",
@@ -4119,11 +4120,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
                 log("%s", line);
             }
-            if (texture && resource && resource->own().drop_levels && desc.ViewDimension == dimension &&
-                (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
-                desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
-                                                                                    resource->own().drop_levels);
-            const auto* view = record.desc_bytes >= 40 ? &desc : nullptr;
             const UINT integer = texture ? integer_view_type(view ? view->Format : texture->GetDesc().Format) : 0;
             if (const auto* twin = tr->integer_srvs.find(i)) {
                 values[twin->entry] = integer;
@@ -4136,7 +4132,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
                 device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
             } else {
-                device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &desc, dest);
+                const auto null_view = null_srv_desc(dimension);
+                device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &null_view, dest);
             }
             if (texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;

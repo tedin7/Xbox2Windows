@@ -68,6 +68,7 @@
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
+#include "startup_stubs/view_desc_check.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
@@ -4987,6 +4988,72 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
+D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension);
+
+namespace srv_check = x2w_startup::view_desc;
+
+void log_srv_refusal(srv_check::Refusal refusal)
+{
+    static LONG counts[static_cast<unsigned>(srv_check::Refusal::count)]{};
+    static constexpr const char* reasons[] = {
+        "", "dimension or sample count", "mip range", "array range", "format",
+        "plane slice", "minimum LOD", "resource denies shader resource views", "view addresses dropped mips"
+    };
+    const auto index = static_cast<unsigned>(refusal);
+    const auto count = static_cast<unsigned>(InterlockedIncrement(&counts[index]));
+    if (count <= 6 || (count & (count - 1)) == 0)
+        log("x2w-d3d12 view refused: %s (count %u)", reasons[index], count);
+}
+
+void log_srv_repair(srv_check::Field field, UINT old_value, UINT new_value, const D3D12_RESOURCE_DESC& resource)
+{
+    static constexpr const char* names[] = {"MipLevels", "ArraySize", "NumCubes", "Shader4ComponentMapping", "Format"};
+    struct RepairCensus {
+        unsigned count;
+        unsigned used;
+        UINT old_values[6];
+        UINT new_values[6];
+    };
+    static RepairCensus cases[static_cast<unsigned>(srv_check::Field::count)]{};
+    static SRWLOCK lock = SRWLOCK_INIT;
+    const auto index = static_cast<unsigned>(field);
+    AcquireSRWLockExclusive(&lock);
+    auto& entry = cases[index];
+    const unsigned count = ++entry.count;
+    bool first = entry.used < 6;
+    for (unsigned i = 0; i < entry.used; ++i)
+        if (entry.old_values[i] == old_value && entry.new_values[i] == new_value) first = false;
+    if (first) {
+        entry.old_values[entry.used] = old_value;
+        entry.new_values[entry.used++] = new_value;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    if (first)
+        log("x2w-d3d12 view repaired: %s %u -> %u (resource %llux%u mips %u fmt %u)",
+            names[index], old_value, new_value, static_cast<unsigned long long>(resource.Width),
+            resource.Height, static_cast<unsigned>(resource.MipLevels), static_cast<unsigned>(resource.Format));
+    if (count > 6 && (count & (count - 1)) == 0)
+        log("x2w-d3d12 view repair count: %s %u", names[index], count);
+}
+
+bool checked_texture_srv(ID3D12Device* device, D3D12_SHADER_RESOURCE_VIEW_DESC* view,
+                         const D3D12_RESOURCE_DESC& resource, unsigned dropped_levels)
+{
+    if (resource.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return true;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+    if (view && view->Format != resource.Format && !x2w_startup::is_typeless(resource.Format) &&
+        x2w_startup::compatible_formats(resource.Format, view->Format)) {
+        device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
+    }
+    const auto refusal = view ? srv_check::check(*view, resource, dropped_levels,
+        [&](srv_check::Field field, UINT old_value, UINT new_value) {
+            log_srv_repair(field, old_value, new_value, resource);
+        }, options.CastingFullyTypedFormatSupported != FALSE) : srv_check::check_default(resource);
+    if (refusal == srv_check::Refusal::none) return true;
+    log_srv_refusal(refusal);
+    return false;
+}
+
 #include "startup_stubs/d3d12_draw.inl"
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
@@ -5508,30 +5575,8 @@ x2w_view_dimension::DefaultViews view_defaults_mode()
 D3D12_SHADER_RESOURCE_VIEW_DESC lazy_null_srv_desc(const D3D12_RESOURCE_DESC& res_desc,
                                                   const D3D12_SHADER_RESOURCE_VIEW_DESC* requested)
 {
-    unsigned dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (requested && requested->ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) {
-        dimension = static_cast<unsigned>(requested->ViewDimension);
-    } else {
-        switch (res_desc.Dimension) {
-        case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-            dimension = res_desc.DepthOrArraySize > 1
-                ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
-            break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-            dimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-            break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
-        default:
-            if (res_desc.SampleDesc.Count > 1) {
-                dimension = res_desc.DepthOrArraySize > 1
-                    ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY : D3D12_SRV_DIMENSION_TEXTURE2DMS;
-            } else {
-                dimension = res_desc.DepthOrArraySize > 1
-                    ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
-            }
-            break;
-        }
-    }
+    const auto dimension = requested && requested->ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN
+        ? requested->ViewDimension : srv_check::default_dimension(res_desc);
     return null_srv_desc(dimension);
 }
 
@@ -5635,7 +5680,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                     log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
                         *reinterpret_cast<const UINT*>(described), dimension, resource_desc_for_check.Format,
                         default_view ? "default view" : "skipped");
-            } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
+            } else if ((N != 18 || dimension == D3D12_RESOURCE_DIMENSION_BUFFER) &&
+                       !x2w_view_dimension::fits(N, view_dimension, dimension)) {
                 skip = "view dimension does not suit the resource";
                 static LONG mismatched;
                 if (first_calls(mismatched, 6))
@@ -5663,6 +5709,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         }
     };
     if (skip) {
+        if constexpr (N == 18) {
+            if (resource_desc_for_check.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+                log_srv_refusal(srv_check::Refusal::denied);
+        }
         refuse_view();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
@@ -5688,6 +5738,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 : x2w_startup::packed_stand_in_of(reinterpret_cast<ID3D12Resource*>(args[0]));
             const auto verdict = x2w_startup::packed_view(mapped, actual, stand_in_for);
             if (verdict == x2w_startup::PackedView::refused) {
+                if constexpr (N == 18) log_srv_refusal(srv_check::Refusal::format);
                 refuse_view();
                 static LONG refused;
                 if (first_calls(refused, 6))
@@ -5758,6 +5809,29 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[0] = reinterpret_cast<u64>(materialize_lazy_texture(lazy_wrapper));
         }
     }
+    D3D12_SHADER_RESOURCE_VIEW_DESC checked_srv;
+    if constexpr (N == 18) {
+        if (args[0]) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr;
+            if (args[1]) {
+                if (x2w_local::readable(reinterpret_cast<const void*>(args[1]), sizeof(checked_srv))) {
+                    std::memcpy(&checked_srv, reinterpret_cast<const void*>(args[1]), sizeof(checked_srv));
+                    view = &checked_srv;
+                } else {
+                    log_srv_refusal(srv_check::Refusal::dimension);
+                    refuse_view();
+                    return 0;
+                }
+            }
+            const auto resource = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            const unsigned dropped_levels = lazy_wrapper ? lazy_wrapper->own().drop_levels : 0;
+            if (!checked_texture_srv(device_of(self), view, resource, dropped_levels)) {
+                refuse_view();
+                return 0;
+            }
+            args[1] = reinterpret_cast<u64>(view);
+        }
+    }
     const LONG removed_before = removal_reported;
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
@@ -5801,38 +5875,38 @@ void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_
                      x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest,
                      unsigned dropped_levels = 0)
 {
-    if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-        device->CreateShaderResourceView(created, nullptr, dest);
-        return;
-    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-    std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
-    if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
-        if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
-                static_cast<unsigned>(created_desc.Format), view_mode)) {
-            device->CreateShaderResourceView(created, nullptr, dest);
+    const bool described = vr.desc_bytes >= sizeof(srv_desc);
+    if (described) std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
+    const auto bind_null = [&] {
+        const auto null_view = lazy_null_srv_desc(created_desc, described ? &srv_desc : nullptr);
+        device->CreateShaderResourceView(nullptr, &null_view, dest);
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr;
+    if (described && srv_desc.ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) {
+        srv_desc.Format = desktop_format(srv_desc.Format);
+        if (x2w_startup::packed_target_format(srv_desc.Format)) {
+            const auto verdict = x2w_startup::packed_view(
+                srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
+            if (verdict == x2w_startup::PackedView::refused) {
+                log_srv_refusal(srv_check::Refusal::format);
+                bind_null();
+                return;
+            }
+            if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
         }
+        view = &srv_desc;
+    } else if (described && !x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
+                   static_cast<unsigned>(created_desc.Format), view_mode)) {
+        log_srv_refusal(srv_check::Refusal::dimension);
+        bind_null();
         return;
     }
-    srv_desc.Format = desktop_format(srv_desc.Format);
-    if (dropped_levels) {
-        // A view that starts below the top level or clamps the LOD names levels that are gone: leave it unbound.
-        // The others lose the same count of levels the texture lost.
-        const bool array = srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        if ((srv_desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D && !array) ||
-            srv_desc.Texture2D.MostDetailedMip != 0 || (!array && srv_desc.Texture2D.ResourceMinLODClamp != 0.0f)) {
-            x2w_startup::drop_mips::counters.keep(x2w_startup::drop_mips::Reason::view_clamp);
-            return;
-        }
-        srv_desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(srv_desc.Texture2D.MipLevels, dropped_levels);
+    if (!checked_texture_srv(device, view, created_desc, dropped_levels)) {
+        bind_null();
+        return;
     }
-    if (x2w_startup::packed_target_format(srv_desc.Format)) {
-        const auto verdict = x2w_startup::packed_view(
-            srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
-        if (verdict == x2w_startup::PackedView::refused) return;
-        if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
-    }
-    device->CreateShaderResourceView(created, &srv_desc, dest);
+    device->CreateShaderResourceView(created, view, dest);
 }
 
 // After a guest descriptor copy: a destination slot that now names a lazy texture which already has its real resource got
