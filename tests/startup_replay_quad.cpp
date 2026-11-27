@@ -31,7 +31,7 @@ constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
 // X2W_TEST_REPLAY_TITLE_RANGE=ring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
 // recorder's 64 KiB root window, so each binding's capture is needed on its own), and clears both before its Present.
 constexpr UINT ring_slice_bytes = 0x20000, ring_vb_offset = 0x10000;
-enum class TitleRange { none, root, generated, supplied, ring };
+enum class TitleRange { none, root, generated, supplied, ring, table };
 
 struct Scene {
     void* target = nullptr;
@@ -287,7 +287,9 @@ int create_title_range(void* device, Scene& s)
         std::printf("title ranges: %llx 0\n", arg(s.ring));
         return 0;
     }
-    s.constants = static_cast<unsigned char*>(VirtualAlloc(nullptr, cbv_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const bool table = s.title_range == TitleRange::table;
+    void* const data_address = table ? reinterpret_cast<void*>(0x21300000000ull) : nullptr;
+    s.constants = static_cast<unsigned char*>(VirtualAlloc(data_address, cbv_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!s.constants) return 40;
     if (s.title_range == TitleRange::root) {
         std::printf("title ranges: %llx 0\n", arg(s.constants));
@@ -298,10 +300,11 @@ int create_title_range(void* device, Scene& s)
     struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word cpu, bytes;
-    } info{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
-    if (s.title_range == TitleRange::supplied) {
-        info.bytes = 2 * s.view_stride;
-        info.cpu = arg(VirtualAlloc(nullptr, info.bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    } info{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, table ? 4u : 2u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    if (s.title_range == TitleRange::supplied || table) {
+        info.bytes = info.desc.NumDescriptors * s.view_stride;
+        void* const heap_address = table ? reinterpret_cast<void*>(0x21300010000ull) : nullptr;
+        info.cpu = arg(VirtualAlloc(heap_address, info.bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!info.cpu) return 42;
     }
     if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&info), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.view_heap)))))
@@ -309,6 +312,29 @@ int create_title_range(void* device, Scene& s)
     s.view_cpu = invoke(s.view_heap, 9);
     s.view_gpu = invoke(s.view_heap, 10);
     if (!s.view_cpu || !s.view_gpu || (info.cpu && s.view_cpu != info.cpu)) return 44;
+    if (table) {
+        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, cbv_bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.constants), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                               arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
+            !s.title_buffer)
+            return 46;
+        constexpr float colours[2][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}};
+        std::memcpy(s.constants, colours, sizeof(colours));
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = 4;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        for (UINT colour = 0; colour < 2; ++colour) {
+            view.Buffer.FirstElement = colour * 4;
+            invoke(device, 18, arg(s.title_buffer), arg(&view), s.view_cpu + (2 + colour) * s.view_stride);
+        }
+        // Give the recorded call recipe an initial red descriptor. Only CPU writes update it in the window.
+        invoke(device, 24, 1, s.view_cpu + s.view_stride, s.view_cpu + 2 * s.view_stride, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return 0;
+    }
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{arg(s.constants), cbv_bytes};
     invoke(device, 17, arg(&view), s.view_cpu);
     // Copy the descriptor through CPU memory. No recorded call populates the slot used by the draw.
@@ -345,7 +371,10 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         std::memcpy(slice + ring_vb_offset, vertices, sizeof(vertices));
     }
     const float t = s.constants ? 0.0f : static_cast<float>(frame) / static_cast<float>(frames);
-    if (s.constants) {
+    if (s.title_range == TitleRange::table) {
+        std::memcpy(reinterpret_cast<void*>(s.view_cpu + s.view_stride),
+                    reinterpret_cast<const void*>(s.view_cpu + (2 + frame % 2) * s.view_stride), s.view_stride);
+    } else if (s.constants) {
         const float colour[] = {float(frame % 2 == 0), float(frame % 2 != 0), 0.0f, 1.0f};
         std::memcpy(s.constants + colour_offset, colour, sizeof(colour));
     }
@@ -449,9 +478,11 @@ int main(int argc, char** argv)
         else if (!std::strcmp(mode, "generated")) scene.title_range = TitleRange::generated;
         else if (!std::strcmp(mode, "supplied")) scene.title_range = TitleRange::supplied;
         else if (!std::strcmp(mode, "ring")) scene.title_range = TitleRange::ring;
+        else if (!std::strcmp(mode, "table")) scene.title_range = TitleRange::table;
         else return 2;
     }
-    const bool table = scene.title_range == TitleRange::generated || scene.title_range == TitleRange::supplied;
+    const bool table = scene.title_range == TitleRange::generated || scene.title_range == TitleRange::supplied ||
+                       scene.title_range == TitleRange::table;
     if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], std::strcmp(argv[4], "hardware") == 0, table, adapter,
                                                device, pso))
         return rc;

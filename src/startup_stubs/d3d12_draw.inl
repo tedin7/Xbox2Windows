@@ -2778,6 +2778,25 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
+bool read_view_token(const std::uint32_t* words, ViewRecord& record, bool* materialized = nullptr,
+                     u64 entry = 0, u64 key = 0)
+{
+    if (words[0] != view_token_magic) return false;
+    note_lock_acquire(false);
+    const bool known = words[1] < view_records().size() && view_records()[words[1]].slot != 0;
+    if (known) {
+        record = view_records()[words[1]];
+        if (materialized) *materialized = view_materialized()[words[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    if (!known && entry) {
+        static LONG unknown;
+        if (first_calls(unknown, 32))
+            log("x2w-draw unknown view token id 0x%x slot %u at entry 0x%llx key %016llx", words[1], words[2], entry, key);
+    }
+    return known;
+}
+
 bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
 {
     if (!tr.d16_srvs.any()) return true;
@@ -2796,18 +2815,14 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
-        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
+        const u64 entry = replay_record::draw_table_entry(pass.view_tables[srv.a], static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
             return refuse(i, "unreadable table entry", srv.a);
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
         ViewRecord record{};
-        bool known = false;
-        note_lock_acquire(false);
-        known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = read_view_token(words, record, nullptr, entry, tr.key);
         if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
         ID3D12Resource* texture = sampled_address_texture(resource);
@@ -3100,19 +3115,6 @@ bool compute_view_tokens_enabled()
     return enabled;
 }
 
-bool read_view_token(const std::uint32_t* words, ViewRecord& record, bool* materialized = nullptr)
-{
-    if (words[0] != view_token_magic) return false;
-    note_lock_acquire(false);
-    const bool known = words[1] < view_records().size();
-    if (known) {
-        record = view_records()[words[1]];
-        if (materialized) *materialized = view_materialized()[words[1]] != 0;
-    }
-    ReleaseSRWLockShared(&note_lock);
-    return known;
-}
-
 const char* refuse_native_buffer_addressing(const std::uint32_t* words)
 {
     if (words[0] == view_token_magic) return nullptr;
@@ -3132,7 +3134,7 @@ const char* refuse_native_buffer_addressing(const std::uint32_t* words)
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool compute_input = false)
+                                         bool compute_input = false, u64 entry = 0, u64 key = 0)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -3148,7 +3150,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                                                         : refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        const bool known = read_view_token(words, record);
+        const bool known = read_view_token(words, record, nullptr, entry, key);
         const bool describe_token = compute_input && compute_view_tokens_enabled();
         if (describe_token && !known) return refuse("an input view token has an unknown kind and record");
         if (record.slot == 17 && record.desc_bytes >= 12) {
@@ -3288,6 +3290,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
+        if (entry) replay_record::draw_pages_note(reinterpret_cast<u64>(self), address, bytes, false);
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
             if (bytes > legacy_limit) return refuse("an input buffer range is over 16 MiB");
             if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
@@ -3497,15 +3500,18 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         const auto& srv = tr.srvs[ud.a];
         if (srv.kind != 0 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(ud.a, "missing hardware descriptor");
-        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), sizeof(descriptor.words));
+        const u64 entry = replay_record::draw_table_entry(pass.view_tables[srv.a], static_cast<u64>(srv.b), sizeof(descriptor.words));
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
         std::uint32_t format = 0;
         FormattedViewDetails view;
         if (const char* reason = formatted_buffer_word3(
-                descriptor.words, format, extended_buffer_formats(), view_diagnostics ? &view : nullptr))
+                descriptor.words, format, extended_buffer_formats(), view_diagnostics ? &view : nullptr)) {
+            ViewRecord record{};
+            read_view_token(descriptor.words, record, nullptr, entry, tr.key);
             return refuse(ud.a, reason, format, view);
+        }
         descriptor.entry = entry;
     }
     return true;
@@ -3518,7 +3524,7 @@ bool read_descriptor_entry_words(const Translation& tr, const Pass& pass, std::u
         const auto& ud = tr.uds[i];
         if (ud.kind != Translation::desc_word) continue;
         const auto& table = pass.view_tables[ud.a];
-        const u64 entry = table.record(static_cast<u64>(ud.b), sizeof(values[i]));
+        const u64 entry = replay_record::draw_table_entry(table, static_cast<u64>(ud.b), sizeof(values[i]));
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(values[i]))) {
             log("x2w-draw %016llx: descriptor word unavailable at table %d byte %d", tr.key, ud.a, ud.b);
             return false;
@@ -3548,17 +3554,14 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         const PixelUav& uav = tr.uavs[i];
         const x2w_startup::ViewTable& table = pass.view_tables[uav.parameter];
         if (!table.address) return refuse(i, "no descriptor table at the parameter", uav.parameter);
-        const u64 entry = table.record(uav.offset, 32);
+        const u64 entry = replay_record::draw_table_entry(table, uav.offset, 32);
         if (!entry) return refuse(i, "table entry outside the bound table", uav.offset);
         std::uint32_t words[8] = {};
         if (!x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) return refuse(i, "table entry unreadable", entry);
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
         ViewRecord record{};
-        note_lock_acquire(false);
-        const bool known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = read_view_token(words, record, nullptr, entry, tr.key);
         if (!known) return refuse(i, "unknown view token", words[1]);
         if (record.slot != 19) return refuse(i, "table entry is not an unordered-access view", record.slot);
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
@@ -3592,14 +3595,14 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
             if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
-            const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
+            const u64 srv_entry = replay_record::draw_table_entry(pass.view_tables[srv.a], static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
             std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
             if (srv_words[0] != view_token_magic) continue;
-            note_lock_acquire(false);
-            const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
-            ReleaseSRWLockShared(&note_lock);
+            ViewRecord srv_record{};
+            read_view_token(srv_words, srv_record, nullptr, srv_entry, tr.key);
+            const u64 srv_resource = srv_record.resource;
             if (srv_resource && srv_resource == record.resource) return refuse(i, "the texture is also an SRV of this draw", s);
         }
         out[i].resource = texture;
@@ -4204,7 +4207,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const auto& formatted = formatted_buffers[i];
         const u64 entry = formatted.entry ? formatted.entry :
             (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
-                pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
+                replay_record::draw_table_entry(pass.view_tables[srv.a], static_cast<u64>(srv.b), 32) : 0);
         std::uint32_t words[8] = {};
         const auto note_null = [&](x2w_local::NullCause cause, std::size_t requested = 0,
                                    const char* why = "range unreadable") {
@@ -4227,13 +4230,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                    srv.kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE3D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
-            bool known = false;
-            if (words[0] == view_token_magic) {
-                note_lock_acquire(false);
-                known = words[1] < view_records().size();
-                if (known) record = view_records()[words[1]];
-                ReleaseSRWLockShared(&note_lock);
-            }
+            const bool known = read_view_token(words, record, nullptr, entry, tr->key);
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             if (srv.kind == 5) {
@@ -4384,7 +4381,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     why = "the bound vertex buffer has no usable stride, size or address";
                 }
             } else if (entry_ok) {
-                view = indirect_table_buffer(self, words, false, &why);
+                view = indirect_table_buffer(self, words, false, &why,
+                                                 u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP, false, entry, tr->key);
             } else {
                 why = "the table descriptor entry is not readable";
             }
@@ -4414,10 +4412,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
             ViewRecord record{};
-            note_lock_acquire(false);
-            buffer_token_known = words[1] < view_records().size();
-            if (buffer_token_known) record = view_records()[words[1]];
-            ReleaseSRWLockShared(&note_lock);
+            buffer_token_known = read_view_token(words, record, nullptr, entry, tr->key);
             if (record.slot == 17 && record.desc_bytes >= 12) {
                 std::uint32_t size = 0;
                 std::memcpy(&address, record.desc, 8);
@@ -4455,6 +4450,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
+        if (srv.source == 0 && entry) replay_record::draw_pages_note(reinterpret_cast<u64>(self), address, bytes, false);
         const std::size_t requested_bytes = bytes;
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
         const auto count_buffer = [&](bool bound, const char* why) {
@@ -5025,7 +5021,9 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 {
     if (parameter >= 16) return;
     auto& pass = pass_of(self);
-    pass.view_tables[parameter] = resolve_title_table(pass, gpu_handle);
+    auto& table = pass.view_tables[parameter];
+    table = resolve_title_table(pass, gpu_handle);
+    replay_record::draw_pages_note(reinterpret_cast<u64>(self), table.address, (std::min)(table.bytes, replay_record::draw_table_window), true);
 }
 // List slot 35 (desktop 31 + 4), SetComputeRootDescriptorTable(parameter, GPU handle). Recorded only for a later
 // Dispatch; slot 33 keeps the desktop compute root bind.
@@ -5034,7 +5032,11 @@ void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
     static LONG dropped;
     if (!self->own().list_open) return;
     auto& pass = pass_of(self);
-    if (!pass.compute_tables.set_table(parameter, resolve_title_table(pass, gpu_handle)) && first_calls(dropped, 4))
+    const auto table = resolve_title_table(pass, gpu_handle);
+    const bool bound = pass.compute_tables.set_table(parameter, table);
+    if (bound)
+        replay_record::draw_pages_note(reinterpret_cast<u64>(self), table.address, (std::min)(table.bytes, replay_record::draw_table_window), true);
+    else if (first_calls(dropped, 4))
         log("x2w-render compute descriptor table dropped: parameter %u (%u parameters are kept)", parameter,
             x2w_startup::ComputeTables::max_parameters);
 }

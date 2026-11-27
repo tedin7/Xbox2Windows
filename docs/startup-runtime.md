@@ -2101,6 +2101,20 @@ stamp is written when it differs but does not change that reference, and two dif
 threads, file order unknown) make the next later capture write the page again. `startup_replay_draw_pages_warp` compares four live and replayed ring colours
 and checks that disabling draw pages changes the replay while leaving the live pictures identical.
 
+Draw pages also capture up to 64 KiB of title descriptor memory at the graphics and compute table setters (list slots
+36 and 35). They capture that span again at the next draw, dispatch or indirect execution on the same list. An entry
+beyond the captured span is captured when read. Buffers read through table descriptors are captured at the consuming
+call, up to 4 MiB per range. The lookup includes caller-supplied descriptor heap CPU backings (DHPM).
+The draw pages log reports table spans and descriptor buffers. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures.
+
+Each call that stores a view can write a `VIDS` chunk after its `CALL`. The chunk contains the call sequence number
+(u64), recording view id (u32) and four bytes of padding. Older players can skip this chunk.
+The player learns the corresponding replay id from the stand-in after playing that call. When it applies a MAP, it
+replaces the view ids it has learned in 32-byte aligned X2WV tokens.
+The console summary and the `view_tokens` object in `replay_summary.json` report the number of replacements and the
+number of tokens whose ids had no mapping. Set `X2W_REPLAY_VIEW_TOKENS=0` to disable this translation.
+`startup_replay_draw_tables_warp` checks alternating CPU descriptor copies and repeats the replay with shifted view ids.
+
 The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
 creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
 destination starts, destination sizes, source starts and source sizes of a `CopyDescriptors` call. Its header is the call
