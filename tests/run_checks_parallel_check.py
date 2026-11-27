@@ -102,4 +102,21 @@ with tempfile.TemporaryDirectory() as tmp:
     assert out.stdout.index("first alpha") < out.stdout.index("second inherited"), out.stdout
     assert "first alpha\n" in out.stdout and "second inherited\n" in out.stdout, out.stdout
     assert "all 2 checks passed" in out.stdout, out.stdout
+
+# Scripts that need arguments are skipped when run bare, and the manifest only names scripts
+# that CMakeLists.txt really runs with arguments.
+import re
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import run_checks_parallel as runner_module
+names = runner_module.read_needs_arguments()
+assert len(names) > 100, len(names)
+cmake = open(os.path.join(ROOT, "CMakeLists.txt"), encoding="utf-8").read()
+with_args = {m.group(1) for m in re.finditer(r'tests/([A-Za-z0-9_]+\.py)"?([^)]*)\)', cmake) if m.group(2).strip()}
+for name in names:
+    assert os.path.isfile(os.path.join(ROOT, "tests", name)), name
+    assert name in with_args, f"{name} is never run with arguments in CMakeLists.txt"
+sample = os.path.join(ROOT, "tests", sorted(names)[0])
+bare = run(sample)
+assert bare.returncode == 1 and "SKIPPED:" in bare.stdout, bare.stdout
+assert "FAILED:" not in bare.stdout and "needs arguments" in bare.stdout, bare.stdout
 print("run_checks_parallel_check: ok")
