@@ -41,7 +41,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) void x2w_d3d12_list_copy_stats(unsigned* buffer_copies, unsigned* resource_copies,
                                                                 unsigned* resolves, unsigned* refused);
 
-extern "C" __declspec(dllimport) void x2w_d3d12_fixture_copy15(BOOL skip_probes);
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_copy15(BOOL partial_move_mutant);
 extern "C" __declspec(dllimport) void x2w_d3d12_fixture_hold_draw_lock(HANDLE acquired, DWORD milliseconds);
 
 namespace {
@@ -173,33 +173,14 @@ struct Probe {
         return bits;
     }
 };
-// Catch only the intended mutation fault. An unrelated exception still fails the child.
-int copy15_source_fault(EXCEPTION_POINTERS* exception, const void* source)
-{
-    const auto& record = *exception->ExceptionRecord;
-    return record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2 &&
-        record.ExceptionInformation[0] == 0 && record.ExceptionInformation[1] >= arg(source) &&
-        record.ExceptionInformation[1] - arg(source) < 64
-        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
-}
-
-bool copy15_protected_source(void* list, void* to, void* from, const void* source)
-{
-    __try {
-        invoke(list, 15, arg(to), 0, arg(from), 0, 64);
-    } __except (copy15_source_fault(GetExceptionInformation(), source)) {
-        return false;
-    }
-    return true;
-}
-
 int check_copy15(void* device, Probe& probe, void* list, ID3D12Resource* upload, bool mutate)
 {
     // The 4 KiB offset cannot be aliased by slot 133. Give each placement its
     // own allocation and leave the first page outside the buffer.
     constexpr std::size_t page = 4096, payload = 256, chunk = 64;
-    auto* source = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    auto* destination = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    constexpr std::size_t boundary = page - chunk;
+    auto* source = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 3 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* destination = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 3 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!source || !destination) return 90;
     source += page;
     destination += page;
@@ -208,7 +189,7 @@ int check_copy15(void* device, Probe& probe, void* list, ID3D12Resource* upload,
         return ok(invoke(device, 133, arg(memory), arg(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                          arg(&__uuidof(ID3D12Resource)), arg(out))) && *out;
     };
-    if (!place(source, buffer(payload), &from) || !place(destination, buffer(payload), &to))
+    if (!place(source, buffer(2 * page), &from) || !place(destination, buffer(2 * page), &to))
         return 90;
 
     std::array<std::uint8_t, payload> expected{};
@@ -243,18 +224,21 @@ int check_copy15(void* device, Probe& probe, void* list, ID3D12Resource* upload,
     std::printf("copy15 record us %.3f\n", elapsed_us);
     if (!step("copy15 CPU copies", {}, seen)) return 91;
 
-    // Change protection after successful copies warmed the same page.
-    DWORD previous = 0;
-    if (!VirtualProtect(source, page, PAGE_NOACCESS, &previous)) return 90;
-    if (!copy15_protected_source(list, to, from, source)) {
-        std::puts("copy15 unreadable source fault");
+    // The first source page is readable and contains different bytes from the destination.
+    // A forward memmove that writes before checking the next page corrupts this prefix.
+    std::array<std::uint8_t, 2 * chunk> untouched{};
+    untouched.fill(0xC7);
+    std::memcpy(destination + boundary, untouched.data(), untouched.size());
+    std::memset(source + boundary, 0x3B, chunk);
+    if (!VirtualFree(source + page, page, MEM_DECOMMIT)) return 90;
+    invoke(list, 15, arg(to), boundary, arg(from), boundary, untouched.size());
+    x2w_d3d12_fixture_copy15(FALSE);
+    if (!step("copy15 decommitted source tail", {0, 0, 0, 1}, seen)) return 93;
+    if (std::memcmp(destination + boundary, untouched.data(), untouched.size())) {
+        std::puts("copy15 destination changed after refused copy");
         return 92;
     }
-    if (!step("copy15 unreadable source", {0, 0, 0, 1}, seen)) {
-        std::puts("copy15 missing unreadable source refusal");
-        return 93;
-    }
-    if (!VirtualProtect(source, page, previous, &previous)) return 90;
+    if (!VirtualAlloc(source + page, page, MEM_COMMIT, PAGE_READWRITE)) return 90;
 
     invoke(list, 15, arg(from), 0, arg(upload), 0, chunk);
     if (!step("copy15 GPU producer", {1, 0, 0, 0}, seen)) return 94;
