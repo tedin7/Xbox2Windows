@@ -3585,6 +3585,22 @@ descriptions with:
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
+With `X2W_SLOT70_MEMORY_BUFFER=1`, a structured view with first element 0, count 1 and
+stride equal to the buffer width can recover from `buffer_unavailable` if its exact byte range
+is readable and outside live resources. Slot 70 copies the requested bytes to a D3D12 upload
+buffer and publishes a desktop SRV. The per-view guard is 1 MiB, subject to the existing
+2048-byte structured-stride limit. The process-wide budget is 128 MiB, charged for the
+desktop allocation and the retained CPU snapshot. A repeated publication reuses an identical
+snapshot by device, address, size and bytes. A changed publication uses a separate backing
+so older descriptors retain their original bytes until device cleanup. To observe a title
+write through a desktop descriptor, publish the SRV again. The switch defaults to off.
+
+On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_slot70_memory_buffer_(enabled|off|stale)_warp$'`.
+The fixture publishes a synthetic 256-byte SRV inside a partially committed reservation and
+compares native compute readback with CPU data. The off control checks the refusal and null
+readback. The stale mutant must fail the refreshed readback with the first generation.
+
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
 address when `Location` is zero, do not read the resource description, and require `DXGI_FORMAT_UNKNOWN`
