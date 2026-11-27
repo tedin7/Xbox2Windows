@@ -162,6 +162,24 @@ def main(scene, backend):
         assert trigger and int(trigger.group(1)) <= 16 and int(trigger.group(2)) >= 300, opened or text[-3000:]
         end_totals(slow)
 
+        # A present ends the window at the end of the scene: a finisher thread writes the shader cache (here 128 extra
+        # 1 MiB files) and XEND while the title goes on, and the process exits right after. Whether the finisher was done
+        # or not, the file ends with XEND and every chunk before it is whole.
+        big_cache = directory / "big_cache"
+        big_cache.mkdir()
+        for item in cache.iterdir():
+            if item.is_file():
+                (big_cache / item.name).write_bytes(item.read_bytes())
+        for n in range(128):
+            (big_cache / ("filler_%03d.bin" % n)).write_bytes(os.urandom(1 << 20))
+        tail = directory / "tail.x2wr"
+        code, text, _ = timed(args + [30], dict(env, X2W_SHADER_CACHE=str(big_cache), X2W_REPLAY_RECORD="f27,2",
+                                               X2W_REPLAY_RECORD_FILE=str(tail)))
+        assert code == 0, text[-3000:]
+        end_totals(tail)
+        shaders = sum(tag == "SHDR" for tag, _, _ in chunks(tail.read_bytes()))
+        print("replay finisher: XEND last, %d shader cache files in the file" % shaders)
+
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),
                             ("recorded", {"X2W_REPLAY_RECORD": "all"})):

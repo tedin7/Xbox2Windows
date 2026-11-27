@@ -1911,7 +1911,9 @@ File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version
 `XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` and settings whose value is a drive or share path left out: recordings travel, and such paths
 carry the user's name).
 Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
-and anything past 512 MiB in total are left out and counted in the log; `X2W_REPLAY_SHADERS=0` writes none).
+and anything past 512 MiB in total are left out and counted in the log; `X2W_REPLAY_SHADERS=0` writes none). When a
+present ends the recording, a finisher thread writes them and `XEND`, so the title's presents go on meanwhile; a later
+stop waits for it, and if the process exits first the file ends at its last whole chunk followed by `XEND`.
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven

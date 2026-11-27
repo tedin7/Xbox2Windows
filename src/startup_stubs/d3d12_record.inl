@@ -542,7 +542,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     ReleaseSRWLockExclusive(&b.lock);
 }
 
-void stop(bool at_exit);
+void stop(bool at_exit, bool from_present = false);
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
 u64 pages_before_call(bool root, u64 address, bool submit);
@@ -588,7 +588,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
     if constexpr (K == descriptor_heap_kind && N == 9)
         if (extra_title_pages) remember_heap_start(rcx, rdx);
-    if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
+    if (stop_requested) stop(false, true);  // after the window's last present: that Present call is in the file
     return ret;
 }
 
@@ -635,7 +635,8 @@ void flush_all(bool at_exit)
 // SHDR chunks: every file directly in X2W_SHADER_CACHE (requests and translations), header = its name (UTF-8), data =
 // its bytes, so a replay on another machine has the translations this run had. Files over 16 MiB, and the files after
 // 512 MiB in total, are left out (counted in the log). At process exit (DllMain, loader lock held) it stops after 5 s
-// so a large cache cannot hold the exit up. file_lock held.
+// so a large cache cannot hold the exit up. file_lock held. whole_bytes is the file size after the last whole chunk.
+u64 volatile whole_bytes;
 void write_shader_cache(bool at_exit)
 {
     // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
@@ -678,6 +679,7 @@ void write_shader_cache(bool at_exit)
         chunk.clear();
         append_chunk(chunk, "SHDR", name, static_cast<std::size_t>(name_bytes), bytes.data(), size);
         write_raw(chunk.data(), chunk.size());
+        whole_bytes = bytes_written;
         ++files;
         total += size;
     } while (FindNextFileW(find, &found));
@@ -696,17 +698,8 @@ void unwrap_all()
             if (original[k][i]) tables[k][i] = original[k][i];
 }
 
-void stop(bool at_exit)
+void write_end_and_close()
 {
-    if (!active.exchange(false)) return;
-    const bool in_prefix = prefix_open;  // for the log: tester_pack.py flags a prefix-only file by this line
-    window_open = false;
-    prefix_open = false;
-    unwrap_all();
-    flush_all(at_exit);
-    if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
-    if (!at_exit) AcquireSRWLockExclusive(&file_lock);
-    write_shader_cache(at_exit);
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
@@ -714,13 +707,79 @@ void stop(bool at_exit)
     FlushFileBuffers(file);
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
+}
+
+// When a present ends the recording, the file's tail (shader cache, end chunk) is written by a finisher thread: a cache
+// of thousands of files takes minutes on a tester's disk and must not stall the title's presents. finished is set once
+// the file is closed; a later stop (a fixture, FreeLibrary) waits for it. At process exit the finisher has been
+// terminated with the other threads: the file then ends at its last whole chunk, with the end chunk after it.
+HANDLE finished = nullptr;
+bool stopped_in_prefix;
+
+void finish_file(bool at_exit)
+{
+    if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
+    if (!at_exit) AcquireSRWLockExclusive(&file_lock);
+    const bool in_prefix = stopped_in_prefix;
+    whole_bytes = bytes_written;
+    write_shader_cache(at_exit);
+    struct { u64 calls, bytes; } end{static_cast<u64>(calls_written), bytes_written};
+    write_end_and_close();
     ReleaseSRWLockExclusive(&file_lock);
     if (!at_exit && in_prefix && cap_reached)
         log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
             "%ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, presents, max_bytes >> 20);
     if (!at_exit)
-        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
-            end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
+        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls,
+            static_cast<unsigned long long>(blobs_stored), end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
+}
+
+DWORD WINAPI finisher(void*)
+{
+    finish_file(false);
+    SetEvent(finished);
+    return 0;
+}
+
+void wait_finisher(bool at_exit)
+{
+    if (!finished || WaitForSingleObject(finished, 0) == WAIT_OBJECT_0) return;
+    if (!at_exit) {
+        WaitForSingleObject(finished, INFINITE);
+        return;
+    }
+    // The process is ending and its other threads are gone, the finisher with whatever lock it held.
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER at;
+    at.QuadPart = static_cast<LONGLONG>(whole_bytes);
+    if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return;
+    bytes_written = whole_bytes;
+    write_end_and_close();
+}
+
+void stop(bool at_exit, bool from_present)
+{
+    if (!active.exchange(false)) {
+        wait_finisher(at_exit);
+        return;
+    }
+    stopped_in_prefix = prefix_open;  // for the log: tester_pack.py flags a prefix-only file by this line
+    window_open = false;
+    prefix_open = false;
+    unwrap_all();
+    flush_all(at_exit);
+    if (from_present && !at_exit) {
+        finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (finished) {
+            if (const HANDLE thread = CreateThread(nullptr, 0, finisher, nullptr, 0, nullptr)) {
+                CloseHandle(thread);
+                return;
+            }
+            CloseHandle(finished);
+            finished = nullptr;
+        }
+    }
+    finish_file(at_exit);
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
