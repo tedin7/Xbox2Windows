@@ -17462,7 +17462,13 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Drop a store whose idx * stride + rec_off needs more than 32 bits. With idx = h * 65536 + l
+                # the high half of idx * stride is (h * stride + ((l * stride) >> 16)) >> 16, exact because
+                # stride <= 0x3fff (checked above); when it is zero the 32-bit product is the whole product.
+                # No integer division: one GPU vendor's Vulkan compiler rejects a pipeline that divides by a
+                # runtime value here.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
@@ -17646,7 +17652,9 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Same 32-bit overflow test as store_format_d16_x, without an integer division.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
