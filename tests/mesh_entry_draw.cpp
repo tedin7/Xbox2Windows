@@ -297,6 +297,14 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     upload->Unmap(0, nullptr);
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
+    // A root signature with HEAP_DIRECTLY_INDEXED needs a descriptor heap bound before it is set.
+    ComPtr<ID3D12DescriptorHeap> indexed_root_heap;
+    if (indexed_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC bind_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&bind_desc, IID_PPV_ARGS(&indexed_root_heap)), "Create mesh root bind heap");
+        ID3D12DescriptorHeap* bind[]{indexed_root_heap.Get()};
+        list->SetDescriptorHeaps(1, bind);
+    }
     list->SetGraphicsRootSignature(root.Get());
     const auto base = upload->GetGPUVirtualAddress();
     std::array<ComPtr<ID3D12Resource>, 2> constants;
