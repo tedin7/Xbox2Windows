@@ -2813,6 +2813,25 @@ bool plain_compute_input_readable(u64 address, u64 bytes)
     return readable_window(address, static_cast<std::size_t>(bytes)) == bytes;
 }
 
+bool compute_view_tokens_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_VIEW_TOKENS");
+    return enabled;
+}
+
+bool read_view_token(const std::uint32_t* words, ViewRecord& record, bool* materialized = nullptr)
+{
+    if (words[0] != view_token_magic) return false;
+    note_lock_acquire(false);
+    const bool known = words[1] < view_records().size();
+    if (known) {
+        record = view_records()[words[1]];
+        if (materialized) *materialized = view_materialized()[words[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return known;
+}
+
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
@@ -2833,9 +2852,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (unfilled_heap_slot(words)) return refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        note_lock_acquire(false);
-        if (words[1] < view_records().size()) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = read_view_token(words, record);
+        const bool describe_token = compute_input && compute_view_tokens_enabled();
+        if (describe_token && !known) return refuse("an input view token has an unknown kind and record");
         if (record.slot == 17 && record.desc_bytes >= 12) {
             UINT size = 0;
             std::memcpy(&address, record.desc, 8);
@@ -2848,6 +2867,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 static const bool enabled = x2w_local::env_on("X2W_NULL_TOKEN_ZERO");
                 if (enabled) return {nullptr, 0, 0, 0, false, 0, true};
             }
+            if (describe_token && view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
+                return refuse("an input shader resource view token describes a texture, but the shader needs a buffer");
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
                 view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
