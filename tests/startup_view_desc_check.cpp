@@ -172,6 +172,67 @@ static bool pure_checks()
         srv::check_default(resource) == srv::Refusal::format;
 }
 
+static D3D12_RESOURCE_DESC depth_stencil_desc()
+{
+    auto desc = texture_desc();
+    desc.Width = desc.Height = 1024;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    return desc;
+}
+
+static bool depth_stencil_checks()
+{
+    auto resource = depth_stencil_desc();
+    auto stencil = view_desc(0, 1);
+    stencil.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    // Mutant: omit the PlaneSlice update. This exact shape must fail even if
+    // the native runtime tolerates plane 0.
+    if (check(stencil, resource) != srv::Refusal::none || stencil.Texture2D.PlaneSlice != 1 ||
+        stencil.Format != DXGI_FORMAT_X24_TYPELESS_G8_UINT) {
+        std::puts("FAIL: D24S8 stencil SRV must select plane 1");
+        return false;
+    }
+
+    auto depth = view_desc(0, 1);
+    depth.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    if (!unchanged(depth, resource)) return false;
+    depth.Texture2D.PlaneSlice = 1;
+    if (check(depth, resource) != srv::Refusal::none || depth.Texture2D.PlaneSlice != 0) return false;
+
+    auto wrong_family = view_desc(0, 1);
+    wrong_family.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    if (check(wrong_family, resource) != srv::Refusal::none ||
+        wrong_family.Format != DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+        wrong_family.Texture2D.PlaneSlice != 1) return false;
+    auto unrelated = view_desc(0, 1);
+    if (check(unrelated, resource) != srv::Refusal::format) return false;
+
+    resource.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    resource.DepthOrArraySize = 2;
+    depth.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    depth.Texture2DArray = {0, 1, 1, 1, 3, 0.0f};
+    if (check(depth, resource) != srv::Refusal::none ||
+        depth.Format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || depth.Texture2DArray.PlaneSlice != 0)
+        return false;
+    resource.SampleDesc.Count = 4;
+    stencil.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    stencil.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    stencil.Texture2DMSArray = {1, 1};
+    if (!unchanged(stencil, resource)) return false;
+
+    auto single_plane = view_desc(0, 1);
+    single_plane.Texture2D.PlaneSlice = 1;
+    if (check(single_plane, texture_desc()) != srv::Refusal::none || single_plane.Texture2D.PlaneSlice != 0)
+        return false;
+    resource = texture_desc();
+    resource.Format = DXGI_FORMAT_R32_TYPELESS;
+    single_plane.Format = DXGI_FORMAT_R32_FLOAT;
+    single_plane.Texture2D.PlaneSlice = 1;
+    return check(single_plane, resource) == srv::Refusal::none && single_plane.Texture2D.PlaneSlice == 0;
+}
+
 static int warp_check()
 {
     ComPtr<ID3D12Debug> debug;
@@ -196,7 +257,7 @@ static int warp_check()
                                                 nullptr, IID_PPV_ARGS(&resource)))) return 1;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = 2;
+    heap_desc.NumDescriptors = 3;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&descriptors)))) return 1;
 
@@ -217,12 +278,26 @@ static int warp_check()
     if (!x2w_startup::last_srv.site || std::strcmp(x2w_startup::last_srv.site, "fixture-refusal") ||
         !history[14].site || std::strcmp(history[14].site, "fixture-repair") ||
         !history[15].site || std::strcmp(history[15].site, "fixture-refusal")) return 1;
-    if (FAILED(device->GetDeviceRemovedReason())) return 1;
+    const auto depth_desc = depth_stencil_desc();
+    ComPtr<ID3D12Resource> depth;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&depth)))) {
+        std::puts("FAIL: WARP could not create the D24S8 resource");
+        return 1;
+    }
+    auto stencil = view_desc(0, 1);
+    stencil.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    dest.ptr += device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    if (!x2w_startup::x2w_create_srv(device.Get(), depth.Get(), &stencil, dest, "fixture-stencil") ||
+        FAILED(device->GetDeviceRemovedReason())) {
+        std::puts("FAIL: WARP rejected the repaired D24S8 stencil SRV");
+        return 1;
+    }
     if (messages && messages->GetNumStoredMessages() != 0) {
         std::puts("FAIL: debug layer reported messages while creating SRVs");
         return 1;
     }
-    std::puts("PASS: WARP created the repaired and null SRVs");
+    std::puts("PASS: WARP created the repaired color and stencil SRVs and the null SRV");
     return 0;
 }
 
@@ -230,6 +305,10 @@ int main(int argc, char** argv)
 {
     if (!buffer_checks() || !alias_checks() || !pure_checks()) {
         std::puts("FAIL: texture, alias mip and buffer SRV descriptor checks");
+        return 1;
+    }
+    if (!depth_stencil_checks()) {
+        std::puts("FAIL: depth-stencil SRV descriptor checks");
         return 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "warp") == 0) return warp_check();

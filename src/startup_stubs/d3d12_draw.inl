@@ -4098,7 +4098,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     const auto refusal = x2w_startup::validate_srv(device_of(the_device), view, real_desc,
                         resource ? resource->own().drop_levels : 0, "draw-texture", log);
                     if (refusal != srv_check::Refusal::none) {
-                        x2w_startup::srv_diagnostic("draw-texture", "refused", static_cast<unsigned>(refusal), 0, 0, log);
+                        x2w_startup::srv_diagnostic("draw-texture", "refused",
+                            x2w_startup::view_desc::refusal_field_name(refusal), 0, 0, log);
                         texture = nullptr;
                     }
                 }

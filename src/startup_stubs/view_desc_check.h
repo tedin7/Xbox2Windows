@@ -13,7 +13,41 @@ enum class Refusal {
     none, dimension, mip_range, array_range, format, plane, lod, denied, dropped_mips, buffer_range, count
 };
 
-enum class Field { mip_levels, array_size, num_cubes, mapping, format, count };
+enum class Field { mip_levels, array_size, num_cubes, mapping, format, plane_slice, count };
+
+inline const char* field_name(Field field)
+{
+    switch (field) {
+    case Field::mip_levels: return "MipLevels";
+    case Field::array_size: return "ArraySize";
+    case Field::num_cubes: return "NumCubes";
+    case Field::mapping: return "Shader4ComponentMapping";
+    case Field::format: return "Format";
+    case Field::plane_slice: return "PlaneSlice";
+    default: return "Unknown";
+    }
+}
+
+inline const char* refusal_field_name(Refusal refusal)
+{
+    switch (refusal) {
+    case Refusal::dimension: return "ViewDimension/SampleDesc.Count";
+    case Refusal::mip_range: return "MostDetailedMip/MipLevels";
+    case Refusal::array_range: return "FirstArraySlice/ArraySize/First2DArrayFace/NumCubes";
+    case Refusal::format: return "Format";
+    case Refusal::plane: return "PlaneSlice";
+    case Refusal::lod: return "ResourceMinLODClamp";
+    case Refusal::denied: return "Flags (DENY_SHADER_RESOURCE)";
+    case Refusal::dropped_mips: return "MostDetailedMip/ResourceMinLODClamp (dropped mips)";
+    case Refusal::buffer_range: return "FirstElement/NumElements";
+    default: return "Unknown";
+    }
+}
+
+inline bool stencil_srv_format(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+}
 
 inline bool valid_mapping(UINT mapping)
 {
@@ -90,9 +124,8 @@ inline Refusal check_default(const D3D12_RESOURCE_DESC& resource)
     if (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return Refusal::denied;
     if (default_dimension(resource) == D3D12_SRV_DIMENSION_UNKNOWN) return Refusal::dimension;
     const auto format = resource.Format;
-    const auto family = format_family(format);
     if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
-        family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS ||
+        is_planar_depth_stencil(format) ||
         format == DXGI_FORMAT_NV12 || format == DXGI_FORMAT_P010 || format == DXGI_FORMAT_P016 ||
         format == DXGI_FORMAT_420_OPAQUE)
         return Refusal::format;
@@ -136,7 +169,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     bool cube = false;
     UINT first_slice = 0;
     UINT first_mip = 0;
-    UINT plane = 0;
+    UINT* plane_slice = nullptr;
     float min_lod = 0.0f;
     UINT* mip_count = nullptr;
     UINT* array_count = nullptr;
@@ -160,14 +193,14 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     case D3D12_SRV_DIMENSION_TEXTURE2D:
         fits = tex2d && single_sample && slices == 1;
         mips(view.Texture2D);
-        plane = view.Texture2D.PlaneSlice;
+        plane_slice = &view.Texture2D.PlaneSlice;
         break;
     case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
         fits = tex2d && single_sample;
         mips(view.Texture2DArray);
         first_slice = view.Texture2DArray.FirstArraySlice;
         array_count = &view.Texture2DArray.ArraySize;
-        plane = view.Texture2DArray.PlaneSlice;
+        plane_slice = &view.Texture2DArray.PlaneSlice;
         break;
     case D3D12_SRV_DIMENSION_TEXTURE2DMS:
         fits = tex2d && multi_sample && slices == 1;
@@ -214,7 +247,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     }
 
     DXGI_FORMAT format = view.Format;
-    const auto family = format_family(resource.Format);
+    UINT plane = plane_slice ? *plane_slice : 0;
     // Planar video resources use a different format family for each plane.
     if (resource.Format == DXGI_FORMAT_NV12 || resource.Format == DXGI_FORMAT_P010 ||
         resource.Format == DXGI_FORMAT_P016) {
@@ -224,6 +257,21 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         else
             format = plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
         if (view.Format != format) return Refusal::format;
+    } else if (is_planar_depth_stencil(resource.Format)) {
+        const bool stencil = stencil_srv_format(format);
+        const bool multisampled = view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
+                                  view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        if (stencil && !plane_slice && !multisampled) return Refusal::plane;
+        if (!stencil && format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS &&
+            format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
+            return Refusal::format;
+        const bool d24 = format_family(resource.Format) == DXGI_FORMAT_R24G8_TYPELESS;
+        if (d24)
+            format = stencil ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        else
+            format = stencil ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        // MSAA descriptors have no PlaneSlice member. Their format selects the aspect.
+        plane = stencil ? 1u : 0u;
     } else {
         if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
             !format_cast_fits(resource.Format, format, fully_typed_casting))
@@ -231,13 +279,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
             format == DXGI_FORMAT_420_OPAQUE)
             return Refusal::format;
-        if (family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS) {
-            const bool stencil = format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
-                                 format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-            if (plane != static_cast<UINT>(stencil)) return Refusal::plane;
-        } else if (plane != 0) {
-            return Refusal::plane;
-        }
+        plane = 0;
     }
 
     const auto update = [&](Field field, auto& value, auto replacement) {
@@ -256,6 +298,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     if (!valid_mapping(view.Shader4ComponentMapping))
         update(Field::mapping, view.Shader4ComponentMapping, UINT{D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING});
     update(Field::format, view.Format, format);
+    if (plane_slice) update(Field::plane_slice, *plane_slice, plane);
     return Refusal::none;
 }
 

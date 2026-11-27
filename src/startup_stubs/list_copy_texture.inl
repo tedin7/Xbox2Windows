@@ -11,6 +11,7 @@ namespace {
 // Memory planes of a format on the resource's device (1 when the device cannot say).
 UINT copy_texture_planes(ID3D12Resource* resource, DXGI_FORMAT format)
 {
+    if (x2w_startup::is_planar_depth_stencil(format)) return 2;
     ID3D12Device* device = nullptr;
     if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device))) || !device) return 1;
     D3D12_FEATURE_DATA_FORMAT_INFO info{format, 1};
@@ -123,7 +124,8 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
         !copy_texture_side(src, real_src, side_src, format_src, bad_subresource))
         return refuse(bad_subresource ? "bad_subresource" : "unknown_resource");
     // Planar (depth-stencil, video) copies name a plane footprint format; only single-plane copies are forwarded.
-    if (side_dst.planes > 1 || side_src.planes > 1) return refuse("planar_unsupported");
+    if (side_dst.planes > 1 || side_src.planes > 1)
+        return refuse("planar_unsupported");
     ID3D12Resource* texture = side_dst.kind == x2w_list_copy_texture::Kind::subresource ? real_dst : real_src;
     if (side_dst.kind == x2w_list_copy_texture::Kind::subresource || side_src.kind == x2w_list_copy_texture::Kind::subresource) {
         x2w_list_copy_texture::Side blocks{};
