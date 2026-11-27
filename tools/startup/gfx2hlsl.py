@@ -4078,6 +4078,7 @@ class Stage:
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
     exec_known = False        # unit probes without __init__ customize this explicitly when needed
+    group_vote = False        # compute retry: one guest wave spans the thread group
     # Every EXEC write so far was a v_cmpx, which keeps only lanes the mask already had: EXEC is a subset of the entry mask.
     exec_narrow_only = False
     has_image_writes = True   # proved False in translate() only when no image write exists in the dispatch
@@ -6166,7 +6167,13 @@ class Stage:
             # the pc dispatch even when the preceding region took different paths.
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
-        refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
+        self.group_vote = (getattr(self, 'kind', None) == 'cs'
+                           and getattr(getattr(self, 'pipe', None), 'retry_group_vote', False))
+        refused = {}
+        if self.group_vote:
+            self.execz_counted_loops = self.waterfall_reads = {}
+        elif getattr(self, 'kind', None) == 'cs':  # probes skip __init__
+            refused = self.execz_refusals()
         # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
         # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
         self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
@@ -6179,7 +6186,7 @@ class Stage:
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         # The new proof is a retry only. Keep the dispatch and HLSL of every legacy success.
         retry_wave = getattr(self, 'retry_wave_reduction', False)
-        self.wave_exec |= retry_wave
+        self.wave_exec |= retry_wave or self.group_vote
         # Use the existing wave-uniform branch path only for a compute shader the lane proof rejected.
         # At most 4 threads always share one host wave (SM 6 minimum); a larger group could split across waves and vote per wave.
         scalar_vote = (bool(refused) and all(self.execz_scalar_votes.get(at) for at in refused)
@@ -6295,7 +6302,8 @@ class Stage:
                 self.recognized_reductions = set()
                 self.reduce_plan, self.reduce_pending = {}, {}
                 self.reduction_scratch = {}
-            self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
+            self.wave_voted_branches = set()  # EXEC / VCC branches decided collectively (wave_exec)
+            self.uses_group_any = self.uses_group_first = False
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
@@ -6485,7 +6493,7 @@ class Stage:
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
                     self.since_join = kept_u
-                    self.scc_uniform = (self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
+                    self.scc_uniform = ((self.group_vote or self.firstlane_cfg and self.kind == 'ps') and self.uniform_cf
                                         and self.scc_def is not None)
                     self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
@@ -6629,7 +6637,7 @@ class Stage:
                         if cond_uniform:
                             self.uniform_branches.add(off)
                         elif self.wave_exec and cond in ('execz', 'execnz', 'vccz', 'vccnz'):
-                            # Decided over the host wave (WaveActiveAnyTrue): every thread takes it together.
+                            # AMD RDNA 2 Instruction Set Architecture, §12.5 SOPP: test the whole wave mask.
                             self.wave_voted_branches.add(off)
                             self.uniform_branches.add(off)
                             cond_uniform = True
@@ -6643,9 +6651,8 @@ class Stage:
                             self.voted_branches.add(off)
                             cond_uniform = True
                         if self.wave_exec and not cond_uniform and self.wave_unsound is None:
-                            # A branch that is neither wave-uniform nor a vote parts the host wave, so no wave intrinsic
-                            # can be trusted to see every lane. Refused at the end of the pass, so that an earlier
-                            # refusal of the program keeps its own reason.
+                            # An unproved branch can separate lanes, making a later collective unsafe. Defer the
+                            # refusal until the end of the pass so an earlier refusal keeps its own reason.
                             self.wave_unsound = Unsupported('wave-wide read in a program with a branch (%s) that is '
                                                             'neither wave-uniform nor an EXEC / VCC vote' % name)
                         if not cond_uniform:
@@ -6780,6 +6787,11 @@ class Stage:
                     error.instruction = names[off]
                     raise error
                 refusals.append((reason, self.kind))
+        if self.group_vote:
+            # A projected mask SCC can also leak through a scalar select or src_scc without branching.
+            # Treat it as unmodelled wherever a reaching write has not been proven wave-uniform.
+            scc_effects = {off: ('an unproved wave mask' if effect == 'emitted' and off not in uniform_scc_writes
+                                 else effect) for off, effect in scc_effects.items()}
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
                 reason = 'scc from %s in %s' % ('descriptor data' if kind == 'descriptor' else kind, name)
@@ -7969,7 +7981,7 @@ class Stage:
 
     def lower_mask_word_sop2(self, base, ops, mods):
         """Lower whole-word reads of entry EXEC and straight-line compare masks."""
-        if (base not in MASK_WORD_SOP2 or mods or len(ops) != 3 or getattr(self, 'kind', None) != 'cs'
+        if (base not in MASK_WORD_SOP2 or mods or len(ops) != 3 or getattr(self, 'kind', None) != 'cs' or self.group_vote
                 or getattr(self, 'has_branches', False) or not getattr(self, 'exec_known', False)):
             return False
         # SM 6.0 guarantees at least four lanes per host wave. The group fits both the host
@@ -8211,15 +8223,16 @@ class Stage:
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
-                # The guest skips the block when no lane of the wave has the bit; here every thread of the host wave
-                # takes the same decision (convergence rule C2).
                 self.needs_sm6 = True
                 word = 'exec' if base[10:].startswith('exec') else 'vcc'
                 bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
-                # Keep the legacy vote spelling on the original translation path.
-                zero = (base[10:] in ('execz', 'vccz') if getattr(self, 'retry_wave_reduction', False)
-                        else base[10:].endswith('z'))
-                cond = ('!' if zero else '') + 'WaveActiveAnyTrue(%s)' % bit
+                if self.group_vote:
+                    cond = ('!' if base[10:] in ('execz', 'vccz') else '') + self.group_any(bit)
+                else:
+                    # Keep the legacy vote spelling on the original translation path.
+                    zero = (base[10:] in ('execz', 'vccz') if getattr(self, 'retry_wave_reduction', False)
+                            else base[10:].endswith('z'))
+                    cond = ('!' if zero else '') + 'WaveActiveAnyTrue(%s)' % bit
             elif base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
                 # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
                 # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
@@ -9439,10 +9452,19 @@ class Stage:
                                           else ('rc', p, w, scale, add + k & 0xffffffff))
                     break
 
+    def group_any(self, bit):
+        self.uses_group_any = True
+        return 'x2w_wave_any(lane, %s)' % bit
+
     def set_exec_scc(self, expr):
         self.exec_known = self.exec_narrow_only = False
         self.scc_effect = 'emitted'
         self.scc_verified = True
+        if self.group_vote:
+            # AMD RDNA 2 Instruction Set Architecture, SOP1: SAVEEXEC and WREXEC set SCC from the new mask.
+            self.emit('exec = (%s) & 1; scc = %s;' % (expr, self.group_any('exec != 0u')))
+            self.scc_uniform = True
+            return
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
@@ -12667,6 +12689,13 @@ class Stage:
         if len(ops) != 2:
             raise Unsupported(READFIRSTLANE_UNIFORM)
         src, dst = reg_range(ops[1]), reg_range(ops[0])
+        valid = (not mods and dst and dst[0] == 's' and dst[1] == dst[2]
+                 and src and src[0] == 'v' and src[1] == src[2])
+        if self.group_vote and valid:
+            # AMD RDNA 2 Instruction Set Architecture, §12.8 VOP1: read the first active lane, or lane 0.
+            self.uses_group_first = True
+            self.set_s(dst[1], 'x2w_wave_first(lane, %s, %s)' % (LE.EXEC_BIT, self.u(ops[1])), uniform=True)
+            return
         past_entry = getattr(self, 'past_entry', True)
         waterfalls = getattr(self, 'waterfall_reads', {})
         # A value defined with entry EXEC is still in the VGPR if no path since then could overwrite it.
@@ -12679,8 +12708,7 @@ class Stage:
             self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
-        if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2]):
+        if not valid:
             raise Unsupported(READFIRSTLANE_UNIFORM)
         if not uniform:
             if getattr(getattr(self, 'pipe', None), 'retry_firstlane', False):
@@ -16296,6 +16324,7 @@ class ComputePipeline(Pipeline):
         self.rw_keys = set()
         self.retry_entry_exec = False
         self.retry_firstlane = False
+        self.retry_group_vote = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -16303,20 +16332,43 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A readfirstlane refusal retries the existing EXEC proof before trying the wider proof and wave lowering."""
+        A readfirstlane refusal first retries the existing proofs. A single guest wave can then retry with group votes."""
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if (refusals is not None and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]
-                        and self.retry_readfirstlane()):
-                    continue
+                if not self.retry_group_vote and refusals is not None and len(refusals) > self._refusals_before:
+                    if ((READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]
+                            and self.retry_readfirstlane()):
+                        continue
+                    if self.retry_group_vote_for(refusals[self._refusals_before][0]):
+                        continue
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if str(reason) != READFIRSTLANE_UNIFORM or not self.retry_readfirstlane():
-                    raise
+                if not self.retry_group_vote:
+                    if str(reason) == READFIRSTLANE_UNIFORM and self.retry_readfirstlane():
+                        continue
+                    if self.retry_group_vote_for(str(reason)):
+                        continue
+                raise
+
+    def retry_group_vote_for(self, reason):
+        if not (reason == READFIRSTLANE_UNIFORM or reason.startswith('compute readfirstlane waterfall:')
+                or ' inside a block s_cbranch_execz skips per lane: ' in reason):
+            return False
+        threads = math.prod(self.group)
+        if threads > 64 or (threads > 32 and self.wave_size == 32):
+            return False
+        if threads > 32 and self.wave_size != 64:
+            code, refusals, decoded = self._stage_args
+            ins = (decoded if refusals is not None and decoded is not None else
+                   decode(strip_header(code), [] if refusals is not None else None))
+            if not wave64_exec_proof(ins):
+                return False
+        self.retry_group_vote = True
+        return True
 
     def retry_readfirstlane(self):
         # Keep both existing lowerings ahead of the new proof and wave path.
@@ -16403,6 +16455,42 @@ class ComputePipeline(Pipeline):
                 '    return word;',
                 '}',
             ])
+        # Uniform SCC/jump targets and group-wide EXEC/VCC decisions keep every thread's dispatch pc equal, even
+        # around back edges. Each collective is therefore reached by the whole group (DirectX-Specs, Work Graphs,
+        # Barrier() / GROUP_SYNC). Scalar writes execute across the group even with empty EXEC, and vector writes
+        # remain predicated on each lane's bit (AMD RDNA 2 Instruction Set Architecture, §3.3 and §4 scalar ALU).
+        if s.uses_group_any:
+            shared.extend([
+                'groupshared uint x2w_vote_word;',
+                'bool x2w_wave_any(uint lane, bool bit) {',
+                '    if (lane == 0u) x2w_vote_word = 0u;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    if (bit) InterlockedOr(x2w_vote_word, 1u);',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    bool voted = x2w_vote_word != 0u;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return voted;',
+                '}',
+            ])
+        if s.uses_group_first:
+            shared.extend([
+                'groupshared uint x2w_first_lane;',
+                'groupshared uint x2w_lane_value[%d];' % math.prod(self.group),
+                'uint x2w_wave_first(uint lane, bool active, uint value) {',
+                '    if (lane == 0u) x2w_first_lane = 0xffffffffu;',
+                '    x2w_lane_value[lane] = value;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    if (active) InterlockedMin(x2w_first_lane, lane);',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint selected = x2w_lane_value[x2w_first_lane == 0xffffffffu ? 0u : x2w_first_lane];',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return selected;',
+                '}',
+            ])
+        lane = []
+        if s.uses_group_any or s.uses_group_first:
+            x, y, _ = self.group
+            lane = ['    uint lane = tid.x + %du * (tid.y + %du * tid.z);' % (x, y)]
         image = getattr(s, 'image_proof', None)
         tables = []
         captures = []
@@ -16413,7 +16501,7 @@ class ComputePipeline(Pipeline):
             captures = ['    uint %s = 0;' % key for key, _ in image.captures.values()]
         return '\n'.join(self.common() + shared + tables + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + captures + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + lane + captures + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
