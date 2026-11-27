@@ -25,6 +25,7 @@ lost, vcc_hi read as zero) must fail the draw.
 
 PS_DATA also exports a hardwired low-word comparison and two scalar arithmetic results. A first-lane read at the
 join of a uniform branch exercises both retries. The exports use normal float bit patterns for both compilers.
+PS_DATA2 keeps a pair write in place and reads uniform scalar selects as VOP3 masks.
 """
 import hashlib
 import os
@@ -185,6 +186,46 @@ s_endpgm
         '6af21480806aeb81f46beb9aff0395be00000010156b15801406064a1500084af2020e7e148006bf010085bff4020e7e'
         '07052c7eff00887d0900090016020c7ef20c0a020f1800f802030405000081bf', None),
     # The extra scalar ranges reserve s8 through s105 and force the retry to use the low SGPRs.
+    'PS_DATA2': ('''s_mov_b64 vcc, 0x14500000
+s_mov_b32 vcc_hi, 0x3f800000
+s_add_u32 s20, vcc_hi, 16
+v_add_nc_u32_e32 v5, s20, v0
+s_cmp_eq_u32 s20, 0x3f800010
+s_cselect_b32 vcc_hi, -1, 0
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+v_add_co_ci_u32_e64 v3, s3, v0, 0, vcc_hi
+v_add_nc_u32_e32 v3, 1.0, v3
+s_cmp_eq_u32 s20, 0
+s_cselect_b32 vcc_lo, -1, 0
+v_cndmask_b32_e64 v4, 1.0, 2.0, vcc_lo
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+''',
+        'ff04eabe00005014f203ebbe6b90148014000a4a14ff06bf1000803fc1806b85020001d5f2e8ad01030328d50001ad01'
+        'f206064a148006bfc1806a85040001d5f2e8a9010f1800f802030405000081bf', None),
+    'PAIR_REACH': ('''s_mov_b32 exec_lo, -1
+s_mov_b32 vcc_hi, 0x40000000
+s_mov_b64 vcc, 0x14500000
+s_add_u32 s20, vcc_hi, 16
+s_mov_b32 vcc_hi, 0x3f800000
+s_add_u32 s21, vcc_hi, s20
+v_mov_b32_e32 v2, s21
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''', 'c103febef403ebbeff04eabe000050146b901480f203ebbe6b1415801502047e0f1800f802020202000081bf', "operand 'vcc_hi'"),
+    'UNIFORM_MOVES': ('''s_movk_i32 vcc_hi, -1
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+s_mov_b32 vcc_lo, 0
+v_cndmask_b32_e64 v3, 1.0, 2.0, vcc_lo
+s_movk_i32 vcc_lo, 0
+v_cndmask_b32_e32 v4, 1.0, v2, vcc_lo
+s_mov_b32 vcc_hi, -1
+v_cndmask_b32_e64 v5, 1.0, 2.0, vcc_hi
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+''',
+        'ffff6bb0020001d5f2e8ad018003eabe030001d5f2e8a90100006ab0f2040802c103ebbe050001d5f2e8ad010f1800f8'
+        '02030405000081bf', None),
     'PS_DESCRIPTOR': ('''s_load_dwordx8 s[100:107], s[8:9], 0x0
 s_load_dwordx4 s[12:15], s[8:9], 0x20
 s_mov_b32 s24, 0
@@ -368,6 +409,20 @@ def data_image():
     return out
 
 
+def data2_image():
+    scalar = 0x3f800000 + 16
+    hi = MASK if scalar == 0x3f800010 else 0
+    lo = MASK if scalar == 0 else 0
+    selected_word = (0x3f800000, 0x40000000)
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            pos = x | y << 16
+            out += [selected_word[hi & 1], (0x3f800000 + pos + (hi & 1)) & MASK,
+                    selected_word[lo & 1], (scalar + pos) & MASK]
+    return out
+
+
 def sub(text, pattern, replacement):
     mutated, count = re.subn(pattern, replacement, text)
     assert count == 1, pattern
@@ -390,6 +445,7 @@ DATA_MUTATIONS = {
 DRAW_CASES = (
     ('PS', image, MUTATIONS),
     ('PS_DATA', data_image, DATA_MUTATIONS),
+    ('PS_DATA2', data2_image, {'the uniform select is ignored': (r'v2 = \(s\d+ & 1\)', 'v2 = (0u & 1)')}),
 )
 
 
@@ -440,6 +496,7 @@ def controls():
 def check_split():
     with patch.object(G, 'wave32_vcc_split', return_value=None):
         for name, reason in (('PS_DATA', 'v_cmp_gt_u32 into vcc_hi'),
+                             ('PS_DATA2', 's_mov_b32 destination vcc_hi'),
                              ('PS_DESCRIPTOR', 's_buffer_load destination vcc_lo for 1 dwords'),
                              ('VS_DATA', 's_mov_b32 destination vcc_hi')):
             _, refusal = translate(name)
@@ -483,6 +540,29 @@ def check_split():
         text, reason = translate('PS_DATA')
         check('the wave64 assumption vetoes an odd mask field without a wave32 EXEC form',
               text is None and reason == 'v_cmp_gt_u32 into vcc_hi', reason)
+
+    check_pair_and_uniform_masks()
+
+
+def check_pair_and_uniform_masks():
+    original = G.decode(fixture_code('PAIR_REACH'))
+    split = G.wave32_vcc_split(original)
+    check('a pair definition pins its high-word reader and leaves the surrounding writes free',
+          split is not None and split[2:4] == original[2:4]
+          and re.fullmatch(r's_mov_b32 s\d+, 2\.0', split[1][3]) is not None
+          and re.fullmatch(r's_mov_b32 s\d+, 1\.0', split[4][3]) is not None
+          and split[5][3] != original[5][3])
+
+    pipe = G.Pipeline(VS_WORDS, fixture_code('PS_DATA2'), root_blob(), ps_hw_inputs=PACKED)
+    check('PS_DATA2 preserves the encoded pair write',
+          pipe.ps.ins[0] == G.decode(fixture_code('PS_DATA2'))[0])
+    hlsl = pipe.hlsl_ps()
+    select = re.search(r'(s\d+) = scc \? 0xffffffffu : 0x00000000u;\s+v2 = \(\1 & 1\)', hlsl)
+    check('PS_DATA2 reads the scalar select bit for both cndmask and carry-in',
+          select is not None and 'a = a + (%s & 1u);' % select[1] in hlsl)
+    with patch.object(G, 'vcc_uniform_mask_def', return_value=False):
+        text, reason = translate('PS_DATA2')
+        check('PS_DATA2 needs the uniform-mask exemption', text is None and reason is not None, reason)
 
 
 def draw(renderer, adapter, vs, ps, expected):
