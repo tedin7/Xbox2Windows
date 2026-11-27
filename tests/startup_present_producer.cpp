@@ -92,6 +92,7 @@ int main(int argc, char** argv)
     const bool flat_onset = argc >= 2 && std::strcmp(argv[1], "auto-onset") == 0;
     const bool automatic = use_magenta || default_cadence || flat_onset || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
     const bool levels = argc >= 2 && std::strcmp(argv[1], "auto-levels") == 0;
+    const bool black_onset = argc >= 2 && std::strcmp(argv[1], "auto-black") == 0;
     const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
@@ -244,6 +245,17 @@ int main(int argc, char** argv)
             call(queue, 10, 1, arg(lists));
             if (!finish() || !present()) return 25;
         }
+    } else if (black_onset) {
+        constexpr float black[]{0, 0, 0, 1}, white[]{1, 1, 1, 1};
+        constexpr float fade[]{9.0f / 255.0f, 0, 0, 1}, dark[]{8.0f / 255.0f, 0, 0, 1};
+        const D3D12_RECT corner{0, 0, 4, 4};
+        // #1–2 start black. #5 has a bright corner and #6 has a dark but nonflat corner.
+        // #8 is the first qualifying onset. Publication at #9 captures #10–11.
+        if (!emit(black) || !present() || !present() || !emit(white) || !present() ||
+            !emit(fade) || !present() || !emit(black, white, &corner) || !present() ||
+            !emit(black, dark, &corner) || !present() || !emit(fade) || !present() ||
+            !emit(dark) || !present() || !present() || !emit(black, dark) || !present() ||
+            !emit(black) || !present() || !emit(black) || !present() || !present()) return 19;
     } else if (!emit(automatic && !default_cadence && !flat_onset ? chosen : blue) || !present()) {
         return 8; // discover the title's present surface
     } else if (flat_onset) {

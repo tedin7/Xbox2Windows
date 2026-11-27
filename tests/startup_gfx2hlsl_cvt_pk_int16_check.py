@@ -4,6 +4,8 @@
                                        provenance, encoding-guard and refusal controls, pure Python
   binary <llvm-mc>                     reassemble every fixture and instruction spelling and compare with recorded words
   decode <libLLVM>                     disassemble the VOP3A words with LLVM's C API and compare with disasm_rdna2.py
+  draw-unorm <dxc> <offscreen_check> warp
+                                       draw normalized packs and require the truncation mutant to fail
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        compile the translated pairs with FXC ps_5_1 when given and with DXC ps_6_0,
                                        draw 16 input pairs per opcode and verify four mutated HLSL controls per opcode
@@ -13,6 +15,7 @@ in bits 31:16, with saturation bounds [0, 65535] (unsigned) and [-32768, 32767] 
 pack_uvec2_to_uint / pack_ivec2_to_uint selected in ACO and the pixel_aot lowering (#779). Both instructions exist
 only in the VOP3A encoding on gfx10.
 """
+import math
 import re
 import struct
 import sys
@@ -524,15 +527,104 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     print(f'{adapter}: {draws} draws matched, {mut_checks} mutated draws read their mutated words')
 
 
+def f32_bits(value):
+    return struct.unpack('<I', struct.pack('<f', value))[0]
+
+
+def unorm_cases():
+    midpoint = f32_bits(0.5)
+    ties = [f32_bits((n + 0.5) / 65535) for n in (0, 1234, 65534)]
+    values = [f32_bits(x) for x in (-1.0, 0.0, 0.5, 1.0, 2.0, math.inf, -math.inf)]
+    values.extend((0x7fc12345, midpoint - 1, midpoint + 1))
+    values.extend(center + delta for center in ties for delta in (-1, 1))
+    return [(left, right, 0) for left, right in zip(values, values[4:] + values[:4])]
+
+
+def unorm_reference(bits, truncate=False):
+    value = struct.unpack('<f', struct.pack('<I', bits))[0]
+    clipped = min(1.0, max(0.0, value)) if not math.isnan(value) else 0.0
+    # A binary32 multiplied by a 16-bit integer is exact in Python's binary64.
+    scaled = clipped * 65535
+    return int(scaled) if truncate else round(scaled)
+
+
+def unorm_words():
+    op = vop3a(0x369, 12, 256, 260) + vop3a(0x369, 13, 257, 261)
+    # Define every exported component, though only the first two carry packed results.
+    op += struct.pack('<2I', 0x7e1c0280, 0x7e1e0280)
+    return PRE_WORDS + op + POST_WORDS
+
+
+def unorm_pipeline(cases):
+    return G.Pipeline(vs_words(cases + [(0, 0, 0)] * 2), unorm_words(), root_blob())
+
+
+def unorm_controls():
+    midpoint = f32_bits(0.5)
+    assert [unorm_reference(x) for x in (midpoint - 1, midpoint, midpoint + 1)] == [32767, 32768, 32768]
+    assert unorm_reference(midpoint, truncate=True) == 32767
+    assert 'pknorm_u16(asuint(F(v0)))' in unorm_pipeline(unorm_cases()[:2]).hlsl_ps()
+    for reserved in (dict(src2=1), dict(op_sel=1), dict(omod=1), dict(clamp=1), dict(neg=4), dict(abs_bits=4)):
+        try:
+            G.decode(vop3a(0x369, 12, 256, 260, **reserved))
+        except G.Unsupported as exc:
+            assert str(exc) == 'v_cvt_pknorm_u16_f32 with reserved operand or modifier bits', exc
+        else:
+            raise AssertionError(reserved)
+
+
+def check_unorm_draw(dxc, renderer, adapter):
+    unorm_controls()
+    cases = unorm_cases()
+    out = HERE.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        text = unorm_pipeline(cases[:2]).hlsl_ps()
+        # Carry each half as the low bits of a finite normal float. The RGBA32F target
+        # can then read back every bit of two packed words, including NaN encodings.
+        export = 'float4(F(v12), F(v13), F(v14), F(v15))'
+        transport = 'float4(' + ', '.join(
+            f'asfloat(0x3f800000u | ((v{reg} >> {shift}u) & 0xffffu))'
+            for reg in (12, 13) for shift in (0, 16)) + ')'
+        assert text.count(export) == 1
+        text = text.replace(export, transport)
+        nearest = 'return q + (guard & uint(sticky || (q & 1u) != 0u));'
+        assert text.count(nearest) == 1
+        good = compile_hlsl(dxc, 'dxc', text, 'unorm', 'ps_6_0', directory)
+        mutant = compile_hlsl(dxc, 'dxc', text.replace(nearest, 'return q;'), 'truncate', 'ps_6_0', directory)
+
+        def expected(chunk, truncate=False):
+            return words_text(0x3f800000 | unorm_reference(x, truncate) for a, b, _ in chunk for x in (a, b))
+
+        rejected = 0
+        for index in range(0, len(cases), 2):
+            chunk = cases[index:index + 2]
+            vs = compile_hlsl(dxc, 'dxc', unorm_pipeline(chunk).hlsl_vs(), f'vs_{index}', 'vs_6_0', directory)
+            want = expected(chunk)
+            run = draw(renderer, adapter, vs, good, want)
+            assert run.returncode == 0, (chunk, run.stdout, run.stderr)
+            truncated = expected(chunk, truncate=True)
+            if truncated != want:
+                run = draw(renderer, adapter, vs, mutant, want)
+                assert run.returncode == 1 and f'actual={truncated}' in run.stderr, (chunk, run.stdout, run.stderr)
+                rejected += 1
+        assert rejected
+        print(f'{adapter}: {len(cases)} normalized packs matched, {rejected} truncation draws rejected')
+
+
 def main():
     if len(sys.argv) == 1:
         controls()
+        unorm_controls()
         return
     mode, *args = sys.argv[1:]
     if mode == 'binary' and len(args) == 1:
         check_binary(args[0])
     elif mode == 'decode' and len(args) == 1:
         check_decode(args[0])
+    elif mode == 'draw-unorm' and len(args) == 3:
+        check_unorm_draw(*args)
     elif mode == 'draw' and len(args) in (3, 4):
         check_draw(*args)
     else:

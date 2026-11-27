@@ -13,6 +13,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "startup_stubs/local_log.h"
 
 namespace era_heap {
 namespace {
@@ -61,6 +62,7 @@ void* allocate_pages(std::size_t bytes, std::size_t alignment) noexcept
         // Another thread can take the range between the release and this call.
         if (auto* p = VirtualAlloc(reinterpret_cast<void*>(aligned), committed,
                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+            x2w_local::record_read_span(p, committed);
             return p;
         }
     }
@@ -117,7 +119,9 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
             return nullptr;
         }
         // Committed pages are zero-filled by the system.
-        return VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        void* allocation = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (allocation) x2w_local::record_read_span(allocation, bytes);
+        return allocation;
     }
 
     // Physical memory types need title physical pages, which this experiment does not model.
@@ -133,7 +137,7 @@ void release(void* allocation) noexcept
     if (allocation && (address & (geometry().granularity - 1)) == 0 &&
         VirtualQuery(allocation, &info, sizeof(info)) == sizeof(info) &&
         info.AllocationBase == allocation) {
-        VirtualFree(allocation, 0, MEM_RELEASE);
+        x2w_local::release_read_span(allocation);
         return;
     }
     _aligned_free(allocation);
@@ -148,7 +152,7 @@ void release_with_attributes(void* allocation, std::uint64_t attributes) noexcep
     if (memory_type == heap) {
         release(allocation);
     } else if (is_graphics(memory_type)) {
-        VirtualFree(allocation, 0, MEM_RELEASE);
+        x2w_local::release_read_span(allocation);
     }
 }
 }

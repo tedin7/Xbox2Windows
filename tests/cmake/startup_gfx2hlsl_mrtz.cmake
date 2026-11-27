@@ -1,0 +1,10 @@
+if(EXISTS "${INTAKE_PYTHON}")
+    set(mrtz_check "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_mrtz_check.py")
+    add_test(NAME startup_gfx2hlsl_mrtz COMMAND "${INTAKE_PYTHON}" -B "${mrtz_check}")
+    if(DXC_EXECUTABLE AND TARGET offscreen_check)
+        add_test(NAME startup_gfx2hlsl_mrtz_warp COMMAND "${INTAKE_PYTHON}" -B "${mrtz_check}"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>")
+        set_tests_properties(startup_gfx2hlsl_mrtz_warp PROPERTIES TIMEOUT 60)
+    endif()
+    unset(mrtz_check)
+endif()

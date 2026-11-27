@@ -31,6 +31,14 @@ struct Stream {
     Root root;
     Stage vs;
 };
+struct alignas(8) TargetFormats {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_RT_FORMAT_ARRAY formats;
+};
+struct TargetStream {
+    TargetFormats targets;
+    Stream stream;
+};
 struct alignas(8) Layout {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
     D3D12_INPUT_LAYOUT_DESC desc;
@@ -197,8 +205,12 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
     const bool layout = GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", nullptr, 0) != 0;
-    void* first = layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
-    const SIZE_T whole = layout ? sizeof(with_layout) : sizeof(with_layout.stream);
+    const bool gbuffer = GetEnvironmentVariableW(L"X2W_TEST_GBUFFER_TARGETS", nullptr, 0) != 0;
+    TargetStream with_targets{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                               {{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT}, 2}}, with_layout.stream};
+    void* first = gbuffer ? static_cast<void*>(&with_targets) :
+                  layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
+    const SIZE_T whole = gbuffer ? sizeof(with_targets) : layout ? sizeof(with_layout) : sizeof(with_layout.stream);
     auto submit = [&](SIZE_T bytes) {
         D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, first};
         const auto hr = reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso);
@@ -279,7 +291,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const bool typed = stream_mrt_format(format, mrt);
     const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
-    // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
+    // A caller that wants a second target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
@@ -297,8 +309,10 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     const float clear[] = {0, 0, 1, narrow ? 0.0f : 1.0f};
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
-        const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? mrt.typeless : view_format;
+        const auto view_format = i ? state.second_format : format;
+        StreamMrtFormat attachment{};
+        const bool typed_attachment = stream_mrt_format(view_format, attachment);
+        const auto resource_format = typed_attachment && attachment.integer ? attachment.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -307,7 +321,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (typed_attachment ? attachment.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 

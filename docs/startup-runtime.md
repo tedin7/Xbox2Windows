@@ -531,23 +531,33 @@ six out-of-range calls. The switched case clears both inputs to the shader.
 
 ## Null bindings in translated draws
 
-The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
-`(entry, buffer, token, wrapper, dimension)`. Each null binding falls in exactly one cause, so
-the five parts add up to N:
+The `x2w-render totals` line reports `null bindings N` and its six causes: `entry`,
+`buffer`, `token`, `wrapper`, `dimension`, and `ring_full`. A ring-full event
+contributes to these totals when the upload failure refuses a translated draw.
 
-- entry: the descriptor table entry is null, empty or unreadable.
-- buffer: the buffer address or size is missing or unreadable, or the frame copy failed.
-- token: the descriptor memory names a view id the wrapper never issued.
-- wrapper: the texture's resource is missing or is not a resource wrapper.
-- dimension: the view dimension does not match the shader, so a null texture is bound.
+The always-on `x2w-render null input` lines show cumulative calls and first/last
+frames by pipeline key, shader input index and cause. The 512-row census
+keeps the first event's input kind, render-target-0 and depth-view formats,
+and cause details. Each totals or 10-second report emits up to 24 changed
+input rows ranked by calls. A separate 64-row census counts recorded translated
+draws by render-target-0 resource since the previous census report. Each
+`x2w-render target` line gives the frame span, total draws and draws that
+bound at least one null input. A refused draw contributes no target draw.
+The overflow line gives cumulative input events and window target draws
+that could not fit in their respective tables. The tester archive includes
+these rows and the percentage of draws with null inputs per target window
+in `null-inputs.txt`.
 
-The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
-`startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
-valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
-by reading a render log. The device prints the counts by cause value, so
-`ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
-checks without a device that each cause lands in the slot printed under its label, and that the
-header's names follow the same order. The control swaps the buffer and token slots and must fail.
+The WARP fixture checks synthetic pixels with valid inputs, an unknown
+texture token and an unreadable buffer. It also fills the upload ring and
+checks that a clear survives the refused draw. A second unknown token on
+a different input exercises the key's input-index field. The control
+requires the readbacks and baseline census to pass before checking for
+the expected index failure.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(null_cause_labels(_buffer_token_control)?|null_views_census(_omit_index_control)?_warp|tester_pack)$'
+```
 
 ### Refused slot 70 calls and token nulls in the five-second report
 
@@ -950,6 +960,20 @@ It interprets none of these parts and still creates a placeholder. With `X2W_D3D
 | `req_<key>.root` | the serialized root signature |
 | `req_<key>.c67` | the program code (at most 1 MiB); written last, as the ready marker |
 
+An allocation-aware request producer can atomically publish an optional
+`req_<key>.lds` sidecar with one little-endian uint32 byte count. The translator
+uses that count when the program allocation is zero or above 32 KiB. The
+count must be positive, dword-aligned and at most 32 KiB. The result manifest
+still identifies one shader per request key, so a producer must supply the
+same allocation for every dispatch using that key. A sidecar published after
+a refusal makes the request eligible for translation again. The current
+command-list dispatch path supplies group counts only.
+
+`startup_compute_lds_size` covers a zero program allocation with a 1 KiB
+sidecar and a 40 KiB program allocation with a 24 KiB sidecar. Each WARP case
+compares the shader output with a CPU peer-exchange reference. Its same-lane
+control must produce a readback mismatch.
+
 The `.c67` extension keeps these requests apart from draft #1954, which uses `req_<key>.cs` for desktop DXIL
 containers created at device slot 62.
 
@@ -1264,6 +1288,13 @@ family when a sample translates. The cache records where probing stopped so a ca
 with the next family. The newest run with both render census and per-key use records supplies the
 weights. The switch defaults to off.
 
+**Typed render-target variants.** Graphics streams that declare their RTV formats request the variant at
+pipeline creation. Streams without a usable format list and the slot 57 graphics state blocks use the bound
+views at draw time. When a base translates successfully, the worker processes its pending variants in the same
+job, including during capped pre-run retries. While a base is refused, its variants report `base refused`. The
+watcher prioritizes variants whose bases are already ready. The periodic RTV totals count distinct requested
+keys, distinct variants loaded (including cache hits), and successful draws using the optional base fallback.
+
 **Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies graphics, RTV variant, slot 67 compute and slot 57 mesh requests under their current keys. It uses `pipeline_key`, `compute_key` and `mesh57_key` from the adjacent `gfx2hlsl.py` and updates each RTV variant with its new graphics key. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
 
 ```powershell
@@ -1483,6 +1514,16 @@ cmake --build --preset dev --target startup_local_log_check startup_local_log_ca
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control|_cache_failure_control)?$' -V
 ```
 
+The opt-in read-cache checks use 96 committed pages separated by reserved pages. The CPU check probes
+10,000 ranges in each switch setting and checks the first probe after a decommit. Its control skips the
+decommit invalidation and must report a stale hit. The WARP check renders a second recording from the
+warmed index pages and compares its pixels with the CPU reference. Its clipped-index control must
+produce the clear color instead. Run these checks on Windows with the development preset and FXC:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_read_cache_(cpu_(on|off)|decommit_control|indexed_warp(_control)?)$' -V
+```
+
 ## Trap-by-default header check
 
 `tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 41 cases, with
@@ -1531,11 +1572,13 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`; `tester_run.ps1` turns it on, `-NoLowAddresses` off) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
+| `X2W_READ_CACHE=1` | Experimental, off by default. Shares up to 16,384 readable committed spans across the process. Allocator commits and section maps seed the table, and decommit, release and unmap remove the affected range. Uncovered addresses go to `VirtualQuery`. Probes and copies still touch title memory under structured exception handling. The render totals report lookups, hits, system queries, spans and erases. |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
+| `X2W_RTV_BASE_FALLBACK=1` | While a typed render-target variant is pending, allow the base translation when every target requiring specialization is a binary32 floating-point target. Any integer RTV keeps the draw pending until the variant is ready. Default off. |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it (private allocations larger than 256 MiB are skipped only with `X2W_D3D12_CAP_EXISTING_HEAP=1`), otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
@@ -1554,6 +1597,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
 | `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
+| `X2W_LIVE_LOG` (read by `tools/startup/debug_launch.py`) | the live debug-log window of a run: unset or `minimized` starts it minimized and without taking the focus (so it does not cover the game or appear in window screenshots); `normal` opens it in front as before; `off` opens none. Any other value is the default. |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
@@ -3428,11 +3472,29 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
-texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. By default, a mismatched or interior view overlapping a live resource preserves the destination descriptor.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
-textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+the linear mode `0x100` without a live texture, multisampled textures, the XOR swizzle modes and
+every other layout value. The texels must be readable and span
 at most 64 MiB.
+
+With `X2W_SLOT70_MEMORY_CUBE=1`, slot 70 also accepts `TextureCube` and
+`TextureCubeArray` views of square, single-sample 2D textures with six slices per
+cube, including 1×1 faces. It uses a matching live texture for layout 0 or the
+existing publication path for supported console layouts. Slice order is +X, -X,
++Y, -Y, +Z, -Z. Cube-array views must fit the resource from the first face, and
+both view types must fit the mip range. The switch defaults to off.
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_address_cube_srv_warp$' -V
+```
+
+The WARP fixture samples all six directions for a placed cube and for a
+two-cube view starting at slice six. It repeats those checks on synthetic
+256-byte tiled backing. It compares all 32 RGBA pixels per draw with the CPU
+reference, checks that switch-off and out-of-range calls preserve the
+descriptor, and requires the swapped +X/-X face data to fail the original
+comparison for each backing and view type.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
 partial-tile BC view is held for. `console_layout_xg_rows`: the latest XG stand-in copy announced
@@ -3486,6 +3548,38 @@ layouts"):
 
 - `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
+
+### Overlapping texture views
+
+`X2W_SLOT70_ALIAS_TEXTURE=1` lets slot 70 publish a multi-mip 2D or 2D-array
+SRV over a live slot 133 texture on the same device. The request must fit a
+single owner and map to a contiguous range of whole mips in one or more
+array slices. The layout check matches the storage format, swizzle, mip
+offsets, block row widths and mip-tail origins. Multi-slice views also need
+the same slice stride. The desktop descriptor names the matching mip and
+slice range of the existing backing, so GPU writes through other views
+are visible with normal resource transitions. A second, differently
+described placed texture cannot generally inherit these bytes under
+[D3D12's texture data inheritance rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-aliasing-and-data-inheritance).
+
+`overlapping_resource` still applies when the request crosses a resource
+boundary, meets multiple live resources, or overlaps a buffer, a lazy
+texture, or an incompatible texture. This includes offsets that miss whole
+subresources, different formats or swizzles, backing with substituted
+format or dimensions, depth resources and resources that deny SRVs.
+A 2D view requires a single-slice owner. The existing console-layout
+holds still apply. The switch defaults off.
+
+The synthetic WARP fixture publishes the alias, clears the owner's mips
+through RTVs and compares the draw's 32 pixels with a CPU reference.
+It exercises both the first slice's mip tail and the second slice's
+interior address. The disabled and misaligned cases preserve the null
+descriptor. The wrong-slice control must differ from the interior reference
+at all 32 pixels.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_slot70_texture_alias_warp$' -V
+```
 
 ## Linear buffer backing (device slot 133, opt-in)
 
@@ -3566,6 +3660,22 @@ descriptions with:
   synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
+
+With `X2W_SLOT70_MEMORY_BUFFER=1`, a structured view with first element 0, count 1 and
+stride equal to the buffer width can recover from `buffer_unavailable` if its exact byte range
+is readable and outside live resources. Slot 70 copies the requested bytes to a D3D12 upload
+buffer and publishes a desktop SRV. The per-view guard is 1 MiB, subject to the existing
+2048-byte structured-stride limit. The process-wide budget is 128 MiB, charged for the
+desktop allocation and the retained CPU snapshot. A repeated publication reuses an identical
+snapshot by device, address, size and bytes. A changed publication uses a separate backing
+so older descriptors retain their original bytes until device cleanup. To observe a title
+write through a desktop descriptor, publish the SRV again. The switch defaults to off.
+
+On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_slot70_memory_buffer_(enabled|off|stale)_warp$'`.
+The fixture publishes a synthetic 256-byte SRV inside a partially committed reservation and
+compares native compute readback with CPU data. The off control checks the refusal and null
+readback. The stale mutant must fail the refreshed readback with the first generation.
 
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's

@@ -89,7 +89,12 @@ struct FreePages {
 };
 
 struct Allocation { uintptr_t cpu; UINT64 gpu, bytes; ID3D12Resource* resource; UINT64 offset; };
+struct DescriptorSnapshot {
+    ComPtr<ID3D12DescriptorHeap> heap;
+    std::vector<ComPtr<ID3D12Resource>> resources;
+};
 struct Arena {
+    std::vector<DescriptorSnapshot> descriptor_snapshots;
     std::vector<std::unique_ptr<Page>> pages;
     std::vector<Allocation> allocations;
     // The queue fences the recording was submitted behind (per fence, the last value), whether one of its submits
@@ -103,10 +108,11 @@ struct Arena {
     std::vector<QueueGuard> guards;
 
     // The caller must retire all recordings and GPU submissions before releasing their pages.
-    void reset() { allocations.clear(); pages.clear(); }
+    void reset() { descriptor_snapshots.clear(); allocations.clear(); pages.clear(); }
 
     // The recording's pages go to `free` (or are released past its limits). The same precondition as reset().
     void recycle(FreePages& free) {
+        descriptor_snapshots.clear();
         allocations.clear();
         for (auto& page : pages) free.give(std::move(page));
         pages.clear();
@@ -135,13 +141,13 @@ struct Arena {
         return true;
     }
 
-    Allocation range(UINT64 cpu, UINT64 bytes) const {
+    Allocation range(UINT64 cpu, UINT64 bytes, bool remaining = false) const {
         if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
             if (offset < it->bytes && bytes <= it->bytes - offset)
-                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, remaining ? it->bytes - offset : bytes, it->resource, it->offset + offset};
         }
         return {};
     }

@@ -60,6 +60,7 @@ void* local_alloc(SIZE_T bytes, ULONGLONG attributes)
 {
     void* block = bytes ? VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : nullptr;
     if (block) {
+        x2w_local::record_read_span(block, bytes);
         AcquireSRWLockExclusive(&local_lock);
         local_blocks().insert(block);
         ReleaseSRWLockExclusive(&local_lock);
@@ -76,7 +77,7 @@ bool local_free(void* block)
     AcquireSRWLockExclusive(&local_lock);
     const bool ours = local_blocks().erase(block) != 0;
     ReleaseSRWLockExclusive(&local_lock);
-    if (ours) VirtualFree(block, 0, MEM_RELEASE);
+    if (ours) x2w_local::release_read_span(block);
     return ours;
 }
 }  // namespace

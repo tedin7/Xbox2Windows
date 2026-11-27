@@ -580,7 +580,7 @@ OperationResult run_compute_store_dpp_case(const OperationContext& ctx)
 // descriptor-table signature, because a texture SRV cannot be a root descriptor.
 OperationResult run_compute_texture_case(const OperationContext& ctx)
 {
-    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4]);
+    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -930,6 +930,12 @@ OperationResult run_depth_mask(const OperationContext& ctx)
 OperationResult run_depth_mask_swapped(const OperationContext& ctx)
 {
     check_depth_mask_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_depth_mask_color(const OperationContext& ctx)
+{
+    check_depth_mask_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, true);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1380,7 +1386,7 @@ OperationResult run_startup_image_2d_view(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array> <vs.cso> <ps.cso> <expected.bin>:
+// --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array|rgba32f_sampled> <vs.cso> <ps.cso> <expected.bin>:
 // draws an 8x2 full-screen pair to an R32G32B32A32_UINT target against a two-mip (8x2 + 4x1) 2D or two-slice
 // 2D-array R16_UNORM / R32G32B32A32_FLOAT source texture and compares all 64 little-endian words with expected.bin.
 OperationResult run_startup_image_load_d16(const OperationContext& ctx)
@@ -1388,15 +1394,16 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     const bool depth16 = std::strcmp(ctx.argv[3], "r16_unorm") == 0 || std::strcmp(ctx.argv[3], "r16_unorm_array") == 0;
     const bool rgba32f = std::strcmp(ctx.argv[3], "rgba32f") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
     const bool array = std::strcmp(ctx.argv[3], "r16_unorm_array") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
-    if (!depth16 && !rgba32f)
-        return {OutcomeKind::fail, "image_load d16 source mode must be r16_unorm[_array] or rgba32f[_array]"};
+    const bool sampled = std::strcmp(ctx.argv[3], "rgba32f_sampled") == 0;
+    if (!depth16 && !rgba32f && !sampled)
+        return {OutcomeKind::fail, "image_load d16 source mode must be r16_unorm[_array] or rgba32f[_array|_sampled]"};
     std::uint32_t expected[64]{};
     std::ifstream file(ctx.argv[6], std::ios::binary);
     file.read(reinterpret_cast<char*>(expected), sizeof(expected));
     if (!file || file.peek() != std::char_traits<char>::eof())
         return {OutcomeKind::fail, "expected file does not hold 64 words"};
     std::uint32_t actual[64]{};
-    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual, array);
+    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual, array, sampled);
     unsigned differing = 0;
     for (unsigned i = 0; i < 16; ++i) {
         const std::uint32_t* want = &expected[i * 4];
@@ -1586,6 +1593,13 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 // target must hold, compared bit for bit.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
+    const bool dynamic_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    if (dynamic_heap) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+            return {OutcomeKind::skip, "direct heap indexing requires resource binding tier 3"};
+    }
     const auto entry = parse_hex_words(ctx.argv[5]);
     const auto expected = parse_hex_words(ctx.argv[6]);
     if (entry.empty() || entry.size() > 32)
@@ -1593,7 +1607,7 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
     if (expected.size() != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap);
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1683,6 +1697,9 @@ constexpr CapabilityGate kGateSm60MinLodLevels{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: MinLod exact mip and blend fixture requires SM 6.0",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66DynamicHeap{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "direct heap indexing requires Shader Model 6.6", CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: MinLod fixture requires SM 6.6",
@@ -1708,7 +1725,7 @@ const OperationSpec kOperations[] = {
     {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
-    {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
+    {"--compute-texture-case", 5, 6, nullptr, kNoGate, run_compute_texture_case},
     {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
     {"--compute-texture-store-case", 5, 5, nullptr, kNoGate, run_compute_texture_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
@@ -1730,6 +1747,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
+    {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
@@ -1786,6 +1804,7 @@ const OperationSpec kOperations[] = {
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
+    {"--depth-mask-color", 6, 6, nullptr, kNoGate, run_depth_mask_color},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},

@@ -28,9 +28,14 @@ identity (so `fi` and `bound_ctrl` have nothing to decide), and `vT` and `sD` be
 ## Contract and helper lanes
 
 The console packs pixels into waves in its own way, so a correct program cannot depend on which pixels share a wave;
-the contract is the active lanes of the desktop wave. The chain is accepted only in a straight-line pixel stage whose
-EXEC is still the entry mask and was not widened by `s_wqm`, so on the console the helper lanes hold the identity,
-and on the desktop the wave operations leave them out (the draws check it).
+the contract is the active lanes of the desktop wave. With entry EXEC, console helper lanes hold the identity and
+desktop wave operations exclude helpers. The draws include partially covered quads.
+
+When the legacy translator refuses a reduction because the program has a backward branch, a pixel-only retry
+proves entry EXEC at the chain on every incoming control-flow edge. It intersects mask facts at joins and back edges
+and recognizes restores from a saved entry mask. EXEC and VCC branches use a wave vote, while SCC branches need a
+wave-uniform condition. The retry refuses programs containing whole-quad mode, unmodeled participation changes,
+jumps into a chain, or uses of the omitted permutation result on any path from the restore.
 
 ## Refusals
 
@@ -89,3 +94,13 @@ object (`-filetype=obj`) and compared with its `.text`, because `-show-encoding`
 offset still unresolved. WARP runs 4-lane waves (one quad per wave), so only
 a hardware adapter reduces across quads. This does not measure console behavior or a title, and wave64 chains are
 the next slice.
+
+The same WARP and hardware checks include eight branched draws. A backward VCC branch selects either a reduction
+of the desktop wave or a zero result. One max fixture narrows EXEC and restores it before voting. The CPU reference
+requires both arms to run across the draw and checks every covered pixel. Reversing the wave vote or using the local
+lane value must each produce a pixel mismatch. The interleaved min/max draw shares permutation scratch and
+its mutant swaps the min and max results.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_wave_reduce_(controls|warp)$' -V
+```

@@ -11,6 +11,7 @@ The instruction bytes are **constructed here** from the field layout the checked
 (`tools/disasm_rdna2.py`, the MTBUF branch): no game-derived bytes are used. Each case encodes the instruction,
 decodes it, and only then translates it, so the test exercises the same path the pipeline uses.
 """
+import hashlib
 import os
 import struct
 import sys
@@ -133,6 +134,43 @@ check('the d16 form stays refused',
 code = encode_mtbuf(MTBUF_LOAD['xyz'], MTBUF_FORMAT_8_UNORM, vdata=1, vaddr=2, srsrc=4)
 asm, emitted = translate_bytes(code)
 check('default format still translates', 'format:[' not in asm[0] and 'v1 =' in emitted, repr(asm))
+
+
+def check_formatted_heap():
+    from startup_compute_dispatch_heap_check import (
+        FORMATTED_ASM, FORMATTED_BINDINGS, FORMATTED_CODE, FORMATTED_GROUP, FORMATTED_RSRC2,
+        FORMATTED_INDEXED_ASM, FORMATTED_INDEXED_BINDINGS, FORMATTED_INDEXED_CODE,
+    )
+    from startup_gfx2hlsl_compute_check import assemble, refused, translate
+    from startup_gfx2hlsl_heap_record_check import root_blob
+
+    if len(sys.argv) == 3 and sys.argv[1] == '--llvm-mc':
+        assert assemble(sys.argv[2], FORMATTED_ASM) == FORMATTED_CODE
+        assert assemble(sys.argv[2], FORMATTED_INDEXED_ASM) == FORMATTED_INDEXED_CODE
+
+    def pipeline(code):
+        return G.ComputePipeline(code, root_blob(table_range=True), FORMATTED_RSRC2, FORMATTED_GROUP)
+
+    program = pipeline(FORMATTED_CODE)
+    assert program.manifest().endswith(FORMATTED_BINDINGS), program.manifest()
+    indexed = pipeline(FORMATTED_INDEXED_CODE).manifest()
+    assert indexed.endswith(FORMATTED_INDEXED_BINDINGS), indexed
+    # Replacing word 3 with zero after the load must invalidate the heap proof.
+    load_at = FORMATTED_CODE.index(bytes.fromhex('00200ce0000c0880'))
+    rewritten = FORMATTED_CODE[:load_at] + bytes.fromhex('8003a3be') + FORMATTED_CODE[load_at:]  # s_mov_b32 s35, 0
+    refused('words were rewritten', lambda: pipeline(rewritten).manifest())
+
+    stage = Stage()
+    stage.sym[4] = ('ptr', ('root', 0))
+    refused('hardware table descriptor (source: root)',
+            lambda: stage.op_buffer_load_format_xyzw(['v[0:3]', 'off', 's[4:7]', '0'], []))
+
+    table = translate('L-uint').hlsl_cs().encode()
+    assert hashlib.sha256(table).hexdigest() == 'a37f185c55f3eb35550ecbd491a4d3077ef5a5d0954a5994cb98e7feac221c2c'
+    print('formatted heap manifest, rewritten-word refusal and byte-identical table HLSL: ok')
+
+
+check_formatted_heap()
 
 if failures:
     print('FAIL')

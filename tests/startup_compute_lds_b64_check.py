@@ -120,7 +120,66 @@ WORDS_B = bytes.fromhex(
     '001078e00d080480000081bf'
 )
 
+# 32 lanes of adjacent pairs. The fixture stores both packed conversion results.
+SOURCE_NEIGHBOUR = PREAMBLE + """\
+v_add_nc_u32 v21, 11, v0
+v_add_nc_u32 v22, 43, v0
+v_swap_b32 v21, v22
+v_cvt_f32_u32 v23, v21
+v_cvt_f32_u32 v24, v22
+v_cvt_pkrtz_f16_f32 v29, v23, v24
+v_cmp_lt_u32_e32 vcc_lo, 14, v0
+v_cndmask_b32_e32 v28, v21, v22, vcc_lo
+v_lshlrev_b32 v26, 3, v0
+ds_write_b64 v26, v[28:29]
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v30, 8, v26
+v_and_b32 v30, 0xf8, v30
+ds_read_b64 v[30:31], v30
+s_waitcnt lgkmcnt(0)
+buffer_store_dwordx2 v[30:31], v26, s[16:19], 0 offen
+s_endpgm
+"""
+SAVE_AND_CLOBBER = "v_mov_b32_e32 v25, v0\nv_xor_b32 v0, 1, v0\n"
+SOURCE_SAVED = SOURCE_NEIGHBOUR.replace(
+    'v_lshlrev_b32 v26, 3, v0', SAVE_AND_CLOBBER + 'v_lshlrev_b32 v26, 3, v25')
+# Keep the observation address tied to the original lane, even in the GPU mutant.
+SOURCE_SAVED = SOURCE_SAVED.replace(SAVE_AND_CLOBBER, 'v_lshlrev_b32 v27, 3, v0\n' + SAVE_AND_CLOBBER)
+SOURCE_SAVED = SOURCE_SAVED.replace('v30, 8, v26', 'v30, 8, v27').replace('v[30:31], v26', 'v[30:31], v27')
+
+SOURCE_LATE = SOURCE_SAVED.replace(
+    SAVE_AND_CLOBBER, 'v_xor_b32 v0, 1, v0\nv_mov_b32_e32 v25, v0\n')
+SOURCE_NO_COPY = SOURCE_SAVED.replace(
+    SAVE_AND_CLOBBER, 'v_xor_b32 v0, 1, v0\n').replace('3, v25', '3, v0')
+
+WORDS_NEIGHBOUR = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf8b002a4aab002c4a16cb2a7e150d2e7e'
+    '160d307e17313a5e8e00827d152d380283003434000034d91a1c00007fc08cbf00008abf'
+    '88343c3aff3c3c36f80000000000d8d91e00001e7fc08cbf001074e01a1e0480000081bf'
+)
+WORDS_SAVED = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf8b002a4aab002c4a16cb2a7e150d2e7e'
+    '160d307e17313a5e8e00827d152d3802830036340003327e8100003a83323434000034d9'
+    '1a1c00007fc08cbf00008abf88363c3aff3c3c36f80000000000d8d91e00001e7fc08cbf'
+    '001074e01b1e0480000081bf'
+)
+WORDS_LATE = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf8b002a4aab002c4a16cb2a7e150d2e7e'
+    '160d307e17313a5e8e00827d152d3802830036348100003a0003327e83323434000034d9'
+    '1a1c00007fc08cbf00008abf88363c3aff3c3c36f80000000000d8d91e00001e7fc08cbf'
+    '001074e01b1e0480000081bf'
+)
+WORDS_NO_COPY = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf8b002a4aab002c4a16cb2a7e150d2e7e'
+    '160d307e17313a5e8e00827d152d3802830036348100003a83003434000034d91a1c0000'
+    '7fc08cbf00008abf88363c3aff3c3c36f80000000000d8d91e00001e7fc08cbf001074e0'
+    '1b1e0480000081bf'
+)
+
 CASES = {
+    'neighbour': (SOURCE_NEIGHBOUR, WORDS_NEIGHBOUR, USER7 | TGID_X | (1 << 15), (32, 1, 1), (1, 1, 1)),
+    'saved': (SOURCE_SAVED, WORDS_SAVED, USER7 | TGID_X | (1 << 15), (32, 1, 1), (1, 1, 1)),
     'P': (SOURCE_P, WORDS_P, USER7 | TGID_X | (2 << 15), (64, 1, 1), (2, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | (1 << 15), (64, 1, 1), (1, 1, 1)),
 }
@@ -139,7 +198,12 @@ SENTINEL = 0xc5c5c5c5
 
 def expected_words(name):
     out = [SENTINEL] * WORDS
-    if name == 'P':
+    if name in ('neighbour', 'saved'):
+        for lane in range(32):
+            peer = lane ^ 1
+            out[lane * 2] = peer + (11 if peer > 14 else 43)
+            out[lane * 2 + 1], = struct.unpack('<I', struct.pack('<ee', peer + 43, peer + 11))
+    elif name == 'P':
         for g in range(2):
             for l in range(64):
                 peer = (g << 8) + (l ^ 32)
@@ -167,7 +231,27 @@ def translate_case(name, code=None, rsrc2=None, group=None):
                              default_rsrc2 if rsrc2 is None else rsrc2, local if group is None else group)
 
 
+def check_saved_id_writes():
+    def scan(source):
+        ins = [(i * 4, 4, asm.split()[0], asm) for i, asm in enumerate(source.splitlines())]
+        G.check_lds_exchange(ins, (32, 1, 1), 128)
+
+    swapped = SOURCE_SAVED.replace('v_xor_b32 v0, 1, v0', 'v_swap_b32 v21, v0')
+    scan(swapped)
+    bad_swap = swapped.replace('3, v25', '3, v0')
+    refused('unchanged entry local X ID: v_swap_b32', lambda: scan(bad_swap))
+    lost_copy = SOURCE_SAVED.replace('ds_write_b64 v26', 'v_mov_b32_e32 v25, 0\nds_write_b64 v26')
+    refused('unchanged entry local X ID: v_xor_b32', lambda: scan(lost_copy))
+
+
 def check_controls():
+    check_saved_id_writes()
+    for name in ('neighbour', 'saved'):
+        translate_case(name).hlsl_cs()
+    for code in (WORDS_LATE, WORDS_NO_COPY):
+        refused('LDS fill needs the unchanged entry local X ID: v_xor_b32',
+                lambda: translate_case('saved', code=code).hlsl_cs())
+    assert mutate(translate_case('saved').hlsl_cs(), 'saved-late-copy')
     # Positive HLSL lowering: declarations, single-eval alias-safe index, barrier, and both dwords.
     hlsl_p = translate_case('P').hlsl_cs()
     assert 'groupshared uint lds[256];' in hlsl_p, hlsl_p
@@ -277,6 +361,8 @@ def check_binary(llvm_mc):
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
+    for source, words in ((SOURCE_LATE, WORDS_LATE), (SOURCE_NO_COPY, WORDS_NO_COPY)):
+        assert assemble(llvm_mc, source) == words
     for line, hex_words in VERIFIED_SNIPPETS.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == hex_words, '%s: assembled %s, recorded %s' % (line, built, hex_words)
@@ -284,6 +370,8 @@ def check_binary(llvm_mc):
 
 
 CONTROLS = {
+    'saved-late-copy': ('saved', '    v25 = v0;\n    v0 = 0x00000001u ^ v0;\n',
+                        '    v0 = 0x00000001u ^ v0;\n    v25 = v0;\n'),
     'p-same-lane': ('P', '    v8 = 0x00000100u ^ v4;\n', '    v8 = v4;\n'),
     'p-swap-dwords': ('P', '    a = (v8 + 16u) >> 2;\n    v8 = lds[a];\n    v9 = lds[a + 1u];\n',
                       '    a = (v8 + 16u) >> 2;\n    v8 = lds[a + 1u];\n    v9 = lds[a];\n'),

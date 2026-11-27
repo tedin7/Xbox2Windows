@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_execz_counted_loop_check.py --llvm-mc llvm-mc-15
