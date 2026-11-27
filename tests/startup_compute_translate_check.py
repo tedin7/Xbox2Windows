@@ -153,11 +153,21 @@ def check_e2e(directory, consumer, dxc, runner, adapter, wrong_group):
     return 0
 
 
+def check_typed_kinds():
+    """A compute input of a 1D, 3D or 2D-array kind needs the runtime's typed-SRV line; 2D inputs keep their manifest."""
+    from startup_compute_dispatch_texture_check import identifier_code
+    for dim, kind in (('3d', 'tex3d'), ('2da', 'tex2da'), ('2d', 'tex2d')):
+        lines = C.translate('A', code=identifier_code(dim)).manifest().splitlines()
+        assert ('srvtypes 1' in lines) == (kind != 'tex2d') and 'srv 0 %s table 1 64' % kind in lines, (dim, lines)
+    print('compute typed input kinds: srvtypes 1 for 3D and 2D-array inputs, none for 2D')
+
+
 if __name__ == '__main__':
     args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as temporary:
         if not args:
             check_requests(Path(temporary))
+            check_typed_kinds()
             sys.exit(0)
         if len(args) in (5, 6) and args[0] == 'e2e' and args[5:] in ([], ['wrong-group']):
             sys.exit(check_e2e(Path(temporary), args[1], args[2], args[3], args[4], args[5:] == ['wrong-group']))

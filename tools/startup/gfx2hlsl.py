@@ -14181,8 +14181,13 @@ class Pipeline:
         for ordinal, res in enumerate(inputs):
             yield res, len(self.resources) + 2 * ordinal, len(self.uds) + ordinal
 
+    # A compute input of one of these kinds is bound only through the runtime's typed-SRV path (srvtypes 1).
+    TYPED_INPUT_KINDS = ('tex1d', 'tex2da', 'tex3d')
+    default_typed_kinds = False  # set by ComputePipeline: the graphics runtime reads no srvtypes line
+
     def integer_srv_manifest(self):
-        if (self.integer_texture_srvs or self.typed_srvs) and any(r['kind'] != 'buf' for r in self.resources.values()):
+        typed_kinds = self.default_typed_kinds and any(r['kind'] in self.TYPED_INPUT_KINDS for r in self.resources.values())
+        if (self.integer_texture_srvs or self.typed_srvs or typed_kinds) and any(r['kind'] != 'buf' for r in self.resources.values()):
             yield 'srvtypes 1'
             for res, reg, entry in self.integer_srv_bindings():
                 yield 'srvint %d %d %d' % (res['index'], reg, entry)
@@ -14847,6 +14852,7 @@ class ReadWriteBuffer(Unsupported):
 
 
 class ComputePipeline(Pipeline):
+    default_typed_kinds = True
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
