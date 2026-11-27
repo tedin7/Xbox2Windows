@@ -32,7 +32,7 @@ struct ViewRecord {
 };
 struct HeapInfo {
     u64 wrapper;
-    std::uint32_t type, count, increment, logical_count;
+    std::uint32_t type, count, increment, title_increment, logical_count;
     u64 title_cpu, desktop_cpu, desktop_gpu;
     u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
@@ -427,11 +427,11 @@ const ResourceInfo* resource_info(const Wrapper* w)
     ReleaseSRWLockShared(&note_lock);
     return info;
 }
-void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
+void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, UINT title_increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
                u64 title_sampler_cpu)
 {
     note_lock_acquire(true);
-    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
+    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, title_increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -814,7 +814,7 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     HeapInfo heap{};
     note_lock_acquire(false);
     for (const HeapInfo& h : heap_infos())
-        if (h.desktop_gpu && gpu_handle >= h.desktop_gpu && gpu_handle < h.desktop_gpu + u64{h.count} * h.increment) heap = h;
+        if (h.desktop_gpu && gpu_handle >= h.desktop_gpu && gpu_handle < h.desktop_gpu + u64{h.count} * h.title_increment) heap = h;
     ReleaseSRWLockShared(&note_lock);
     if (!heap.wrapper) {
         struct { std::uint32_t sequence, slot, parameter, entries; u64 gpu_handle, heap, index; } header{
@@ -824,7 +824,7 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     }
     object(reinterpret_cast<Wrapper*>(heap.wrapper));
     const u64 offset = gpu_handle - heap.desktop_gpu;
-    const u64 index = offset / heap.increment;
+    const u64 index = offset / heap.title_increment;
     if (index + entries > heap.count) entries = static_cast<std::uint32_t>(heap.count - index);
     std::vector<std::uint32_t> ids(entries * 2);  // [shadow ids + 1][token ids + 1]
     for (std::uint32_t i = 0; i < entries; ++i) ids[i] = heap.shadow ? heap.shadow[index + i] : 0;
