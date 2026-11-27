@@ -874,7 +874,16 @@ def check_null_inputs():
     other = row.format(1, 2).replace("input 1", "input 2")
     target = "x2w-render target abc (4x2 format 28): draws 2, with a null input 1 frames 1..2"
     clean = "x2w-render target abc (4x2 format 28): draws 3, with a null input 0 frames 3..5"
-    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean])
+    key = "0000000000000123"
+    candidate = f"{key} x7 (missing_guest_root)"
+    refused = f"x2w-render target abc (4x2 format 28): draws 0, with a null input 0 frames 6..42, not drawn 7 by {candidate}"
+    starved = f"x2w-render starved target abc (4x2 format 28): last drawn frame 5, not drawn since: {candidate}"
+    no_candidate = "x2w-render starved target def (2x2 format 10): last drawn frame 2, starved, no candidate"
+    totals = "x2w-render totals: translated draws 43 (not drawn 7)"
+    pipeline = f"x2w-render not drawn key {key}: 7 (missing_guest_root 7), targets abc (4x2 format 28)"
+    old_pipeline = "x2w-render not drawn key 0000000000000777: 1 (state_not_ready 1)"
+    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean, refused, totals,
+                         starved, no_candidate, pipeline, old_pipeline])
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "run"
         run.mkdir()
@@ -887,6 +896,10 @@ def check_null_inputs():
     assert row.format(1, 1) not in section
     assert f"{target} (50.0% poisoned)" in section
     assert f"{clean} (0.0% poisoned)" in section
+    assert refused in section.splitlines()
+    assert f"render summary\n{totals}\n\nstarved targets\n{starved}\n{no_candidate}\n" in section
+    assert f"not drawn by pipeline\n{pipeline}\n{old_pipeline}, targets unknown\n" in section
+    assert T.key_weights(stderr)[key] == 7
     assert not T.null_inputs_section("unrelated log")
 
 

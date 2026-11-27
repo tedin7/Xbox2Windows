@@ -3074,14 +3074,48 @@ std::unordered_map<u64, NotDrawnKey>& not_drawn_keys()
     static std::unordered_map<u64, NotDrawnKey> keys;
     return keys;
 }
-thread_local u64 not_drawn_key = 0;  // set by draw_translated once the pipeline's translation is known
-static bool not_drawn(int site)
+SRWLOCK target_draw_census_lock = SRWLOCK_INIT;
+x2w_startup::TargetDrawCensus target_draw_census;
+bool fixture_omit_refused_target = false;  // Protected by target_draw_census_lock.
+
+x2w_startup::TargetDrawCensus target_draw_snapshot(bool advance)
 {
+    AcquireSRWLockExclusive(&target_draw_census_lock);
+    auto snapshot = target_draw_census;
+    if (advance) target_draw_census.next_window();
+    ReleaseSRWLockExclusive(&target_draw_census_lock);
+    return snapshot;
+}
+
+void note_target_draw(const Pass& pass, LONG frame, bool poisoned, ID3D12Resource* const* inputs, unsigned input_count)
+{
+    AcquireSRWLockExclusive(&target_draw_census_lock);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        target_draw_census.draw(pass.target_surfaces[i], frame, poisoned);
+    if (pass.bound_depth && pass.depth_view_writable)
+        target_draw_census.draw(pass.depth_surface, frame, poisoned);
+    for (unsigned i = 0; i < input_count; ++i)
+        target_draw_census.read(reinterpret_cast<std::uintptr_t>(inputs[i]), frame);
+    ReleaseSRWLockExclusive(&target_draw_census_lock);
+}
+
+// Called after releasing draw_lock, including for the late indexed refusal.
+static bool not_drawn(const Pass& pass, ID3D12GraphicsCommandList* list, u64 key, int site)
+{
+    const auto surface = pass.target_count ? pass.target_surfaces[0] : pass.depth_surface;
+    if (pass.targets_bound && surface.resource) {
+        const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
+        AcquireSRWLockExclusive(&target_draw_census_lock);
+        target_draw_census.refuse(fixture_omit_refused_target ? x2w_startup::TargetDrawCensus::Surface{} : surface,
+                                  key, not_drawn_names[site], frame);
+        ReleaseSRWLockExclusive(&target_draw_census_lock);
+    }
+    red_producer_attachments(pass, list, "not-drawn", key, not_drawn_names[site]);
     const LONG seen = InterlockedIncrement(&not_drawn_counts[site]);
     if (seen <= 3)
         log("x2w-draw not drawn: %s (call %ld at this site)", not_drawn_names[site], seen);
     AcquireSRWLockExclusive(&not_drawn_key_lock);
-    NotDrawnKey& entry = not_drawn_keys()[not_drawn_key];
+    NotDrawnKey& entry = not_drawn_keys()[key];
     ++entry.total;
     ++entry.by_site[site];
     ReleaseSRWLockExclusive(&not_drawn_key_lock);
@@ -3103,6 +3137,7 @@ std::vector<std::string> not_drawn_key_lines()
     char head[128];
     snprintf(head, sizeof(head), "x2w-render not drawn by pipeline key: %zu keys, %lld draws", keys.size(), static_cast<long long>(all));
     lines.push_back(head);
+    const auto targets = target_draw_snapshot(false);
     for (std::size_t k = 0; k < keys.size() && k < 40; ++k) {
         const NotDrawnKey& entry = keys[k].second;
         int order[not_drawn_sites];
@@ -3115,7 +3150,10 @@ std::vector<std::string> not_drawn_key_lines()
         causes[used > 0 ? used : 0] = 0;
         char line[384];
         snprintf(line, sizeof(line), "x2w-render not drawn key %016llx: %ld (%s)", keys[k].first, entry.total, causes);
-        lines.push_back(line);
+        std::string text = line;
+        const auto target = targets.top_target(keys[k].first);
+        if (!target.empty()) text += ", targets " + target;
+        lines.push_back(std::move(text));
     }
     return lines;
 }
@@ -3168,13 +3206,13 @@ bool indirect_guest_root_matches(const BoundPipeline& bound, const Pass& pass)
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
-    not_drawn_key = 0;
+    u64 not_drawn_key = 0;
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
     const bool indexed_rect = rect && indexed && indirect;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
-        (rect && indexed && !indexed_rect)) return not_drawn(0);
+        (rect && indexed && !indexed_rect)) return not_drawn(pass, list, known_pipeline_key(pass.pipeline), 0);
     draw_lock_acquire_exclusive();
     DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
@@ -3193,26 +3231,26 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                      : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
         draw_lock_release_exclusive();
-        return not_drawn(1);
+        return not_drawn(pass, list, not_drawn_key, 1);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
             indirect->set_refusal("translated draw requires the guest pipeline's root signature",
                                   indirect_refusal_code::missing_guest_root);
             draw_lock_release_exclusive();
-            return not_drawn(2);
+            return not_drawn(pass, list, not_drawn_key, 2);
         }
         if (indexed && pass.compute_pipeline) {
             indirect->set_refusal("indexed validation cannot replace a live guest compute pipeline",
                                   indirect_refusal_code::live_compute_pipeline);
             draw_lock_release_exclusive();
-            return not_drawn(3);
+            return not_drawn(pass, list, not_drawn_key, 3);
         }
         if (!tr->uavs.empty()) {
             indirect->set_refusal("translated draw with a writable texture is not bound for indirect draws",
                                   indirect_refusal_code::unsupported_resource_or_entry);
             draw_lock_release_exclusive();
-            return not_drawn(4);
+            return not_drawn(pass, list, not_drawn_key, 4);
         }
         auto& entry = indexed ? tr->indexed_indirect_entry : tr->independent_indirect_entry;
         if (!entry.has_value()) {
@@ -3234,7 +3272,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
                                   indirect_refusal_code::unsupported_resource_or_entry);
             draw_lock_release_exclusive();
-            return not_drawn(5);
+            return not_drawn(pass, list, not_drawn_key, 5);
         }
         if (bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
             ((bound->depth_stencil.DepthEnable && bound->depth_stencil.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) ||
@@ -3242,7 +3280,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             indirect->set_refusal("translated draw writes depth or stencil to a read-only depth view",
                                   indirect_refusal_code::read_only_depth_write);
             draw_lock_release_exclusive();
-            return not_drawn(6);
+            return not_drawn(pass, list, not_drawn_key, 6);
         }
     }
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
@@ -3255,18 +3293,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
                                                : indirect_refusal_code::sampler_heap_unavailable;
         draw_lock_release_exclusive();
-        return not_drawn(7);
+        return not_drawn(pass, list, not_drawn_key, 7);
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
     if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {
         draw_lock_release_exclusive();
-        return not_drawn(8);
+        return not_drawn(pass, list, not_drawn_key, 8);
     }
     const bool trace_inputs = red_producers().onset();
-    ID3D12Resource* sampled_textures[32];
+    ID3D12Resource* sampled_textures[32]{};
     unsigned sampled_count = 0;
     const auto follow_inputs = [&] {
-        red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
+        if (trace_inputs) red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
     };
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT srv_count = n + tr->integer_srvs.descriptors();
@@ -3285,7 +3323,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();
-            return not_drawn(dynamic_resource_heap_unavailable_site);
+            return not_drawn(pass, list, not_drawn_key, dynamic_resource_heap_unavailable_site);
         }
     } else {
         first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
@@ -3468,7 +3506,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
-                return not_drawn(9);
+                return not_drawn(pass, list, not_drawn_key, 9);
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) {
@@ -3498,7 +3536,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 indirect->set_refusal("translated draw could not bind its sampled texture",
                                       indirect_refusal_code::sampled_texture_unbindable);
                 draw_lock_release_exclusive();
-                return not_drawn(10);
+                return not_drawn(pass, list, not_drawn_key, 10);
             }
             x2w_local::BindingFacts facts;
             facts.texture = facts.from_table = true;
@@ -3534,7 +3572,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             } else {
                 device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &desc, dest);
             }
-            if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
+            if (texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
         }
         if (indirect) {
@@ -3558,7 +3596,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     srv.source == 1 ? indirect_refusal_code::incomplete_vertex_stream
                                     : indirect_refusal_code::incomplete_table_buffer);
                 draw_lock_release_exclusive();
-                return not_drawn(11);
+                return not_drawn(pass, list, not_drawn_key, 11);
             }
             if (!view.upload)
                 require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3614,7 +3652,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (first_calls(refused, 6))
                     log("x2w-draw %016llx srv %u: formatted buffer refused (buffer larger than the 16 MiB draw copy)", tr->key, i);
                 draw_lock_release_exclusive();
-                return not_drawn(12);
+                return not_drawn(pass, list, not_drawn_key, 12);
             }
         }
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
@@ -3647,7 +3685,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
                 note_null(x2w_local::NullCause::ring_full, padded);
                 draw_lock_release_exclusive();
-                return not_drawn(buffer_copy_failed_site);
+                return not_drawn(pass, list, not_drawn_key, buffer_copy_failed_site);
             }
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
@@ -3788,7 +3826,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(refused, 6))
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
             draw_lock_release_exclusive();
-            return not_drawn(13);
+            return not_drawn(pass, list, not_drawn_key, 13);
         }
         if (readable_range && !have) {
             // The guest memory is readable and only the frame copy failed (upload ring full): refuse the draw instead of
@@ -3798,7 +3836,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
             note_null(x2w_local::NullCause::ring_full, bytes);
             draw_lock_release_exclusive();
-            return not_drawn(buffer_copy_failed_site);
+            return not_drawn(pass, list, not_drawn_key, buffer_copy_failed_site);
         }
         const char* const buffer_failure = !address ? "address missing" : !requested_bytes ? "size missing" : "range unreadable";
         if (!have && identity_for_null) {
@@ -3901,7 +3939,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             indirect->set_refusal("translated indexed argument validation could not be recorded",
                                   indirect_refusal_code::indexed_validation_failed);
             draw_lock_release_exclusive();
-            return not_drawn(14);
+            return not_drawn(pass, list, not_drawn_key, 14);
         }
     }
     list->SetPipelineState(pipeline);
@@ -3925,6 +3963,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
+    bool index_refusal = false;
     if (indirect) {
         follow_inputs();
         const auto red_samples = trace_inputs
@@ -3956,7 +3995,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             static LONG index_refused;
             if (first_calls(index_refused, 6))
                 log("x2w-draw %016llx: index data unavailable (readable %d, %zu bytes), draw skipped", tr->key, indices_ok ? 1 : 0, index_total);
-            not_drawn(index_data_unavailable_site);
+            index_refusal = true;
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);
@@ -3974,13 +4013,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
-    if (drawn && pass.target_count && pass.target0) {
-        null_input_census.note_target({reinterpret_cast<std::uintptr_t>(pass.target0), pass.target0_width,
-                                      pass.target0_height, static_cast<int>(pass.target_formats[0]), binding_frame, binding_frame},
-                                     has_null_input);
-    }
+    if (drawn) note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
+    if (index_refusal) not_drawn(pass, list, not_drawn_key, index_data_unavailable_site);
     if (indirect) return drawn;
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";

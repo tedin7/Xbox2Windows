@@ -35,6 +35,9 @@ extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, voi
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
 
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_target_frame(LONG frame, bool omit_target);
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_target_report(LONG threshold);
+
 #if defined(OFFSCREEN_AGILITY_620)
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
@@ -219,6 +222,10 @@ float4 translated_vertex_with_start(uint id : SV_VertexID) : SV_Position {
     return translated_vertex(id + ud1);
 }
 
+float4 starvation_source_pixel() : SV_Target {
+    return float4(0.3125, 0.625, 0.875, 1);
+}
+
 float4 translated_pixel() : SV_Target {
     return translated_texture.Load(int3(0, 0, 0));
 }
@@ -311,16 +318,16 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
-enum class TableSample { texture, buffer, buffer_tail, null_census };
+enum class TableSample { texture, buffer, buffer_tail, null_census, starvation_source };
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
                                     bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false,
-                                    UINT descriptor_stride = 0, std::uint64_t* key_out = nullptr)
+                                    UINT descriptor_stride = 0, std::uint64_t* key_out = nullptr, bool publish = true)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
     auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
@@ -345,23 +352,27 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         file.write(static_cast<const char*>(bytes), count);
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
-    const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel", "null_census_pixel"};
-    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
-    write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
-    write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
-    constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
-    constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
-    constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
-    if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
-    else if (sample == TableSample::null_census) {
-        char census_manifest[256];
-        const int bytes = std::snprintf(census_manifest, sizeof(census_manifest),
-            "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 tex2d table 0 0\nsrv 1 tex2d table 0 %u\n"
-            "srv 2 buf table 0 %u\nparams 0\ntargets 0\n", descriptor_stride, descriptor_stride * 2);
-        write(".txt", census_manifest, bytes);
-    } else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
-    else write(".txt", manifest, sizeof(manifest) - 1);
+    if (publish) {
+        const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
+        const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel", "null_census_pixel", "starvation_source_pixel"};
+        const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
+        write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
+        write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
+        constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
+        constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
+        constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
+        constexpr char source_manifest[] = "x2w-manifest 1\nud 1\nudsrc 0 rect\nparams 0\ntargets 0\n";
+        if (sample == TableSample::starvation_source) write(".txt", source_manifest, sizeof(source_manifest) - 1);
+        else if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
+        else if (sample == TableSample::null_census) {
+            char census_manifest[256];
+            const int bytes = std::snprintf(census_manifest, sizeof(census_manifest),
+                "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 tex2d table 0 0\nsrv 1 tex2d table 0 %u\n"
+                "srv 2 buf table 0 %u\nparams 0\ntargets 0\n", descriptor_stride, descriptor_stride * 2);
+            write(".txt", census_manifest, bytes);
+        } else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
+        else write(".txt", manifest, sizeof(manifest) - 1);
+    }
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
         reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
         reinterpret_cast<UINT64>(&vertex_id), sizeof(vertex_id), 0, 0,
@@ -1754,6 +1765,205 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
     return true;
 }
 // Direct translated draws exercise null descriptors that the indirect path refuses.
+int check_starved_target(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQueue* info,
+                         const std::wstring& log_path, bool keep_writing, bool omit_target)
+{
+    const auto cache = std::filesystem::current_path() / ("starved-target-" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directory(cache);
+    check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set starvation fixture cache");
+
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = {1, &range};
+    ComPtr<ID3DBlob> root_blob;
+    const auto root = create_root(guest, {1, &parameter, 0, nullptr,
+                                  D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT}, &root_blob);
+    std::uint64_t missing_key = 0;
+    const auto writer = translated_pipeline(guest, root.Get(), root_blob.Get(), false, TableSample::starvation_source);
+    const auto missing = translated_pipeline(guest, root.Get(), root_blob.Get(), true, TableSample::texture,
+                                             false, false, 0, &missing_key, false);
+    const auto upscale = translated_pipeline(guest, root.Get(), root_blob.Get(), false);
+
+    const auto source_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const D3D12_RESOURCE_DESC source_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+        source_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    auto output_desc = source_desc;
+    output_desc.Format = format;
+    const auto source = resource(guest, source_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    const auto native_source = native_object<ID3D12Resource>(device, guest, source.Get());
+    const D3D12_CLEAR_VALUE output_clear{format, {0, 0, 0, 1}};
+    const auto output = resource(device, output_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &output_clear);
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    ComPtr<ID3D12DescriptorHeap> rtvs;
+    check(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtvs)), "create starvation RTV heap");
+    const D3D12_CPU_DESCRIPTOR_HANDLE handles[]{
+        rtvs->GetCPUDescriptorHandleForHeapStart(),
+        {rtvs->GetCPUDescriptorHandleForHeapStart().ptr +
+         device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)}};
+    guest->CreateRenderTargetView(source.Get(), nullptr, handles[0]);
+    guest->CreateRenderTargetView(output.Get(), nullptr, handles[1]);
+
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } view_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    ComPtr<ID3D12DescriptorHeap> views;
+    check(guest->CreateDescriptorHeap(&view_desc.desc, IID_PPV_ARGS(&views)), "create starvation view heap");
+    using Handle = UINT64(WINAPI*)(IUnknown*, void*);
+    const UINT64 cpu = slot<Handle>(views.Get(), 9)(views.Get(), nullptr);
+    const UINT64 gpu = slot<Handle>(views.Get(), 10)(views.Get(), nullptr);
+    check(cpu && gpu ? S_OK : E_FAIL, "get starvation view handles");
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+        UINT64 tail[3]{};
+    } view;
+    view.desc.Format = source_format;
+    view.desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.desc.Texture2D.MipLevels = 1;
+    using View = void (WINAPI*)(IUnknown*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, UINT64, UINT64);
+    slot<View>(guest, 18)(guest, source.Get(), &view.desc, cpu, 0);
+
+    const D3D12_DRAW_ARGUMENTS command{3, 1, 0, 0};
+    PlacedBuffer arguments(device, guest, sizeof(command), D3D12_RESOURCE_FLAG_NONE);
+    const auto upload = make_buffer(device, sizeof(command), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped = nullptr;
+    const D3D12_RANGE no_read{0, 0};
+    check(upload->Map(0, &no_read, &mapped), "map starvation indirect command");
+    std::memcpy(mapped, &command, sizeof(command));
+    upload->Unmap(0, nullptr);
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(command), 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create starvation signature");
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 bytes = 0;
+    device->GetCopyableFootprints(&output_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    const auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = footprint;
+    const D3D12_TEXTURE_COPY_LOCATION src{output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    const D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes)};
+    // Convert the binary16 source colour to the output's 8-bit UNORM representation.
+    static constexpr std::array<unsigned char, 4> reference{80, 159, 223, 255};
+    static constexpr float clear[]{0, 0, 0, 1};
+    static constexpr LONG frames = 40, threshold = 4;
+    for (LONG frame = 1; frame <= frames; ++frame) {
+        x2w_d3d12_fixture_target_frame(frame, omit_target);
+        ComPtr<ID3D12CommandAllocator> allocator;
+        check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create starvation allocator");
+        const auto wrapped = begin_guest_list(guest, allocator.Get());
+        auto* list = wrapped.Get();
+        const auto native = native_object<ID3D12GraphicsCommandList>(device, guest, list);
+        if (frame == 1) {
+            transition(native.Get(), arguments.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            native->CopyBufferRegion(arguments.native.Get(), 0, upload.Get(), 0, sizeof(command));
+            transition(native.Get(), arguments.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
+
+        using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+        using Targets = void (WINAPI*)(IUnknown*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+        using Draw = void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT);
+        using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+        const auto draw = [&](IUnknown* pipeline) {
+            slot<Bind>(list, 25)(list, pipeline);
+            slot<Draw>(list, 12)(list, 3, 1, 0, 0);
+        };
+        slot<Bind>(list, 34)(list, root.Get());
+        slot<void (WINAPI*)(IUnknown*, D3D12_PRIMITIVE_TOPOLOGY)>(list, 20)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
+        const D3D12_RECT scissor{0, 0, width, height};
+        slot<void (WINAPI*)(IUnknown*, UINT, const D3D12_VIEWPORT*)>(list, 21)(list, 1, &viewport);
+        slot<void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*)>(list, 22)(list, 1, &scissor);
+
+        slot<Targets>(list, 50)(list, 1, &handles[0], FALSE, nullptr);
+        if (frame == 1 || keep_writing) draw(writer.Get());
+        if (frame > 1) {
+            if (frame % 2) draw(missing.Get());
+            else {
+                slot<Bind>(list, 25)(list, missing.Get());
+                slot<Execute>(list, 61)(list, signature.Get(), 1, arguments.wrapped.Get(), 0, nullptr, 0);
+            }
+        }
+
+        slot<Targets>(list, 50)(list, 1, &handles[1], FALSE, nullptr);
+        slot<void (WINAPI*)(IUnknown*, SIZE_T, const float*, UINT, const D3D12_RECT*)>(list, 52)(
+            list, handles[1].ptr, clear, 0, nullptr);
+        ID3D12DescriptorHeap* const heaps[]{views.Get()};
+        slot<void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*)>(list, 32)(list, 1, heaps);
+        slot<void (WINAPI*)(IUnknown*, UINT, UINT64)>(list, 36)(list, 0, gpu);
+        draw(upscale.Get());
+        transition(native.Get(), output.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        native->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        transition(native.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        check(slot<HRESULT (WINAPI*)(IUnknown*)>(list, 9)(list), "close starvation recording");
+        submit(device, native.Get());
+
+        check(readback->Map(0, &read_range, &mapped), "map starvation readback");
+        bool matches = true;
+        for (UINT y = 0; y < height; ++y) {
+            const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset + footprint.Footprint.RowPitch * y;
+            for (UINT x = 0; x < width; ++x)
+                matches &= std::memcmp(row + x * reference.size(), reference.data(), reference.size()) == 0;
+        }
+        readback->Unmap(0, &no_read);
+        if (!matches) {
+            std::fprintf(stderr, "starvation fixture frame %ld differs from CPU pixel reference\n", frame);
+            return 1;
+        }
+        if (frame == 1 || frame == frames) x2w_d3d12_fixture_target_report(threshold);
+    }
+
+    if (info && info->GetNumStoredMessages()) return 1;
+    std::filesystem::remove_all(cache);
+    char target[96], key[24], attached[48];
+    std::snprintf(target, sizeof(target), "%llx (%ux%u format %d)",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(native_source.Get())),
+                  width, height, source_format);
+    std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(missing_key));
+    std::snprintf(attached, sizeof(attached), " rt0=%p/%d", native_source.Get(), source_format);
+    const std::string cause = "translation_or_d16_or_formatted_not_ready";
+    const std::string candidate = std::string(key) + " x39 (" + cause + ")";
+    const std::string window = std::string("x2w-render target ") + target + ": draws " +
+        (keep_writing ? "39" : "0") + ", with a null input 0 frames 2..40, not drawn 39 by " + candidate;
+    const std::string starved = std::string("x2w-render starved target ") + target + ": last drawn frame 1";
+    std::string keyed(x2w_d3d12_not_drawn_keys_report(nullptr, 0) + 1, '\0');
+    x2w_d3d12_not_drawn_keys_report(keyed.data(), keyed.size());
+    std::ifstream file{std::filesystem::path(log_path)};
+    std::string line;
+    unsigned attachment_rows = 0, starved_rows = 0;
+    bool found_window = false, found_candidate = false, found_no_candidate = false;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        found_window |= line == window;
+        found_candidate |= line == starved + ", not drawn since: " + candidate;
+        found_no_candidate |= line == starved + ", starved, no candidate";
+        if (line.find("x2w-render starved target ") == 0) ++starved_rows;
+        if (line.find("x2w-red attachments ") == 0 &&
+            line.find(std::string(" op=not-drawn key=") + key) != std::string::npos &&
+            line.find(attached) != std::string::npos && line.find(" cause=" + cause) != std::string::npos)
+            ++attachment_rows;
+    }
+    file.close();
+    DeleteFileW(log_path.c_str());
+    const bool keyed_target = keyed.find(std::string(", targets ") + target) != std::string::npos;
+    if (attachment_rows != 39) {
+        std::fprintf(stderr, "expected 39 refused attachments, got %u\n", attachment_rows);
+        return 1;
+    }
+    if (found_window && keyed_target && (keep_writing ? starved_rows == 0 : starved_rows == 1 && found_candidate))
+        return 0;
+    if (omit_target && starved_rows == 1 && found_no_candidate && !found_window && !keyed_target)
+        std::puts("starvation mutant detected: refused draws lost their target");
+    else
+        std::fprintf(stderr, "missing starvation evidence for %s: window=%d keyed=%d rows=%u candidate=%d\n",
+                     target, found_window, keyed_target, starved_rows, found_candidate);
+    return 1;
+}
+
 int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQueue* info)
 {
     const auto cache = std::filesystem::current_path() / ("null-census-" + std::to_string(GetCurrentProcessId()));
@@ -2022,6 +2232,10 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool starvation_control = argc == 3 && std::strcmp(argv[2], "starved-target-control") == 0;
+    const bool starvation_mutant = argc == 3 && std::strcmp(argv[2], "starved-target-mutant") == 0;
+    const bool starvation = starvation_control || starvation_mutant ||
+                            (argc == 3 && std::strcmp(argv[2], "starved-target") == 0);
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
@@ -2040,7 +2254,7 @@ int main(int argc, char** argv) try
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
-    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer && !null_census) return 2;
+    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer && !null_census && !starvation) return 2;
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
     const bool fixed_create_fixture = mesh && GetEnvironmentVariableA("X2W_FIXED_MESH_CREATE_FIXTURE", nullptr, 0);
@@ -2075,11 +2289,14 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census || starvation) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
     }
+    if (starvation)
+        check(SetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", "2,41") &&
+              SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable starvation fixture capture");
     DXGI_ADAPTER_DESC1 desc{};
     check(adapter->GetDesc1(&desc), "get selected adapter description");
     std::printf("adapter: %ls, debug layer %s\n", desc.Description, debug ? "enabled" : "unavailable");
@@ -2106,6 +2323,8 @@ int main(int argc, char** argv) try
     if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");
+    if (starvation) return check_starved_target(device.Get(), guest.Get(), info.Get(), log_path,
+                                                starvation_control, starvation_mutant);
     if (null_census) return check_null_input_draws(device.Get(), guest.Get(), info.Get());
     if ((lease_fixture || lease_arguments) && !supports_lease_heap(device.Get())) {
         std::puts("mesh XMem capability skip: existing heaps unavailable");

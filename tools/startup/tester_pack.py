@@ -19,6 +19,8 @@ shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it 
 `shader_requests/`: the request files (req_<key>.*) of the 40 worst refused keys, ranked by draws not drawn (graphics) or dispatches
 without a translation (compute) from stderr.txt, at most 4 MB in all, listed in the manifest (`request_files`). Private data: mailed, never posted.
 
+`null-inputs.txt` includes render-target windows, starved targets, and the most frequent target for each refused
+graphics pipeline when present in the log.
 `d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
 d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
@@ -598,13 +600,23 @@ NM_SYMBOL = re.compile(r"^([0-9a-fA-F]{8,16})\s+[TtWw]\s+(\S+)\s*$")
 NULL_INPUTS_NAME = "null-inputs.txt"
 NULL_INPUT_RE = re.compile(
     r"^x2w-render null input: key ([0-9a-f]{16}) input (\d+) \([^)]+\) cause (\w+) calls (\d+) ")
+TARGET_LABEL = r"[0-9a-f]+ \(\d+x\d+ format \d+\)"
 NULL_TARGET_RE = re.compile(
-    r"^x2w-render target [0-9a-f]+ \(\d+x\d+ format \d+\): draws (\d+), with a null input (\d+) frames -?\d+\.\.-?\d+$")
+    rf"^x2w-render target {TARGET_LABEL}: draws (\d+), with a null input (\d+) frames -?\d+\.\.-?\d+"
+    r"(?:, not drawn \d+ by .+)?$")
+STARVED_TARGET_RE = re.compile(
+    rf"^x2w-render starved target ({TARGET_LABEL}): last drawn frame -?\d+, "
+    r"(?:not drawn since: .+|starved, no candidate)$")
+DRAW_PIPELINE_RE = re.compile(
+    rf"^x2w-render not drawn key ([0-9a-f]{{16}}): (\d+) \([^)]+\)(?:, targets ({TARGET_LABEL}))?$")
 
 
 def null_inputs_section(stderr_text):
     inputs = {}
     windows = []
+    pipelines = {}
+    starved = {}
+    totals = ""
     for line in stderr_text.splitlines():
         if match := NULL_INPUT_RE.match(line):
             key, index, cause, calls = match.groups()
@@ -613,12 +625,28 @@ def null_inputs_section(stderr_text):
             draws, poisoned = map(int, match.groups())
             if draws and poisoned <= draws:
                 windows.append(f"{line} ({poisoned / draws:.1%} poisoned)")
-        elif line.startswith("x2w-render null census overflow:"):
+            elif draws == poisoned == 0 and ", not drawn " in line:
+                windows.append(line)
+        elif line.startswith(("x2w-render null census overflow:", "x2w-render target census omitted:")):
             windows.append(line)
-    if not inputs and not windows:
+        elif line.startswith("x2w-render totals:"):
+            totals = line
+        elif match := STARVED_TARGET_RE.fullmatch(line):
+            starved[match[1]] = line
+        elif match := DRAW_PIPELINE_RE.fullmatch(line):
+            key, calls, target = match.groups()
+            pipelines[key] = (int(calls), line if target else line + ", targets unknown")
+    if not (inputs or windows or starved or pipelines):
         return ""
     rows = [line for _, line in sorted(inputs.values(), key=lambda row: (-row[0], row[1]))]
-    return "\n".join(["null inputs", *rows, "", "render target windows", *windows]) + "\n"
+    sections = ["null inputs", *rows, "", "render target windows", *windows, "", "render summary"]
+    if totals:
+        sections.append(totals)
+    sections.extend(["", "starved targets", *starved.values()])
+    if pipelines:
+        sections.extend(["", "not drawn by pipeline",
+                         *(line for _, line in sorted(pipelines.values(), key=lambda row: (-row[0], row[1])))])
+    return "\n".join(sections) + "\n"
 
 
 def parse_symbols(text):
