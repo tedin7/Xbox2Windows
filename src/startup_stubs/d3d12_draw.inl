@@ -3142,7 +3142,11 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format,
 
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
-    static const bool view_diagnostics = x2w_local::env_on("X2W_FORMATTED_BUFFER_DIAGNOSTICS");
+    // On by default so a tester log names the missing view format; X2W_FORMATTED_BUFFER_DIAGNOSTICS=0 turns it off.
+    static const bool view_diagnostics = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_FORMATTED_BUFFER_DIAGNOSTICS", value, sizeof(value)) != 1 || value[0] != '0';
+    }();
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0,
                             FormattedViewDetails view = {}) {
         InterlockedIncrement(&formatted_draws_refused);

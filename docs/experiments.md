@@ -499,9 +499,9 @@ Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for th
 
 An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
 
-Set `X2W_FORMATTED_BUFFER_DIAGNOSTICS=1` in the runtime to log the DXGI
+The runtime logs the DXGI
 format number and component mapping on the first view refusal per pipeline
-and SRV slot. Set `X2W_EXTENDED_BUFFER_FORMATS=1` in both the runtime and the
+and SRV slot (`X2W_FORMATTED_BUFFER_DIAGNOSTICS=0` turns it off). Set `X2W_EXTENDED_BUFFER_FORMATS=1` in both the runtime and the
 translator to enable 25 additional formats for translated draws. The expanded
 graphics cache keys are scoped to that setting. The default uses the
 existing keys and shader source.
