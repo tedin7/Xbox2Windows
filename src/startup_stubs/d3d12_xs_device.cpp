@@ -92,7 +92,7 @@
 #include "key_use.h"
 #include "root_constant_store.h"
 #include "null_texture_view.h"
-#include "packed_target_format.h"
+#include "clear_value_format.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
@@ -854,19 +854,9 @@ __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d,
 // Resource descriptions: the title sets flag bits desktop D3D12 rejects (0x20000 on buffers,
 // 0x100000 and 0x200000 on render-target textures). Desktop receives only the bits it defines
 // up to ALLOW_SIMULTANEOUS_ACCESS (0x3f); dropped bits are logged once per value.
-// Console-only DXGI format values (116-120 in the console's format extensions: two 10-bit float
-// formats, D16_UNORM_S8_UINT and its two typed views) mapped to the nearest desktop formats. The
-// bit layouts differ, so contents are not interchangeable; this only lets the resources exist.
 DXGI_FORMAT desktop_format(DXGI_FORMAT format)
 {
-    DXGI_FORMAT mapped = format;
-    switch (static_cast<UINT>(format)) {
-    case 116: case 117: mapped = DXGI_FORMAT_R10G10B10A2_UNORM; break;
-    case 118: mapped = DXGI_FORMAT_D24_UNORM_S8_UINT; break;
-    case 119: mapped = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
-    case 120: mapped = DXGI_FORMAT_X24_TYPELESS_G8_UINT; break;
-    default: break;
-    }
+    const DXGI_FORMAT mapped = x2w_startup::desktop_format(format);
     if (mapped != format) {
         static LONG calls;
         if (first_calls(calls, 6)) log("x2w-d3d12 console format %u -> desktop format %u", format, mapped);
@@ -919,19 +909,6 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
         }
     }
     return copy;
-}
-
-// An optimized clear belongs to the actual texture format, including when the
-// wrapper substitutes it. Preserve the caller's clear colour.
-const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI_FORMAT requested,
-                                          DXGI_FORMAT created, D3D12_CLEAR_VALUE& copy)
-{
-    const auto* mapping = x2w_startup::packed_target_mapping(requested);
-    if (!clear || !mapping || created != mapping->replacement || desktop_format(clear->Format) != requested)
-        return clear;
-    copy = *clear;
-    copy.Format = created;
-    return &copy;
 }
 
 bool legacy_retire_view_stats()
@@ -993,12 +970,15 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     D3D12_CLEAR_VALUE clear_copy{};
     DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
-        requested_format = desktop_format(reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc])->Format);
-        desc_copy = sanitized(*reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]));
+        const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]);
+        requested_format = desktop_format(desc.Format);
+        desc_copy = sanitized(desc);
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
-        if constexpr (K == device_kind && (N == 27 || N == 29))
-            args[4] = reinterpret_cast<u64>(packed_clear_value(reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[4]),
-                                                               requested_format, desc_copy.Format, clear_copy));
+        if constexpr (K == device_kind && (N == 27 || N == 29 || N == 30)) {
+            constexpr int clear_index = N == 30 ? 2 : 4;
+            args[clear_index] = reinterpret_cast<u64>(x2w_startup::desktop_clear_value(
+                reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[clear_index]), desc.Format, desc_copy.Format, clear_copy));
+        }
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], args[4], args[5],
                                                 args[6], args[7]);
@@ -6306,8 +6286,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             return S_OK;
         }
         D3D12_CLEAR_VALUE clear_copy{};
-        const auto* clear_value = packed_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
-                                                    desktop_format(desc->Format), texture.Format, clear_copy);
+        const auto* clear_value = x2w_startup::desktop_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
+                                                                  desc->Format, texture.Format, clear_copy);
         ID3D12Resource* created = nullptr;
         // On E_OUTOFMEMORY of the default heap, X2W_D3D12_SYSMEM_FALLBACK=1 creates the texture once more in system memory.
         bool in_system_memory = false;
@@ -8030,7 +8010,7 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
                                           : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                                     : D3D12_RESOURCE_STATE_COMMON;
     D3D12_CLEAR_VALUE clear_copy{};
-    const auto* clear_value = packed_clear_value(clear, desktop_format(desc->Format), copy.Format, clear_copy);
+    const auto* clear_value = x2w_startup::desktop_clear_value(clear, desc->Format, copy.Format, clear_copy);
     HRESULT hr = kind_for(*iid) == resource_kind
         ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear_value, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;

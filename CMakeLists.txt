@@ -1996,6 +1996,7 @@ target_link_libraries(startup_clear_depth_stencil PRIVATE d3d12_xs_shim d3d12 dx
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_clear_depth_stencil_${backend} COMMAND startup_clear_depth_stencil ${backend})
     set_tests_properties(startup_clear_depth_stencil_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "Device::slot76[(]CreateCommittedResource[)].*clear=[^ ]*[(]dropped[)]"
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
@@ -2377,7 +2378,7 @@ add_executable(startup_packed_target_check tests/startup_packed_target_check.cpp
 target_include_directories(startup_packed_target_check PRIVATE src)
 target_compile_features(startup_packed_target_check PRIVATE cxx_std_17)
 add_test(NAME startup_packed_target COMMAND startup_packed_target_check)
-foreach(mutation IN ITEMS stand-in array b565 sharedexp sharedexp-uav view tag)
+foreach(mutation IN ITEMS stand-in array b565 sharedexp sharedexp-uav view tag raw-clear)
     add_test(NAME startup_packed_target_${mutation}_control COMMAND startup_packed_target_check --mutate ${mutation})
     set_tests_properties(startup_packed_target_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()

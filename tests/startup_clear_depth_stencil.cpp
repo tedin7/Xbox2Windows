@@ -8,13 +8,14 @@
 //   B  2x2 D32_FLOAT   cleared 0.75f with rect covering surface,
 //                      then a clear with a read-only DSV (refused, no overwrite)
 //                                                                         read back: 0.75f (0x3f400000)
+//   D  1x1 console format 118   slot 76 creation and matching depth/stencil clear
 //   C  1x1 RGBA8 RTV   a clear through an RTV handle (wrong kind, refused, counted)
 //   -  Empty handle    a clear through a CPU handle that holds no view (refused, counted)
 //   -  Zero flags      a clear with flags == 0 (refused, no-op)
 //
 // The desktop device must not be removed and the debug layer must report no errors.
 //
-// Exit codes: 0 pass, 77 no physical adapter, other values name the failing step.
+// Exit codes: 0 pass, 77 no physical adapter or debug callback, other values name the failing step.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
@@ -69,8 +70,13 @@ unsigned unresolved_now()
 }
 
 std::atomic<unsigned long long> debug_error_count{0};
-void WINAPI on_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID, LPCSTR text, void*)
+std::atomic<unsigned> clear_mismatches{0};
+void WINAPI on_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR text, void*)
 {
+    if (id == D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE) {
+        ++clear_mismatches;
+        std::printf("debug layer: %.300s\n", text);
+    }
     if (severity > D3D12_MESSAGE_SEVERITY_ERROR) return;
     if (++debug_error_count <= 12) std::printf("debug layer: %.300s\n", text);
 }
@@ -99,7 +105,7 @@ struct Probe {
     bool watch()
     {
         return SUCCEEDED(desktop.As(&queue1)) &&
-               SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
+               SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS, nullptr, &cookie));
     }
 
     bool readback_depth(ID3D12Resource* target, UINT width, UINT height, std::vector<float>& out)
@@ -203,16 +209,20 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 4;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
 
-    if (!probe.watch()) std::printf("no debug layer message callback: validation not counted\n");
+    if (!probe.watch()) {
+        std::puts("SKIP: no debug layer message callback");
+        return 77;
+    }
 
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const auto depth_desc = [](UINT w, UINT h) {
         return D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0},
                                    D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
     };
-    D3D12_CLEAR_VALUE clear_val{};
-    clear_val.Format = DXGI_FORMAT_D32_FLOAT;
-    clear_val.DepthStencil = {1.0f, 0};
+    D3D12_CLEAR_VALUE clear_a{}, clear_b{};
+    clear_a.Format = clear_b.Format = DXGI_FORMAT_D32_FLOAT;
+    clear_a.DepthStencil = {0.25f, 0};
+    clear_b.DepthStencil = {0.75f, 0};
 
     ComPtr<ID3D12Resource> a, b, c;
     const D3D12_RESOURCE_DESC desc_a = depth_desc(1, 1);
@@ -222,22 +232,42 @@ int main(int argc, char** argv)
     const D3D12_CLEAR_VALUE rtv_clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0}};
 
     if (FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_a, D3D12_RESOURCE_STATE_COMMON,
-                                                      &clear_val, IID_PPV_ARGS(&a))) ||
+                                                      &clear_a, IID_PPV_ARGS(&a))) ||
         FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_b, D3D12_RESOURCE_STATE_COMMON,
-                                                      &clear_val, IID_PPV_ARGS(&b))) ||
+                                                      &clear_b, IID_PPV_ARGS(&b))) ||
         FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_c, D3D12_RESOURCE_STATE_COMMON,
                                                       &rtv_clear, IID_PPV_ARGS(&c))))
         return 5;
 
-    // DSV heap with 4 descriptors:
+    constexpr auto console_depth = static_cast<DXGI_FORMAT>(118);
+    auto desc_d = depth_desc(1, 1);
+    desc_d.Format = console_depth;
+    D3D12_CLEAR_VALUE clear_d{};
+    clear_d.Format = console_depth;
+    clear_d.DepthStencil = {0.5f, 0x5a};
+    ComPtr<ID3D12Resource> d;
+    const auto errors_before_create = debug_error_count.load();
+    const auto hr = invoke(device, 76, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc_d), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                           arg(&clear_d), arg(&__uuidof(ID3D12Resource)), arg(d.GetAddressOf()));
+    D3D12_RESOURCE_DESC created_d{};
+    if (d) invoke(d.Get(), 10, arg(&created_d));  // Resource::GetDesc with the return buffer explicit.
+    if (!ok(hr) || created_d.Format != DXGI_FORMAT_D24_UNORM_S8_UINT ||
+        debug_error_count.load() != errors_before_create) {
+        std::printf("FAIL: slot 76 console depth creation or debug validation, hr=0x%08lx\n",
+                    static_cast<unsigned long>(static_cast<HRESULT>(hr)));
+        return 21;
+    }
+
+    // DSV heap with 5 descriptors:
     // 0: DSV for A (writable)
     // 1: DSV for B (writable)
     // 2: DSV for B (read-only)
     // 3: Empty (unmapped)
+    // 4: DSV for D (writable)
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
-    } dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0},
+    } dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0},
       rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0};
 
     void* dsv_heap = nullptr;
@@ -259,6 +289,10 @@ int main(int argc, char** argv)
     invoke(device, 21, arg(a.Get()), arg(&dsv_writable), dsv_cpu);
     invoke(device, 21, arg(b.Get()), arg(&dsv_writable), dsv_cpu + dsv_stride);
     invoke(device, 21, arg(b.Get()), arg(&dsv_readonly), dsv_cpu + 2 * dsv_stride);
+
+    auto dsv_mapped = dsv_writable;
+    dsv_mapped.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    invoke(device, 21, arg(d.Get()), arg(&dsv_mapped), dsv_cpu + 4 * dsv_stride);
 
     // Create RTV:
     // Slot 20: CreateRenderTargetView(resource, desc, dest)
@@ -306,20 +340,31 @@ int main(int argc, char** argv)
     clear_dsv(list, handle_a, static_cast<D3D12_CLEAR_FLAGS>(0), 0.5f, 0, 0, nullptr);
     if (!check_count("6 zero clear flags", seen, 0)) return 15;
 
+    // Mutant: forwarding raw format 118 fails on debug validation or the slot 76
+    // retry (CTest also rejects the "(dropped)" log marker).
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle_d{static_cast<SIZE_T>(dsv_cpu + 4 * dsv_stride)};
+    clear_dsv(list, handle_d, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5f, 0x5a, 0, nullptr);
+    if (!check_count("7 mapped depth/stencil clear", seen, 0)) return 22;
+
     // Close and submit
     invoke(list, 9);
     if (!probe.submit(list)) return 16;
+
+    if (clear_mismatches.load() != 0) {
+        std::puts("FAIL: depth/stencil clear did not match the optimized clear value");
+        return 23;
+    }
 
     // Read back depth values
     std::vector<float> values_a, values_b;
     if (!probe.readback_depth(a.Get(), 1, 1, values_a)) return 17;
     if (!probe.readback_depth(b.Get(), 2, 2, values_b)) return 18;
 
-    std::printf("7 A depth: %.4f (expected 0.2500)\n", values_a[0]);
+    std::printf("8 A depth: %.4f (expected 0.2500)\n", values_a[0]);
     if (values_a[0] != 0.25f) return 19;
 
     for (int i = 0; i < 4; ++i) {
-        std::printf("8 B[%d] depth: %.4f (expected 0.7500)\n", i, values_b[i]);
+        std::printf("9 B[%d] depth: %.4f (expected 0.7500)\n", i, values_b[i]);
         if (values_b[i] != 0.75f) return 20;
     }
 
