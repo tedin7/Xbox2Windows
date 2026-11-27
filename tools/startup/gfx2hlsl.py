@@ -7470,23 +7470,25 @@ class Stage:
         each destination register, a component or the constant 0 or 1. The draw builds the word from a hardware
         descriptor or from the title's typed buffer view (src/startup_stubs/buffer_format_word3.h) and refuses the
         draw when it has none or the FORMAT has no case here, so the default arm is not reached from a draw.
-        For compute, the caller must validate the native descriptor and reachable byte addresses, and bind the
-        SRV and entry constants from that same descriptor snapshot.
+        Compute also accepts proven heap records. A view token needs a decoded format before dispatch, while
+        an unknown format in a native heap record returns zero in every destination.
         """
         buf, address = self.buffer_address(ops, mods)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
-        # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
+        # FORMAT and DST_SEL come from the bound descriptor, so all four words must be intact.
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
+        source = first[1][0] if first and first[0] in ('desc', 'ptr') else None
+        heap = source == 'resheap' and getattr(self, 'kind', None) == 'cs'
+        if source not in (None, 'table') and not heap:
+            raise Unsupported('formatted buffer load requires a hardware table descriptor (source: %s)' % source)
         if (not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc'
                 or not names_one_value(first) or any(
                     self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
-        if first[1][0] != 'table':
-            raise Unsupported('formatted buffer load requires a hardware table descriptor')
-        if self.past_entry and not self.formatted_descriptor_from_block(r, first):
+        if not heap and self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
         word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
@@ -7499,7 +7501,10 @@ class Stage:
             if fmt in DESC_ONE_INTEGER:
                 body.append('one = 1u;')
             self.emit('case %du: %s break;' % (code, ' '.join(body)))
-        self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
+        if heap:
+            self.emit('default: one = 0u; break; }')
+        else:
+            self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
         pick = ('((%s >> %d) & 7u)' % (word3, 3 * i) for i in range(count))
         for i, sel in enumerate(pick):
             self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'

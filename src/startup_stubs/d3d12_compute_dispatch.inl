@@ -279,6 +279,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
     } views[40]{};
+    bool formatted_inputs[32]{};  // input count is bounded by the manifest parser
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
@@ -311,6 +312,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    if (!reason)
+        for (const auto& ud : tr->uds)
+            if (ud.source == ComputeTranslation::input_word3) formatted_inputs[ud.a] = true;
     phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
@@ -447,6 +451,17 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             continue;
         }
         if (!output) {
+            // A heap token supplies the view format and mapping. Native heap records keep their
+            // word verbatim, including unknown formats handled by the generated switch.
+            if (slot.heap && formatted_inputs[i] && words[0] == view_token_magic) {
+                std::uint32_t format = 0;
+                if (const char* refusal = formatted_buffer_word3(words, format)) {
+                    reason = refusal == x2w_startup::undecoded_view_format
+                        ? "a formatted input view has no buffer format code"
+                        : "a formatted input has no word 3 the program decodes";
+                    break;
+                }
+            }
             // Each condition of a complete GPU-backed buffer range has its own reason.
             const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
             if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
@@ -516,6 +531,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;
         case ComputeTranslation::input_stride: values[i] = view.stride; break;
         case ComputeTranslation::input_word3:
+            if (tr->srvs[ud.a].heap) {
+                values[i] = view.words[3];
+                break;
+            }
             std::memcpy(word, view.words, sizeof(word));
             if (formatted_buffer_word3(word, format)) {
                 reason = "a formatted input has no word 3 the program decodes";

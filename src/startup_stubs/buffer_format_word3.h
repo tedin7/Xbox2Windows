@@ -37,6 +37,8 @@ inline std::uint32_t buffer_format_code(DXGI_FORMAT format)
     }
 }
 
+inline constexpr char undecoded_view_format[] = "view format has no decoded buffer FORMAT";
+
 // Word 3 for a typed buffer view: DST_SEL 4..7 for channels x..w, 0 and 1 for the forced constants. Returns
 // nullptr and sets `word`, or the reason no word can be given (the draw is then refused, not read as zeros).
 inline const char* view_word3(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::uint32_t& word)
@@ -46,7 +48,7 @@ inline const char* view_word3(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::
         view.Buffer.StructureByteStride != 0)
         return "not a typed buffer view";
     const std::uint32_t code = buffer_format_code(view.Format);
-    if (!code) return "view format has no decoded buffer FORMAT";
+    if (!code) return undecoded_view_format;
     const UINT mapping = view.Shader4ComponentMapping;
     if ((mapping >> 12) != 1) return "invalid component mapping";
     std::uint32_t selects = 0;
