@@ -193,6 +193,14 @@ requires a vote. [SIMT execution model](https://opus.bibliothek.uni-augsburg.de/
 Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
 uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
 
+Phase 2 also exercises the path-sensitive guard proof in step 6. The mesh
+walk retains definitions covered by `thread < B` when every active path
+writes them. After the count exchange, the same thread can read them under
+`thread < V` when `V` comes from zero or the same stable group-uniform
+bound. The count clamp can only reduce the required lanes. The scalar arms
+remain real wave-voted branches, following the distinction between uniform
+branches and predicates in Moll and Hack (PLDI 2018). [Partial Control-Flow Linearization](https://compilers.cs.uni-saarland.de/papers/moll_parlin_pldi18.pdf)
+
 ### Phase 3: `v_readfirstlane` and waterfalls
 
 Trace the per-lane source of a first-lane read through `v_cndmask_b32`, an if/else whose arms set

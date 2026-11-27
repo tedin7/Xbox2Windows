@@ -171,3 +171,19 @@ checks passed. Round 2 adds seven accepting fixtures and four refusal controls.
 A before/after comparison against `fd5f476b7` covered seven existing scripts
 and matched 496 emitted HLSL and manifest outputs byte for byte. Windows
 readback remains pending.
+
+
+## Defined positions under the published count
+
+Round 3 tracks the sources of mask operations even when no mask instruction
+writes those pairs. The loaded-pair and entry-only-pair controls changed
+from pure to impure. The compare-and-NOT control stayed pure.
+
+Both S1 arms now supply position VGPRs in a synthetic guarded draw. The
+offline tests accept the same bound, a zero-or-bound select, and an unsigned
+export compare. Five controls retain the legacy undefined-VGPR refusal.
+The widened-count mutant adds one allocated vertex and changes 80 CPU
+reference pixels. The mesh, compute and pixel controls, the mesh and
+compute LLVM 19 assembly checks, and docs links passed on Linux. A
+before/after check against `cf0e0c388` matched 517 legacy HLSL and manifest
+outputs across seven scripts. Windows readback remains pending.

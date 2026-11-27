@@ -2604,7 +2604,10 @@ def lane_mask_webs(ins, edges=None, *, readers=None):
     accesses, writes, possible_writes, candidates = lane_mask_accesses(ins)
     if not successors or not candidates or not lane_mask_flow_supported(successors):
         return {}
-    words = set().union(*(lane_mask_words(pair) for pair in candidates.values()))
+    pairs = set(candidates.values())
+    pairs.update(pair for ops, _, sources, _ in accesses for j in sources
+                 if (pair := lane_mask_pair(ops[j])) not in (None, 'exec'))
+    words = set().union(*(lane_mask_words(pair) for pair in pairs))
     incoming = reaching_mask_words(successors, writes, possible_writes, words)
     bad, uses, links = set(), {}, {}
     for i, (ops, dests, sources, implicit) in enumerate(accesses):
@@ -3134,8 +3137,147 @@ def mesh_mask_arm(ins, source, target, edges, live_at_join):
     return {branch}, mask_ops
 
 
+def mesh_guard_scalar_values(ins, first, compare, uniform_entry):
+    """Track group-uniform identities and alternatives of scalar selects up to the guard."""
+    uniform_scc = False
+    values = {reg: frozenset({('entry', reg)}) for reg in uniform_entry}
+
+    def value(token):
+        if token in values:
+            return values[token]
+        try:
+            return frozenset({int(token, 0) & 0xffffffff})
+        except ValueError:
+            return frozenset()
+
+    for i in range(first, compare):
+        name, asm = ins[i][2:]
+        ops = parse(asm)[1]
+        _, _, writes = scalar_effects(name, asm)
+        result = frozenset()
+        if name == 's_mov_b32':
+            result = value(ops[1])
+        if name == 's_cselect_b32' and uniform_scc:
+            left, right = map(value, ops[1:])
+            if left and right:
+                result = left | right
+        if re.fullmatch(r's_(?:add|sub|mul|min|max|lshl|lshr|and|or|xor)_[biu]32', name):
+            if len(ops) == 3 and all(value(tok) for tok in ops[1:]):
+                result = frozenset({('definition', i)})
+        if 'scc' in writes and name not in ('s_mov_b32', 's_mov_b64', 's_movk_i32', 's_cselect_b32', 's_cselect_b64'):
+            uniform_scc = name.startswith(('s_cmp_', 's_bitcmp')) and all(value(tok) for tok in ops)
+        for word in writes:
+            values.pop(word, None)
+        if result and re.fullmatch(r's\d+', ops[0]):
+            values[ops[0]] = result
+    return values
+
+
+def mesh_guard_step(name, asm, active, saves):
+    """Return possible lane EXEC states, interpreting only known writes to EXEC."""
+    _, ops, _ = parse(asm)
+    if not writes_exec(name, ops):
+        return [(active, saves)]
+    if name.startswith('v_cmpx_'):
+        return [(False, saves), (active, saves)]
+    if name == 's_and_saveexec_b64':
+        saved = tuple(sorted((dict(saves) | {ops[0]: active}).items()))
+        return [(False, saved), (active, saved)]
+    held = dict(saves)
+    if name == 's_andn2_b64' and ops[0] == 'exec' and ops[1] in held and ops[2] == 'exec':
+        return [(held[ops[1]] and not active, saves)]
+    if name == 's_or_b64' and ops[:2] == ['exec', 'exec'] and ops[2] in held:
+        return [(active or held[ops[2]], saves)]
+    if name == 's_mov_b64' and ops[0] == 'exec' and ops[1] in held:
+        return [(held[ops[1]], saves)]
+    if name == 's_and_b64' and ops[0] == 'exec' and ops[1] in held:
+        return [(False, saves), (held[ops[1]], saves)]
+    if name == 's_and_b64' and ops[0] == 'exec' and 'exec' in ops[1:]:
+        return [(False, saves), (active, saves)]
+    return []
+
+
+def mesh_guard_vgpr_writes(name, asm):
+    """Return direct VALU or load destinations predicated by this lane's EXEC."""
+    if (not name.startswith(('v_', 'buffer_load_', 'tbuffer_load_', 'image_load'))
+            or name.startswith(('v_cmp', 'v_read', 'v_write', 'v_movrel', 'v_swap'))):
+        return set()
+    _, ops, mods = parse(asm)
+    if not ops or '_sdwa' in name or '_d16' in name or 'd16' in mods:
+        return set()
+    dest = reg_range(ops[0])
+    return set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
+
+
+def mesh_guard_definitions(ins, branch, join, edges):
+    """Intersect definitions over every possible trace of an outer-EXEC lane."""
+    paths = {branch + 1: {(True, ()): set()}}
+    for i in range(branch + 1, join):
+        for (active, saves), written in paths.get(i, {}).items():
+            name, asm = ins[i][2:]
+            if saves and any(scalar_tokens(pair) & scalar_effects(name, asm)[2]
+                             for pair, _ in saves if name != 's_and_saveexec_b64'):
+                return set()
+            states = mesh_guard_step(name, asm, active, saves)
+            if not states:
+                return set()
+            if active:
+                written = written | mesh_guard_vgpr_writes(name, asm)
+            successors = [] if name == 's_branch' else [i + 1]
+            if i in edges and (name != 's_cbranch_execz' or not active):
+                successors.append(edges[i])
+            for dest in successors:
+                if not i < dest <= join:
+                    return set()
+                incoming = paths.setdefault(dest, {})
+                for state in states:
+                    incoming[state] = incoming[state] & written if state in incoming else written
+                if len(incoming) > 64:
+                    return set()
+    results = paths.get(join, {})
+    return set.intersection(*results.values()) if results else set()
+
+
+def mesh_guarded_registers(ins, first, exchange, end, branches, edges, counts, uniform_entry):
+    """Prove thread < published count implies the defining thread < B guard."""
+    if not branches or any(name.startswith(('s_movrel', 'v_movrel', 's_setpc', 's_swappc'))
+                           for _, _, name, _ in ins):
+        return {}
+    proved = {}
+    before = set().union(*(scalar_effects(*item[2:])[2] for item in ins[:first]))
+    uniform_entry = set(uniform_entry) - before
+    exchange_writes = set().union(*(scalar_effects(*item[2:])[2] for item in ins[exchange:end]))
+    scratch = exchange_writes - set(counts.values())
+    for compare, sources in branches.items():
+        if len(sources) != 1:
+            continue
+        # A bypass or another entry would leave the definitions below unexecuted.
+        source = sources[0]
+        if any(first <= a < exchange and (a < source or b <= source or b > exchange)
+               for a, b in edges.items()):
+            continue
+        name, asm = ins[compare][2:]
+        args = parse(asm)[1]
+        if name != 'v_cmpx_gt_u32_e32' or not re.fullmatch(r's\d+', args[0]):
+            continue
+        bound, thread = args
+        values = mesh_guard_scalar_values(ins, first, compare, uniform_entry)
+        held = values.get(bound, frozenset())
+        if len(held) != 1:
+            continue
+        modified = set().union(*(scalar_effects(*item[2:])[2] for item in ins[compare + 1:exchange] + ins[end:]))
+        if bound in modified or bound in scratch:
+            continue
+        guarded = mesh_guard_definitions(ins, source, edges[source], edges)
+        for key, reg in counts.items():
+            possible = values.get(reg, frozenset())
+            if possible and possible <= held | {0} and reg not in modified:
+                proved.setdefault(compare, {})[key, int(thread[1:])] = guarded.copy()
+    return proved
+
+
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
-                  mask_arm_sites=None, standalone_selects=None):
+                  mask_arm_sites=None, standalone_selects=None, uniform_entry=()):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -3533,6 +3675,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     out = list(ins[:first])
     span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
     # State of the walk over the code outside the two exchanges.
+    guarded_candidates = mesh_guarded_registers(
+        ins, a_end, count_at, b_end, load_branches, edges,
+        {key: env[key] for key in ('verts', 'prims')}, uniform_entry)
+    exchange_clobbers = {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+    guarded_defined = {}
     stale = set(range(256))   # VGPRs the model does not hold for every lane; no entry VGPR is modelled
     pending = set()           # of those, the ones written only for the lanes of a narrowed exec
     mask = None           # None (all lanes), an output count, or another narrowed mask
@@ -3727,6 +3874,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         elif index in load_compares:
             if thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
+            if mask is None and all(wave_loads[ins[source][0]][1] is not None for source in load_branches[index]):
+                for guard, defined in guarded_candidates.get(index, {}).items():
+                    kept = defined - exchange_clobbers
+                    if kept:
+                        guarded_defined.setdefault(guard, set()).update(kept)
             for source in load_branches[index]:
                 branch_off = ins[source][0]
                 compare_off, bound, loads, live = wave_loads[branch_off]
@@ -3736,7 +3888,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
-            if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
+            signed_or_proven = (base_name == 'v_cmpx_gt_i32' or (
+                base_name == 'v_cmpx_gt_u32' and (count, thread) in guarded_defined))
+            if (not signed_or_proven or not after or mask is not None or count is None
                     or thread is None or ops[1:] != ['v%d' % thread]):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
@@ -3773,11 +3927,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
         if lane_spill:
             reads_v, writes_v = set(), set()
-        if keep[2] != 'x2w_mesh_group' and reads_v & stale:
+        undefined = reads_v & stale
+        if after:
+            undefined -= guarded_defined.get((mask, thread), set())
+        if keep[2] != 'x2w_mesh_group' and undefined:
             if mask_arm_sites is not None and off in mask_arm_sites:
                 raise mesh_wave_block_error('a vector input is undefined on the active lanes')
             raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
-                              'left different per wave by an exchange)' % min(reads_v & stale))
+                              'left different per wave by an exchange)' % min(undefined))
         if mask is not None:
             pending |= writes_v & stale
         else:
@@ -3902,6 +4059,18 @@ def mrtz_covers_every_path(ins, at, *, deferred_vm=False):
 # Inline float constants of a packed binary16 operation and their binary16 words.
 PK_INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00, '2.0': 0x4000, '-2.0': 0xc000, '4.0': 0x4400, '-4.0': 0xc400}
 
+def mesh_group_uniform_entry(root):
+    """Names of root constant SGPRs in the graphics entry layout."""
+    reg = 8
+    for param in root['params']:
+        if param['type'] == 1:
+            for i in range(param['count']):
+                yield 's%d' % (reg + i)
+            reg += param['count']
+        else:
+            reg += 1 if param['type'] == 0 else 2
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -3966,7 +4135,8 @@ class Stage:
             try:
                 self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
                                          self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
-                                         self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites)
+                                         self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites,
+                                         uniform_entry=tuple(mesh_group_uniform_entry(pipe.root)))
             except Unsupported as reason:
                 if not str(reason).startswith(('slot 57 mesh:', MESH_WAVE_BLOCK)):
                     raise
@@ -3977,7 +4147,7 @@ class Stage:
                 self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
                                          self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
                                          self.mesh_wave_scalar_joins, self.mesh_mask_arm_sites,
-                                         self.mesh_standalone_selects)
+                                         self.mesh_standalone_selects, tuple(mesh_group_uniform_entry(pipe.root)))
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):

@@ -346,6 +346,42 @@ ROUND2_REFUSED = (
 )
 
 
+# Both arms load each lane's position, including the high lanes of the first
+# guest wave. These VGPRs have no definition outside the prefix guard.
+GUARDED_POSITION_SETUP = (
+    ('select', 'beaa0309 bf068008 850e2a80'),
+    ('same', 'be8e0309'),
+    ('unsigned export', 'beaa0309 bf068008 850e2a80'),
+    ('plus one', 'beaa0309 800e812a'),
+    ('different SGPR', 'beaa0308 be8e0309'),
+    ('rewritten bound', 'beaa0309 bf068008 850e2a80'),
+    ('one arm', 'beaa0309 bf068008 850e2a80'),
+    ('wave index', 'beaa0306 be8e032a'),
+)
+GUARDED_POSITION_LOAD = 'e0381000 80043204 bf8c3f70'
+
+
+def guarded_position_mesh(case, setup):
+    prefix = MASK_PREFIX.replace('beaa03ff 00000080', setup).replace(' beaa0380', '')
+    prefix = prefix.replace('befe04c1', 'befe04c1 3608008f 34080884')  # v4 = (thread & 15) * 16
+    if case == 'same':
+        prefix = prefix.replace('7da8002a', '7da8000e')
+    otherwise = MASK_ELSE if case == 'one arm' else MASK_ELSE + ' ' + GUARDED_POSITION_LOAD
+    mesh = lane_mask_mesh(prefix=prefix, value=GUARDED_POSITION_LOAD, otherwise=otherwise, exports='')
+    count_copy = mesh.index('be8e0309', mesh.index('be8d0308'))
+    mesh.pop(count_copy)
+    if case == 'rewritten bound':
+        mesh.insert(count_copy, 'beaa0384')  # s42 = 4
+    if case == 'unsigned export':
+        mesh = mutate('7d28000e', '7da8000e', mesh=mesh)
+    return mutate('13121110', '35343332', mesh=mesh)  # position uses v[50:53]
+
+
+GUARDED_POSITIONS = {case: guarded_position_mesh(case, setup) for case, setup in GUARDED_POSITION_SETUP}
+GUARDED_REFUSAL = ('unsupported: slot 57 mesh: v50 is read where it is not defined for every lane '
+                   '(an entry value, or left different per wave by an exchange)')
+
+
 WAVE_LOAD_MESH = wave_load_mesh()
 WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 WAVE_LOAD_REFUSALS = (
@@ -843,6 +879,14 @@ def lane_mask_controls(tmp):
                 expect(label + ' mutant changes a CPU image', any(
                     lane_mask_reference(label, full, mutant)[-1] != lane_mask_reference(label, full)[-1]
                     for full in (False, True)), True)
+    for label, mesh in GUARDED_POSITIONS.items():
+        key, result = request(tmp, mesh)
+        expect('guarded positions with ' + label, result, 'ok' if label in ('select', 'same', 'unsigned export') else GUARDED_REFUSAL)
+        if label == 'select' and result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('export count mutant changes its source', widen_position_count(source) != source, True)
+            _, good, bad = guarded_position_reference()
+            expect('export count mutant changes the CPU image', good != bad, True)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
     for label, mesh, reason in MASK_CONTROLS:
@@ -1049,6 +1093,15 @@ v_cndmask_b32_e64 v7, 0, 1.0, vcc
     expect('re-narrowed EXEC words',
            assemble(mc, 'v_cmp_gt_u32_e64 s[60:61], 64, v0\ns_and_b64 exec, s[54:55], s[60:61]'),
            'd4c4003c 000200c0 87fe3c36'.split())
+    expect('guarded position load words', assemble(mc, """
+buffer_load_dwordx4 v[50:53], v4, s[16:19], 0 offen
+s_waitcnt vmcnt(0)
+"""), GUARDED_POSITION_LOAD.split())
+    expect('guarded position select words', assemble(mc, """
+s_mov_b32 s42, s9
+s_cmp_eq_u32 s8, 0
+s_cselect_b32 s14, 0, s42
+"""), dict(GUARDED_POSITION_SETUP)['select'].split())
     source = """
 s_mov_b32 s40, 0x3e808081
 s_lshl_b32 s41, s6, 2
@@ -1293,6 +1346,59 @@ def draw_lane_masks(dxc, renderer, adapter):
                 status = draw_lane_mask_case(tmp, dxc, renderer, adapter, label, program, full)
                 if status:
                     return status
+    with tempfile.TemporaryDirectory() as tmp:
+        return draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+
+
+def guarded_position_reference():
+    """Extra vertex 10 is inactive in the defining region and has zero clip position in the mutant."""
+    points, colours, _ = geometry()
+    triangles = [(7, 2, 10), (5, 0, 8), (3, 4, 1), (6, 9, 4)]
+    data = buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles])
+    correct = rasterise(points, colours, triangles, 10, 4)
+    # The guest clamps index 10 to 9. When 10 is exported as (0,0,0,0),
+    # all nonzero homogeneous combinations in its triangle project onto the other edge.
+    mutant = rasterise(points, colours, triangles[1:], 11, 3)
+    return data, correct, mutant
+
+
+def widen_position_count(source):
+    """Widen the export predicate and its allocation together by one vertex."""
+    old = 's14 = min(lds[1], 128u);'
+    assert source.count(old) == 1
+    return source.replace(old, 's14 = min(lds[1] + 1u, 128u);')
+
+
+def draw_guarded_positions(tmp, dxc, renderer, adapter):
+    mesh = GUARDED_POSITIONS['select']
+    key, result = request(tmp, mesh)
+    expect('guarded positions compile', result, 'ok')
+    if result != 'ok':
+        return 1
+    base = tmp / ('%016x' % key)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+    for slot, count in enumerate((4, 10)):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+    data, correct, wrong = guarded_position_reference()
+    count = sum(a != b for a, b in zip(correct, wrong))
+    expect('widened export changes the CPU reference', count > 0, True)
+    path = tmp / 'guarded.bin'
+    path.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, correct)))
+    mutant, mutant_text = tmp / 'wider.cso', tmp / 'wider.hlsl'
+    mutant_text.write_text(widen_position_count(base.with_suffix('.ms57.hlsl').read_text()), encoding='ascii')
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutant_text], check=True)
+    for name, shader in (('guarded positions', base.with_suffix('.ms57.cso')), ('widened export', mutant)):
+        run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), path],
+                             capture_output=True, text=True)
+        if run.returncode == 77:
+            return 77
+        matches = re.search(r'pixels=1024 mismatches=(\d+)', run.stdout)
+        got = int(matches[1]) if matches else None
+        if shader == mutant:
+            expect(name + ' differs from the guest image', run.returncode == 1 and got is not None and got > 0, True)
+        else:
+            expect(name + ' matches the guest image', (run.returncode, got), (0, 0))
     return 0
 
 

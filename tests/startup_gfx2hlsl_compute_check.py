@@ -1926,6 +1926,23 @@ def check_execz_mask_exact():
         assert bad == want, (name, sorted(bad))
 
 
+def check_mask_web_sources():
+    """A numeric or entry-only source cannot supply a lane mask bit."""
+    compare = ('v_cmp_gt_u32_e64', 's24, 7, v0')
+    select = ('v_cndmask_b32_e64', 'v2, 0, v1, s[28:29]')
+    cases = (
+        ('scalar-load source', (('s_load_dwordx2', 's[26:27], s[10:11], 0'), compare,
+                               ('s_and_b64', 's[28:29], s[26:27], s[24:25]'), select), False),
+        ('entry-only source', (compare, ('s_or_b64', 's[28:29], s[26:27], s[24:25]'), select), False),
+        ('compare-only source', (compare, ('s_not_b64', 's[28:29], s[24:25]'), select), True),
+    )
+    for label, steps, pure in cases:
+        ins = [(4 * i, 4, name, name + ' ' + args) for i, (name, args) in enumerate(steps)]
+        webs = G.lane_mask_webs(ins)
+        got = tuple('s[28:29]' in webs.get(i, ()) for i in (len(ins) - 2, len(ins) - 1))
+        assert got == (pure, pure), (label, got)
+
+
 def check_pair_phi_controls():
     for name, *_ in PAIR_PHI_CASES:
         text = translate(name).hlsl_cs()
@@ -1958,6 +1975,7 @@ def check_pair_phi_controls():
 
 
 def check_controls():
+    check_mask_web_sources()
     check_pair_phi_controls()
     f16_unary = translate(CASE_F16_UNARY).hlsl_cs()
     assert 'v6 = f16rn(exp2(f16tof32(v5 & 0xffffu)));' in f16_unary
