@@ -70,7 +70,10 @@ def play(player, backend, env, directory, name, data):
 
 def main(scene, player, backend):
     env = {key: value for key, value in os.environ.items() if not key.startswith("X2W_")}
-    env.update(X2W_D3D12_BUDGET="1", X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1")
+    # X2W_UPLOAD_PAGE_REUSE=0 as in startup_resource_budget_*: with reuse on, a finished list's upload page stays in the
+    # free pool (still counted live) and the scene's "allocator reset and shared heap released" count fails.
+    env.update(X2W_D3D12_BUDGET="1", X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_UPLOAD_PAGE_REUSE="0")
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         capture = directory / "resource_budget.x2wr"
