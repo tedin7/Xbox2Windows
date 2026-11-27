@@ -496,7 +496,7 @@ def controls():
     parser = draw_inl.split('const char* read_pixel_uav_line', 1)[1].split('\nbool float_uav_format', 1)[0]
     assert 'typedload' in parser and 'needs_typed_load' in parser and 'tex2da' in parser, parser
     store_cpp = (HERE / 'startup_image_store.cpp').read_text(encoding='utf-8')
-    gate = store_cpp.split('check_startup_image_store_typed_load', 1)[1]
+    gate = store_cpp.split('check_startup_image_store_typed_load', 1)[1].split('\n}\n', 1)[0]
     assert 'DrawInstanced' not in gate and 'typed_uav_load_refusal' in gate, gate
     print('typed UAV load is refused before the view is filled and before any draw')
 

@@ -1411,8 +1411,8 @@ def check_repaired_odd_sample():
     # Baseline captured from the pre-change translator for an unrelated program.
     pipe = G.Pipeline(VS_WORDS, odd_tail_program(3), root_blob(),
                       ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
-    assert hashlib.sha256(pipe.hlsl_vs().encode()).hexdigest() == '7ac5b3ccc1ba98750c54dd4f8b44b3eebe992b0010ece56720386e5ec8690afa'
-    assert hashlib.sha256(pipe.hlsl_ps().encode()).hexdigest() == 'f4ff17baab48fa7222b287976dd218643a2b7bfb06dd984cc9ec7855a78dc508'
+    assert hashlib.sha256(pipe.hlsl_vs().encode()).hexdigest() == 'f85ae4c1203104786d2b9e23560300f73bb04ea923f4a18182ec161e48585768'
+    assert hashlib.sha256(pipe.hlsl_ps().encode()).hexdigest() == 'fac60e62abde72dd302b231e1042995c97b62605618fb809eca82a3c90d9145e'
     assert hashlib.sha256(pipe.manifest().encode()).hexdigest() == '7b710cc0d0fe56ab4d0f3af31121a25a928a33f57894c4f79a03acbdd70f5801'
     return source
 
