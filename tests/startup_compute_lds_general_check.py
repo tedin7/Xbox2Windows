@@ -277,7 +277,7 @@ def controls():
     hidden_field = patch(BASE, '100034d904050000', '100034d904050100')
     refused('reserved or unused', lambda: shader(hidden_field))
     branched = patch(BASE, '100034d904050000', 'ffff82bf100034d904050000')
-    refused('straight-line', lambda: shader(branched))
+    refused('LDS general lowering: backward branch', lambda: shader(branched))
     for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned'):
         text = pipeline(name).hlsl_cs()
         assert simulate(name) == simulate(name, reverse=True), name
@@ -334,7 +334,7 @@ def controls():
         assert branch_reference(name, value) == branch_reference(name, value, reverse=True)
     refused('LDS barrier inside per-lane control flow', lambda: branch_pipeline('execz', 'guest-barrier'))
     refused('LDS ordering point inside per-lane control flow', lambda: branch_pipeline('execz', 'ordering'))
-    refused('straight-line', lambda: branch_pipeline('execz', 'loop'))
+    refused('LDS general lowering: backward branch', lambda: branch_pipeline('execz', 'loop'))
     # The plan must split all plain/atomic hazards, but not read/read or atomic/atomic.
     assembly = ['ds_write_b32 v4, v3', 'ds_read_b32 v20, v4',
                 'ds_read_b32 v21, v4', 'ds_add_u32 v4, v3',
@@ -346,11 +346,34 @@ def controls():
         bad_ins = ins[:1] + [(4, 4, bad.split()[0], bad)] + ins[1:]
         assert G.lds_general_plan(bad_ins, (8, 8, 1), 512) is None
     assert G.lds_general_plan(ins, (4, 4, 4), 8193) is None
+    # Every declined planning path records the actual condition and location/value.
+    def plan_reason(lines, expected, group=(8, 8, 1), words=128, sites=None):
+        instructions = [(i * 4, 4, line.split()[0], line) for i, line in enumerate(lines)]
+        reasons = []
+        assert G.lds_general_plan(instructions, group, words, sites, reasons) is None
+        assert len(reasons) == 1 and expected in reasons[0], (expected, reasons)
+    plan_reason(['s_endpgm'], 'allocation is 8193 dwords', words=8193)
+    plan_reason(['s_endpgm'], 'invalid group shape (0, 8, 1)', group=(0, 8, 1))
+    plan_reason(['s_setpc_b64 s[0:1]'], 's_setpc_b64 at +0x0')
+    plan_reason(['s_cbranch_vccz label_0x4', 's_endpgm'], 'branch s_cbranch_vccz at +0x0')
+    plan_reason(['s_branch label_0x40', 's_endpgm'], 'invalid branch target')
+    plan_reason(['s_branch label_0x0', 's_endpgm'], 'backward branch at +0x0 to +0x0')
+    plan_reason(['s_endpgm', 's_endpgm'], 'early s_endpgm at +0x0')
+    plan_reason(['s_and_saveexec_b64 s[0:1], vcc', 's_endpgm'], 'EXEC write s_and_saveexec_b64 at +0x0')
+    plan_reason(['s_xor_b64 exec, exec, s[0:1]', 's_endpgm'], 'EXEC write s_xor_b64 at +0x0', sites={0: 0, 4: 0})
+    plan_reason(['ds_write_b32 v4, v3 gds', 's_endpgm'], 'GDS operation ds_write_b32 at +0x0')
+    plan_reason(['ds_swizzle_b32 v1, v0', 's_endpgm'], 'ds_swizzle_b32 at +0x0 is not supported')
+    plan_reason(['s_branch label_0x4', 's_endpgm'], 'no convergence proof for 2 instructions')
+    plan_reason(['s_barrier 1', 's_endpgm'], 's_barrier at +0x0 has operands')
+    plan_reason(['s_branch label_0x4', 's_barrier', 's_endpgm'], 'barrier inside per-lane control flow at +0x4', sites={8: 8})
+    plan_reason(['ds_write_b32 v1, v2', 'ds_read_b32 v3, v1', 's_endpgm'],
+                'ordering point inside per-lane control flow at +0x4', sites={0: 0, 8: 8})
+    plan_reason(['s_branch label_0x4', 's_endpgm'], 'lacks proven group convergence and entry EXEC at +0x4', sites={})
     invalid, rsrc, group = program('same_wave')
     write = enc.ds_single(0x0d, 4, data0=3)
-    refused('optional byte offset', lambda: G.ComputePipeline(
+    refused('LDS general lowering: GDS operation', lambda: G.ComputePipeline(
         invalid.replace(write, enc.ds_single(0x0d, 4, data0=3, gds=1)), sibling.root_blob(), rsrc, group))
-    refused('at most 32 KiB', lambda: G.ComputePipeline(
+    refused('LDS general lowering: allocation is 8320 dwords', lambda: G.ComputePipeline(
         invalid, sibling.root_blob(), (rsrc & ~(0x1ff << 15)) | (65 << 15), group))
     unknown = invalid.replace(write, enc.ds_single(0x35, 4, vdst=20))
     refused('ds_swizzle_b32', lambda: G.ComputePipeline(unknown, sibling.root_blob(), rsrc, group))
