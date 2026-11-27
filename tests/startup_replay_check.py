@@ -19,6 +19,7 @@ usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware
 """
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -141,12 +142,12 @@ def check_timing(summary, recording, progress):
     assert calls <= summary["played"] and presents <= summary["presents"], progress
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False):
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=()):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     if timing:
         env["X2W_REPLAY_TIMING"] = "1"
-    code, text = run([player, recording, out, "--adapter", backend], env)
+    code, text = run([player, recording, out, "--adapter", backend, *extra], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
         raise AssertionError("x2w_replay exit %d on %s (%d bytes)\n%s\n%s" % (code, recording.name, recording.stat().st_size,
@@ -324,6 +325,41 @@ def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     print("replay: slot-133 target made before window f6,6 replays presents 7-12 equal")
 
 
+def check_prefix_live(scene, player, backend, env, directory, vs, ps, root):
+    """--prefix-live on: a window opened mid-run (f6,6) whose prefix wrote the target's view twice (a null view first),
+    mapped an upload buffer and asked its GPU address every frame, and asked for an allocation size (device 108). The
+    replay leaves the null view, the repeated Map, Unmap and GPU address calls and the query out, and presents 7-12 are
+    the same pictures as the recorded run and as the replay of the whole prefix."""
+    recorded_dir, recording = directory / "live_recorded", directory / "live.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir), X2W_TEST_REPLAY_PREFIX_LIVE="1",
+                          X2W_TEST_REPLAY_ALLOC108="1"))
+    assert code == 0, text[-3000:]
+    whole = pictures(recorded_dir)
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    results = {}
+    for name, extra in (("live_full", ()), ("live_cut", ("--prefix-live", "on"))):
+        _score, played = replay(player, recording, directory / name, backend, env, presents=6, extra=extra)
+        differ = [b for a, b in pairs if played.get(a) != whole[b]]
+        assert not differ, "%s window replay differs at %s\n%s" % (
+            name, differ, explain(whole[differ[0]], played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
+                                  directory / name / "stderr.txt"))
+        results[name] = json.loads((directory / name / "replay_summary.json").read_text())["prefix"]
+    full, cut = results["live_full"], results["live_cut"]
+    log = (directory / "live_cut" / "stderr.txt").read_text(errors="replace")
+    counts = re.search(r"prefix live: of (\d+) prefix calls, (\d+) descriptor writes .*?, (\d+) repeated .*? and (\d+) "
+                       r"allocation-size queries", log)
+    assert counts, log[-3000:]
+    calls, writes, repeats, queries = map(int, counts.groups())
+    # One null view; frames 1-6 map, unmap and ask the GPU address: all but the first of each are repeats.
+    assert writes >= 1 and repeats >= 3 * 5 - 1 and queries >= 1, counts.group(0)
+    assert full["left_out"] == 0 and cut["left_out"] == writes + repeats + queries, (full, cut)
+    assert cut["calls"] == full["calls"] == calls and cut["played"] < full["played"], (full, cut)
+    print("replay: --prefix-live left out %d of %d prefix calls, window f6,6 presents 7-12 equal" % (cut["left_out"], calls))
+
+
 def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -436,6 +472,7 @@ def main(scene, player, backend, mode=None):
             wide_recorded[differ[0]], wide_played.get(differ[0], ((0, 0), b"")), directory / "wide_replayed" / "stderr.txt")
             if differ else "")
         check_placed_window(scene, player, backend, env, directory, vs, ps, root)
+        check_prefix_live(scene, player, backend, env, directory, vs, ps, root)
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
               (PRESENTS, score))

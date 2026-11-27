@@ -2093,9 +2093,13 @@ recording, 3 a title range could not be reserved at its address, 4 no device, 5 
 accepted and ignored in this version.
 
 The prefix is every call before the recording's first `PRES` chunk (the recorder writes `PRES` only inside the window).
-The log line `x2w-replay: prefix: P of N calls played, wall X s` and `prefix` in `replay_summary.json` give its size
-and time. A recording with a window records in its prefix only the calls the window may depend on (device calls,
-`Map`, heap starts, GPU addresses, reference counts, fence and queue signals): no command lists.
+The log line `x2w-replay: prefix: P of N calls played (L left out by --prefix-live), wall X s` and `prefix` in
+`replay_summary.json` give its size and time. A recording with a window records in its prefix only the calls the window
+may depend on (device calls, `Map`, heap starts, GPU addresses, reference counts, fence and queue signals): no command
+lists. `--prefix-live on` plays the prefix without the calls that leave nothing for the window (`src/replay/prefix_live.h`):
+descriptor writes that a later write to the same destination replaces (a descriptor copy keeps the writes before it),
+the repeats of a resource's `Map`, `Unmap` and `GetGPUVirtualAddress`, and allocation-size queries (device slots 25 and
+108). Every creation, `AddRef` and `Release` still plays. `x2w-replay: prefix live: ...` gives the counts.
 
 Set `X2W_REPLAY_TIMING=1` in the player environment to benchmark replay steps. At each elapsed wall-second boundary,
 the player prints `x2w-replay timing` with calls played, presents, and up to five `kind:slot=us` entries ranked by

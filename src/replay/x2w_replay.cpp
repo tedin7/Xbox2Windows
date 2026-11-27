@@ -3,7 +3,10 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]
+//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--prefix-live on]
+// --prefix-live on: the prefix (the calls before the window's first present) plays without the calls that leave nothing
+// for the window (prefix_live.h): descriptor writes a later write to the same destination replaces, repeated Map, Unmap,
+// GPU address and heap start calls, and allocation-size queries.
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
@@ -47,6 +50,7 @@
 
 #include "replay_file.h"
 #include "replay_pages_apply.h"
+#include "prefix_live.h"
 #include "../startup_stubs/d3d12_replay_slots.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -71,6 +75,7 @@ struct Options {
     bool hardware = false;
     double max_seconds = 0;
     u64 dump_address = 0, dump_bytes = 0;
+    bool prefix_live = false;  // --prefix-live on
 };
 
 struct HeapInfo {
@@ -103,7 +108,7 @@ struct Player {
     bool use_slot_layouts = false;
     u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
     // The prefix: the calls before the window's first present (Recording::window_seq), how many were played, how long.
-    u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0;
+    u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0, prefix_left_out = 0;
     double prefix_seconds = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
@@ -719,6 +724,7 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--prefix-live" && value == L"on") o.prefix_live = true;
         else if (name == L"--dump") {
             if (!parse_dump(value, o)) return false;
         }
@@ -816,8 +822,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
                             "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
-        std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"wall_s\": %.3f}", p.prefix_calls,
-                     p.prefix_played, p.prefix_seconds);
+        std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"left_out\": %llu, \"wall_s\": %.3f}",
+                     p.prefix_calls, p.prefix_played, p.prefix_left_out, p.prefix_seconds);
         if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
@@ -885,6 +891,29 @@ void seed_shader_cache(const Recording& r)
         else DeleteFileW(path.c_str());
     }
     say("x2w-replay: shader cache %ls: %d files from the recording, %d already there, %d refused", dir, written, present, refused);
+}
+
+// --prefix-live: the prefix calls in sequence order, as prefix_live.h reads them. Logged with its counts.
+PrefixLive prefix_live_of(const Recording& r, u64 window_seq)
+{
+    PrefixLive live;
+    Step step;
+    std::vector<u64> outputs;
+    for (const StepRef& ref : r.steps) {
+        if (ref.seq >= window_seq) break;
+        r.load(ref, step);
+        outputs.clear();
+        for (const Output& o : step.outputs) outputs.push_back(o.value);
+        LiveCall c{step.call.seq, step.call.kind, step.call.slot, step.call.object, {}, outputs.data(), outputs.size()};
+        std::memcpy(c.args, step.call.args, sizeof(c.args));
+        live.add(c);
+    }
+    const PrefixLiveCounts& n = live.counts();
+    say("x2w-replay: prefix live: of %llu prefix calls, %llu descriptor writes a later write replaces, %llu repeated Map, Unmap, "
+        "GPU address or heap start calls and %llu allocation-size queries are left out",
+        static_cast<unsigned long long>(n.calls), static_cast<unsigned long long>(n.superseded_writes),
+        static_cast<unsigned long long>(n.repeated_teaching), static_cast<unsigned long long>(n.queries));
+    return live;
 }
 
 int run(const Options& o)
@@ -981,14 +1010,17 @@ int run(const Options& o)
     const auto elapsed = [&] { return std::chrono::duration<double>(ReplayClock::now() - started).count(); };
     bool stopped = false;
     p.window_seq = r.window_seq;
+    std::optional<PrefixLive> live;
+    if (o.prefix_live) live = prefix_live_of(r, p.window_seq);
     bool in_prefix = true;
     const auto end_prefix = [&](u64 calls) {
         in_prefix = false;
         p.prefix_calls = calls;
         p.prefix_played = p.played;
         p.prefix_seconds = elapsed();
-        say("x2w-replay: prefix: %llu of %llu calls played, wall %.3f s", static_cast<unsigned long long>(p.prefix_played),
-            static_cast<unsigned long long>(calls), p.prefix_seconds);
+        say("x2w-replay: prefix: %llu of %llu calls played (%llu left out by --prefix-live), wall %.3f s",
+            static_cast<unsigned long long>(p.prefix_played),
+            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(p.prefix_left_out), p.prefix_seconds);
     };
     u64 index = 0;
     Step s;  // the call being played, loaded from the mapping
@@ -999,6 +1031,11 @@ int run(const Options& o)
             break;
         }
         if (in_prefix && s.call.seq >= p.window_seq) end_prefix(index);
+        if (in_prefix && live && live->left_out(static_cast<std::size_t>(index))) {
+            ++p.prefix_left_out;
+            ++index;
+            continue;
+        }
         ++index;
         if (timing) {
             const auto before = ReplayClock::now();
@@ -1048,7 +1085,7 @@ int wmain(int argc, wchar_t** argv)
     x2w_replay::Options options;
     if (!x2w_replay::parse(argc, argv, options)) {
         std::fprintf(stderr, "usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] "
-                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]\n");
+                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--prefix-live on]\n");
         return 2;
     }
     return x2w_replay::run(options);

@@ -1,3 +1,9 @@
+# --prefix-live: which prefix calls the replay can leave out (src/replay/prefix_live.h). Pure logic, no D3D12.
+add_executable(startup_replay_prefix_live_check tests/startup_replay_prefix_live_check.cpp)
+target_include_directories(startup_replay_prefix_live_check PRIVATE src)
+target_compile_features(startup_replay_prefix_live_check PRIVATE cxx_std_17)
+add_test(NAME startup_replay_prefix_live COMMAND startup_replay_prefix_live_check)
+
 # x2w_replay: a recording of startup_replay_quad replays to the same pictures, and a recording with one clear colour
 # changed replays to a different last picture only (tests/startup_replay_check.py).
 if(TARGET startup_replay_quad AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
