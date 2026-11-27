@@ -130,13 +130,6 @@ constexpr int slot_count = 512;
 // Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
-x2w_startup::MemorySrvCensus memory_srv_diagnostics;
-
-bool memory_srv_diagnostics_enabled()
-{
-    static const bool enabled = x2w_local::env_on("X2W_SLOT70_DIAGNOSTICS");
-    return enabled;
-}
 x2w_startup::MemorySrvSwitchCensus memory_srv_switch_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
@@ -8418,8 +8411,6 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
         memory_srv_census.report([](const char* line) { log("%s", line); }, true);
-        if (memory_srv_diagnostics_enabled())
-            memory_srv_diagnostics.report([](const char* line) { log("%s", line); }, true, true);
         memory_srv_switch_census.report([](const char* line) { log("%s", line); }, true);
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
@@ -8449,7 +8440,6 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
     memory_srv_census.report(emit, false);
-    if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.report(emit, false, true);
     memory_srv_switch_census.report(emit, false);
     token_null_census.report(emit, false);
     x2w_startup::NullInputCensus::Batch null_report;

@@ -3671,30 +3671,6 @@ and then makes the requested bytes readable while the cache witness stays reserv
 The cache-first mutant must sample null. The off control checks the refusal and null
 readback. The stale mutant must fail the refreshed readback with the first generation.
 
-With `X2W_SLOT70_DIAGNOSTICS=1`, the heartbeat also reports three snapshot conflicts
-by requested resource shape. `snapshot_already_owned` means an indexed placement
-covers the whole span. `snapshot_placement_rejected` means the placement lookup
-found an ambiguous or crossing range. `snapshot_resource_overlap` means the
-general resource index found an overlap after the placement lookup found none.
-The legacy `view_does_not_fit` total still includes these conflicts and malformed
-snapshot views.
-
-The same switch reports why texture requests touching a live alias registration
-missed. Examples include multiple overlapping resources, an uncovered range,
-incompatible backing or mip layout, and a hold before alias lookup. A registration
-whose range receives no request contributes only to the registration count.
-The switch also reports which desktop format check failed. For a format-29
-(`R8G8B8A8_UNORM_SRGB`) 1D view of width 7, the desktop-row fixture exercises
-publication. A console-layout source is held as `texture_1d_layout_unmapped`
-because there is no verified 1D source footprint mapping. The diagnostics switch
-defaults to off and leaves descriptor publication rules unchanged.
-
-Run the WARP fixtures with
-`ctest --preset dev --no-tests=error -R '^startup_(address_srv|slot70_texture_alias|slot70_snapshot_diagnostics(_off|_no_snapshot)?)_warp$' -V`.
-The snapshot fixture checks one request per conflict, exact structured-buffer
-readback for the fitting request, the same readback with diagnostics disabled,
-and null readback with snapshot publication disabled.
-
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
 address when `Location` is zero, do not read the resource description, and require `DXGI_FORMAT_UNKNOWN`

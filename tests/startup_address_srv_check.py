@@ -152,28 +152,19 @@ def check_unregistered_1d(directory, consumer, backend):
     env.pop("X2W_PLACED_1D_TEXTURE", None)
     env.pop("X2W_TEST_PLACED_1D_WRONG_WIDTH", None)
     env.pop("X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", None)
-    env.pop("X2W_TEST_PLACED_1D_SRGB", None)
-    env.pop("X2W_SLOT70_DIAGNOSTICS", None)
 
-    def reference(width, srgb=False):
-        def red(x, y):
-            texel = (2 * x + 1) * width // 16
-            if not width:
-                return 0
-            if srgb:
-                return 255 if (texel + y // 2) % 3 == 1 else 0
-            return 11 + 19 * texel + 73 * (y // 2)
+    def reference(width):
+        return bytes(c for y in range(4) for x in range(8)
+                     for c in (11 + 19 * ((2 * x + 1) * width // 16) + 73 * (y // 2) if width else 0,
+                               0, 0, 255))
 
-        return bytes(c for y in range(4) for x in range(8) for c in (red(x, y), 0, 0, 255))
-
+    expected = reference(7)
     cases = (
         ("switch off", 0, {"X2W_PLACED_SRV_1D": "1"}, "texture_no_resource"),
         ("enabled", 7, {"X2W_PLACED_1D_TEXTURE": "1"}, None),
         ("wrong width", 4, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_WRONG_WIDTH": "1"}, None),
-        ("odd sRGB desktop rows", 7, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_SRGB": "1",
-                                      "X2W_SLOT70_DIAGNOSTICS": "1"}, None),
-        ("unmapped layout", 0, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_CONSOLE_LAYOUT": "1",
-                                "X2W_SLOT70_DIAGNOSTICS": "1"}, "unsupported_desktop_format"),
+        ("unmapped layout", 0, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_CONSOLE_LAYOUT": "1"},
+         "unsupported_desktop_format"),
     )
     for case, width, switches, refusal in cases:
         output.unlink(missing_ok=True)
@@ -196,18 +187,10 @@ def check_unregistered_1d(directory, consumer, backend):
                 raise AssertionError(f"{case}: missing {counts}\n{result.stdout}")
         elif "memory SRV switches:" in result.stdout:
             raise AssertionError(f"{case}: unexpected switch census\n{result.stdout}")
-        if case == "unmapped layout":
-            shape = "reason=texture_1d_layout_unmapped dim=2 fmt=29 size=7x1x1 mips=1 layout=0x100 flags=0x0 calls=2"
-            if shape not in result.stdout:
-                raise AssertionError(f"{case}: missing layout census\n{result.stdout}")
-        elif "memory SRV diagnostics" in result.stdout:
-            raise AssertionError(f"{case}: unexpected diagnostics\n{result.stdout}")
         actual = output.read_bytes()
-        srgb = case in {"odd sRGB desktop rows", "unmapped layout"}
-        expected = reference(width, srgb)
-        if actual != expected:
-            raise AssertionError(f"{case}: actual {actual.hex()} expected {expected.hex()}")
-        if width != 7 and actual == reference(7, srgb):
+        if actual != reference(width):
+            raise AssertionError(f"{case}: actual {actual.hex()} expected {reference(width).hex()}")
+        if width != 7 and actual == expected:
             raise AssertionError(f"{case}: unexpectedly passed the width-7 oracle")
         print(f"{backend}: placed 1D {case}; all 32 RGBA pixels exact for its CPU reference")
 

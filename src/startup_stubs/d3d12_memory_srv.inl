@@ -135,30 +135,24 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
 bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& r,
                                     const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
-    const auto blocked = [&](const char* reason) {
-        if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(reason, &r);
-        return false;
-    };
     auto* const desktop = device_of(device);
     D3D12_FEATURE_DATA_FORMAT_INFO planes{r.Format};
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) || planes.PlaneCount != 1)
-        return blocked("format_plane_count");
+        return false;
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT view{v.Format};
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &view, sizeof(view))) ||
         !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
-        return blocked("format_view_support");
+        return false;
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
     if (r.Format == v.Format) storage = view;
-    else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage))))
-        return blocked("format_storage_support");
+    else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage)))) return false;
     const UINT req = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D   ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
                      : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
                                                                          : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
-    if (!(storage.Support1 & req)) return blocked("format_dimension_support");
-    if (r.MipLevels != 1 && !(storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP)) return blocked("format_mip_support");
-    return true;
+    return (storage.Support1 & req) &&
+           (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
 }
 
 bool memory_srv_destination(u64 handle)
@@ -242,7 +236,7 @@ bool address_resource_overlap(u64 address, u64 span)
 
 // Find a whole subresource window in a live slot 133 texture. Compare the console layout
 // before referring to the desktop backing, whose physical tile layout is private to D3D12.
-const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D12_RESOURCE_DESC& requested,
+bool remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D12_RESOURCE_DESC& requested,
                          const x2w_startup::gfx10::Layout& layout, D3D12_SHADER_RESOURCE_VIEW_DESC& view)
 {
     const auto& owner = info.console;
@@ -251,7 +245,7 @@ const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D1
         (owner.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
                         D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)) ||
         owner.MipLevels < requested.MipLevels || owner.DepthOrArraySize < requested.DepthOrArraySize)
-        return "alias_description_incompatible";
+        return false;
     const UINT last_start = owner.MipLevels - requested.MipLevels;
     UINT first_mip = 0;
     for (; first_mip <= last_start; ++first_mip) {
@@ -259,7 +253,7 @@ const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D1
             (std::max)(1u, owner.Height >> first_mip) == requested.Height)
             break;
     }
-    if (first_mip > last_start) return "alias_mip_shape_mismatch";
+    if (first_mip > last_start) return false;
 
     const x2w_startup::gfx10::Layout backing(owner);
     const u64 first_slice = offset / backing.slice_size;
@@ -267,19 +261,19 @@ const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D1
     if (first_slice + requested.DepthOrArraySize > owner.DepthOrArraySize ||
         layout.slice_size > backing.slice_size - slice_offset ||
         (requested.DepthOrArraySize > 1 && layout.slice_size != backing.slice_size))
-        return "alias_slice_window_mismatch";
+        return false;
     for (UINT mip = 0; mip < requested.MipLevels; ++mip) {
         const UINT source = first_mip + mip;
         if ((mip >= layout.first_tail) != (source >= backing.first_tail) ||
             backing.blocks_wide[source] != layout.blocks_wide[mip] ||
             backing.start[source] != slice_offset + layout.start[mip] ||
             backing.origin_x[source] != layout.origin_x[mip] || backing.origin_y[source] != layout.origin_y[mip])
-            return "alias_subresource_layout_mismatch";
+            return false;
     }
 
     // Expand the all-mips sentinel relative to the requested description.
     if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
-        if (owner.DepthOrArraySize != 1) return "alias_view_dimension_mismatch";
+        if (owner.DepthOrArraySize != 1) return false;
         auto& v = view.Texture2D;
         if (v.MipLevels == UINT_MAX) v.MipLevels = requested.MipLevels - v.MostDetailedMip;
         v.MostDetailedMip += first_mip;
@@ -289,13 +283,13 @@ const char* remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D1
         v.MostDetailedMip += first_mip;
         v.FirstArraySlice += static_cast<UINT>(first_slice);
     } else {
-        return "alias_view_dimension_mismatch";
+        return false;
     }
-    return nullptr;
+    return true;
 }
 
 Wrapper* find_texture_alias(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc,
-                            D3D12_SHADER_RESOURCE_VIEW_DESC& view, bool& overlap, const char*& why)
+                            D3D12_SHADER_RESOURCE_VIEW_DESC& view, bool& overlap)
 {
     const x2w_startup::gfx10::Layout layout(desc);
     const u64 span = layout.bytes();
@@ -311,7 +305,6 @@ Wrapper* find_texture_alias(Wrapper* device, u64 address, const D3D12_RESOURCE_D
         if (!x2w_startup::address_span_touches(address, span, base, bytes)) return false;
         if (overlap) {
             owner = nullptr;
-            why = "alias_multiple_overlaps";
             return true;
         }
         overlap = true;
@@ -339,27 +332,17 @@ Wrapper* find_texture_alias(Wrapper* device, u64 address, const D3D12_RESOURCE_D
     }
     const ResourceInfo info = retained ? resource_infos().at(retained) : ResourceInfo{};
     ReleaseSRWLockShared(&note_lock);
-    if (!retained) {
-        if (owner && memory_srv_diagnostics_enabled()) {
-            memory_srv_diagnostics.note("alias_owner_retired", &desc);
-        } else if (!why) {
-            why = "alias_range_not_covered";
-        }
-        return nullptr;
-    }
+    if (!retained) return nullptr;
 
     // Lazy and format/size-substituted resources have no verified backing for this mapping.
-    if (retained->own().lazy_slot133_texture || !retained->own().real || retained->own().drop_levels) {
-        why = "alias_backing_unavailable";
-    } else if (!(why = remap_texture_alias(info, address - reinterpret_cast<u64>(retained->own().title_memory),
-                                           desc, layout, view))) {
+    if (!retained->own().lazy_slot133_texture && retained->own().real && !retained->own().drop_levels &&
+        remap_texture_alias(info, address - reinterpret_cast<u64>(retained->own().title_memory), desc, layout, view)) {
         const auto native = static_cast<ID3D12Resource*>(retained->own().real)->GetDesc();
         const auto& source = info.console;
         if (native.Width == source.Width && native.Height == source.Height && native.Format == source.Format &&
             native.DepthOrArraySize == source.DepthOrArraySize && native.MipLevels == source.MipLevels &&
             !(native.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && x2w_startup::address_view_fits(native, view))
             return retained;
-        why = "alias_native_view_incompatible";
     }
     release(retained);
     return nullptr;
@@ -470,13 +453,7 @@ Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOUR
         return failed(counts.view_does_not_fit);
     if (bytes > max_view_bytes) return failed(counts.over_limit);
     const auto placed = placed_buffer_range(device, address, bytes);
-    const char* conflict = placed.owner ? "snapshot_already_owned" :
-                           placed.reject ? "snapshot_placement_rejected" :
-                           address_resource_overlap(address, bytes) ? "snapshot_resource_overlap" : nullptr;
-    if (conflict) {
-        if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(conflict, &requested);
-        return failed(counts.view_does_not_fit);
-    }
+    if (placed.owner || placed.reject || address_resource_overlap(address, bytes)) return failed(counts.view_does_not_fit);
 
     const auto* source = reinterpret_cast<const void*>(address);
     if (!x2w_local::readable(source, static_cast<std::size_t>(bytes))) return failed(counts.not_readable);
@@ -887,23 +864,17 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     constexpr UINT gpu_writes = static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
                                 static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) |
                                 static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    const auto note_blocker = [&](const char* reason) {
-        if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(reason, &title);
-    };
     if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
-        note_blocker("texture_1d_layout_unmapped");
         detail = "unsupported 1D source layout (no console footprint mapping)";
         return nullptr;
     }
     detail = "unsupported 1D resource shape or flags";
     if ((title.Flags & gpu_writes) ||
         title.Width > D3D12_REQ_TEXTURE1D_U_DIMENSION ||
-        title.DepthOrArraySize > D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION ||
-        !title.MipLevels || title.MipLevels > x2w_startup::SliceFootprints::max_mips ||
-        (title.Width >> (title.MipLevels - 1)) == 0) {
-        note_blocker("texture_1d_shape_unsupported");
+        title.DepthOrArraySize > D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION)
         return nullptr;
-    }
+    if (!title.MipLevels || title.MipLevels > x2w_startup::SliceFootprints::max_mips ||
+        (title.Width >> (title.MipLevels - 1)) == 0) return nullptr;
 
     auto desc = sanitized(title);
     desc.Alignment = 0;
@@ -917,10 +888,7 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     detail = "unavailable 1D texture at the supplied base and layout";
     auto* const desktop = device_of(device);
     const x2w_startup::SliceFootprints plan(desktop, desc, desc.MipLevels);
-    if (!plan.size || plan.size == UINT64_MAX) {
-        note_blocker("texture_1d_footprint_unavailable");
-        return nullptr;
-    }
+    if (!plan.size || plan.size == UINT64_MAX) return nullptr;
     const u64 stride = (plan.size + 0xFFFF) & ~u64{0xFFFF};
     const u64 bytes = stride * (desc.DepthOrArraySize - 1) + plan.size;
     refusal = "texture_over_64mib";
@@ -1124,25 +1092,6 @@ void note_alias_texture_unreadable(Wrapper* device, u64 address, const char* rea
     ReleaseSRWLockShared(&note_lock);
 }
 
-// Count only requests touching a live registration for this device. A registration
-// whose range never receives a slot 70 request contributes only to alias_registered.
-void note_alias_miss(Wrapper* device, u64 address, u64 span, const D3D12_RESOURCE_DESC& desc, const char* why)
-{
-    if (!why || !memory_srv_diagnostics_enabled() || !slot70_texture_alias_enabled()) return;
-    bool registered = false;
-    note_lock_acquire(false);
-    resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        const auto& info = resource_infos().at(wrapper);
-        if (info.texture_alias_device != device ||
-            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
-            return false;
-        return registered = x2w_startup::address_span_touches(address, span,
-            reinterpret_cast<u64>(wrapper->own().title_memory), info.texture_alias_bytes);
-    });
-    ReleaseSRWLockShared(&note_lock);
-    if (registered) memory_srv_diagnostics.note(why, &desc);
-}
-
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
@@ -1262,7 +1211,6 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
     if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
-        note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
         if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
             refuse_memory_srv(refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
                               destination);
@@ -1352,7 +1300,6 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const char* detail = nullptr;
         texture = publish_placed_1d_texture(self, input->address, *resource, view, refusal, detail);
         log_address_kind(texture ? "published placed 1D texture" : refusal, *resource, input->view, input->address);
-        note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
         if (!texture) {
             note_alias_texture_unreadable(self, input->address, refusal);
             refuse_memory_srv(refused, detail, refusal, resource, input, destination);
@@ -1365,21 +1312,17 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
     if (console_layout_srv(*resource)) {
-        const char* alias_miss = texture ? "alias_existing_texture" : "alias_ineligible_shape";
         if ((!texture || !supports_placed_memory_srv(*resource, input->view)) &&
             !desktop_address_view_supported(self, *resource, input->view)) {
             held = "unsupported_desktop_format";
-            alias_miss = "alias_unsupported_desktop_format";
             texture = nullptr;
         } else if (!texture) {
             held = console_address_hold(self, input->address, *resource);
-            if (held) alias_miss = held;
             if (!held && slot70_texture_alias_enabled() && resource->MipLevels > 1 &&
                 resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
                 auto adjusted = input->view;
                 bool overlap = false;
-                alias_miss = nullptr;
-                if (Wrapper* owner = find_texture_alias(self, input->address, *resource, adjusted, overlap, alias_miss)) {
+                if (Wrapper* owner = find_texture_alias(self, input->address, *resource, adjusted, overlap)) {
                     log_address_kind("published overlapping subresources", *resource, input->view, input->address);
                     view_slot<18, 2>(self, reinterpret_cast<u64>(owner), reinterpret_cast<u64>(&adjusted), destination, 0);
                     note_memory_srv_write(resource, input, destination);
@@ -1394,10 +1337,6 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             texture = held ? nullptr : publish_tiled_texture(self, input->address, *resource);
             outcome = "published console layout";
         }
-        if (memory_srv_diagnostics_enabled() && slot70_texture_alias_enabled())
-            note_alias_miss(self, input->address, x2w_startup::gfx10::Layout(*resource).bytes(), *resource, alias_miss);
-    } else {
-        note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
     }
     // A publication was attempted for a BC / console-layout view; any other view only looks up a live resource.
     const char* unavailable = texture || held ? nullptr

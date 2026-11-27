@@ -33,7 +33,6 @@ def check(directory, consumer):
     for name, switch, mode, slice_index in cases:
         trap = directory / f"{name}.log"
         run_env = dict(env, X2W_SLOT70_ALIAS_TEXTURE=switch, X2W_TEST_SLOT70_TEXTURE_ALIAS=mode,
-                       X2W_SLOT70_DIAGNOSTICS=switch,
                        X2W_TRAP_LOG=str(trap))
         result = subprocess.run([*args, "warp", output], env=run_env, capture_output=True, text=True)
         print(result.stdout, end="")
@@ -51,12 +50,6 @@ def check(directory, consumer):
                 raise AssertionError(f"{name}: missing {counts}\n{result.stdout}")
         elif "memory SRV switches:" in result.stdout:
             raise AssertionError(f"{name}: unexpected switch census\n{result.stdout}")
-        if name == "misaligned":
-            shape = "reason=alias_subresource_layout_mismatch dim=3 fmt=61 size=32x32x1 mips=2 layout=0x105 flags=0x0 calls=1"
-            if shape not in result.stdout:
-                raise AssertionError(f"{name}: missing alias-miss shape\n{result.stdout}")
-        elif "memory SRV diagnostics" in result.stdout:
-            raise AssertionError(f"{name}: unexpected alias diagnostic\n{result.stdout}")
         actual = output.read_bytes()
         expected = bytes((0, 0, 0, 255)) * 32 if refused else expected_pixels(slice_index)
         if actual != expected:

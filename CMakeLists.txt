@@ -691,18 +691,6 @@ foreach(mode IN ITEMS enabled off stale recover cache_first)
     set_tests_properties(startup_slot70_memory_buffer_${mode}_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=${slot70_switch};X2W_TEST_SLOT70_MEMORY_BUFFER_STALE=${slot70_mutant};X2W_TEST_SLOT70_CACHE_FIRST=${slot70_cache_first}")
 endforeach()
-add_test(NAME startup_slot70_snapshot_diagnostics_warp
-    COMMAND startup_view_dimension_device warp memory-buffer-diagnostics)
-add_test(NAME startup_slot70_snapshot_diagnostics_off_warp
-    COMMAND startup_view_dimension_device warp memory-buffer-diagnostics-off)
-add_test(NAME startup_slot70_snapshot_diagnostics_no_snapshot_warp
-    COMMAND startup_view_dimension_device warp memory-buffer-diagnostics-no-snapshot)
-set_tests_properties(startup_slot70_snapshot_diagnostics_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=1;X2W_SLOT70_DIAGNOSTICS=1")
-set_tests_properties(startup_slot70_snapshot_diagnostics_off_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=1;X2W_SLOT70_DIAGNOSTICS=0")
-set_tests_properties(startup_slot70_snapshot_diagnostics_no_snapshot_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=0;X2W_SLOT70_DIAGNOSTICS=1")
 set_tests_properties(startup_slot70_memory_buffer_off_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "unavailable buffer at the supplied address: reason=buffer_unavailable.*slot70 switch-off control: all three publications left the null SRVs intact")
 set_tests_properties(startup_slot70_memory_buffer_enabled_warp startup_slot70_memory_buffer_stale_warp PROPERTIES
