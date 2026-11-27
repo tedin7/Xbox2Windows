@@ -1181,6 +1181,35 @@ BoundPipeline* translation_for(Wrapper* pipeline)
                     chosen.reason);
         }
     }
+    {
+        // Census, whatever the switch: pipelines by their own creation slot, with a depth state, without one, and of
+        // those without one how many have registers the decoder accepts. Derived records (slot 55) are counted by tag.
+        static LONG by_class[4][3];
+        static LONG derived_tags[8];
+        const int own_path = own ? own->path : 0;
+        const int kind = own_path == 57 ? 0 : own_path == 55 ? 1 : own_path == 86 ? 2 : 3;
+        int slot = 0;
+        if (!bound->has_depth_stencil) {
+            slot = 1;
+            if (info && info->path == 57 && x2w_pipeline_state::select_depth_stencil(true, info->state_a.data(), info->state_a.size()).applied)
+                slot = 2;
+        }
+        if (own_path == 55 && own && own->desc.size() % x2w_derived_blend::record_size == 0) {
+            for (std::size_t at = 0; at < own->desc.size(); at += x2w_derived_blend::record_size) {
+                std::uint32_t tag;
+                std::memcpy(&tag, own->desc.data() + at, sizeof(tag));
+                InterlockedIncrement(&derived_tags[tag < 7 ? tag : 7]);
+            }
+        }
+        const LONG seen = InterlockedIncrement(&by_class[kind][slot]);
+        if ((seen & (seen - 1)) == 0)
+            log("x2w-draw depth census: own path %d (%s): %ld pipelines %s; derived record tags 0..7: %ld %ld %ld %ld %ld %ld %ld %ld",
+                own_path, slot == 0 ? "with a depth state" : slot == 1 ? "no depth state, registers not decodable" : "no depth state, registers decodable",
+                static_cast<long>(seen), x2w_local::env_on("X2W_DEPTH_STATE") ? "(switch on)" : "(switch off)", static_cast<long>(derived_tags[0]),
+                static_cast<long>(derived_tags[1]), static_cast<long>(derived_tags[2]), static_cast<long>(derived_tags[3]),
+                static_cast<long>(derived_tags[4]), static_cast<long>(derived_tags[5]), static_cast<long>(derived_tags[6]),
+                static_cast<long>(derived_tags[7]));
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
