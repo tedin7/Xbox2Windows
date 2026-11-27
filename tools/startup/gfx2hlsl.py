@@ -18465,13 +18465,13 @@ def jobs_argument(args):
 
 
 def translator_stamp():
-    """The newest modification time of the translator's own files (this module and the modules it loaded from its
-    folder): a .fail older than this was written by another build and is tried again. None with X2W_RETRY_FAILED=1,
+    """The newest modification time of the translator's own files. Include the serial mesh backend before its
+    first use so a cold pending scan can retry a mesh failure from an older backend. None with X2W_RETRY_FAILED=1,
     which retries every failure."""
     if os.environ.get('X2W_RETRY_FAILED') == '1':
         return None
     here = os.path.dirname(os.path.abspath(__file__))
-    files = {os.path.abspath(__file__)} | {
+    files = {os.path.abspath(__file__), os.path.join(here, 'mesh_waveloop.py')} | {
         os.path.abspath(module.__file__) for module in list(sys.modules.values())
         if getattr(module, '__file__', None) and os.path.dirname(os.path.abspath(module.__file__)) == here}
     return max(os.path.getmtime(name) for name in files if os.path.isfile(name))
@@ -18570,6 +18570,9 @@ def translator_version():
                *(tools / (name + '.py') for name in (
                    'disasm_rdna2', 'pixel_aot', 'resource_inventory', 'verify_build',
                    'shader_minmax', 'compute_store_aot', 'mesh_param_link')))
+    serial_mesh = script.with_name('mesh_waveloop.py')
+    if serial_mesh.is_file():
+        sources += (serial_mesh,)
     digest = hashlib.sha256()
     for source in sources:
         digest.update(source.name.encode('ascii') + b'\0')
