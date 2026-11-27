@@ -324,6 +324,41 @@ def identifier_load(directory, consumer, dxc, env, dim, explicit_mip=False):
     print(f'Integer texture dispatch {dim}: UINT, SINT and FLOAT matched the CPU, both mutants rejected')
 
 
+def default_typed_load(directory, consumer, dxc, env, dim):
+    """A float 3D or 2D-array input translated with no switch set (the default) binds through the typed-SRV line."""
+    cache, base = prepare(directory)
+    env = dict(base, **env, X2W_TEST_DEBUG_LAYER='1', X2W_TEST_IDENTIFIER_DIMENSION=dim)
+    root = directory / 'compute_root'
+    root.write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(root)
+    _, _, rsrc2, group, _ = C.CASES['A']
+    (directory / 'program').write_bytes(identifier_code(dim))
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    layout = '<%dI' % C.WORDS
+    written = 24 * 3 * 2 * 2
+    untouched = [C.SENTINEL] * C.WORDS
+    expected = list((*FLOAT_BITS, 0, 0, 0)) * (written // 8) + untouched[written:]
+    got, result = run(directory, consumer, env, 'dispatch-texel-float', layout)
+    assert got == untouched
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key, integer_srvs=False)
+    manifest = cache / f'{key:016x}.txt'
+    original = manifest.read_text()
+    assert original.count('srvtypes 1\n') == 1, original
+    got, result = run(directory, consumer, env, 'dispatch-texel-float', layout)
+    assert clean(result) == 'enabled, no error message'
+    assert lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
+    assert got == expected, (dim, got[:16], result.stderr[-3000:])
+    # Control: without the typed-SRV line the runtime refuses the kind, by name, and writes nothing.
+    manifest.write_bytes(original.replace('srvtypes 1\n', '').encode())
+    got, result = run(directory, consumer, env, 'dispatch-texel-float', layout)
+    refused = lines(result, 'refused: ')
+    assert got == untouched and len(refused) == 1 and 'not a raw table buffer, a 2D texture or a cube map' in refused[0], (
+        refused, result.stderr[-3000:])
+    print(f'Default typed compute input {dim}: the float texels matched the CPU; without srvtypes the kind is refused')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
@@ -335,6 +370,8 @@ def main(consumer, dxc, adapter):
         for dim in DIMENSIONS:
             identifier_load(Path(temporary) / f'identifier-{dim}', consumer, dxc, env, dim)
         identifier_load(Path(temporary) / 'identifier-1d-mip', consumer, dxc, env, '1d', explicit_mip=True)
+        for dim in ('3d', '2da'):
+            default_typed_load(Path(temporary) / f'default-{dim}', consumer, dxc, env, dim)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
