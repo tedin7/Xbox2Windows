@@ -1256,7 +1256,9 @@ def lane_mask_reference(label, full, mutant=None):
             then = outer
         if mutant == 'wrong constant select' and first == 64:
             then = outer
-        if mutant == 'wrong mask select' and first == 0:
+        if mutant == 'wrong mask select':
+            # s54 = 0 clears s46 & s54 in every wave, so its complement opens the then-arm to every outer lane
+            # of both waves (wave 1 too, whose correct then-arm is empty), and v7 there becomes 0.0.
             then = outer
         if mutant == 'per-lane VCC branch' and first == 0:
             then = [active and lane == 0 for lane, active in enumerate(outer)]
@@ -1419,11 +1421,7 @@ def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
         hlsl, shader = Path(tmp, f'mutant{i}.hlsl'), Path(tmp, f'mutant{i}.cso')
         hlsl.write_text(mutated)
         subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', shader, hlsl], check=True)
-        if name == 'wrong mask select':
-            # The scalar model does not reproduce this mutant's exact image; it only has to differ from the guest.
-            cases += [(name, shader, correct, None)]
-        else:
-            cases += [(name, shader, correct, differences), (name + ' reference', shader, wrong, 0)]
+        cases += [(name, shader, correct, differences), (name + ' reference', shader, wrong, 0)]
     constants = bytearray(1024)
     uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
     for slot, count in enumerate((4, 128)):
@@ -1438,9 +1436,6 @@ def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
         if run.returncode == 77:
             print(run.stdout + run.stderr)
             return 77
-        if differences is None:
-            expect(name, run.returncode, 1)
-            continue
         expect(name, (run.returncode, f'pixels=1024 mismatches={differences}' in run.stdout),
                (int(differences != 0), True))
     return 0
