@@ -556,9 +556,6 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", nullptr, 0)) {
         extern int draw_single_element_srvs(void*, void*);
         if (const int result = draw_single_element_srvs(guest, list)) return result;
-    } else if (GetEnvironmentVariableW(L"X2W_TEST_DESCRIPTOR_COUNT", nullptr, 0)) {
-        extern int draw_descriptor_count(void*, void*);
-        if (const int result = draw_descriptor_count(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
         extern int draw_formatted_view(void*, void*);
         if (const int result = draw_formatted_view(guest, list)) return result;
