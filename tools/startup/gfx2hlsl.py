@@ -6,6 +6,7 @@ values (tables, vertex-buffer table, root buffers) turn into HLSL resources inst
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
 import bisect
+import copy
 from collections import Counter
 from contextlib import suppress
 from copy import deepcopy
@@ -5228,6 +5229,8 @@ class Stage:
                         term = ('branch', 'mesh_vote %s 0u' % ('==' if zero else '!='), term[2])
                     elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
+                except PixelImageConflict:
+                    raise
                 except Unsupported as reason:
                     if refusals is None:
                         if self.has_branches and ('read_vcc', None) in self.vcc_events.get(off, ()):
@@ -9353,8 +9356,15 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
-        tex = self.pipe.resource(desc_key, kinds[dim])
-        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+        shared_load = (getattr(self, 'kind', None) == 'ps' and how == 'load'
+                       and kinds[dim] in ('tex2d', 'tex2da') and not integer_srvs
+                       and 'a16' not in mods and 'd16' not in mods
+                       and getattr(self.pipe, 'pixel_rw_images', None) is not None
+                       and self.is_fixed_table_image(ops[2], desc_key))
+        tex = (self.pipe.pixel_image_load(desc_key, kinds[dim]) if shared_load
+               else self.pipe.resource(desc_key, kinds[dim]))
+        uav_load = shared_load and desc_key in self.pipe.pixel_rw_images
+        if not uav_load and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
@@ -9389,7 +9399,8 @@ class Stage:
                 address = [self.u(c) for c in cs[:axes]]
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
             location = 'int%d(%s)' % (axes + 1, ', '.join(address + [mip]))
-            call = '%s.Load(%s)' % (tex, location)
+            call = ('%s[uint%d(%s)]' % (tex, axes, ', '.join(address)) if uav_load
+                    else '%s.Load(%s)' % (tex, location))
             if integer_srvs and not packed_d16:
                 res = self.pipe.resources[desc_key]
                 res['integer_load'] = True
@@ -9498,7 +9509,7 @@ class Stage:
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
-        self.emit('t = %s;' % call)
+        self.emit(('if (exec & 1) ' if uav_load and not self.exec_known else '') + 't = %s;' % call)
         if sample_d16 or (how in ('load', 'load_mip') and 'd16' in mods):
             self.pipe.uses_pack16_rne = True
             if sample_d16:
@@ -9665,7 +9676,7 @@ class Stage:
     def op_image_load_mip(self, ops, mods):
         self.image(ops, mods, 'load_mip')
 
-    def fixed_table_image(self, operand, name):
+    def fixed_table_image(self, operand, name, *, known_key=None):
         """Return the table location if the manifest can bind the original eight-word image view."""
         image = reg_range(operand)
         first = self.sym.get(image[1]) if image and image[0] == 's' and image[2] - image[1] == 7 else None
@@ -9676,7 +9687,16 @@ class Stage:
             # A write through a second load of this descriptor can leave these SGPR symbols intact.
             if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
                 raise Unsupported('%s through a modified image descriptor' % name)
-        return self.descriptor(operand)
+        return self.descriptor(operand) if known_key is None else known_key
+
+    def is_fixed_table_image(self, operand, key):
+        if key[0][0] != 'table' or key[1] is None or key[1] % 32 or key in self.pipe.other_modified:
+            return False
+        try:
+            self.fixed_table_image(operand, 'pixel image access', known_key=key)
+            return True
+        except Unsupported:
+            return False
 
     def op_image_store(self, ops, mods):
         """Write the selected channels of a typed image texel.
@@ -9758,7 +9778,13 @@ class Stage:
             value = 'float4(%s)' % ', '.join(rgba)
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, image_kind)
+        if (self.kind == 'ps' and getattr(self.pipe, 'pixel_rw_images', None) is not None
+                and self.is_fixed_table_image(ops[2], key)):
+            image = self.pipe.pixel_image_store(key, image_kind)
+        else:
+            if key in (getattr(self.pipe, 'pixel_rw_images', None) or ()):
+                raise Unsupported('resource %s is both read and stored to' % (key,))
+            image = self.pipe.uav(key, image_kind)
         if packed_2d:
             packed = self.u(cs[0])
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
@@ -12970,6 +12996,12 @@ def unaligned_dword_body(low, high):
             'return (lo >> k) | (%s << (32 - k)); }' % (low, high))
 
 
+class PixelImageConflict(Unsupported):
+    def __init__(self, key):
+        self.key = key
+        super().__init__('resource %s is both read and stored to' % (key,))
+
+
 class Pipeline:
     vertex_kind = 'vs'
     uses_dynamic_heap = False
@@ -13055,11 +13087,11 @@ class Pipeline:
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
-            self.ps = self._build_pixel_stage(ps_code) if ps_code is not None else None
+            self.ps = self._pixel_stage(ps_code)
         else:
             decoded = {} if decoded is None else decoded
             self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
-            self.ps = self._build_pixel_stage(ps_code, refusals, decoded.get('ps')) if ps_code is not None else None
+            self.ps = self._pixel_stage(ps_code, refusals=refusals, decoded=decoded.get('ps'))
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
             if 'pos' not in self.vs.exports:
@@ -13106,10 +13138,54 @@ class Pipeline:
         return self.uds.index(source)
 
 
+    def _pixel_stage(self, code, refusals=None, decoded=None):
+        if code is None:
+            return None
+        # Keep the vertex bindings and discard every side effect of an abandoned pixel pass.
+        baseline = self.__dict__.copy()
+        mutable = copy.deepcopy({k: v for k, v in baseline.items() if isinstance(v, (dict, list, set))})
+        first_refusal = len(refusals) if refusals is not None else 0
+        promoted = set()
+        self.pixel_rw_images = promoted
+        while True:
+            try:
+                return self._build_pixel_stage(code, refusals=refusals, decoded=decoded)
+            except PixelImageConflict as conflict:
+                if conflict.key in promoted or len(promoted) == 8:
+                    raise
+                promoted.add(conflict.key)
+                self.__dict__.clear()
+                self.__dict__.update(baseline)
+                self.__dict__.update(copy.deepcopy(mutable))
+                self.pixel_rw_images = promoted
+                if refusals is not None:
+                    del refusals[first_refusal:]
+
+    def pixel_image_load(self, key, kind):
+        if key in self.pixel_rw_images:
+            view = self.uav(key, kind)
+            self.uavs[key]['load'] = True
+            return view
+        stored = self.stored_images().get(key)
+        if stored and stored.get('fixed_pixel_store') and stored['kind'] == kind:
+            raise PixelImageConflict(key)
+        view = self.resource(key, kind)
+        r = self.resources[key]
+        r['pixel_loads'] = r.get('pixel_loads', 0) + 1
+        return view
+
+    def pixel_image_store(self, key, kind):
+        r = self.resources.get(key)
+        if r and r['kind'] == kind and r.get('pixel_loads') == r['calls']:
+            raise PixelImageConflict(key)
+        view = self.uav(key, kind)
+        self.uavs[key]['fixed_pixel_store'] = True
+        return view
+
     def resource(self, key, kind):
         if key[0][0] == 'dynamic_heap':
             raise Unsupported('dynamic resource heap views require a raw buffer load')
-        if key in self.stored_images():
+        if key in self.stored_images() or key in getattr(self, 'pixel_rw_images', ()):
             raise Unsupported('resource %s is both read and stored to' % (key,))
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
