@@ -879,7 +879,16 @@ def check_null_inputs():
                 "unreadable 1 (texture_unreadable: CPU source range); 1D published 1 bound 3 refused 2 "
                 "unsupported_desktop_format=2")
     stale = switches.replace("attempts 4", "attempts 1").replace("resolved 2", "resolved 0")
-    stderr = "\n".join([row.format(1, 1), other, target, stale, row.format(2, 5), clean, switches])
+    key = "0000000000000123"
+    candidate = f"{key} x7 (missing_guest_root)"
+    refused = f"x2w-render target abc (4x2 format 28): draws 0, with a null input 0 frames 6..42, not drawn 7 by {candidate}"
+    starved = f"x2w-render starved target abc (4x2 format 28): last drawn frame 5, not drawn since: {candidate}"
+    no_candidate = "x2w-render starved target def (2x2 format 10): last drawn frame 2, starved, no candidate"
+    totals = "x2w-render totals: translated draws 43 (not drawn 7)"
+    pipeline = f"x2w-render not drawn key {key}: 7 (missing_guest_root 7), targets abc (4x2 format 28)"
+    old_pipeline = "x2w-render not drawn key 0000000000000777: 1 (state_not_ready 1)"
+    stderr = "\n".join([row.format(1, 1), other, target, stale, row.format(2, 5), clean, switches, refused, totals,
+                         starved, no_candidate, pipeline, old_pipeline])
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "run"
         run.mkdir()
@@ -896,6 +905,10 @@ def check_null_inputs():
                "1D textures: bound 3, refused 2"]
     assert section.splitlines()[-3:] == summary
     assert T.null_inputs_section(switches).splitlines()[-3:] == summary
+    assert refused in section.splitlines()
+    assert f"render summary\n{totals}\n\nstarved targets\n{starved}\n{no_candidate}\n" in section
+    assert f"not drawn by pipeline\n{pipeline}\n{old_pipeline}, targets unknown\n" in section
+    assert T.key_weights(stderr)[key] == 7
     assert not T.null_inputs_section("unrelated log")
 
 

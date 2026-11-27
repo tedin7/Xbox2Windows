@@ -315,6 +315,22 @@ struct RedDrawSamples {
     unsigned count = 0;
 };
 
+void red_producer_attachments(const Pass& pass, ID3D12GraphicsCommandList* list, const char* operation,
+                              u64 key, const char* cause = nullptr)
+{
+    if ((!cause && (!list || !pass.targets_bound)) || !red_producers().interested()) return;
+    const auto depth = pass.targets_bound ? pass.trace_depth : nullptr;
+    const auto dsv = pass.targets_bound ? pass.dsv_format : DXGI_FORMAT_UNKNOWN;
+    const UINT count = pass.targets_bound ? pass.target_count : 0;
+    const auto target = [&](UINT i) { return cause ? (i < count ? pass.bound_targets[i] : nullptr) : pass.trace_targets[i]; };
+    const auto format = [&](UINT i) { return cause && i >= count ? DXGI_FORMAT_UNKNOWN : pass.target_formats[i]; };
+    log("x2w-red attachments record=%ld list=%p op=%s key=%016llx dsv=%p/%d targets=%u rt0=%p/%d rt1=%p/%d rt2=%p/%d rt3=%p/%d rt4=%p/%d rt5=%p/%d rt6=%p/%d rt7=%p/%d%s%s",
+        frame_number + 1, list, operation, key, depth, dsv, count,
+        target(0), format(0), target(1), format(1), target(2), format(2), target(3), format(3),
+        target(4), format(4), target(5), format(5), target(6), format(6), target(7), format(7),
+        cause ? " cause=" : "", cause ? cause : "");
+}
+
 RedDrawSamples red_producer_draw_before(Wrapper* self, ID3D12GraphicsCommandList* list, const char* operation, u64 key)
 {
     RedDrawSamples samples;
@@ -322,13 +338,7 @@ RedDrawSamples red_producer_draw_before(Wrapper* self, ID3D12GraphicsCommandList
     if (!tracker.may_record()) return samples;
     const Pass& pass = pass_of(self);
     if (!pass.targets_bound) return samples;
-    if (tracker.interested())
-        log("x2w-red attachments record=%ld list=%p op=%s key=%016llx dsv=%p/%d targets=%u rt0=%p/%d rt1=%p/%d rt2=%p/%d rt3=%p/%d rt4=%p/%d rt5=%p/%d rt6=%p/%d rt7=%p/%d",
-            frame_number + 1, list, operation, key, pass.trace_depth, pass.dsv_format, pass.target_count,
-            pass.trace_targets[0], pass.target_formats[0], pass.trace_targets[1], pass.target_formats[1],
-            pass.trace_targets[2], pass.target_formats[2], pass.trace_targets[3], pass.target_formats[3],
-            pass.trace_targets[4], pass.target_formats[4], pass.trace_targets[5], pass.target_formats[5],
-            pass.trace_targets[6], pass.target_formats[6], pass.trace_targets[7], pass.target_formats[7]);
+    red_producer_attachments(pass, list, operation, key);
     for (UINT i = 0; i < pass.target_count; ++i) {
         if (const unsigned mark = tracker.before(self, list, pass.trace_targets[i], operation, key, i))
             samples.marks[samples.count++] = mark;
