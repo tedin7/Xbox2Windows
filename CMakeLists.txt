@@ -2446,6 +2446,12 @@ add_test(NAME startup_manifest_prefetch_open_under_lock_control COMMAND startup_
 set_tests_properties(startup_manifest_prefetch_open_under_lock_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_manifest_prefetch_retry_under_lock_control COMMAND startup_manifest_prefetch_check --mutate retry-under-lock)
 set_tests_properties(startup_manifest_prefetch_retry_under_lock_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_locked_open_retry_check tests/startup_locked_open_retry_check.cpp)
+target_include_directories(startup_locked_open_retry_check PRIVATE src)
+target_compile_features(startup_locked_open_retry_check PRIVATE cxx_std_17)
+add_test(NAME startup_locked_open_retry COMMAND startup_locked_open_retry_check)
+add_test(NAME startup_locked_open_retry_no_retry_control COMMAND startup_locked_open_retry_check --mutate no-retry)
+set_tests_properties(startup_locked_open_retry_no_retry_control PROPERTIES WILL_FAIL TRUE)
 # A range is judged committed and readable from VirtualQuery alone (src/startup_stubs/committed_range.h); the mutated run
 # touches the memory instead and faults on a reserved page, so it must fail.
 add_executable(startup_committed_range_check tests/startup_committed_range_check.cpp)
