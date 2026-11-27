@@ -200,7 +200,7 @@ DIM_EXPORT = bytes.fromhex('1b0c087e1c0c0a7e') + bytes.fromhex(IMAGE_TAIL)  # co
 def image_dimensions_null_shader(compare, on_null=ZERO, on_bound=27):
     # Give the null path a nonzero candidate width so dropping the select changes the readback.
     width_min = sop2(0x09, 27, 27, ONE)  # s_max_u32 s27, s27, 1
-    select = sop2(0x0a, 27, on_null, on_bound)  # s_cselect_b32 s27, 0, s27
+    select = sop2(0x0a, 27, on_null, on_bound)  # s_cselect_b32 s27, on_null, on_bound
     return (bytes.fromhex(IMAGE_HEAD) + DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_CLAMP
             + width_min + compare + select + bytes.fromhex(IMAGE_LOAD) + DIM_EXPORT)
 
