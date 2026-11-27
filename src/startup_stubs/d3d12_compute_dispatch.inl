@@ -528,6 +528,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 break;
             }
             std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+            if ((reason = refuse_native_buffer_addressing(words))) break;
             const std::uint32_t at = slot.at + index * slot.times;
             const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
             const UINT stride = (words[1] >> 16) & 0x3fff;
@@ -812,8 +813,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     for (std::size_t i = inputs; i < count; ++i)
                         if (views[i].resource == resource) return true;
                     return false;
-                }, first);
-            if (!view_heap) reason = "the dynamic resource heap could not be bound";
+                }, first, reason, words);
+            if (!view_heap && !reason) reason = "the dynamic resource heap could not be bound";
         }
     }
     timer.valued();

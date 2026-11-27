@@ -2901,6 +2901,19 @@ bool read_view_token(const std::uint32_t* words, ViewRecord& record, bool* mater
     return known;
 }
 
+const char* refuse_native_buffer_addressing(const std::uint32_t* words)
+{
+    if (words[0] == view_token_magic) return nullptr;
+    const char* reason = x2w_startup::buffer_input_addressing_refusal(words[1], words[3]);
+    if (reason) {
+        static LONG64 refusals;
+        const auto n = static_cast<u64>(InterlockedIncrement64(&refusals));
+        if (n <= 8 || (n & (n - 1)) == 0)
+            log("x2w-draw input V# %08x %08x %08x %08x refused: %s", words[0], words[1], words[2], words[3], reason);
+    }
+    return reason;
+}
+
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
@@ -2994,6 +3007,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {
+        if (const char* reason = refuse_native_buffer_addressing(words)) return refuse(reason);
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
@@ -3146,7 +3160,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
 // records in the same shader-visible heap, since D3D12 binds only one CBV/SRV/UAV heap at a time.
 template <typename Writable>
 ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RESOURCE_STATES state,
-                                          Writable writable, UINT& count)
+                                          Writable writable, UINT& count, const char*& reason,
+                                          std::uint32_t* refusal_words = nullptr)
 {
     const auto source = pass_of(self).title_view_heap;
     constexpr UINT record_bytes = 32;
@@ -3171,6 +3186,11 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
             IndirectBufferView view;
             if (entry && (readable_heap || x2w_local::readable(entry, sizeof(words)))) {
                 std::memcpy(words, entry, sizeof(words));
+                // The shader can select a mirrored record at execution time.
+                if ((reason = refuse_native_buffer_addressing(words))) {
+                    if (refusal_words) std::memcpy(refusal_words, words, sizeof(words));
+                    return nullptr;
+                }
                 if (words[0] || words[1] || words[2] || words[3])
                     view = indirect_table_buffer(self, words);
             }
@@ -3217,6 +3237,7 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format,
         if (details) *details = {true, static_cast<UINT>(view.Format), view.Shader4ComponentMapping};
         return x2w_startup::view_word3(view, words[3], extended);
     }
+    if (const char* reason = refuse_native_buffer_addressing(words)) return reason;
     if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code, extended)) {
         format = code;
         return "unsupported FORMAT";
@@ -3823,12 +3844,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT first = 0;
     if (tr->dynamic_heap) {
         if (!indirect) {
+            const char* reason = nullptr;
             view_heap = snapshot_buffer_heap(self, views, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, [&](ID3D12Resource* resource) {
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
-                }, first);
+                }, first, reason);
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();
@@ -4162,6 +4184,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (srv.source == 0 && words[0] != view_token_magic && entry) {
             // A hardware buffer descriptor the title wrote itself: base address, stride and record count.
+            if (refuse_native_buffer_addressing(words)) {
+                draw_lock_release_exclusive();
+                return not_drawn(pass, list, not_drawn_key, 11);
+            }
             address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];

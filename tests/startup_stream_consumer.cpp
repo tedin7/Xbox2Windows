@@ -15,11 +15,18 @@
 #include <thread>
 #include <vector>
 
+#include "../src/startup_stubs/buffer_input_addressing.h"
 #include "startup_stream_draw.h"
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
 
 using Microsoft::WRL::ComPtr;
+
+static_assert(!x2w_startup::buffer_input_addressing_refusal(0, 0));
+static_assert(!x2w_startup::buffer_input_addressing_refusal(1u << 30, 3u << 21));
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 0) == x2w_startup::swizzled_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(0, 1u << 23) == x2w_startup::add_tid_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 1u << 23) == x2w_startup::swizzled_input_buffer);
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
@@ -334,6 +341,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         descriptors[0][0] = static_cast<UINT>(address);
         descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
         descriptors[0][2] = input_bytes / 4;
+        if (mode == "dispatch-input-title-swizzled") descriptors[0][1] |= 1u << 31;
+        if (mode == "dispatch-input-title-add-tid") descriptors[0][3] |= 1u << 23;
+        if (mode == "dispatch-input-title-cache-hint") descriptors[0][1] |= 1u << 30;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they

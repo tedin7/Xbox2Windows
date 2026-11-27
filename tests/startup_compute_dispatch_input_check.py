@@ -20,6 +20,8 @@ memory no buffer is placed over, 16 bytes in, and writes the input words there a
 words match. The stand-in places that buffer in the consumer's own heap, outside its placement index.
 The title-input switch cases use a second program and a D3D12 readback heap. The CPU sum covers three records,
 including one in the final 16 bytes. A first-chunk-only copy must fail the same comparison.
+Native input V# swizzle and ADD_TID flags must refuse the dispatch before it writes the output,
+while the cache hint alone must preserve the linear sum.
 The view-token case reads a selected texture mip and writes a selected raw UAV range.
 Exit 77 when the adapter is not available.
 """
@@ -86,8 +88,9 @@ def check_title_inputs(directory, cache, consumer, dxc, env, untouched):
     def refused(mode, settings, reason):
         got, result = run(mode, settings)
         messages = lines(result, 'Dispatch(1, 1, 1) refused: ')
-        assert got == untouched and len(messages) == 1 and messages[0].endswith('refused: ' + reason), (
-            mode, got[0], result.stderr[-3000:])
+        assert len(messages) == 1 and messages[0].endswith('refused: ' + reason), (
+            mode, 'missing expected refusal', reason, result.stderr[-3000:])
+        assert got == untouched, (mode, 'refused dispatch changed output', got[0])
         return result
 
     cold = refused('plain', env, 'no translation')
@@ -121,6 +124,24 @@ def check_title_inputs(directory, cache, consumer, dxc, env, untouched):
         assert totals.endswith(f'from a GPU copy {gpu}, from a title snapshot {placed} ({kib} KiB), '
                                f'from plain title memory {plain}, ring retries {retries}, ring full 0'), totals
         compare(got, mode)
+
+    # Mutant: removing the refusal lets the swizzled leg dispatch and fail on the missing refusal line.
+    for mode, word, bit, reason in (
+        ('swizzled', 1, 31,
+         'an input buffer descriptor is swizzled (V# swizzle_enable); swizzled addressing is not implemented'),
+        ('add-tid', 3, 23,
+         'an input buffer descriptor adds the thread ID to the index (V# add_tid_enable); not implemented'),
+    ):
+        result = refused(mode, enabled, reason)
+        diagnostic, = lines(result, 'x2w-draw input V# ')
+        assert diagnostic.endswith('refused: ' + reason), diagnostic
+        words = [int(value, 16) for value in diagnostic.split()[3:7]]
+        assert len(words) == 4 and words[word] & (1 << bit), diagnostic
+
+    got, result = run('cache-hint', enabled)
+    assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+    compare(got, 'cache-hint')
+    print('input addressing: swizzle and ADD_TID refused with untouched output; cache hint matches the linear CPU sum')
 
     refused('protected', enabled, 'an input range in title memory is not readable')
     full = refused('ring-full', enabled, 'an input range could not be copied from title memory (ring full)')
@@ -369,6 +390,7 @@ def main(consumer, dxc, adapter):
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
         check_title_inputs(directory, cache, consumer, dxc, env, untouched)
         check_view_tokens(directory, cache, consumer, dxc, env, untouched)
+    print('mutant: removing the refusal lets the swizzled leg dispatch and fail on the missing refusal line')
 
 
 if __name__ == '__main__':
