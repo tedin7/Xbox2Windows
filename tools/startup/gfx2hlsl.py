@@ -3509,9 +3509,10 @@ class Stage:
     address_carry_pairs = ()
     address_carry_reader = None
 
-    def __init__(self, pipe, kind, code, refusals=None, decoded=None, *, refine_joins=False):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None, *, refine_joins=False, refine_edges=True):
         self.pipe, self.kind = pipe, kind
         self.refine_joins = refine_joins
+        self.refine_edges = refine_edges
         self.refusals = refusals
         self.raw_code = strip_header(code)
         self.image_proof = None
@@ -5514,8 +5515,10 @@ class Stage:
                        and math.prod(getattr(self.pipe, 'group', (5,))) <= 4)
         if scalar_vote:
             self.wave_exec = True
-        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(
-            with_cfg=True, refine=getattr(self, 'refine_joins', False))
+        refine_joins = getattr(self, 'refine_joins', False)
+        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True, refine=refine_joins)
+        edge_counts = (Counter(tgt for _, tgt in branches)
+                       if refine_joins and getattr(self, 'refine_edges', True) and not back_targets else {})
         self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
@@ -5702,6 +5705,7 @@ class Stage:
             incoming_masks = {}
             skipped_marks = (set(), set(), set())  # program-order marks suppressed in the current block
             carried_masks = set()  # edge marks absent from the program-order state
+            edge_since, edge_mask_regs = {}, {}
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -5757,6 +5761,7 @@ class Stage:
                 # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
+                edge_uniform = edge_since.get(off) if not falls else None
                 if off in targets:
                     marks = (self.masks, self.mask_high, self.join_masks)
                     arriving_masks = incoming_masks.get(off, set())
@@ -5789,8 +5794,23 @@ class Stage:
                     here = joined.get(off, set())
                     arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
                         incoming.get(off, [])
+                    # Only the taken edge reaches this block. The preceding sibling can leave unrelated symbols
+                    # and mask tags in the walk. Keep the existing merge rules for values that are masks on the edge.
+                    edge_scalars = here - edge_mask_regs[off] if edge_uniform is not None else set()
+                    self.masks.difference_update(edge_scalars)
+                    self.mask_high.difference_update(edge_scalars)
+                    self.join_masks.difference_update(edge_scalars)
                     written = (written - here) | set().union(*(w for _, w in arriving))
                     for reg in here:
+                        if reg in edge_scalars:
+                            sym = arriving[0][0][reg]
+                            if sym is None:
+                                self.sym.pop(reg, None)
+                            else:
+                                self.sym[reg] = sym
+                            self.exec_copies.pop(reg, None)
+                            self.execcopy_epoch.pop(reg, None)
+                            continue
                         paths = [s[reg] for s, w in arriving if reg in w]
                         force = forced.get(off, {}).get(reg)
                         if falls and off in execz_targets and self.exec_zero_keepable(off, reg, arriving, paths, branches):
@@ -5851,7 +5871,7 @@ class Stage:
                     # after those, by a block every path runs, with no later write on any path, is still known.
                     consts = {reg for reg in join_writes.get(off, set()) | (clobber & every_sgpr)
                               if (self.sym.get(reg) or ('',))[0] == 'const'}
-                    for reg in self.unjoined(off, last_write, consts):
+                    for reg in self.unjoined(off, last_write, consts - edge_scalars):
                         del self.sym[reg]
                     fconsts = (join_writes.get(off, set()) | (clobber & every_sgpr)) & set(self.float_const_s)
                     for reg in self.unjoined(off, last_write, fconsts):
@@ -5883,6 +5903,10 @@ class Stage:
                             self.firstlane_v.clear()
                     elif not falls:
                         self.firstlane_v.clear()
+                if edge_uniform is not None:
+                    self.since_join = edge_uniform.copy()
+                    self.defined_uniform_s = edge_uniform.copy()
+                    self.varying_s.difference_update(edge_uniform)
                 if off in targets and self.exec_keep and name.startswith('s_'):
                     # The join instruction itself runs with exec == 0 on the taken edge: a scalar read of a kept word ends it here.
                     self.end_exec_keep_scalar_read(name, asm)
@@ -6074,6 +6098,11 @@ class Stage:
                 if self.scc_effect or not self.scc_verified:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
+                    if term[0] == 'branch' and edge_counts.get(term[2]) == 1 and off in self.uniform_branches:
+                        scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
+                        mask_regs = self.masks | self.mask_high | self.join_masks
+                        edge_since[term[2]] = scalar_facts - self.varying_s - mask_regs
+                        edge_mask_regs[term[2]] = mask_regs
                     self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
@@ -15355,17 +15384,18 @@ class Pipeline:
         state = deepcopy(self.__dict__, memo.copy())
         before = len(refusals) if refusals is not None else 0
 
-        def restore():
+        def restore(firstlane):
             self.__dict__.clear()
             self.__dict__.update(deepcopy(state, memo.copy()))
             if refusals is not None:
                 del refusals[before:]
+            if firstlane:
+                self.retry_firstlane = True
 
         wave_branch = WAVE_BRANCH_UNIFORM % 's_cbranch_scc0'
         for firstlane in (False, True):
             if firstlane:
-                restore()
-                self.retry_firstlane = True
+                restore(firstlane)
             try:
                 stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
             except Unsupported as reason:
@@ -15380,9 +15410,17 @@ class Pipeline:
                 if reported != [(wave_branch, 'ps')]:
                     return stage
             # Change the join facts only after the legacy pixel passes have refused the SCC branch.
-            restore()
-            if firstlane:
-                self.retry_firstlane = True
+            restore(firstlane)
+            try:
+                stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded, refine_joins=True, refine_edges=False)
+            except Unsupported as reason:
+                if str(reason) != wave_branch:
+                    raise
+            else:
+                if refusals is None or refusals[before:] != [(wave_branch, 'ps')]:
+                    return stage
+            # Keep earlier join-refinement successes byte-identical too.
+            restore(firstlane)
             return Stage(self, 'ps', code, refusals=refusals, decoded=decoded, refine_joins=True)
 
     def _graphics_pixel_stage(self, code, pixel_refusal):

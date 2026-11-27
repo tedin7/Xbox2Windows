@@ -17,6 +17,19 @@ The WARP case binds the six loaded words through the pixel AOT harness. It
 compares all four channels with the CPU reference for each bit value. Reversing
 the bit test must cause a readback mismatch in both draws.
 
+The retry also restores scalar symbols and uniformity from a sole incoming
+forward branch proven wave-uniform when the first refinement still refuses.
+The branch carries the buffer word and a constant past a sibling arm that
+rewrites both. Targets reached by fall-through
+or by several branches keep the existing join rules. The per-lane branch
+control uses a position-dependent vector compare and keeps its lane-mask
+refusal.
+
+The WARP range cases load 15, 16 and 31 to exercise both outcomes of the first
+branch and both outcomes of the range check in the other arm. The green channel
+uses the constant that reaches the selected arm. Reversing the inner range
+check must preserve the draw at 15 and produce mismatches at 16 and 31.
+
 ```bash
 nice -n 15 python3 -B tests/startup_gfx2hlsl_reaching_defs_check.py
 ```
@@ -29,3 +42,7 @@ The Python control passed on Linux x86-64 with Python 3.14.8. Base revision
 `ab02c55aef` refused the dominating-load case at `s_cbranch_scc0`. Disabling
 the refinement reproduced that refusal. Dropping `s36` despite two reaching
 definitions failed the last-diamond control. Windows WARP readback is pending.
+
+The single-edge control passes on the same Linux setup. Revision `1c8dd2b85`
+refuses the new case at `s_cbranch_scc0`. Removing the wave-uniform branch
+guard makes the per-lane control fail by losing its expected refusal.
