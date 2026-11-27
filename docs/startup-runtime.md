@@ -3776,6 +3776,8 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. By default, a mismatched or interior view overlapping a live resource preserves the destination descriptor.
+Linear `0x100` 2D views bind only a live resource with the same description and base address;
+their bytes are never read from the address.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
 the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
 textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
