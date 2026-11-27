@@ -4983,6 +4983,9 @@ class Stage:
                     # Publish in guest lane order, independent of the desktop wave width.
                     flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
                     self.uses_quad_shared = True
+                    # An earlier quad exchange reads x2w_quad after its own barrier only: keep a fast thread's
+                    # write below from overwriting a slot a slower thread has yet to read.
+                    self.emit('GroupMemoryBarrierWithGroupSync();')
                     self.emit('x2w_quad[%s] = (%s & 1u) << %s;' % (flat, self.u(tok), flat))
                     self.emit('GroupMemoryBarrierWithGroupSync();')
                     self.emit('uint %s = 0u;' % name)
