@@ -3222,6 +3222,29 @@ class Stage:
                 return None
         return head, end
 
+    def execz_forward_join(self, branch, join, succ, jumps, index):
+        """Find a common join for an execz region with an outward s_branch.
+
+        Close the forward interval over its successors. Each path must reach the resulting
+        boundary, and an outside edge may enter only at the opening branch or the boundary.
+        The ordinary execz proof then checks the enlarged interval, including the path from
+        the original join that an inactive invocation can run while the wave jumps over it.
+        """
+        if not any(branch < src < join and self.ins[src][2] == 's_branch'
+                   and index.get(target, -1) > join for src, target in jumps):
+            return join
+        end = join
+        for i in range(branch + 1, len(succ)):
+            if i == end:
+                break
+            if not succ[i] or any(dst <= i for dst in succ[i]):
+                return join
+            end = max(end, *succ[i])
+        if any(branch < index.get(target, -1) < end and not branch <= src < end
+               for src, target in jumps):
+            return join
+        return end
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3229,7 +3252,10 @@ class Stage:
         model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
         join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
         therefore accepted unchanged when every scalar register, mask and SCC it may define is dead where it joins,
-        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted when it
+        and it has no effect outside scalar registers and no branch out of the proven region. An outward s_branch
+        can extend the region to a common forward join. The block dispatcher uses each invocation's pc to
+        guard the remaining blocks after a jump, including any code between the original join and the new one.
+        An exec write is accepted when it
         cannot set the bit of a lane whose bit was clear at the branch: clear_after carries, over every path through
         the block (its branches and loops included), which masks have that lane's bit clear, and the write must
         leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
@@ -3301,10 +3327,16 @@ class Stage:
                 head, end = loop
                 self.execz_counted_loops[offsets[t]] = (offsets[head], offsets[head + 2], offsets[end])
                 continue
+            original_join = t
+            t = self.execz_forward_join(b, t, succ, jumps, index)
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
             # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
             entry = frozenset({('exec', 0), ('exec_hi', 1)})
             before = {b + 1: entry} if b + 1 < t else {}
+            if original_join < t:
+                # The modeled inactive lane enters here directly. Facts from the body
+                # cannot establish the values of any other masks on that edge.
+                before[original_join] = entry
             entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
             changed = not entered
             while changed:
