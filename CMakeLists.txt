@@ -13,8 +13,8 @@ if(WIN32)
         set(native_shader_revision "")
         foreach(source gfx1013_compute_native.cpp gfx1013_compute_native.h gfx1013_compute_opcodes.inl gfx1013_graphics_wqm.inl
                 gfx1013_isa_tables.inl gfx1013_isa.cpp gfx1013_isa.h gfx1013_compute_alu.inl gfx1013_direct_compute.inl gfx1013_compute_ir.cpp gfx1013_compute_ir.h
-                gfx1013_compute_mtbuf.inl gfx1013_direct_graphics.inl gfx1013_rect_geometry.cpp guest_shader_container.cpp guest_shader_container.h
-                dxil_module.h direct_compute_cache.cpp direct_compute_cache.h
+                gfx1013_compute_mtbuf.inl gfx1013_direct_graphics.inl gfx1013_direct_mesh.inl gfx1013_pixel_waterfall.inl gfx1013_rect_geometry.cpp guest_shader_container.cpp guest_shader_container.h
+                dxil_module.h mesh_pixel_heap.h direct_compute_cache.cpp direct_compute_cache.h
                 shader_compute_request.cpp shader_compute_request.h startup_stubs/inflate.h)
             set(native_shader_file "${CMAKE_CURRENT_SOURCE_DIR}/src/${source}")
             set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${native_shader_file}")
@@ -1911,6 +1911,10 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
     add_test(NAME native_sampled_replay COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_sampled_replay_check.py"
         "$<TARGET_FILE:native_sampled_pixel_gpu>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     foreach(backend IN ITEMS warp hardware)
+        add_test(NAME native_indexed_pixel_texture_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_indexed_pixel_texture_check.py" "$<TARGET_FILE:native_sampled_pixel_gpu>"
+            "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(native_indexed_pixel_texture_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
         add_test(NAME native_buffered_vertex_${backend} COMMAND native_buffered_vertex_gpu ${backend} "${DXC_BIN_DIR}"
             "${CMAKE_CURRENT_BINARY_DIR}/native-buffered-${backend}")
         set_tests_properties(native_buffered_vertex_${backend} PROPERTIES SKIP_RETURN_CODE 77)
@@ -1930,6 +1934,23 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
     add_test(NAME native_direct_container
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_test(NAME native_direct_mesh
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_mesh_check.py"
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    add_executable(native_frozen_request_check tests/native_frozen_request_check.cpp)
+    target_include_directories(native_frozen_request_check PRIVATE src)
+    target_compile_features(native_frozen_request_check PRIVATE cxx_std_17)
+    target_link_libraries(native_frozen_request_check PRIVATE x2w_shader_compiler)
+    set_property(TARGET native_frozen_request_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_frozen_request COMMAND native_frozen_request_check)
+    add_executable(native_compute_pack_check tests/native_compute_pack_check.cpp)
+    target_link_libraries(native_compute_pack_check PRIVATE x2w_shader_compiler)
+    target_include_directories(native_compute_pack_check PRIVATE src)
+    target_compile_features(native_compute_pack_check PRIVATE cxx_std_17)
+    set_property(TARGET native_compute_pack_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME native_compute_pack COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_compute_pack_check.py" "$<TARGET_FILE:compile_dxil>"
+        "$<TARGET_FILE:native_compute_pack_check>" "${DXC_BIN_DIR}")
     add_test(NAME native_dpp_mirror_hardware COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_dpp_mirror_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:native_store_replay>" "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
@@ -1938,6 +1959,12 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_graphics_wqm_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
     set_tests_properties(native_graphics_wqm_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    foreach(adapter warp hardware)
+        add_test(NAME native_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_sampler_heap_check.py" "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}" ${adapter})
+        set_tests_properties(native_sampler_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endforeach()
     add_test(NAME native_graphics_interface_library
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_graphics_interface_library_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")

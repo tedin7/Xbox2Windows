@@ -77,6 +77,51 @@ def quad_mask(word):
     return sum(15<<shift for shift in range(0,32,4) if word & (15<<shift))
 
 
+def check_packed_and_exact_exec(draw, compile_guest):
+    target = (b"OSG1", signature(b"SV_Target", 64))
+    position = (b"ISG1", signature(b"SV_Position", 1))
+
+    def packed_color(code, **kwargs):
+        return patched_pixel(len(code), code, export=(0xf8001c0f, 0x05050505), **kwargs)
+
+    def fma(op, src):
+        # Destination v5, operands (src, inline 1.0, inline 0).
+        return [op | 5, src | (242 << 9) | (128 << 18)]
+
+    low, high = fma(0xcc210000, 242), fma(0xcc220000, 244)
+    def interleaved(src):
+        return [0xd54b000c, src | (242 << 9) | (128 << 18)]  # v_fma_f32 v12,src,1,0
+
+    expected = [(1.0, 2.0, 1.0, 2.0)] * 16
+    for code in (low + high, high + low, low + interleaved(242) + high):
+        draw(packed_color(code, input_signature=(target,)), expected)
+    for code in (low, low + low, low + interleaved(261) + high, low + fma(0xcc220000, 261)):
+        result = compile_guest(packed_color(code, input_signature=(target,)))
+        assert result.returncode and "entry VGPR 5" in result.stderr, result.stderr
+
+    # WQM -> exact -> WQM: the exact write to unallocated v4 has no old
+    # helper value. Packed arithmetic observes only the eventual color.
+    prefix = [sop1(4, 10, 126), sop1(10, 126, 126), sop1(4, 12, 126),
+              sop1(4, 126, 10), vmove(4, 242), sop1(4, 126, 12)]
+    tail = fma(0xcc210000, 260) + high + [sop1(4, 126, 10)]
+    kwargs = dict(input_address=1 << 8, input_signature=(position, target))
+    draw(packed_color(prefix + tail, **kwargs), expected)
+    quad_read = [vmove(2, 250), 0xff04b104]  # DPP reads v4 from another quad lane
+    result = compile_guest(packed_color(prefix + quad_read + tail, **kwargs))
+    assert result.returncode and "entry VGPR 4" in result.stderr, result.stderr
+
+    # CMPX compares 4.0 < SV_Position.x. Its read-only arm updates v2
+    # only on the right half of the draw; all pixels export after restore.
+    def cmpx(body):
+        code = [vmove(2, 242), sop1(4, 10, 126), 0x7c2200f6,
+                0xbf880000 | len(body), *body, sop1(4, 126, 10)]
+        return patched_pixel(len(code), code, export=(0xf800180f, 0x02020202), **kwargs)
+
+    draw(cmpx([vmove(2, 244)]), [(1.0 + (lane % 8 >= 4),) * 4 for lane in range(16)])
+    result = compile_guest(cmpx(quad_read))
+    assert result.returncode and "graphics branch on a wave mask" in result.stderr, result.stderr
+
+
 # Cross-quad EXECZ (#2907). A region term (axis, "le"|"ge", value) keeps the lanes with
 # SV_Position.axis <= value or >= value; the compare sets VCC for the lanes it removes.
 def term_compare(axis, op, value):
@@ -241,6 +286,32 @@ def main(cli, raster, sdk, backend="hardware"):
             result=run(blob,pixels)
             assert result.returncode==0,(result.stdout,result.stderr)
             print(result.stdout.strip())
+        # On a 2x2 quad, compare the vertical neighbor with the negated
+        # current value. The equal case on column two checks ordered GT.
+        cmp_code=[sop1(10,126,126),0x06220300,0x062222ff,0xc0600000, # v17 = x+y-3.5
+                  0x7c0822fa,0xff4c4e11,0x7e0402f2,0x02000480]
+        def quad_compare(code):
+            return patched_pixel(len(code),code,input_address=0x300,
+                                 input_signature=((b"ISG1",signature(b"SV_Position",1)),))
+        expected=[(float(x>=3),)*4 for y in range(2) for x in range(8)]
+        draw(quad_compare(cmp_code),expected)
+        # The high word of v54 contains floor(x). Its low word is zero.
+        # -1 as 32-bit raw bits is qNaN (class bit 1), while 0x7c01 is
+        # binary16 sNaN (bit 0). Both arms write v0, on complementary EXEC.
+        for half in (False,True):
+            selector=[0x7d1e6cf9,0x0586b40f] if half else [0x7d106cf9,0x0586b4c1]
+            seq=[0x7e6c0f00,0x346c6c90,0xbe8f03ff,0x7c01,0xbebc047e,
+                 *selector,0xbeb40834,0x87fe7e34,0xbf880001,0x7e0002f2,
+                 0x8afe7e3c,0x7e0002f0,0xbefe043c]
+            flags=1 if half else 2
+            reference=[(0.5 if x & flags else 1.0,)*4 for y in range(2) for x in range(8)]
+            draw(quad_compare(seq),reference)
+        for control in (0xff4ce411,0xff0c4e11): # Identity permutation or unnegated src1.
+            wrong=cmp_code.copy()
+            wrong[5]=control
+            failed=run(quad_compare(wrong),expected)
+            assert failed.returncode==1 and "pixels differ" in failed.stderr,failed.stderr
+        check_packed_and_exact_exec(draw, compile_guest)
         for lo,hi,narrow in ((0,0,False),(0,1,False),(0x80000000,0,False),
                              (0x80000021,0x42,False),(0,1,True),(0x22,0,True)):
             a,b=quad_mask(lo),0 if narrow else quad_mask(hi)

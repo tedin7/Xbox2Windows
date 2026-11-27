@@ -26,4 +26,5 @@ std::string read_shader_container_bytes(const std::filesystem::path &file);
 ComputeContainer read_compute_container(const std::filesystem::path &file);
 // Verify the content key over all six immutable capture parts before exposing any bytes.
 ComputeRequest read_compute_request(const std::filesystem::path &marker);
+void validate_compute_request_shape(const ComputeRequest &request);
 } // namespace x2w

@@ -35,20 +35,23 @@ bool embedded_graphics_id(std::string_view raw) {
     }
     return true;
 }
-GuestShaderStage match_graphics_stage(std::string_view raw, const Bytes &blob, bool &exact) {
+GuestShaderStage match_graphics_stage(std::string_view raw, const Bytes &blob, bool &exact,
+                                      std::optional<GpuStage> required = {}) {
     auto stages = read_guest_shader_container(blob);
     int best = 0;
     size_t selected = 0;
     bool tie = false;
     for (size_t i = 0; i < stages.size(); ++i) {
         const auto &stage = stages[i];
-        if (stage.stage != GpuStage::vs && stage.stage != GpuStage::ps) continue;
+        if (required ? stage.stage != *required : (stage.stage != GpuStage::vs && stage.stage != GpuStage::ps))
+            continue;
         // A pixel container can carry materialized export instructions in a
         // patch table. The running PS already contains the selected export.
         int rank = 0;
         if (raw == stage.code) rank = stage.exports.empty() ? 3 : 2;
         if (!stage.exports.empty() && raw == stage.full_precision_code()) rank = 3;
-        if (!rank && raw.substr(0,24) == std::string_view(stage.code).substr(0,24) && embedded_graphics_id(raw))
+        if (!rank && raw.substr(0,24) == std::string_view(stage.code).substr(0,24) && embedded_graphics_id(raw) &&
+            (!required || (stage.container_identifier && native_shader_identifier(raw) == stage.container_identifier)))
             rank = 1;
         if (rank > best) { best = rank; selected = i; tie = false; }
         else if (rank && rank == best) tie = true;
@@ -96,6 +99,7 @@ Bytes encode(const NativeComputeShader &program) {
     for (const auto &c : program.constants)
         for (unsigned n : {c.root_parameter, c.first_sgpr, c.count})
             word(out, n);
+    word(out, program.sampler_heap);
     word(out, static_cast<uint32_t>(program.samplers.size()));
     for (const auto &s : program.samplers) {
         for (auto n : s.words)
@@ -127,7 +131,13 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
+<<<<<<< HEAD
         auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_sampler)));
+||||||| ca6593968
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_buffer_srv)));
+=======
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::indexed_raw_srv)));
+>>>>>>> a48d39dc1
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -144,6 +154,7 @@ NativeComputeShader decode(std::string_view bytes) {
             throw std::runtime_error("invalid cached constants");
         shader.constants.push_back(c);
     }
+    shader.sampler_heap = in.count(1) != 0;
     n = in.count(2048);
     for (unsigned j = 0; j < n; ++j) {
         ComputeSampler sampler{};
@@ -254,7 +265,7 @@ std::shared_ptr<const InterfaceMap> load_interfaces(const fs::path &dir) {
     Reader reader{index};
     while (!reader.remaining.empty()) {
         auto key = reader.take(65), value = reader.take(64);
-        if ((key.front() != 'F' && key.front() != 'I') || !digest_text(key.substr(1)) ||
+        if (std::string_view("FIMN").find(key.front()) == std::string_view::npos || !digest_text(key.substr(1)) ||
             (!digest_text(value) && value != Bytes(64,'-')) || !entries->emplace(key,value).second)
             throw std::runtime_error("invalid graphics interface catalog entry");
     }
@@ -262,10 +273,10 @@ std::shared_ptr<const InterfaceMap> load_interfaces(const fs::path &dir) {
     resident = entries;
     return resident;
 }
-Bytes indexed_interface(const fs::path &dir, const InterfaceMap &entries, std::string_view raw, const Bytes &hash) {
-    auto it = entries.find("F" + hash);
+Bytes indexed_interface(const fs::path &dir, const InterfaceMap &entries, std::string_view raw, const Bytes &hash, bool mesh = false) {
+    auto it = entries.find((mesh ? "M" : "F") + hash);
     if (it == entries.end() && embedded_graphics_id(raw))
-        it = entries.find("I" + shader_digest(raw.substr(0,24)));
+        it = entries.find((mesh ? "N" : "I") + shader_digest(raw.substr(0,24)));
     if (it == entries.end()) return {};
     if (it->second.front() == '-') throw UnsupportedComputeShader("ambiguous reviewed graphics interfaces");
     Bytes container;
@@ -274,6 +285,15 @@ Bytes indexed_interface(const fs::path &dir, const InterfaceMap &entries, std::s
     return container;
 }
 } // namespace
+
+GuestShaderStage reviewed_graphics_stage(std::string_view raw, GpuStage kind, const fs::path &cache, bool &exact) {
+    const auto dir = cache / "interfaces" / "library";
+    const auto entries = load_interfaces(dir);
+    if (!entries) throw UnsupportedComputeShader("missing reviewed graphics interfaces");
+    const auto blob = indexed_interface(dir, *entries, raw, shader_digest(raw), kind == GpuStage::ms);
+    if (blob.empty()) throw UnsupportedComputeShader("stage absent from reviewed graphics interfaces");
+    return match_graphics_stage(raw, blob, exact, kind);
+}
 
 size_t index_graphics_interfaces(const fs::path &source, const fs::path &cache) {
     const auto dir = cache / "interfaces" / "library";
@@ -290,11 +310,13 @@ size_t index_graphics_interfaces(const fs::path &source, const fs::path &cache) 
         };
         bool graphics = false;
         for (const auto &stage : stages) {
-            if (stage.stage != GpuStage::vs && stage.stage != GpuStage::ps) continue;
+            const bool mesh = stage.stage == GpuStage::ms;
+            if (!mesh && stage.stage != GpuStage::vs && stage.stage != GpuStage::ps) continue;
             graphics = true;
-            add("F" + shader_digest(stage.code));
+            add((mesh ? "M" : "F") + shader_digest(stage.code));
             if (!stage.exports.empty()) add("F" + shader_digest(stage.full_precision_code()));
-            if (embedded_graphics_id(stage.code)) add("I" + shader_digest(std::string_view(stage.code).substr(0,24)));
+            if (embedded_graphics_id(stage.code))
+                add((mesh ? "N" : "I") + shader_digest(std::string_view(stage.code).substr(0,24)));
         }
         if (!graphics) continue;
         publish(dir / (id + ".stage"), id, blob);
@@ -308,17 +330,47 @@ size_t index_graphics_interfaces(const fs::path &source, const fs::path &cache) 
     publish(dir / "catalog", catalog_version(), generation);
     return count;
 }
-NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, unsigned entry, bool container,
-                                           const std::filesystem::path &cache, bool &cache_hit,
-                                           HeapViewContract heap_view) {
-    if (!container && heap_view != HeapViewContract::none)
-        throw std::runtime_error("a heap view contract needs a container request");
-    ComputeRequest request{};
-    ComputeContainer packed;
-    Bytes identity = X2W_NATIVE_SHADER_REVISION;
-    identity += container ? "/container/cs_6_6" : "/slot67/cs_6_6";
-    word(identity, container ? 0 : entry);
+namespace {
+Bytes slot67_digest(const ComputeRequest &request, unsigned entry) {
+    Bytes identity = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6";
+    word(identity, entry);
+    for (const auto *part : {&request.code, &request.data, &request.root, &request.description, &request.sa, &request.sb})
+        identity += shader_digest(*part);
+    return shader_digest(identity);
+}
+template<class Translate>
+NativeComputeShader cached_compute_ir(const fs::path &cache, const Bytes &key, bool &hit, Translate translate) {
+    const auto path = cache / (key + ".csir");
+    Bytes payload;
+    hit = lookup(path, key, payload);
+    if (hit) {
+        try { return decode(payload); }
+        catch (const std::runtime_error &) { hit = false; }
+    }
+    auto program = translate();
+    publish(path, key, encode(program));
+    return program;
+}
+Bytes pack_version(unsigned entry) {
+    Bytes version = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6/prepared-1";
+    word(version, entry);
+    return shader_digest(version);
+}
+}
+NativeComputeShader prepare_direct_compute(const fs::path &input, unsigned entry, bool container,
+                                           const fs::path &cache, bool &cache_hit, HeapViewContract heap_view) {
+    if (!container) {
+        if (heap_view != HeapViewContract::none)
+            throw std::runtime_error("a heap view contract needs a container request");
+        const auto request = read_compute_request(input);
+        return cached_compute_ir(cache, slot67_digest(request, entry), cache_hit,
+                                 [&] { return translate_compute(request, entry, true); });
+    }
+    auto packed = read_compute_container(input);
+    Bytes identity = X2W_NATIVE_SHADER_REVISION "/container/cs_6_6";
+    word(identity, 0);
     if (heap_view != HeapViewContract::none)
+<<<<<<< HEAD
         identity += heap_view == HeapViewContract::raw_buffer    ? "/heap-view/raw_buffer"
                     : heap_view == HeapViewContract::typed_dword ? "/heap-view/typed_dword"
                                                                  : "/heap-view/other";
@@ -336,17 +388,114 @@ NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, u
     Bytes payload;
     cache_hit = lookup(path, key, payload);
     if (cache_hit) {
+||||||| ca6593968
+        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
+    if (container) {
+        packed = read_compute_container(input);
+        identity += shader_digest(packed.bytes) + shader_digest(packed.root);
+    } else {
+        request = read_compute_request(input);
+        for (auto *part : {&request.code, &request.data, &request.root, &request.description, &request.sa, &request.sb})
+            identity += shader_digest(*part);
+    }
+    const auto key = shader_digest(identity);
+    const auto path = cache / (key + ".csir");
+    NativeComputeShader program{};
+    Bytes payload;
+    cache_hit = lookup(path, key, payload);
+    if (cache_hit) {
+=======
+        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
+    identity += shader_digest(packed.bytes) + shader_digest(packed.root);
+    return cached_compute_ir(cache, shader_digest(identity), cache_hit,
+                             [&] { return translate_compute_container(std::move(packed), heap_view); });
+}
+
+ComputePackCounts build_compute_frontend_pack(const fs::path &requests, const fs::path &cache, unsigned entry) {
+    std::vector<fs::path> markers;
+    for (const auto &file : fs::directory_iterator(requests))
+        if (file.is_regular_file() && file.path().extension() == ".c67" && file.path().stem().wstring().rfind(L"req_",0) == 0)
+            markers.push_back(file.path());
+    if (markers.empty() || markers.size() > 100000)
+        throw std::runtime_error("invalid compute pack request count");
+    std::sort(markers.begin(), markers.end());
+    Bytes pack;
+    word(pack, 0);
+    ComputePackCounts counts;
+    for (const auto &marker : markers) {
+>>>>>>> a48d39dc1
         try {
-            program = decode(payload);
-        } catch (const std::runtime_error &) {
-            cache_hit = false;
+            const auto request = read_compute_request(marker);
+            const auto digest = slot67_digest(request, entry);
+            Bytes payload;
+            bool unsupported = false, hit = false;
+            try {
+                auto program = cached_compute_ir(cache, digest, hit, [&] { return translate_compute(request, entry, true); });
+                payload = encode(program);
+
+            } catch (const UnsupportedComputeShader &error) {
+                payload = error.what();
+                unsupported = true;
+
+            }
+            constexpr size_t limit = (256u << 20) - 128;
+            if (payload.empty() || payload.size() > limit || pack.size() + 80 + payload.size() > limit)
+                throw std::runtime_error("invalid compute pack size");
+            word(pack, static_cast<uint32_t>(request.key));
+            word(pack, static_cast<uint32_t>(request.key >> 32));
+            pack += digest;
+            word(pack, unsupported);
+            word(pack, static_cast<uint32_t>(payload.size()));
+            pack += payload;
+            if (unsupported) ++counts.unsupported;
+            else ++counts.prepared;
+        } catch (const std::runtime_error &e) {
+            counts.errors.push_back(marker.filename().string() + ": " + e.what());
         }
     }
-    if (!cache_hit) {
-        program = container ? translate_compute_container(std::move(packed), heap_view) : translate_compute(request, entry, true);
-        publish(path, key, encode(program));
+    const uint32_t total = static_cast<uint32_t>(counts.prepared + counts.unsupported);
+    if (!total) throw std::runtime_error(counts.errors.at(0));
+    std::memcpy(pack.data(), &total, sizeof(total));
+    publish(cache / ("compute-" + std::to_string(entry) + ".pack"), pack_version(entry), pack);
+    return counts;
+}
+
+ComputeFrontendPack ComputeFrontendPack::load(const fs::path &file, unsigned entry) {
+    Bytes bytes;
+    if (!x2w::lookup(file, pack_version(entry), bytes))
+        throw std::runtime_error("missing, stale or damaged compute pack");
+    Reader in{bytes};
+    ComputeFrontendPack pack;
+    pack.entry_ = entry;
+    auto count = in.count(100000);
+    if (!count) throw std::runtime_error("empty compute pack");
+    pack.records_.reserve(count);
+    for (unsigned j = 0; j < count; ++j) {
+        uint64_t key = in.word();
+        key |= uint64_t(in.word()) << 32;
+        auto digest = in.take(64);
+        bool unsupported = in.count(1) != 0;
+        auto payload = in.take(in.word());
+        if (!digest_text(digest) || payload.empty() || (unsupported && payload.size() > 4096) ||
+            !pack.records_.emplace(key, Record{Bytes(digest), Bytes(payload), unsupported}).second)
+            throw std::runtime_error("invalid compute pack record");
     }
-    return program;
+    if (!in.remaining.empty()) throw std::runtime_error("trailing compute pack data");
+    return pack;
+}
+
+ComputePackResult ComputeFrontendPack::lookup(const ComputeRequest &request, unsigned entry,
+                                               NativeComputeShader &program, Bytes &diagnostic) const {
+    auto it = records_.find(request.key);
+    if (it == records_.end() || entry != entry_ || it->second.digest != slot67_digest(request, entry))
+        return ComputePackResult::miss;
+    if (it->second.unsupported) {
+        diagnostic = it->second.payload;
+        return ComputePackResult::unsupported;
+    }
+    try { program = decode(it->second.payload); }
+    catch (const std::runtime_error &) { return ComputePackResult::miss; }
+    return ComputePackResult::prepared;
 }
 
 unsigned dxil_io_component(unsigned format) {
@@ -534,14 +683,18 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     Bytes payload;
     cache_hit = write_cache && !cache.empty() && lookup(path, key, payload);
     auto effective_layout = [&](const NativeComputeShader &vs) {
-        if (!input_layout.empty() || (pixel_entry.empty() && !reflected) || !vs.vertex_fetch) return std::string(input_layout);
+        if (!input_layout.empty() || !vs.vertex_fetch) return std::string(input_layout);
         unsigned count = 0;
         std::ostringstream elements;
         for (const auto &r : vs.inputs) {
             if (r.name != "X2W_RAW_VERTEX") continue;
             unsigned format = 0;
+            if (r.component == 5 && r.width == 1) format = DXGI_FORMAT_R8_UINT;
             if (r.component == 5 && r.width == 2) format = DXGI_FORMAT_R32G32_UINT;
             if (r.component == 5 && r.width == 3) format = DXGI_FORMAT_R32G32B32_UINT;
+            if (r.component == 5 && r.width == 4) format = DXGI_FORMAT_R32G32B32A32_UINT;
+            if (r.component == 9 && r.width == 1) format = DXGI_FORMAT_R8_UNORM;
+            if (r.component == 9 && r.width == 2) format = DXGI_FORMAT_R8G8_UNORM;
             if (r.component == 9 && r.width == 4) format = DXGI_FORMAT_R8G8B8A8_UNORM;
             if (!format) throw UnsupportedComputeShader("unsupported fixed vertex format");
             elements << " X2W_RAW_VERTEX " << r.index << ' ' << format << " 0 " << r.index << " 0 0";
@@ -574,6 +727,12 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     std::optional<GpuStage> first_stage;
     bool exact_pair = reflected;
     Bytes entry;
+    const bool fixed_entry = pixel_entry.size() == 12 && pixel_entry.substr(0,4) == "PSI1";
+    if (fixed_entry && !reflected)
+        throw UnsupportedComputeShader("fixed graphics entry requires matching stage interfaces");
+    bool packed_xy = false;
+    std::optional<unsigned> captured_interp_count;
+    std::optional<std::array<bool,2>> stage_wave32;
     if (reflected) {
         for (size_t i = 0; i < companions.size(); ++i) {
             bool exact = false;
@@ -586,6 +745,28 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
         }
         if (!interfaces.count(GpuStage::vs) || !interfaces.count(GpuStage::ps))
             throw UnsupportedComputeShader("missing vertex or pixel interface");
+        const auto &pixel_defaults = interfaces.at(GpuStage::ps);
+        stage_wave32 = {{interfaces.at(GpuStage::vs).wave32, pixel_defaults.wave32}};
+        if (fixed_entry) {
+            // Fixed slot 57 supplies ADDR and NUM_INTERP, not ENA. Intersect
+            // the observed ABI with the reviewed stage and the raw consumers.
+            uint32_t address, interpolants;
+            std::memcpy(&address, pixel_entry.data() + 4, 4);
+            std::memcpy(&interpolants, pixel_entry.data() + 8, 4);
+            if (!interpolants || interpolants > 7 || interpolants > pixel_defaults.attributes.size())
+                throw UnsupportedComputeShader("captured interpolation count disagrees with pixel interface");
+            captured_interp_count = interpolants;
+            packed_xy = address == 0x8002 && pixel_defaults.pixel_input_address == 0x302;
+            if (!(address == 2 && pixel_defaults.pixel_input_address == 2) && !packed_xy)
+                throw UnsupportedComputeShader("unsupported fixed pixel entry layout");
+            // Center I/J and, in the specialized position variant, packed XY
+            // are the only allocated inputs. The raw frontend checks each
+            // register use; the interpolants are checked below after linking.
+            entry = "psin1";
+            word(entry, address);
+            word(entry, address);
+            pixel_entry = entry;
+        }
         if (exact_pair && !pixel_entry.empty()) {
             auto &ps = interfaces.at(GpuStage::ps);
             uint32_t enable_mask = 0, address_mask = 0;
@@ -619,24 +800,37 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
         }
         interfaces.at(GpuStage::ps).target_components = targets;
         pair = translate_reflected_graphics(interfaces.at(GpuStage::vs),interfaces.at(GpuStage::ps),layout);
-    } else pair = translate_graphics_pair(a, b, layout, pixel_entry, first_stage, targets);
+    } else pair = translate_graphics_pair(a, b, layout, pixel_entry, first_stage, targets, stage_wave32);
     pair.target_components = targets;
     if (!entry.empty()) {
         const auto &attrs = interfaces.at(GpuStage::ps).attributes;
         std::vector<unsigned> channels(attrs.size());
         for (const auto &r : pair.pixel.inputs) {
             if (r.kind == 28 && r.interpolation == 2) continue;
-            if (r.name != "TEXCOORD" || r.index / 4 >= channels.size() || r.interpolation != 2 ||
+            if (packed_xy && r.kind == 3 && r.name == "SV_Position" && r.first == 0 &&
+                r.index == 0 && r.width == 4 && r.interpolation == 4) continue;
+            // Fixed pipelines may specialize individual components from
+            // P1/P2 to VINTRP_MOV P0. The raw front end links each observed
+            // component to a VS PARAM channel and emits flat mode only for
+            // that P0 instruction. It may drop unused reflected rows, too.
+            if (r.name != "TEXCOORD" || r.index / 4 >= channels.size() ||
+                (captured_interp_count && r.index / 4 >= *captured_interp_count) ||
+                (r.interpolation != 2 && !(fixed_entry && r.interpolation == 1)) ||
                 r.width != 1 || r.first != r.index % 4)
                 throw UnsupportedComputeShader("raw and reflected interpolation inputs disagree");
             channels[r.index / 4] |= 1u << r.first;
         }
         for (const auto &attr : attrs) {
             if (attr.usage != 6 || attr.location >= channels.size() || attr.flags != 2 ||
-                attr.mask != channels[attr.location] || !attr.mask)
-                throw UnsupportedComputeShader("raw and reflected interpolation channels disagree");
+                (channels[attr.location] & ~attr.mask) || !attr.mask)
+                throw UnsupportedComputeShader("raw and reflected interpolation channels disagree at location " +
+                    std::to_string(attr.location) + " (usage " + std::to_string(attr.usage) + ", flags " +
+                    std::to_string(attr.flags) + ", reflected mask " + std::to_string(attr.mask) +
+                    ", raw mask " + std::to_string(attr.location < channels.size() ? channels[attr.location] : 0) + ")");
             channels[attr.location] = 0;
         }
+        if (std::any_of(channels.begin(), channels.end(), [](unsigned bits) { return bits != 0; }))
+            throw UnsupportedComputeShader("raw interpolation has no reflected attribute");
     }
     pair.input_layout = vertex_layout(effective_layout(pair.vertex), pair.vertex);
     if (!root.empty()) {
@@ -683,7 +877,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
                     // Scalar buffer loads also consume CBV table records. The
                     // resolver supplies a raw SRV over the recorded CBV window.
                     if (first <= slot && slot < next && (kind == range.RangeType ||
-                        (binding.kind == ComputeViewKind::buffer_srv && range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV)))
+                        (accepts_cbv_window(binding.kind) && range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV)))
                         found = true;
                 }
                 if (reflected && binding.array_count == 1) {
@@ -696,11 +890,11 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
                     }
                     const bool used = apply_reflected_table_use(binding, iface,
                         exact_pair ? std::optional<unsigned>{} : std::optional<unsigned>{sgpr});
-                    const bool needs_record = !found || (!exact_pair && (binding.kind == ComputeViewKind::buffer_srv ||
+                    const bool needs_record = !found || (!exact_pair && (accepts_cbv_window(binding.kind) ||
                                                                          binding.kind == ComputeViewKind::texture_srv ||
                                                                          binding.kind == ComputeViewKind::d16_sample_srv));
                     if (!used && needs_record && binding.kind != ComputeViewKind::heap_stride_srv)
-                        throw UnsupportedComputeShader("raw load disagrees with reflected table record");
+                        throw UnsupportedComputeShader(std::string("missing reflected resource: ") + (vertex ? "VS" : "PS") + " root " + std::to_string(binding.root_parameter) + " offset " + std::to_string(binding.byte_offset) + " kind " + std::to_string(static_cast<unsigned>(binding.kind)) + " user SGPR " + std::to_string(sgpr));
                     found |= used;
                 }
                 apply_scalar_table_layout(binding, p.DescriptorTable);
@@ -800,10 +994,18 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
 }
 
 std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair, std::string_view rtv_request) {
-    if (pair.vertex.vertex_fetch || !pair.input_layout.empty())
+    const bool fixed_stream = pair.vertex.vertex_fetch && !pair.input_layout.empty();
+    if (pair.vertex.vertex_fetch != !pair.input_layout.empty())
         return std::nullopt;
+    for (const auto &e : pair.input_layout)
+        if (e.semantic != "X2W_RAW_VERTEX" || e.slot || e.offset != e.index || e.classification || e.step_rate ||
+            !e.used || (e.format != DXGI_FORMAT_R8_UNORM && e.format != DXGI_FORMAT_R8G8_UNORM &&
+                        e.format != DXGI_FORMAT_R8G8B8A8_UNORM && e.format != DXGI_FORMAT_R32G32_UINT &&
+                        e.format != DXGI_FORMAT_R32G32B32_UINT && e.format != DXGI_FORMAT_R32G32B32A32_UINT &&
+                        e.format != DXGI_FORMAT_R8_UINT))
+            return std::nullopt;
     for (const auto &in : pair.vertex.inputs)
-        if (in.name != "SV_VertexID" && in.name != "SV_InstanceID")
+        if (in.name != "SV_VertexID" && in.name != "SV_InstanceID" && !(fixed_stream && in.name == "X2W_RAW_VERTEX"))
             return std::nullopt;
     // An integer target is published only for the RTV variant whose format asked for that type.
     for (const auto &out : pair.pixel.outputs)
@@ -838,10 +1040,12 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
         if (b.kind == ComputeViewKind::buffer_srv || b.kind == ComputeViewKind::raw_vector_srv ||
             b.kind == ComputeViewKind::byte_window_srv) {
             srv_lines << "srv " << i << " buf table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+        } else if (b.kind == ComputeViewKind::indexed_raw_srv && b.array_count == 1 &&
+                   b.required_bytes && !(b.required_bytes % 4) && b.required_bytes <= 2048) {
+            srv_lines << "srv " << i << " idxbuf table " << b.root_parameter << ' ' << b.byte_offset << ' ' << b.required_bytes << '\n';
         } else if (b.kind == ComputeViewKind::root_buffer_srv && b.byte_offset == 0 && b.array_count == 1) {
             srv_lines << "srv " << i << " buf root " << b.root_parameter << '\n';
-        } else if ((b.kind == ComputeViewKind::texture_srv || b.kind == ComputeViewKind::comparison_texture_srv) &&
-                   b.array_count == 1) {
+        } else if (b.kind == ComputeViewKind::texture_srv || b.kind == ComputeViewKind::comparison_texture_srv) {
             const char *tex = b.image_dimension == 0   ? "tex1d"
                               : b.image_dimension == 1 ? "tex2d"
                               : b.image_dimension == 2 ? "tex3d"
@@ -865,6 +1069,7 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
         uav_lines << "uav " << j << (b.image_dimension == 5 ? " tex2da table " : " tex2d table ") << b.root_parameter
                   << ' ' << b.byte_offset << '\n';
     }
+    if (bindings.samplers.heap) sampler_lines << "smpheap 2048 1 fallback 2047\n";
     for (size_t i = 0; i < bindings.samplers.statics.size(); ++i) {
         const auto &w = bindings.samplers.statics[i];
         const bool cmp = i < bindings.samplers.comparison.size() && bindings.samplers.comparison[i];
@@ -881,7 +1086,9 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
             params = (std::max)(params, out.index / 4 + 1);
 
     std::ostringstream out;
-    out << "x2w-manifest " << (uav_count ? 2 : 1) << "\nud " << (total_constants ? total_constants : 1u) << '\n';
+    out << "x2w-manifest " << (fixed_stream ? 3 : uav_count ? 2 : 1) << "\nud " << (total_constants ? total_constants : 1u) << '\n';
+    for (const auto &e : pair.input_layout)
+        out << "fixedvb " << e.offset << ' ' << e.format << '\n';
     if (!total_constants) {
         out << "udsrc 0 rect\n";
     } else {

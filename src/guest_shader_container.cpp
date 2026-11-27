@@ -1,5 +1,6 @@
 #include "guest_shader_container.h"
 #include "startup_stubs/inflate.h"
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -168,6 +169,37 @@ void stages(Span packed, std::vector<GuestShaderStage> &result, size_t &total) {
     }
 }
 } // namespace
+unsigned GuestShaderStage::physical_user_sgpr(unsigned logical) const noexcept {
+    switch (stage) {
+    case GpuStage::ls:
+    case GpuStage::hs:
+    case GpuStage::es:
+    case GpuStage::gs:
+    case GpuStage::ms:
+        return logical + 8;
+    default:
+        return logical;
+    }
+}
+
+std::optional<ShaderIdentifier> native_shader_identifier(std::string_view code) {
+    // Two literal-bearing V_NOPs carry the sixteen DXBC HASH bytes. Each
+    // operand selector contributes eight bits; bit 8 is an encoding bit.
+    if (code.size() < 24) return {};
+    ShaderIdentifier id{};
+    for (unsigned half = 0; half < 2; ++half) {
+        const unsigned off = half * 12;
+        const uint32_t inst = u32(code, off), operands = u32(code, off + 4);
+        if (inst >> 16 != 0xd580 || (operands & 0xfffe0100u) != 0x03fe0100u) return {};
+        auto* bytes = id.data() + half * 8;
+        bytes[0] = static_cast<uint8_t>(inst);
+        bytes[1] = static_cast<uint8_t>(inst >> 8);
+        bytes[2] = static_cast<uint8_t>(operands);
+        bytes[3] = static_cast<uint8_t>(operands >> 9);
+        std::memcpy(bytes + 4, code.data() + off + 8, 4);
+    }
+    return id;
+}
 std::string GuestShaderStage::full_precision_code() const {
     auto patched = code;
     for (const auto &p : exports)
@@ -180,6 +212,8 @@ std::vector<GuestShaderStage> read_guest_shader_container(std::string_view bytes
     std::vector<GuestShaderStage> result;
     size_t total = 0;
     std::vector<ShaderSemantic> inputs, outputs;
+    std::optional<ShaderIdentifier> identifier;
+    std::optional<unsigned> mesh_threads;
     const auto count = u32(bytes, 28);
     if (count > 4096)
         throw std::runtime_error("invalid DXBC part count");
@@ -188,6 +222,14 @@ std::vector<GuestShaderStage> read_guest_shader_container(std::string_view bytes
         uint64_t part = u32(offsets, 4ull * i);
         auto data = slice(bytes, part + 8, u32(bytes, part + 4));
         auto kind = slice(bytes, part, 4);
+        if (kind == "HASH" && data.size() == 20) {
+            ShaderIdentifier parsed;
+            std::memcpy(parsed.data(), data.data() + 4, parsed.size());
+            if (identifier && *identifier != parsed) throw std::runtime_error("conflicting shader identifiers");
+            identifier = parsed;
+        }
+        if (kind == "PSV0" && data.size() >= 52 && u32(data, 0) >= 48 && u32(data, 0) <= data.size() - 4)
+            mesh_threads = u32(data, 40);
         if (kind == "ISG1" || kind == "ISGN")
             inputs = read_signature(data, kind == "ISG1");
         if (kind == "OSG1" || kind == "OSGN")
@@ -209,6 +251,10 @@ std::vector<GuestShaderStage> read_guest_shader_container(std::string_view bytes
         if (stage.stage == GpuStage::vs || stage.stage == GpuStage::ps || stage.stage == GpuStage::ms) {
             stage.input_signature = inputs;
             stage.output_signature = outputs;
+            stage.container_identifier = identifier;
+            if (stage.stage == GpuStage::ms)
+                stage.mesh_group_stride = mesh_threads
+                    ? std::max({*mesh_threads, stage.max_vertices, stage.max_primitives}) : stage.threads[0];
         }
     return result;
 }

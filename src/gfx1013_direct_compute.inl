@@ -21,10 +21,12 @@ struct DirectCompute {
             refuse(i.pc, "lane read/write needs full waves");
     }
     Emit &analysis;
+    const GuestShaderStage *graphics_interface = nullptr;
     DxilModule ir;
     std::set<unsigned> allocated;
     string lane, lane_bit, half_index, upper_half, exchange_base;
     unsigned exchange_words = 0;
+    unsigned virtual_waves = 0;
     bool uses_exchange = false;
     bool wave64 = false;
     // The view class a GPU-selected heap slot is read as; see HeapViewContract.
@@ -43,6 +45,8 @@ struct DirectCompute {
     std::vector<bool> scc_live;
     unsigned label_number = 0;
     bool pixel_stage = false;
+    bool pixel_heap_enabled = false;
+    struct PixelHeapIndex { string index; unsigned first, last; bool nonuniform; };
     // Straight-line graphics stages keep exact SSA definitions; a missing
     // entry value is resolved through the container's stage signature.
     std::function<string(unsigned)> graphics_input;
@@ -68,6 +72,11 @@ struct DirectCompute {
     }
     string address(unsigned r) {
         const auto name = "%r" + to_string(r);
+        if (virtual_waves) {
+            const auto type = "[" + to_string(virtual_waves) + " x i32]";
+            if (allocated.insert(r).second) ir.setup << "  " << name << " = alloca " << type << ", align 4\n";
+            return ir.value("getelementptr " + type + ", " + type + "* " + name + ", i32 0, i32 %virtualWave");
+        }
         if (allocated.insert(r).second)
             ir.setup << "  " << name << " = alloca i32, align 4\n";
         return name;
@@ -110,7 +119,7 @@ struct DirectCompute {
             return "true";
         return cmp("ne", ir.binary("and", wave64 ? select(upper_half, read(127), read(126)) : read(126), lane_bit), "0");
     }
-    void vector_write(unsigned r, const string &value) {
+    void vector_write(unsigned r, const string &value, const string &sampled_float = {}) {
         if (graphics_input && graphics_predicate.empty())
             write(r, value);
         else if (perspective_center_pair && (r == 256 || r == 257) &&
@@ -122,6 +131,13 @@ struct DirectCompute {
             // Only covered lanes can observe this result. In particular no
             // subsequent implicit LOD or quad operation can inspect helpers.
             write(r, value);
+        } else if (exact_pixel_entry && !graphics_predicate.empty() && !sampled_float.empty()) {
+            // Keep the floating sample and the incoming register live on the
+            // corresponding sides of the exact/helper predicate. Select has
+            // no floating-point arithmetic and preserves the old register bits.
+            auto previous = ir.value("bitcast i32 " + read(r) + " to float");
+            auto result = ir.value("select i1 " + graphics_predicate + ", float " + sampled_float + ", float " + previous);
+            write(r, ir.value("bitcast float " + result + " to i32"));
         } else
             write(r, select(graphics_input ? graphics_predicate : active(), value, read(r)));
     }
@@ -195,8 +211,10 @@ struct DirectCompute {
     }
     void initialize(unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         unsigned threads = x * y * z;
-        lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
-        lane_bit = ir.binary("shl", "1", lane);
+        if (!virtual_waves) {
+            lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
+            lane_bit = ir.binary("shl", "1", lane);
+        }
         write(126, ballot("true"));
         if (!wave64) {
             write(127, "0");
@@ -204,7 +222,9 @@ struct DirectCompute {
             write(107, "0");
         }
         string wave = "0";
-        if (threads > 32) {
+        if (virtual_waves) {
+            wave = ir.binary("add",ir.binary("shl","%virtualWave","1"),half_index);
+        } else if (threads > 32) {
             auto flat = ir.invoke("i32", "flattenedThreadIdInGroup.i32", 96, {}, "nounwind readnone");
             auto first =
                 ir.invoke("i32", "waveActiveOp.i32", 119, {{"i32", flat}, {"i8", "2"}, {"i8", "1"}}, "nounwind");
@@ -228,10 +248,12 @@ struct DirectCompute {
             }
         }
         if (wave64) {
-            exchange_words = threads / 32;
-            half_index = wave;
-            exchange_base = ir.binary("and", wave, "4294967294");
-            upper_half = cmp("ne", ir.binary("and", wave, "1"), "0");
+            if (!virtual_waves) {
+                exchange_words = threads / 32;
+                half_index = wave;
+                exchange_base = ir.binary("and", wave, "4294967294");
+                upper_half = cmp("ne", ir.binary("and", wave, "1"), "0");
+            }
             write(127, "4294967295");
         }
         auto logical = ir.binary("add", ir.binary("mul", wave, "32"), lane);
@@ -356,9 +378,10 @@ struct DirectCompute {
         if (bound_register) *bound_register = it->shader_register;
         const bool raw = kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::buffer_srv ||
                          kind == ComputeViewKind::raw_vector_srv || kind == ComputeViewKind::byte_window_srv ||
-                         kind == ComputeViewKind::indexed_atomic_uav;
+                         kind == ComputeViewKind::indexed_atomic_uav || kind == ComputeViewKind::indexed_raw_srv;
         const bool half = kind == ComputeViewKind::half_buffer_uav;
-        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 : bytes / (half ? 2 : 4);
+        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 :
+                               kind == ComputeViewKind::packed_d16_x_uav ? 1 : bytes / (half ? 2 : 4);
         if (raw)
             ir.features |= 16;
         return ir.handle({unsigned(compute_uav(kind)), it->shader_register, raw ? 11u : 10u,
@@ -441,6 +464,20 @@ struct DirectCompute {
     }
     #include "gfx1013_compute_mtbuf.inl"
 
+    string root_buffer_handle(unsigned parameter, unsigned span) {
+        auto &bindings = analysis.result.bindings;
+        auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
+            return b.kind == ComputeViewKind::root_buffer_srv && b.root_parameter == parameter;
+        });
+        if (binding == bindings.end()) {
+            bindings.push_back({ComputeViewKind::root_buffer_srv, parameter, 0, analysis.srv++, span});
+            binding = std::prev(bindings.end());
+        } else
+            binding->required_bytes = (std::max)(binding->required_bytes, span);
+        ir.features |= 16;
+        return ir.handle({0, binding->shader_register, 11});
+    }
+
     // global_load_dword in the saddr form (#2962): ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
     // FLAT/GLOBAL addressing), with SADDR the unadvanced root address of a root SRV, as for the scalar root loads.
     // The byte offset zext(VADDR) + OFFSET is guarded to [0, 2^32) before it becomes a 32-bit view offset, so a
@@ -460,17 +497,7 @@ struct DirectCompute {
         if (offset % 4)
             refuse(i.pc, "global load at an unaligned immediate offset");
         const unsigned span = offset > 0 ? unsigned(offset) + 4 : 4;
-        auto &bindings = analysis.result.bindings;
-        auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
-            return b.kind == ComputeViewKind::root_buffer_srv && b.root_parameter == low.value;
-        });
-        if (binding == bindings.end()) {
-            bindings.push_back({ComputeViewKind::root_buffer_srv, low.value, 0, analysis.srv++, span});
-            binding = std::prev(bindings.end());
-        } else
-            binding->required_bytes = (std::max)(binding->required_bytes, span);
-        ir.features |= 16;
-        const auto h = ir.handle({0, binding->shader_register, 11});
+        const auto h = root_buffer_handle(low.value, span);
         const auto vaddr = read(256 + (i.b & 255));
         string in_range, addr = vaddr;
         if (offset > 0) {
@@ -503,6 +530,38 @@ struct DirectCompute {
         if (i.enc == Encoding::Smem) {
             unsigned so = i.b >> 25;
             const auto &low = s.at(i.src[0]);
+            if (low.type == Symbol::Type::sampler_heap) {
+                if (i.op != 2 || !(s.at(i.src[0] + 1) == Symbol{Symbol::Type::constant, 0}))
+                    refuse(i.pc, "sampler heap requires a four-word load with zero high address");
+                if (so == 125 || s.at(so).type == Symbol::Type::constant)
+                    refuse(i.pc, "constant sampler heap offset has no validated sampler-table contract");
+                auto bytes = ir.binary("add", operand32(i, so), to_string(i.b & 0xfffff));
+                // gfx2hlsl.x2w_sampler_entry: slot 2047 is reserved by the runtime.
+                auto aligned = cmp("eq", ir.binary("and", bytes, "15"), "0");
+                auto in_range = cmp("ult", bytes, "32752");
+                auto valid = ir.value("and i1 " + aligned + ", " + in_range);
+                auto index = select(valid, ir.binary("lshr", bytes, "4"), "2047");
+                for (unsigned j = 0; j < 4; ++j)
+                    write(i.dst + j, index);
+                return;
+            }
+            if (pixel_heap_enabled && low.type == Symbol::Type::table && low.value == compute_resource_heap && i.op == 3) {
+                if (i.dst + 8 > 106 || !(s.at(i.src[0] + 1) == Symbol{Symbol::Type::constant,0}))
+                    refuse(i.pc, "invalid pixel heap texture descriptor address");
+                const Word offset = i.b & 0xfffff;
+                if (offset & 31) refuse(i.pc, "unaligned pixel heap immediate byte offset");
+                string index = to_string(offset / 32);
+                if (so != 125) {
+                    const auto value = s.at(so);
+                    if ((value.type != Symbol::Type::masked && value.type != Symbol::Type::constant) ||
+                        (value.value & 31) || value.value > UINT_MAX - offset)
+                        refuse(i.pc,"pixel heap byte offset has no proven aligned range");
+                    auto address = ir.binary("add", operand32(i,so), to_string(offset));
+                    index = ir.binary("lshr",address,"5");
+                }
+                for (unsigned j=0;j<8;++j) write(i.dst+j,index);
+                return;
+            }
             const bool root = low.type == Symbol::Type::root_address;
             if (!root && low.type == Symbol::Type::table && low.value == compute_resource_heap) {
                 // Reads from the whole descriptor heap: only the indexed descriptor load of a captured raw buffer slot.
@@ -536,10 +595,11 @@ struct DirectCompute {
                     s.at(i.src[0] + 1).type != Symbol::Type::constant || s.at(i.src[0] + 1).value != 0)
                     refuse(i.pc, "direct descriptor address outside bound table");
                 if (so != 125) {
-                    if (i.op != 2 || so > 105)
+                    const bool pixel_texture = pixel_stage && i.op == 3 && low.value != compute_resource_heap;
+                    if ((!pixel_texture && i.op != 2) || so > 105 || (pixel_texture && i.dst + 8 > 106))
                         refuse(i.pc, "direct indexed descriptor load shape");
                     auto index = ir.binary("lshr", operand32(i, so), "5");
-                    for (unsigned j = 0; j < 4; ++j)
+                    for (unsigned j = 0; j < memory_count(i); ++j)
                         write(i.dst + j, index);
                 }
                 return; // The CFG transfer already associated every destination word with its table slot.
@@ -548,7 +608,9 @@ struct DirectCompute {
             string h;
             if (root) {
                 const Symbol high{Symbol::Type::root_address, low.value, 1};
-                if (low.offset || !(s.at(i.src[0] + 1) == high))
+                const bool stride_one = i.op >= 8 && s.at(i.src[0] + 1) ==
+                    Symbol{Symbol::Type::root_stride_one_high, low.value, 1};
+                if (low.offset || (!(s.at(i.src[0] + 1) == high) && !stride_one))
                     refuse(i.pc, "mismatched root address high half");
                 // Like Victory's Source::Built, retain the root identity through
                 // SGPR copies. Scalar buffer loads read dwords at byte offsets.
@@ -556,7 +618,7 @@ struct DirectCompute {
                 // only for this verified zero-stride, byte-address V# layout.
                 const bool built = i.op >= 8;
                 if (built && (s.at(i.src[0] + 2).type != Symbol::Type::constant ||
-                              !(s.at(i.src[0] + 3) == Symbol{Symbol::Type::constant, 0x31016fac})))
+                              !(s.at(i.src[0] + 3) == Symbol{Symbol::Type::constant, stride_one ? 0x11014facu : 0x31016facu})))
                     refuse(i.pc, "unsupported synthesized scalar buffer descriptor fields");
                 unsigned span = off + 4 * n;
                 if (off % 4 || span > 65536 || i.dst + n > 106)
@@ -570,17 +632,7 @@ struct DirectCompute {
                 }
                 if (built && span > s.at(i.src[0] + 2).value)
                     refuse(i.pc, "scalar load exceeds synthesized descriptor byte bound");
-                auto &bindings = analysis.result.bindings;
-                auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
-                    return b.kind == ComputeViewKind::root_buffer_srv && b.root_parameter == low.value;
-                });
-                if (binding == bindings.end()) {
-                    bindings.push_back({ComputeViewKind::root_buffer_srv, low.value, 0, analysis.srv++, span});
-                    binding = std::prev(bindings.end());
-                } else
-                    binding->required_bytes = (std::max)(binding->required_bytes, span);
-                ir.features |= 16;
-                h = ir.handle({0, binding->shader_register, 11});
+                h = root_buffer_handle(low.value, span);
             } else
                 h = resource(i, s, i.src[0], ComputeViewKind::buffer_srv, so == 125 ? off + 4 * n : 4);
             auto addr = so == 125 ? to_string(off)
@@ -602,14 +654,64 @@ struct DirectCompute {
         unsigned n = raw ? widths[i.op & 3] : (i.op & 3) + 1, data = 256 + i.dst;
         if (i.dst + (half ? (n + 1) / 2 : n) > 256)
             refuse(i.pc, "direct buffer data overflow");
+        const bool packed_x = half && n == 1 && !graphics_input;
         auto kind = store ? (raw    ? ComputeViewKind::raw_buffer_uav
+                             : packed_x ? ComputeViewKind::packed_d16_x_uav
                              : half ? ComputeViewKind::half_buffer_uav
                                     : ComputeViewKind::typed_buffer_uav)
                     : raw && s.at(((i.b >> 16) & 31) * 4 + 1).type == Symbol::Type::zero_stride_word
                           ? ComputeViewKind::byte_window_srv
                     : raw ? ComputeViewKind::raw_vector_srv
                           : ComputeViewKind::typed_buffer_srv;
-        auto h = resource(i, s, ((i.b >> 16) & 31) * 4, kind, raw ? 4 : n * (half ? 2 : 4));
+        const unsigned base = ((i.b >> 16) & 31) * 4;
+        string h;
+        if (!store && raw && (i.a & 0x2000)) {
+            const auto &descriptor = s.at(base);
+            const unsigned offset = i.a & 4095;
+            if (!graphics_interface || descriptor.type != Symbol::Type::descriptor)
+                refuse(i.pc, "indexed raw load needs a reflected table SRV");
+            std::optional<unsigned> record_stride;
+            for (const auto &use : graphics_interface->resources) {
+                if (use.type || use.root_type != 3 || use.dwords != 4 ||
+                    use.root_parameter != descriptor.value || uint64_t(use.offset_dwords)*4 != descriptor.offset) continue;
+                if (record_stride && *record_stride != use.stride) refuse(i.pc, "ambiguous indexed SRV record stride");
+                record_stride = use.stride;
+            }
+            const unsigned stride = record_stride.value_or(0);
+            if (!stride || stride > 2048 || (stride | offset) % 4 || offset + 4*n > stride)
+                refuse(i.pc, "indexed raw load outside a verified dword-aligned record");
+            h = resource(i, s, base, ComputeViewKind::indexed_raw_srv, stride);
+            auto index = read(256 + (i.b & 255));
+            auto dimensions = ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
+                                       {{"%dx.types.Handle", h}, {"i32", "undef"}}, "nounwind readonly");
+            auto size = ir.value("extractvalue %dx.types.Dimensions " + dimensions + ", 0");
+            auto valid = cmp("ult", index, ir.binary("udiv", size, to_string(stride)));
+            auto start = ir.binary("add", ir.binary("mul", index, to_string(stride)), to_string(offset));
+            auto result = load_buffer(h, start, true, n);
+            for (unsigned j=0; j<n; ++j) {
+                auto word = ir.value("extractvalue %dx.types.ResRet.i32 " + result + ", " + to_string(j));
+                vector_write(data + j, select(valid, word, "0"));
+            }
+            return;
+        }
+        if (!store && raw && s.at(base).type == Symbol::Type::root_address) {
+            const auto &low = s.at(base);
+            // Byte-stride V#, unbounded NUM_RECORDS, raw OFFEN access.
+            // A shorter guest bound needs its own per-access bounds check.
+            const bool stride_one=s.at(base+1)==Symbol{Symbol::Type::root_stride_one_high,low.value,1} &&
+                                  s.at(base+3)==Symbol{Symbol::Type::constant,0x11014fac};
+            // With IDXEN clear, the original zero-stride, byte-count V#
+            // also reads exactly the OFFEN byte window of its root SRV.
+            const bool byte_bounds=s.at(base+1)==Symbol{Symbol::Type::root_address,low.value,1} &&
+                                   s.at(base+3)==Symbol{Symbol::Type::constant,0x31016fac};
+            if (low.offset || (!stride_one && !byte_bounds) ||
+                !(s.at(base+2) == Symbol{Symbol::Type::constant, 0xffffffff}) ||
+                (i.a & 0x3fff) != 0x1000 || (i.b >> 24) != 128)
+                refuse(i.pc, "unsupported raw root buffer descriptor or offset");
+            h = root_buffer_handle(low.value, 4*n);
+        } else {
+            h = resource(i, s, base, kind, raw ? 4 : n * (half ? 2 : 4));
+        }
         auto addr = (i.a & (raw ? 0x1000 : 0x2000)) ? read(256 + (i.b & 255)) : "0";
         if (raw) {
             addr = ir.binary("add", addr, to_string(i.a & 4095));
@@ -631,20 +733,22 @@ struct DirectCompute {
             if (j < n || !raw) {
                 const unsigned component = (std::min)(j, n - 1);
                 value = read(data + (half ? component / 2 : component));
-                if (half) {
+                if (packed_x) {
+                    value = ir.binary("and", value, "65535");
+                } else if (half) {
                     if (component % 2)
                         value = ir.binary("lshr", value, "16");
                     value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", value}}, "nounwind readnone");
                 }
             }
-            args.emplace_back(half ? "float" : "i32", value);
+            args.emplace_back(half && !packed_x ? "float" : "i32", value);
         }
         args.emplace_back("i8", to_string(raw ? (1u << n) - 1 : 15));
         if (raw)
             args.emplace_back("i32", "4");
         ir.invoke("void",
                   raw    ? "rawBufferStore.i32"
-                  : half ? "bufferStore.f32"
+                  : half && !packed_x ? "bufferStore.f32"
                          : "bufferStore.i32",
                   raw ? 140 : 69, args, "nounwind");
         if (!graphics_input)
@@ -665,6 +769,7 @@ struct DirectCompute {
                 select_float(is_y, major, nv),
                 select_float(is_x, select_float(negative, u, nu), select_float(is_y, select_float(negative, nv, v), major))};
     }
+<<<<<<< HEAD
     string texture_dimensions(const string &handle, const string &mip) {
         return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
                          {{"%dx.types.Handle", handle}, {"i32", mip}}, "nounwind readonly");
@@ -744,7 +849,52 @@ struct DirectCompute {
         }
     }
     void image_io(const Inst &i, const State &s) {
+||||||| ca6593968
+    void image_io(const Inst &i, const State &s) {
+=======
+    string pixel_heap_texture(const Inst &i, const State &s, unsigned base, unsigned dim,
+                              std::optional<PixelHeapIndex> selected) {
+        const auto sym = s.at(base);
+        if (!pixel_heap_enabled || sym.type != Symbol::Type::indexed_descriptor ||
+            sym.value != compute_resource_heap || base+8>106 || (sym.offset & 31) || (dim != 1 && dim != 5))
+            refuse(i.pc, "unproven pixel heap Texture2D descriptor");
+        for (unsigned j=1;j<8;++j) {
+            auto expected = sym;
+            expected.offset += 4*j;
+            if (!(s.at(base+j)==expected)) refuse(i.pc,"mixed pixel heap texture descriptor words");
+        }
+        if (!selected) {
+            if ((sym.index_mask & 31) || sym.index_mask > UINT_MAX - sym.offset)
+                refuse(i.pc,"pixel texture heap requires a proven slot domain");
+            selected = PixelHeapIndex{read(base),sym.offset/32,(sym.offset+sym.index_mask)/32,false};
+        }
+        auto &spans = analysis.result.pixel_heap_spans;
+        const auto &key=*selected;
+        if (key.first>key.last || key.last>UINT_MAX/32) refuse(i.pc,"invalid pixel texture heap range");
+        auto it=std::find_if(spans.begin(),spans.end(),[&](const auto &v){
+            return v.first==key.first && v.last==key.last && v.dimension==dim;
+        });
+        if (it==spans.end()) {
+            const unsigned first=spans.empty()? first_pixel_heap_slot :
+                spans.back().host_first+(spans.back().last-spans.back().first+1);
+            if (uint64_t(first)+key.last-key.first+1 > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1-256)
+                refuse(i.pc,"pixel texture heap domain exceeds desktop descriptor capacity");
+            spans.push_back({key.first,key.last,dim,first});
+            it=std::prev(spans.end());
+        }
+        auto physical=ir.binary("add",key.index,to_string(it->host_first-key.first));
+        ir.features |= 0x40000000;
+        return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
+    }
+    void image_io(const Inst &i, const State &s, std::optional<PixelHeapIndex> selected = {}) {
+>>>>>>> a48d39dc1
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
+        // With a different texture in neighboring lanes, compute the quad's
+        // derivatives on the original coordinates, independently of the
+        // descriptor selected by each iteration of the guest waterfall.
+        const bool quad_gradient = selected && selected->nonuniform && i.op==32;
+        if (quad_gradient && (i.a & 0x1000u))
+            refuse(i.pc,"nonuniform implicit sampling requires normalized coordinates");
         // image_gather4_c_lz (79) is the comparison gather at the view's first mip (#2969): DXIL textureGatherCmp.
         const bool compare_gather = i.op == 79;
         const bool compare = i.op == 40 || i.op == 47 || compare_gather;
@@ -761,15 +911,24 @@ struct DirectCompute {
         constexpr unsigned dx_kind[]{1, 2, 4, 5, 6, 7, 3, 8};
         constexpr unsigned coord_count[]{1, 2, 3, 3, 2, 3, 2, 3};
         const unsigned coords = coord_count[dim];
+<<<<<<< HEAD
         if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
             (i.b & 0x3c000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
+||||||| ca6593968
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+            (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
+=======
+        const bool indexed = pixel_stage && !store && s.at(base).type == Symbol::Type::indexed_descriptor;
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+            (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
+>>>>>>> a48d39dc1
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
             (compare_gather && dim == 3) ||
             ((sample || gather) && (i.a & 0x1000u) && gradient) ||
             (dimensions && (dim == 4 || dim >= 6 || (i.b & 0x40000000u))) ||
             (store && !half && mask != 15) || (half && mask != 1 && mask != 3 && mask != 15) ||
-            s.at(base).type != Symbol::Type::descriptor)
+            (!indexed && s.at(base).type != Symbol::Type::descriptor))
             refuse(i.pc, "direct image opcode or descriptor modifiers");
         if (gather_lod && (dim != 1 || (mask & (mask - 1)) || (i.a & 0x1006u) || (i.b & 0xc0000000u) || i.dst > 252))
             refuse(i.pc, "unsupported explicit 2D gather operands");
@@ -786,15 +945,23 @@ struct DirectCompute {
                           : d16_sample ? ComputeViewKind::d16_sample_srv
                           : compare ? ComputeViewKind::comparison_texture_srv
                                   : ComputeViewKind::texture_srv;
-        analysis.binding(i, s, base, 8, kind, 0, dim);
-        const auto &bs = analysis.result.bindings;
-        auto it = std::find_if(bs.begin(), bs.end(), [&](const auto &b) {
-            return !b.array_position && b.image_dimension == dim && b.kind == kind &&
-                   b.root_parameter == s[base].value && b.byte_offset == s[base].offset;
-        });
-        if (it == bs.end())
-            throw std::logic_error("missing image binding");
-        auto h = ir.handle({unsigned(store), it->shader_register, cube_sample ? 9u : dx_kind[dim], 9, compare ? 1u : channels, 0});
+        string h;
+        if (selected || (indexed && s[base].value==compute_resource_heap)) {
+            if (kind != ComputeViewKind::texture_srv) refuse(i.pc,"unsupported pixel heap texture view class");
+            h=pixel_heap_texture(i,s,base,dim,selected);
+        } else {
+            analysis.binding(i, s, base, 8, kind, 0, dim);
+            const auto &bs = analysis.result.bindings;
+            const unsigned count = indexed ? 1 + s[base].index_mask / 32 : 1;
+            auto it = std::find_if(bs.begin(), bs.end(), [&](const auto &b) {
+                return !b.array_position && b.array_count == count && b.image_dimension == dim && b.kind == kind &&
+                       b.root_parameter == s[base].value && b.byte_offset == s[base].offset;
+            });
+            if (it == bs.end())
+                throw std::logic_error("missing image binding");
+            h = ir.handle({unsigned(store), it->shader_register, cube_sample ? 9u : dx_kind[dim], 9, compare ? 1u : channels, 0, count},
+                               indexed && count > 1 ? read(base) : "");
+        }
         auto coordinate = [&](unsigned j) {
             unsigned r = addr + j;
             if (j && (i.a & 6)) {
@@ -843,6 +1010,7 @@ struct DirectCompute {
         if (!store) {
             string r;
             if (sample || gather) {
+<<<<<<< HEAD
                 const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
                                                                 implicit || gradient, compare);
                 if (i.op == 64 && !sampler_ref.heap &&
@@ -854,6 +1022,32 @@ struct DirectCompute {
                     sampler = ir.sampler_heap_handle(to_string(sampler_ref.index));
                 } else
                     sampler = ir.handle({3, sampler_ref.index, 14, 0, 0, 0, 1, compare});
+||||||| ca6593968
+                auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                                                          implicit || gradient, compare);
+                if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
+                    refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
+                auto sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
+=======
+                string sampler;
+                const unsigned sampler_base = ((i.b >> 21) & 31) * 4;
+                const auto &first = s.at(sampler_base);
+                if (first.type == Symbol::Type::sampler_word) {
+                    if (compare || gather)
+                        refuse(i.pc, "unsupported heap sampler operation or destination");
+                    for (unsigned j = 0; j < 4; ++j)
+                        if (!(s.at(sampler_base+j) == Symbol{Symbol::Type::sampler_word,first.value,j,0,first.definition}))
+                            refuse(i.pc, "mixed sampler heap descriptor words");
+                    analysis.result.sampler_heap = true;
+                    sampler = ir.handle({3, 0, 14, 0, 0, 0, 2048, false, 1}, read(sampler_base));
+                } else {
+                    auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                                                          implicit || gradient, compare);
+                    if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
+                        refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
+                    sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
+                }
+>>>>>>> a48d39dc1
                 using Arg = std::pair<string, string>;
                 std::vector<Arg> args{{"%dx.types.Handle", h}, {"%dx.types.Handle", sampler}};
                 const auto size = (i.a & 0x1000u) ? texture_dimensions(h, "0") : string{};
@@ -908,13 +1102,14 @@ struct DirectCompute {
                     args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
                     if (implicit)
                         args.emplace_back("float", "undef");
-                } else if (gradient) {
+                } else if (gradient || quad_gradient) {
                     // Victory emit/lower.rs: d/dx and then d/dy of spatial
                     // coordinates precede the coordinates, excluding array slices.
                     for (unsigned axis = 0; axis < 2; ++axis) {
                         std::array<string, 3> d{"undef", "undef", "undef"};
                         for (unsigned j = 0; j < spatial; ++j)
-                            d[j] = ir.value("bitcast i32 " + coordinate(axis * spatial + j) + " to float");
+                            d[j] = quad_gradient ? ir.invoke("float","unary.f32",83+axis,{{"float",c[j]}},"nounwind readnone") :
+                                ir.value("bitcast i32 " + coordinate(axis * spatial + j) + " to float");
                         if (dim == 3)
                             d = cube_axes(face, ir.value("fmul float " + d[0] + ", 2.0"),
                                           ir.value("fmul float " + d[1] + ", 2.0"), true);
@@ -929,10 +1124,10 @@ struct DirectCompute {
                     args.emplace_back("float", lod ? ir.value("bitcast i32 " + level + " to float") : "0.0");
                 const char *method = compare_gather ? "textureGatherCmp.f32" :
                                      compare ? (implicit ? "sampleCmp.f32" : "sampleCmpLevelZero.f32") :
-                                     gather ? "textureGather.f32" : gradient ? "sampleGrad.f32" :
+                                     gather ? "textureGather.f32" : (gradient || quad_gradient) ? "sampleGrad.f32" :
                                      bias ? "sampleBias.f32" : implicit ? "sample.f32" : "sampleLevel.f32";
                 const unsigned opcode = compare_gather ? 74 : compare ? (implicit ? 64 : 65) : gather ? 73 :
-                                        gradient ? 63 : bias ? 61 : implicit ? 60 : 62;
+                                        (gradient || quad_gradient) ? 63 : bias ? 61 : implicit ? 60 : 62;
                 r = ir.invoke("%dx.types.ResRet.f32", method, opcode, args, "nounwind readonly");
             } else
                 r = ir.invoke("%dx.types.ResRet.f32", "textureLoad.f32", 66,
@@ -962,7 +1157,7 @@ struct DirectCompute {
                         bits = ir.binary("or", pending_half, ir.binary("shl", bits, "16"));
                         pending_half.clear();
                     }
-                    vector_write(256 + dst++, bits);
+                    vector_write(256 + dst++, bits, !d16_sample && (sample || gather) ? value : string{});
                 }
             if (!pending_half.empty()) vector_write(256 + dst, pending_half);
         } else {
@@ -994,6 +1189,28 @@ struct DirectCompute {
         }
     }
     void local_memory(const Inst &i, unsigned words) {
+        if (((i.a >> 18) & 255) == 0x3e && virtual_waves) {
+            const unsigned offset = i.a & 65535;
+            if ((i.a & 0x30000) || (i.b & 0xffffff) || offset % 4 || offset / 4 >= words)
+                refuse(i.pc, "invalid local append counter");
+            const auto count_bits = [&](unsigned reg) {
+                return ir.invoke("i32", "unaryBits.i32", 31, {{"i32", read(reg)}}, "nounwind readnone");
+            };
+            const auto count = ir.binary("add", count_bits(126), count_bits(127));
+            const auto leader = ir.value("and i1 " + cmp("eq", half_index, "0") + ", " + cmp("eq", lane, "0"));
+            auto take = ir.value("and i1 " + leader + ", " + cmp("ne", count, "0"));
+            const auto tag = to_string(label_number++);
+            barrier();
+            ir.body << "  br i1 " << take << ", label %append" << tag << ", label %skipAppend" << tag
+                    << "\nappend" << tag << ":\n";
+            auto ptr = shared_address("lds", words, to_string(offset / 4));
+            auto old = ir.value("atomicrmw add i32 addrspace(3)* " + ptr + ", i32 " + count + " monotonic");
+            ir.body << "  br label %afterAppend" << tag << "\nskipAppend" << tag << ":\n  br label %afterAppend"
+                    << tag << "\nafterAppend" << tag << ":\n";
+            const auto result = ir.value("phi i32 [ " + old + ", %append" + tag + " ], [ 0, %skipAppend" + tag + " ]");
+            vector_write(256 + (i.b >> 24), exchange_halves(result)[0]);
+            return;
+        }
         const auto op = decode_local_data(i.a, i.b);
         // The host executes a guest wave64 on two wave32s. Meet before
         // each operation, outside its lane predicate, as in Victory split_lds.
@@ -1011,7 +1228,11 @@ struct DirectCompute {
                 write(256 + op.destination + j, ir.value("load i32, i32 addrspace(3)* " + ptr + ", align 4"));
             else {
                 auto data = read(256 + op.data_register(j));
-                if (op.atomic_ir) {
+                if (op.compare_exchange) {
+                    auto result = ir.value("cmpxchg i32 addrspace(3)* " + ptr + ", i32 " + data + ", i32 " +
+                                           read(256 + op.data1) + " monotonic monotonic");
+                    write(256 + op.destination, ir.value("extractvalue { i32, i1 } " + result + ", 0"));
+                } else if (op.atomic_ir) {
                     if (op.subtract)
                         data = ir.binary("sub", "0", data);
                     auto old = ir.value(string("atomicrmw ") + op.atomic_ir + " i32 addrspace(3)* " + ptr +
@@ -1431,9 +1652,15 @@ struct DirectCompute {
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
+<<<<<<< HEAD
         const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" || n == "v_mac_legacy_f32";
         if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && !unfused_mad &&
             n != "v_mul_legacy_f32" &&
+||||||| ca6593968
+        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
+=======
+        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" && n != "v_mac_f32" && n != "v_mad_legacy_f32" &&
+>>>>>>> a48d39dc1
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -1538,6 +1765,7 @@ struct DirectCompute {
                 auto c = n == "v_fmac_f32" ? as_float(read(i.dst)) : n == "v_fmaak_f32" ? as_float(to_string(i.literal)) :
                          n == "v_fmamk_f32" ? fp(1) : fp(2);
                 result = ir.invoke("float", "tertiary.f32", 46, {{"float", a}, {"float", b}, {"float", c}}, "nounwind readnone");
+<<<<<<< HEAD
             } else if (unfused_mad) {
                 // gfx2hlsl.py mad32 and pixel_aot (#3005): flush denormal inputs to signed zero, round the product on
                 // its own (the legacy form makes 0 * anything 0), add the flushed addend and flush the sum. Plain
@@ -1561,10 +1789,20 @@ struct DirectCompute {
                 }
                 result = ftz(ir.value("fadd float " + ftz(product) + ", " + ftz(c)));
             } else if (n == "v_mul_legacy_f32") {
+||||||| ca6593968
+            } else if (n == "v_mul_legacy_f32") {
+=======
+            } else if (n == "v_mac_f32") {
+                const auto product=ir.value("fmul float "+a+", "+fp(1));
+                const auto acc=ir.value("bitcast i32 "+read(i.dst)+" to float");
+                result=ir.value("fadd float "+product+", "+acc);
+            } else if (n == "v_mul_legacy_f32" || n == "v_mad_legacy_f32") {
+>>>>>>> a48d39dc1
                 auto b = fp(1);
                 auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + a + ", 0.0") + ", " +
                                      ir.value("fcmp oeq float " + b + ", 0.0"));
                 result = select_float(zero, "0.0", ir.value("fmul float " + a + ", " + b));
+                if (n=="v_mad_legacy_f32") result=ir.value("fadd float "+result+", "+fp(2));
             } else if (n == "v_sin_f32" || n == "v_cos_f32") {
                 // Victory trig_turns: reduce in turns before converting to
                 // radians, preserving signed zero and exact quarter-turn zeros.
@@ -1671,7 +1909,7 @@ struct DirectCompute {
         };
         if (op == "class" && fp) {
             if ((i.abs | i.neg) & 2 ||
-                (i.subword && (half || i.src_select[0] != 6 || i.src_sext[0])) ||
+                (i.subword && (i.src_select[0] != 6 || i.src_sext[0])) ||
                 (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported floating class operand selection");
             // The class mask is integer data. Testing raw bits keeps sNaNs,
@@ -1739,10 +1977,18 @@ struct DirectCompute {
                 // SRC_SCC operand still takes precedence below.
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
                     n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
+<<<<<<< HEAD
                     n == "s_quadmask_b32" || n == "s_quadmask_b64" ||
                     n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
                 const bool overwrites = mask_scc || n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
                     inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
+||||||| ca6593968
+                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
+                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
+=======
+                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64" || n == "s_andn2_wrexec_b64";
+                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
+>>>>>>> a48d39dc1
                     n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
@@ -1986,7 +2232,7 @@ struct DirectCompute {
             // observe a placeholder for this field or its SCC.
             // The byte-address OOB selector ORs in two nonzero bits.
             // Its SCC is known for every source descriptor.
-            if (field->type == Symbol::Type::byte_oob)
+            if (field->type == Symbol::Type::byte_oob || field->type == Symbol::Type::root_stride_one_high)
                 write(128, "1");
             else if (n != "s_mul_i32" && uses_scc_after(i))
                 refuse(i.pc, "numeric SCC from a symbolic descriptor field");
@@ -2114,9 +2360,12 @@ struct DirectCompute {
                     refuse(i.pc, "descriptor used as mask");
                 if (n == "s_mov_b64" && ((i.dst | i.src[0]) & 1))
                     refuse(i.pc, "unaligned scalar pair");
-                if (state[i.src[0]].type == Symbol::Type::indexed_descriptor)
+                auto indexed = [](const Symbol &v) {
+                    return v.type == Symbol::Type::indexed_descriptor || v.type == Symbol::Type::sampler_word;
+                };
+                if (indexed(state[i.src[0]]))
                     write(i.dst, read(i.src[0]));
-                if (n == "s_mov_b64" && state.at(i.src[0] + 1).type == Symbol::Type::indexed_descriptor)
+                if (n == "s_mov_b64" && indexed(state.at(i.src[0] + 1)))
                     write(i.dst + 1, read(i.src[0] + 1));
                 // Transfer tracks symbolic low words; preserve numeric high words of a pair independently.
                 if (n == "s_mov_b64" && state.at(i.src[0] + 1).numeric())
@@ -2331,7 +2580,7 @@ struct DirectCompute {
             if ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
                 refuse(i.pc, "invalid " + string(n) + " destination");
             auto high = [&](unsigned src) {
-                if (src == 106 || src == 126)
+                if (!wave64 && (src == 106 || src == 126))
                     refuse(i.pc, "invalid " + string(n) + " source");
                 return pair_high(i, src);
             };
@@ -2578,14 +2827,25 @@ struct DirectCompute {
             write(128, ir.value("zext i1 " + carry + " to i32"));
             return;
         }
+        if (compute && n == "s_bcnt1_i32_b64") {
+            const auto count = [&](const string &word) {
+                return ir.invoke("i32", "unaryBits.i32", 31, {{"i32", word}}, "nounwind readnone");
+            };
+            auto total = ir.binary("add", count(a), count(pair_high(i, i.src[0])));
+            write(i.dst, total);
+            write(128, ir.value("zext i1 " + cmp("ne", total, "0") + " to i32"));
+            return;
+        }
         if ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) && n.size() > 6 && n.substr(n.size() - 4) == "_b64") {
             bool save = n.find("_saveexec_") != Name::npos;
+            const bool write_exec = compute && n == "s_andn2_wrexec_b64";
             auto op = n.substr(2, n.find('_', 2) - 2);
             if ((i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
-                (save && i.enc != Encoding::Sop1) || (!save && i.enc != Encoding::Sop2))
+                ((save || write_exec) ? i.enc != Encoding::Sop1 : i.enc != Encoding::Sop2))
                 refuse(i.pc, "unsupported wave64 scalar operation");
             auto ah = pair_high(i, i.src[0]);
-            auto bl = save ? read(126) : b, bh = save ? read(127) : pair_high(i, i.src[1]);
+            auto bl = save || write_exec ? read(126) : b;
+            auto bh = save || write_exec ? read(127) : pair_high(i, i.src[1]);
             auto combine = [&](const string &left, const string &right) -> string {
                 if (op == "and" || op == "or" || op == "xor") return ir.binary(string(op), left, right);
                 if (op == "andn2" || op == "orn2")
@@ -2598,7 +2858,7 @@ struct DirectCompute {
             auto lo = combine(a, bl), hi = combine(ah, bh);
             write(i.dst, save ? bl : lo);
             write(i.dst + 1, save ? bh : hi);
-            if (save) { write(126, lo); write(127, hi); }
+            if (save || write_exec) { write(126, lo); write(127, hi); }
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             return;
         }
@@ -2627,6 +2887,10 @@ struct DirectCompute {
             auto carry2 = add ? cmp("ult", result, partial) : cmp("ult", partial, carry);
             write(i.dst, result);
             write(128, ir.value("zext i1 " + ir.value("or i1 " + flag + ", " + carry2) + " to i32"));
+            return;
+        }
+        if (n == "s_ff1_i32_b32") {
+            write(i.dst, ir.invoke("i32", "unaryBits.i32", 32, {{"i32", a}}, "nounwind readnone"));
             return;
         }
         if (n == "s_brev_b32" || n == "v_bfrev_b32" || n == "v_bcnt_u32_b32") {
@@ -3147,13 +3411,60 @@ struct DirectCompute {
         const unsigned updated = (mode_bits & ~mask) | ((i.literal << offset) & mask);
         return accept(updated);
     }
+    // A 64-thread desktop group executes one guest wave at a time. Register
+    // banks and resume PCs are private to each virtual wave; guest LDS is
+    // shared. Yield at branches for fairness and park at guest barriers.
+    void start_virtual_group(const std::set<unsigned>& labels) {
+        constexpr auto initial = "4294967294";
+        const auto type = "[" + to_string(virtual_waves) + " x i32]";
+        ir.setup << "  %vpc = alloca " << type << ", align 4\n  %cursor = alloca i32, align 4\n";
+        std::vector<string> positions;
+        for (unsigned j=0; j<virtual_waves; ++j) {
+            auto ptr=ir.value("getelementptr " +type+", "+type+"* %vpc, i32 0, i32 "+to_string(j));
+            positions.push_back(ptr);
+            ir.body << "  store i32 " << initial << ", i32* " << ptr << "\n";
+        }
+        lane=ir.invoke("i32","waveGetLaneIndex",111,{},"nounwind readnone");
+        lane_bit=ir.binary("shl","1",lane);
+        auto flat=ir.invoke("i32","flattenedThreadIdInGroup.i32",96,{},"nounwind readnone");
+        auto first=ir.invoke("i32","waveActiveOp.i32",119,{{"i32",flat},{"i8","2"},{"i8","1"}},"nounwind");
+        upper_half=cmp("ne",first,"0");
+        half_index=ir.value("zext i1 "+upper_half+" to i32");
+        exchange_base="0"; exchange_words=2;
+        ir.body << "  br label %cycle\ncycle:\n  store i32 0, i32* %cursor\n  br label %choose\nchoose:\n"
+                << "  %virtualWave = load i32, i32* %cursor\n  %currentPC = getelementptr " << type << ", " << type
+                << "* %vpc, i32 0, i32 %virtualWave\n  %resume = load i32, i32* %currentPC\n"
+                << "  switch i32 %resume, label %yield [ i32 " << initial << ", label %initializeWave\n";
+        for (auto pc:labels) ir.body << "    i32 " << pc << ", label %pc" << pc << "\n";
+        ir.body << "  ]\nyield:\n";
+        barrier(11);
+        auto next=ir.binary("add","%virtualWave","1");
+        ir.body << "  store i32 " << next << ", i32* %cursor\n";
+        auto again=cmp("ult",next,to_string(virtual_waves));
+        ir.body << "  br i1 " << again << ", label %choose, label %checkCycle\ncheckCycle:\n";
+        string runnable="false", waiting="false";
+        for (const auto& ptr:positions) {
+            auto pc=ir.value("load i32, i32* "+ptr);
+            runnable=ir.value("or i1 "+runnable+", "+cmp("ult",pc,"2147483648"));
+            waiting=ir.value("or i1 "+waiting+", "+cmp("ne",pc,"4294967295"));
+        }
+        ir.body << "  br i1 " << runnable << ", label %cycle, label %rendezvous\nrendezvous:\n";
+        for (const auto& ptr:positions) {
+            auto pc=ir.value("load i32, i32* "+ptr);
+            auto resumed=select(cmp("eq",pc,"4294967295"),pc,ir.binary("and",pc,"2147483647"));
+            ir.body << "  store i32 " << resumed << ", i32* " << ptr << "\n";
+        }
+        ir.body << "  br i1 " << waiting << ", label %cycle, label %finished\nfinished:\n  ret void\ninitializeWave:\n";
+    }
+    void yield_virtual_wave(const string& next) {
+        ir.body << "  store i32 " << next << ", i32* %currentPC\n  br label %yield\n";
+    }
     NativeComputeShader lower(unsigned entry, unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         const unsigned lds_words = ((flags >> 15) & 511) * 128;
         const bool uses_lds = std::any_of(analysis.program.code.begin(), analysis.program.code.end(),
                                           [](const Inst &i) { return i.enc == Encoding::Lds; });
         if (uses_lds)
             ir.globals << "@lds = internal addrspace(3) global [" << lds_words << " x i32] undef, align 4\n";
-        initialize(user, flags, x, y, z);
         const auto &p = analysis.program;
         mode_bits = 0xf0;
         bool mode_write = false, conditional = false;
@@ -3176,17 +3487,22 @@ struct DirectCompute {
                    (i.enc == Encoding::Image && i.op == 8);
         });
         std::set<unsigned> labels{entry};
-        ir.body << "  br label %pc" << entry << "\n";
         for (auto &i : p.code)
             if (i.branch()) {
                 labels.insert(i.target());
                 if (i.op != 2)
                     labels.insert(i.next);
             }
+        if (virtual_waves) for (const auto &i : p.code)
+            if (i.name == "s_barrier") labels.insert(i.next);
+        if (virtual_waves) start_virtual_group(labels);
+        initialize(user, flags, x, y, z);
+        ir.body << "  br label %pc" << entry << "\n";
         for (size_t k = 0; k < p.code.size(); ++k) {
             const auto &i = p.code[k];
             if (labels.count(i.pc)) {
-                if (k && p.code[k - 1].name != "s_endpgm" && !p.code[k - 1].branch())
+                if (k && p.code[k - 1].name != "s_endpgm" && !p.code[k - 1].branch() &&
+                    !(virtual_waves && p.code[k-1].name=="s_barrier"))
                     ir.body << "  br label %pc" << i.pc << "\n";
                 ir.body << "pc" << i.pc << ":\n";
             }
@@ -3197,18 +3513,23 @@ struct DirectCompute {
                 continue;
             }
             if (i.branch()) {
-                if (i.op == 2)
-                    ir.body << "  br label %pc" << i.target() << "\n";
+                if (i.op == 2) {
+                    if (virtual_waves) yield_virtual_wave(to_string(i.target()));
+                    else ir.body << "  br label %pc" << i.target() << "\n";
+                }
                 else {
                     unsigned r = i.op == 4 || i.op == 5 ? 128 : i.op == 6 || i.op == 7 ? 106 : 126;
                     auto mask = wave64 && r != 128 ? ir.binary("or", read(r), read(r + 1)) : read(r);
                     auto pred = cmp((i.op & 1) ? "ne" : "eq", mask, "0");
-                    ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
+                    if (virtual_waves) yield_virtual_wave(select(pred,to_string(i.target()),to_string(i.next)));
+                    else ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
                 }
             } else if (i.dpp_control)
                 lower_dpp(i, p.before[k], x*y*z);
-            else if (i.name == "s_endpgm")
-                ir.body << "  ret void\n";
+            else if (i.name == "s_endpgm") {
+                if (virtual_waves) yield_virtual_wave("4294967295");
+                else ir.body << "  ret void\n";
+            }
             // Hardware scheduling and register-dependency waits have no SGPR
             // operands. SSA dependencies carry these constraints into DXIL.
             else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||
@@ -3218,8 +3539,10 @@ struct DirectCompute {
                 memory(i, p.before[k]);
             else if (i.enc == Encoding::Lds)
                 local_memory(i, lds_words);
-            else if (i.name == "s_barrier")
-                barrier(writes_uavs ? 11 : 9); // group rendezvous, LDS and, when used, UAV memory
+            else if (i.name == "s_barrier") {
+                if (virtual_waves) yield_virtual_wave(to_string(i.next | 0x80000000u));
+                else barrier(writes_uavs ? 11 : 9);
+            }
             else if (i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt" ||
                      i.name == "s_waitcnt_lgkmcnt" || i.name == "s_waitcnt_expcnt") {
                 // null,0 drains this wave's counter. Memory-only barriers
@@ -3242,10 +3565,10 @@ struct DirectCompute {
         }
         auto &r = analysis.result;
         r.instruction_count = unsigned(p.code.size());
-        const unsigned rank_words = x * y * z > 64 ? x * y * z : 0;
+        const unsigned rank_words = !virtual_waves && x * y * z > 64 ? x * y * z : 0;
         if ((uses_lds ? lds_words : 0) + rank_words + (uses_exchange ? exchange_words : 0) > 8192)
             refuse(entry, "combined shared storage exceeds 32 KiB");
-        r.dxil_ir = ir.finish_compute(x, y, z);
+        r.dxil_ir = virtual_waves ? ir.finish_compute(64,1,1) : ir.finish_compute(x,y,z);
         return std::move(r);
     }
 };

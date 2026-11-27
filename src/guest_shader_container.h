@@ -1,12 +1,15 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace x2w {
 enum class GpuStage { ls, hs, es, gs, vs, ps, ms, cs };
+using ShaderIdentifier = std::array<uint8_t, 16>;
+std::optional<ShaderIdentifier> native_shader_identifier(std::string_view code);
 struct ShaderRootInput {
     uint32_t type, offset_dwords, sgpr_count, base_register;
     uint8_t user_data, root_parameter;
@@ -35,6 +38,7 @@ struct GuestShaderStage {
     bool fixed_vertex_abi{};
     unsigned vgprs, lds_bytes;
     std::string code;
+    std::optional<ShaderIdentifier> container_identifier;
     std::vector<ShaderRootInput> inputs;
     std::vector<ShaderResourceUse> resources;
     std::array<unsigned, 3> threads{};
@@ -46,6 +50,9 @@ struct GuestShaderStage {
     // The signature component (9 f32, 5 u32, 4 i32) an RTV variant request asks of each color target; 0 when none.
     std::array<unsigned char, 8> target_components{};
     unsigned mesh_clip_control{}, max_vertices{}, max_primitives{}, topology{};
+    unsigned mesh_group_stride{};
+    // Merged hardware stages reserve the first eight SGPRs for the system entry.
+    unsigned physical_user_sgpr(unsigned logical) const noexcept;
     std::string full_precision_code() const;
 };
 std::vector<GuestShaderStage> read_guest_shader_container(std::string_view container);

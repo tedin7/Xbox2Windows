@@ -36,11 +36,12 @@ string normalized_channel(const string &field, unsigned width, bool snorm) {
     auto magnitude = select(cmp("eq", p, "0"), "0", ir.binary("add", base, rounded));
     return snorm ? ir.binary("or", magnitude, sign) : magnitude;
 }
-void formatted_byte_load(const Inst &i, const State &s) {
+void formatted_byte_load(const Inst &i, const State &s, const string &byte_window = {}) {
     constexpr MtbufFamily families[] = {
         {1, 6, 8, 1, ChannelNumber::unorm}, {7, 13, 16, 1, ChannelNumber::unorm},
         {14, 19, 8, 2, ChannelNumber::unorm}, {20, 22, 32, 1, ChannelNumber::uint_},
-        {23, 29, 16, 2, ChannelNumber::unorm}, {56, 61, 8, 4, ChannelNumber::unorm},
+        {23, 29, 16, 2, ChannelNumber::unorm}, {44, 49, 0, 4, ChannelNumber::unorm},
+        {50, 55, 0, 4, ChannelNumber::unorm}, {56, 61, 8, 4, ChannelNumber::unorm},
         {62, 64, 32, 2, ChannelNumber::uint_}, {65, 71, 16, 4, ChannelNumber::unorm},
         {72, 74, 32, 3, ChannelNumber::uint_}, {75, 77, 32, 4, ChannelNumber::uint_}
     };
@@ -52,13 +53,25 @@ void formatted_byte_load(const Inst &i, const State &s) {
         refuse(i.pc, "unsupported MTBUF format or absent component");
     if (i.dst + count > 256)
         refuse(i.pc, "MTBUF destination tuple overflow");
-    const unsigned width = family->bits;
+    const auto component_width=[&](unsigned j) {
+        // The name lists the most significant field first; logical X is
+        // the low field. See Victory lower.rs format_layout.
+        return family->bits ? family->bits : j==(family->first==44 ? 0u : 3u) ? 2u : 10u;
+    };
+    unsigned requested_bits=0;
+    for (unsigned j=0;j<count;++j) requested_bits+=component_width(j);
     const auto numeric = static_cast<ChannelNumber>(unsigned(family->first_number) + format - family->first);
+<<<<<<< HEAD
     // The byte-address rewrite of a descriptor (stride cleared in word 1) is read as the same raw view, as for MUBUF.
     const unsigned base = (i.b >> 16 & 31) * 4;
     const auto handle = resource(i, s, base, s.at(base + 1).type == Symbol::Type::zero_stride_word
                                                  ? ComputeViewKind::byte_window_srv
                                                  : ComputeViewKind::raw_vector_srv, 4);
+||||||| ca6593968
+    const auto handle = resource(i, s, (i.b >> 16 & 31) * 4, ComputeViewKind::raw_vector_srv, 4);
+=======
+    const auto handle = byte_window.empty() ? resource(i, s, (i.b >> 16 & 31) * 4, ComputeViewKind::raw_vector_srv, 4) : byte_window;
+>>>>>>> a48d39dc1
     const unsigned scalar_offset = i.b >> 24;
     auto addr = to_string(i.a & 4095);
     if (scalar_offset != 125 && scalar_offset != 128)
@@ -70,17 +83,17 @@ void formatted_byte_load(const Inst &i, const State &s) {
     auto dimensions = ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
                                 {{"%dx.types.Handle", handle}, {"i32", "undef"}}, "nounwind readonly");
     auto bytes = ir.value("extractvalue %dx.types.Dimensions " + dimensions + ", 0");
-    auto size = to_string(width * family->components / 8);
+    auto size = to_string(family->bits ? family->bits * family->components / 8 : 4u);
     auto valid = ir.value("and i1 " + cmp("uge", bytes, size) + ", " +
                           cmp("ule", addr, ir.binary("sub", bytes, size)));
     const auto aligned = ir.binary("and", addr, "4294967292");
     const auto shift_bits = ir.binary("shl", ir.binary("and", addr, "3"), "3");
-    const unsigned word_count = (count * width + 31) / 32;
+    const unsigned word_count = (requested_bits + 31) / 32;
     const auto chunk = load_buffer(handle, aligned, true, word_count);
     std::array<string, 5> words;
     for (unsigned j = 0; j < word_count; ++j)
         words[j] = ir.value("extractvalue %dx.types.ResRet.i32 " + chunk + ", " + to_string(j));
-    if (count * width > 8) {
+    if (requested_bits > 8) {
         const auto next = ir.binary("add", aligned, to_string(word_count * 4));
         const auto high = load_buffer(handle, next, true, 1);
         words[word_count] = select(cmp("ult", next, aligned), "0",
@@ -95,12 +108,15 @@ void formatted_byte_load(const Inst &i, const State &s) {
         words[j] = words[j + 1].empty() ? low :
             ir.binary("or", low, select(aligned_access, "0", ir.binary("shl", words[j + 1], inverse)));
     }
+    unsigned bit_offset=0;
     for (unsigned j = 0; j < count; ++j) {
-        auto field = words[j * width / 32];
+        const auto width=component_width(j);
+        auto field = words[bit_offset / 32];
         if (width < 32) {
-            field = ir.binary("lshr", field, to_string(j * width % 32));
+            field = ir.binary("lshr", field, to_string(bit_offset % 32));
             field = ir.binary("and", field, to_string((1u << width) - 1));
         }
+        bit_offset+=width;
         const bool signed_field = numeric == ChannelNumber::sint || numeric == ChannelNumber::snorm ||
                                   numeric == ChannelNumber::sscaled;
         if (signed_field && width < 32) {

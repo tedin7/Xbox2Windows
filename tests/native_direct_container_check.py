@@ -106,7 +106,7 @@ def vertex(fetch=False, constants=None, program=None, extra=(), varying=False, t
     return pack(body, (((b"ISG1", signature(b"POSITION")),) if fetch else ()) + extra)
 
 def patched_pixel(where=1, prefix=None, table=False, input_address=0, input_signature=(), constants=None,
-                  export=(0xf800180f, 0), root_inputs=(), wave32=False, tail=(), attributes=()):
+                  export=(0xf800180f, 0), root_inputs=(), wave32=False, tail=(), attributes=(), uses=()):
     record = 112
     io = record + 84
     body = bytearray(io + 0x14c + 8 * 404)
@@ -132,6 +132,11 @@ def patched_pixel(where=1, prefix=None, table=False, input_address=0, input_sign
         struct.pack_into("<I", body, record+56, len(root_inputs))
         for record_words in root_inputs:
             body.extend(words(*record_words))
+    if uses:
+        struct.pack_into("<Q", body, record+48, len(body))
+        struct.pack_into("<I", body, record+60, len(uses))
+        for use in uses:
+            body.extend(words(*use))
     code = words(*prefix, 0xffffffff, 0xffffffff, 0xbf810000, *tail)
     struct.pack_into("<QQ", body, record, len(body), len(code))
     struct.pack_into("<I", body, io+0x148, 2)
@@ -161,10 +166,13 @@ def interpolated_pixel(mismatched=False):
     body.extend(code)
     return pack(body,[(b"ISG1",signature(b"TEXCOORD"))])
 
-def publish(directory, *stages, ps_inputs=None):
+def publish(directory, *stages, ps_inputs=None, slot57_inputs=None):
     directory.mkdir(exist_ok=True)
     key = 1469598103934665603
     tail = b"" if ps_inputs is None else b"psin1" + struct.pack("<II", *ps_inputs)
+    if slot57_inputs is not None:
+        assert ps_inputs is None
+        tail = b"PSI1" + struct.pack("<II", *slot57_inputs)
     for byte in b"x2w-startup-shader-28" + b"".join(stages) + tail:
         key = ((key ^ byte) * 1099511628211) & ((1 << 64) - 1)
     hex_key = f"{key:016x}"
@@ -175,6 +183,8 @@ def publish(directory, *stages, ps_inputs=None):
         (directory / (stem + ".psin")).write_bytes(
             f"psin1 {hex_key} ena=0x{ps_inputs[0]:04x} addr=0x{ps_inputs[1]:04x}\n".encode("ascii")
         )
+    if slot57_inputs is not None:
+        (directory / (stem + ".ps57in")).write_bytes(tail)
     return hex_key
 
 
@@ -441,6 +451,13 @@ def main():
         def built_load(bound=128, control=0x31016fac, high=0xbe850301):
             return [0xbe840300, high, 0xbe8603ff, bound, 0xbe8703ff, control, 0xf42c0202, 0xfa000060]
         check("built-root-cs", cs, compute(words(*built_load(), end), root_descriptor=True))
+        # Build the same byte range from a root address with stride one.
+        unit_stride = [0xbe840300, 0x8805ff01, 0x10000, *built_load(control=0x11014fac)[2:]]
+        check("built-root-unit-stride", cs, compute(words(*unit_stride, end), root_descriptor=True))
+        wrong_control = unit_stride.copy()
+        wrong_control[-3] = 0x31016fac
+        check("built-root-unit-stride-control", cs, compute(words(*wrong_control, end), root_descriptor=True),
+              "unsupported synthesized scalar buffer descriptor fields")
         check("built-root-range", cs, compute(words(*built_load(bound=127), end), root_descriptor=True),
               "exceeds synthesized descriptor byte bound")
         check("built-root-fields", cs, compute(words(*built_load(control=0x01016fac), end), root_descriptor=True),
@@ -651,6 +668,65 @@ def main():
                                   capture_output=True, text=True)
         assert rejected.returncode and ("unbound numeric SGPR s26" in rejected.stderr or
                                         "undefined on an incoming path: 26" in rejected.stderr), rejected.stderr
+        # A PS selects one of two read-only scalar records. Only the VGPR
+        # written by the selected arm is defined after EXEC is restored.
+        record_select=[0xbe810380, 0xf4080200,0xfa000000,
+                       0x7c0800ff,0x40800000, 0xbe9a246a,0xbf880004,
+                       0x80118080,0xf4200804,17<<25,0x7e040220,
+                       0x8afe7e1a,0xbf880004,
+                       0x80118480,0xf4200804,17<<25,0x7e040220,
+                       0xbefe041a,0x7e000302]
+        def record_pixel(seq):
+            return patched_pixel(len(seq),seq,table=True,input_address=1<<8,input_signature=position_input)
+        check("pixel-mask-record-choice","gfx1013-container-ps",record_pixel(record_select))
+        record_ir=subprocess.check_output([pathlib.Path(sdk)/"dxc.exe","-dumpbin",folder/"pixel-mask-record-choice.cso"],text=True)
+        assert record_ir.count("call %dx.types.ResRet.i32 @dx.op.rawBufferLoad")==2,record_ir
+        # The next lookup re-filters the restored EXEC with the same VCC. It
+        # has no second SAVEEXEC and its ELSE names the earlier saved pair.
+        twice = record_select[:-1] + [0x87fe7e6a] + record_select[6:]
+        check("pixel-mask-record-refilter","gfx1013-container-ps",record_pixel(twice))
+        wrong_parent = twice.copy()
+        wrong_parent[len(record_select)-1+6]=0x8afe7e1c
+        check("pixel-mask-record-wrong-parent","gfx1013-container-ps",record_pixel(wrong_parent),"wave mask")
+        invalid = record_select.copy()
+        invalid[-1]=0x7e000220  # Read s32 after a possibly empty arm.
+        check("pixel-mask-record-escaping","gfx1013-container-ps",record_pixel(invalid),"unbound numeric SGPR")
+        # A mesh pixel shader uses floor(SV_Position.x)&1 to pick a texture.
+        # The two forms compare the slot itself or its 32-byte heap offset.
+        waterfall_root=folder/"waterfall-root.hlsl"
+        waterfall_root.write_text('#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)"\n')
+        subprocess.run([pathlib.Path(sdk)/"dxc.exe","-T","rootsig_1_1","-E","RS",waterfall_root,
+                        "-Fo",folder/"waterfall.root"],check=True)
+        (folder/"waterfall.pslayout").write_text("meshps1 256 256 64 guest_root\n")
+        def waterfall_pixel(byte_key=False,modifier=None):
+            code=[0x7e000f00,0x362e0081,0x7e040280,0x7e060280,0x7e080280,
+                  0xbebc047e,0xbeb4047e]  # two distinct copies of entering EXEC
+            if byte_key: code.append(0x342e2e85)
+            if modifier=="unbounded": code[1]=0x7e2e0300
+            if modifier=="wrong-mask": code[6]=0xbeb4046a  # seed remaining lanes from VCC
+            head=len(code)
+            code.extend([0x7e1e0517,0x7d242e0f])
+            if modifier=="wrong-key": code[-1]+=1
+            if not byte_key: code.append(0x8f0f850f)
+            code.extend([0xf40c1004,15<<25,0xf0000108,0x00100002,0xbeb43a34])
+            if modifier=="effect": code.append(0x7e0a0281)
+            code.append((0xbf890000 if byte_key else 0xbf850000) | ((head-len(code)-1)&65535))
+            code.extend([0xbefe043c,0xf800180f,0,0xbf810000])
+            if modifier=="last-scalar": code.insert(-3,0x7e00020f)
+            return words(*code)
+        for byte_key in (False,True):
+            check("waterfall","gfx1013-raw-mesh-ps",waterfall_pixel(byte_key))
+            dump=subprocess.check_output([pathlib.Path(sdk)/"dxc.exe","-dumpbin",folder/"waterfall.cso"],text=True)
+            assert re.search(r"call %dx.types.Handle @dx.op.createHandleFromHeap\([^\n]+i1 false, i1 true\)",dump),dump
+            assert dump.count("call %dx.types.ResRet.f32 @dx.op.textureLoad")==1,dump
+        for reason in ("wrong-key","wrong-mask","effect","unbounded","last-scalar"):
+            source=folder/"waterfall"
+            source.write_bytes(waterfall_pixel(modifier=reason))
+            destination=folder/(reason+".dxil")
+            result=subprocess.run([exe,sdk,folder/"cache","gfx1013-raw-mesh-ps",source,destination],
+                                  capture_output=True,text=True)
+            assert result.returncode and not destination.exists(),(reason,result.stderr)
+            if reason=="unbounded": assert "bounded aligned material index" in result.stderr,result.stderr
         check("split-mask-two-arms", "gfx1013-container-ps", patched_pixel(len(two_arms), two_arms,
               input_address=1 << 8, input_signature=position_input))
         cmpx = [0xbefe0a7e, 0xbe8a047e, 0x7c2800f4, 0x7e0002f2,
@@ -761,6 +837,15 @@ def main():
             check(f"derivative{op}", cs, compute(words(*prefix, end), table=True),
                   "implicit derivatives require a pixel stage")
         image_setup = prefix[:-2]
+        # Reread v0 as the input record index before the instruction overwrites it.
+        descriptor = [0xbe810380, 0xf4080200, 0xfa000000]
+        indexed = [*descriptor, 0x7e000281, 0xe0302004, 0x80020000]
+        for stride, expected in [(16, ""), (4, "outside a verified"), (0, "outside a verified")]:
+            check(f"indexed-pixel-record-{stride}", "gfx1013-container-ps",
+                  patched_pixel(len(indexed), indexed, table=True, uses=[(0x300, 0, 0, stride, 4)]), expected)
+        raw_immediate = [*descriptor, 0xe0300134, 0x80020000]
+        check("raw-pixel-immediate-offset", "gfx1013-container-ps",
+              patched_pixel(len(raw_immediate), raw_immediate, table=True))
         for op in (32, 34, 36, 37, 39):
             coords = [0x7e060280, 0x7e080280, 0x7e0a0280]
             sample = [*image_setup, *coords, 0xf0000e08 | (op << 18), 0x80220400]
@@ -783,6 +868,7 @@ def main():
                                              folder/"wave32-exact-sample.cso"], text=True)
         assert all(op in sample_ir for op in ("@dx.op.sample.f32", "@dx.op.isHelperLane.i1", "select i1",
                                                "@dx.op.quadOp.i32"))
+        assert re.search(r"select i1 %\w+, float %\w+, float %\w+", sample_ir), sample_ir
         clobbered = window.copy()
         clobbered.insert(3, 0xbe950380)  # Overwrite the exact coverage mask in s21.
         check("wave32-clobbered-exec", "gfx1013-container-ps",
@@ -930,7 +1016,8 @@ def main():
             fixture_dir = folder/f"reflected-slot-{slot}"
             publish(fixture_dir, ps, raw, short.read_bytes(), ps_inputs=(0x8080, 0x8080))
             job = [exe,sdk,interfaces.parent,"gfx1013-container-pair","--requests",fixture_dir,folder/"warm"]
-            for offset,error in ((8*slot,None),(8*slot+8,"raw load disagrees with reflected table record")):
+            missing_record = f"missing reflected resource: VS root 0 offset {32*slot} kind 0 user SGPR 8"
+            for offset,error in ((8*slot,None),(8*slot+8,missing_record)):
                 install(raw, vertex(program=op, uses=[(0x302,offset,0,0,4 | 8<<8)]))
                 result = subprocess.run(job, capture_output=True,text=True)
                 if error:
@@ -1012,6 +1099,45 @@ def main():
                 dump = subprocess.check_output([pathlib.Path(sdk)/"dxc.exe", "-dumpbin", binary], text=True)
                 channels = re.findall(r"call float @dx\.op\.loadInput\.f32\(i32 4, i32 0, i32 0, i8 (\d+)", dump)
                 assert set(channels) == set("0123" if name.endswith("packed") else "23"), (name, channels)
+        # A UNORM byte at offset 7 and a pair at offset 4 feed distinct VS outputs.
+        # Keep both conversions and byte offsets on cold and decoded-IR cache paths.
+        for label, pair_offset in (("fixed-unorm", 4), ("fixed-unaligned-pair", 5)):
+            vertex_program = words(0xbe8c0400, 0x938dff0d, 0x80000, 0xf4080406, 0xfa000000,
+                           0x4a000002, 0xbf8cc07f, 0xe8082007, 0x80040100,
+                           0xe8712000 | pair_offset, 0x80040200,
+                           0xf80008cf, 0x01030201, end)
+            fixture = folder / label
+            key = publish(fixture, raw_ps, vertex_program, root, ps_inputs=(2, 2))
+            job = batch.copy()
+            job[-2] = fixture
+            for run in range(2):
+                result = subprocess.run(job, capture_output=True, text=True)
+                if pair_offset == 5:
+                    assert result.returncode and not (folder/"warm"/f"{key}.txt").exists(), result.stderr
+                    break
+                assert result.returncode == 0, result.stderr
+                manifest = (folder/"warm"/f"{key}.txt").read_text().splitlines()
+                assert "x2w-manifest 3" in manifest and {"fixedvb 7 61", "fixedvb 4 49"} <= set(manifest), manifest
+        # All attributes use the entry vertex index. An x4 fetch may overwrite
+        # that VGPR after the byte selector has been fetched, but not before.
+        for label, overlap_early in (("fixed-uint4-byte", False), ("fixed-clobbered-index", True)):
+            prologue = [0xbe8c0400, 0x938dff0d, 0x80000, 0xf4080406, 0xfa000000,
+                        0x4a000002, 0xbf8cc07f]
+            wide = [0xe0382004, 0x80040000]
+            selector = [0xe8282014, 0x80040400]
+            fetch = wide + selector if overlap_early else selector + wide
+            vertex_program = words(*prologue, *fetch, 0xf80008cf, 0x04020100, end)
+            fixture = folder / label
+            key = publish(fixture, raw_ps, vertex_program, root, ps_inputs=(2, 2))
+            job = batch.copy()
+            job[-2] = fixture
+            result = subprocess.run(job, capture_output=True, text=True)
+            if overlap_early:
+                assert result.returncode and not (folder/"warm"/f"{key}.txt").exists(), result.stderr
+            else:
+                assert result.returncode == 0, result.stderr
+                manifest = (folder/"warm"/f"{key}.txt").read_text().splitlines()
+                assert {"fixedvb 4 3", "fixedvb 20 62"} <= set(manifest), manifest
         # Mask a real PS root constant to select table byte offset 0 or 32.
         # Reading through the resulting descriptor must require two SRV slots.
         indexed = [0xbe810380, 0x8702a002, 0xf4080200, 2 << 25,

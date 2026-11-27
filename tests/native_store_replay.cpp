@@ -161,7 +161,8 @@ int wmain(int argc, wchar_t **argv) {
                 transition(cmd.list.Get(),w.resource.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
                 v.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;v.Buffer.FirstElement=guard;v.Buffer.NumElements=elements;
-                v.Format=raw?DXGI_FORMAT_R32_TYPELESS:typed_format(stride,b.kind==ComputeViewKind::half_buffer_uav,false);
+                v.Format=raw?DXGI_FORMAT_R32_TYPELESS:typed_format(stride,b.kind==ComputeViewKind::half_buffer_uav ||
+                                                                    b.kind==ComputeViewKind::packed_d16_x_uav,false);
                 if(raw)v.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
                 if (indexed) {
                     if (stride > 4) {
@@ -177,7 +178,8 @@ int wmain(int argc, wchar_t **argv) {
                 if(!native_buffer_store_view(b,v,w.bytes,&shape) ||
                    native_buffer_store_view(b,truncated,w.bytes-guard*stride-1,&shape)) return 2;
                 if (indexed) atomic.push_back(shape);
-                if(reference&&!raw)v.Format=typed_format(stride,b.kind==ComputeViewKind::half_buffer_uav,true);
+                if(reference&&!raw)v.Format=typed_format(stride,b.kind==ComputeViewKind::half_buffer_uav ||
+                                                         b.kind==ComputeViewKind::packed_d16_x_uav,true);
                 device->CreateUnorderedAccessView(w.resource.Get(),nullptr,&v,cpu);
                 w.readback=make_buffer(device.Get(),w.bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
             } else {

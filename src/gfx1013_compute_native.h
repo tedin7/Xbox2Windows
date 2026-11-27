@@ -1,4 +1,5 @@
 #pragma once
+#include "mesh_pixel_heap.h"
 #include "shader_compute_request.h"
 #include <array>
 #include <optional>
@@ -35,13 +36,24 @@ enum class ComputeViewKind {
     indexed_atomic_uav,
     d16_sample_srv,
     byte_window_srv,
+<<<<<<< HEAD
     heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
     heap_typed_srv, // A one-channel 32-bit typed buffer read the same way (HeapViewContract::typed_dword).
     // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
     // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
     // fallback and never read.
     heap_sampler
+||||||| ca6593968
+    heap_buffer_srv // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+=======
+    heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
+    indexed_raw_srv // Fixed-stride record read. required_bytes is one complete record and its checked stride.
+>>>>>>> a48d39dc1
 };
+inline bool accepts_cbv_window(ComputeViewKind kind) {
+    return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
+}
 inline constexpr unsigned compute_resource_heap = ~0u;
 // the directly indexed sampler heap; entry n is title byte offset 16 * n
 inline constexpr unsigned compute_sampler_heap = ~0u - 1;
@@ -51,7 +63,8 @@ inline bool compute_heap_binding(ComputeViewKind kind) {
 }
 inline bool compute_buffer_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::typed_buffer_uav ||
-           kind == ComputeViewKind::half_buffer_uav || kind == ComputeViewKind::indexed_atomic_uav;
+           kind == ComputeViewKind::half_buffer_uav || kind == ComputeViewKind::packed_d16_x_uav ||
+           kind == ComputeViewKind::indexed_atomic_uav;
 }
 struct IndexedAtomicView {
     unsigned stride = 0, count = 0; // Bytes per guest index and number of valid indices.
@@ -107,12 +120,18 @@ struct GraphicsLinkage {
     std::string name;
     unsigned index, row, first, width, component, used, kind, interpolation;
 };
+struct MeshHeapRead {
+    unsigned root_parameter, dword, mask; // R32_UINT SRV at (root constant & mask).
+};
 struct NativeComputeShader {
+    std::vector<PixelHeapSpan> pixel_heap_spans;
+    std::vector<MeshHeapRead> mesh_heap_reads;
     std::vector<GraphicsLinkage> inputs, outputs;
     std::vector<ComputeConstants> constants;
     std::string hlsl, dxil_ir;
     std::vector<ComputeViewBinding> bindings;
     std::vector<ComputeSampler> samplers;
+    bool sampler_heap = false;
     unsigned instruction_count{};
     std::array<unsigned, 3> group{};
     bool vertex_fetch = false;
@@ -158,11 +177,31 @@ struct DirectGraphicsPair {
 DirectGraphicsPair translate_graphics_pair(std::string_view a, std::string_view b,
                                           const D3D12_ROOT_SIGNATURE_DESC1 &layout, std::string_view pixel_entry = {},
                                           std::optional<GpuStage> first_stage = {},
-                                          const std::array<unsigned char, 8> &target_components = {});
+                                          const std::array<unsigned char, 8> &target_components = {},
+                                          std::optional<std::array<bool,2>> stage_wave32 = {});
 DirectGraphicsPair translate_graphics_pair(std::string_view a, std::string_view b);
+void validate_raster_link(const NativeComputeShader &producer, const NativeComputeShader &pixel);
 DirectGraphicsPair translate_reflected_graphics(GuestShaderStage &vs, GuestShaderStage &ps,
                                                 const D3D12_ROOT_SIGNATURE_DESC1 &layout);
 std::string native_rectangle_geometry(const std::vector<GraphicsLinkage>& vertex_outputs,
                                       const std::vector<GraphicsLinkage>& pixel_inputs);
 NativeComputeShader translate_graphics_container(const std::string &bytes, bool pixel);
+struct MeshRootInput {
+    unsigned sgpr, root_parameter, constant_count; // Zero words denotes a table unless root_address is set.
+    bool root_address{};
+};
+struct MeshStageLayout {
+    unsigned threads, max_vertices, max_primitives, topology, group_stride;
+    bool wave32;
+    std::vector<MeshRootInput> root_inputs{};
+    std::optional<unsigned> resource_heap_sgpr{};
+    bool validate_uint_heap_reads{};
+    bool packed_parameters{};
+};
+NativeComputeShader translate_mesh_pixel_program(std::string_view code, unsigned enable, unsigned address,
+                                                 unsigned wave_size, const D3D12_ROOT_SIGNATURE_DESC1 *root = nullptr);
+NativeComputeShader translate_mesh_program(const std::string &code, const MeshStageLayout &layout);
+NativeComputeShader translate_mesh_program(const std::string &code, const MeshStageLayout &layout,
+                                           const D3D12_ROOT_SIGNATURE_DESC1 &root);
+NativeComputeShader translate_mesh_container(const std::string &container, bool validate_uint_heap_reads = false);
 } // namespace x2w

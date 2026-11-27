@@ -14,6 +14,8 @@ struct NativeGraphicsBindings {
     explicit NativeGraphicsBindings(const DirectGraphicsPair &pair) {
         std::vector<ComputeViewBinding> writes;
         for (const auto *stage : {&pair.vertex, &pair.pixel}) {
+            samplers.heap |= stage->sampler_heap;
+            samplers.reserved_fallback |= stage->sampler_heap;
             for (const auto &v : stage->bindings) {
                 auto &range = compute_uav(v.kind) ? writes : views;
                 if (v.shader_register != range.size())

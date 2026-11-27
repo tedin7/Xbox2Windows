@@ -467,6 +467,7 @@ struct GraphicsMaskRegions {
     std::map<unsigned, MaskCapture> captures;
     std::set<unsigned> vertex_anchors, vertex_partitions;
     std::map<unsigned,unsigned> mask_inputs;
+    std::map<unsigned,unsigned> inverted_compare;
     std::set<unsigned> vertex_mask_compares, uniform_mask_tests;
     std::set<unsigned> scalar_mask_selects;
     std::map<unsigned,unsigned> then_fallthroughs;
@@ -523,6 +524,57 @@ struct GraphicsMaskRegions {
         skip.enc = Encoding::Sopp;
         skip.op = 0;
         skip.name = "s_nop"; // VGPR writes use the corresponding lane predicate.
+    }
+    // A material flag is tested with a CLASS mask, then the compare bits
+    // are complemented before selecting an optional read. All active lanes
+    // take exactly one arm. Require a reaching save of the enclosing EXEC,
+    // side-effect-free bodies and a join that restores precisely that mask.
+    void pixel_class_arms(const Program &p,const std::multimap<unsigned,unsigned> &entries) {
+        const auto &code=p.code;
+        for (size_t k=0;k+5<code.size();++k) {
+            const auto &cmp=code[k], &invert=code[k+1], &narrow=code[k+2], &skip=code[k+3];
+            if ((cmp.name!="v_cmp_class_f32" && cmp.name!="v_cmp_class_f16") || cmp.dst>104 || (cmp.dst&1) ||
+                invert.name!="s_not_b64" || invert.dst!=cmp.dst || invert.src[0]!=cmp.dst ||
+                narrow.name!="s_and_b64" || narrow.dst!=126 || narrow.src[0]!=cmp.dst || narrow.src[1]!=126 ||
+                !skip.branch() || skip.op!=8 || skip.target()<=skip.next) continue;
+            const size_t middle=p.at.at(skip.target());
+            const auto &otherwise=code[middle];
+            const auto parent=otherwise.src[0];
+            if (otherwise.name!="s_andn2_b64" || otherwise.dst!=126 || parent>104 || (parent&1) ||
+                parent==cmp.dst || otherwise.src[1]!=126) continue;
+            auto pure=[](const Inst &i) {
+                return (local_alu(i) && !carry_destination(i)) || i.name=="s_waitcnt" || i.name=="s_nop" ||
+                    (i.enc==Encoding::Mubuf && i.name=="buffer_load_dword");
+            };
+            size_t end=middle+1;
+            while (end<code.size() && pure(code[end])) ++end;
+            if (end==code.size() || end==middle+1 || code[end].name!="s_mov_b64" ||
+                code[end].dst!=126 || code[end].src[0]!=parent ||
+                !std::all_of(code.begin()+k+4,code.begin()+middle,pure)) continue;
+            bool external=false;
+            for (auto it=entries.upper_bound(cmp.pc);it!=entries.end() && it->first<=code[end].pc;++it)
+                if (it->second!=skip.pc) external=true;
+            if (external) continue;
+            bool saved=false;
+            for (size_t j=k;j && !entries.count(code[j].pc);) {
+                const auto &prev=code[--j];
+                if (prev.name=="s_mov_b64" && ((prev.dst==126 && prev.src[0]==parent) ||
+                    (prev.dst==parent && prev.src[0]==126))) {saved=true; break;}
+                const auto w=scalar_width(prev);
+                if (prev.branch() || prev.name.find("exec")!=Name::npos || carry_destination(prev) ||
+                    (w && ((prev.dst<parent+2 && parent<prev.dst+w) || prev.dst+w>126))) break;
+            }
+            if (!saved) continue;
+            inverted_compare[invert.pc]=1024+cmp.pc;
+            mask_inputs[narrow.pc]=1024+invert.pc;
+            const unsigned predicate=1024+narrow.pc;
+            branch_saves[narrow.pc]=predicate;
+            lane_branches.emplace(skip.pc,std::make_pair(predicate,false));
+            branch_merges[otherwise.pc]=branch_merges[code[end].pc]=predicate;
+            then_fallthroughs[code[middle-1].pc]=code[end].pc;
+            expired[otherwise.pc].insert(128);
+            expired[code[end].pc].insert(128);
+        }
     }
     void vertex_scalar_tails(const Program &p, const std::multimap<unsigned,unsigned> &entries) {
         const auto &code = p.code;
@@ -657,19 +709,66 @@ struct GraphicsMaskRegions {
             const bool split = save.name == mov && save.src[0] == 126 &&
                 narrow.name == (wave32 ? "s_and_b32" : "s_and_b64") && narrow.dst == 126 &&
                 ((narrow.src[0] == 126 && narrow.src[1] == 106) || (narrow.src[0] == 106 && narrow.src[1] == 126));
-            const bool cmpx = vertex && !wave32 && save.enc == Encoding::Vopc &&
+            const bool cmpx = !wave32 && save.enc == Encoding::Vopc &&
                 save.name.substr(0,7) == "v_cmpx_" && save.dst == 126 && !save.subword && !save.scale &&
                 !save.clamp && save.name.find("class") == Name::npos;
             // Input is an individual bit proven by an earlier scalar mask
             // intersection. Its numeric SGPR pair remains inaccessible.
             const bool from_mask = mask_inputs.count(save.pc) && save.dst == 126;
             const bool saved_mask = mask_inputs.count(save.pc) && save.name == "s_and_saveexec_b64";
-            if (!cmpx && !from_mask && !saved_mask && !split && (save.name != (wave32 ? "s_and_saveexec_b32" : "s_and_saveexec_b64") ||
+            bool refilter = false;
+            if (!vertex && !from_mask && save.name==(wave32 ? "s_and_b32" : "s_and_b64") && save.dst==126 &&
+                ((save.src[0]==106 && save.src[1]==126) || (save.src[0]==126 && save.src[1]==106)) &&
+                narrow.branch() && narrow.op==8 && narrow.target()>narrow.next) {
+                // A material lookup can reuse an earlier saved EXEC across
+                // independent arithmetic, including reads of other SGPRs.
+                const auto &other=program.code[program.at.at(narrow.target())];
+                if (other.name==(wave32 ? "s_andn2_b32" : "s_andn2_b64") && other.dst==126 && other.src[1]==126 &&
+                    other.src[0]<=(wave32 ? 105u : 104u) && (wave32 || !(other.src[0]&1))) {
+                    const unsigned parent=other.src[0];
+                    for (size_t j=k; j && !entries.count(program.code[j].pc);) {
+                        const auto &prev=program.code[--j];
+                        if (prev.name==mov && ((prev.dst==126 && prev.src[0]==parent) ||
+                            (prev.dst==parent && prev.src[0]==126))) {
+                            save.dst=parent;
+                            refilter=true;
+                            break;
+                        }
+                        const auto n=scalar_width(prev);
+                        auto changes=[&](unsigned r) {return n && prev.dst<r+(wave32 ? 1 : 2) && r<prev.dst+n;};
+                        if (prev.branch() || changes(126) || changes(parent) || carry_destination(prev) ||
+                            prev.name.find("exec")!=Name::npos) break;
+                    }
+                }
+            }
+            if (!cmpx && !from_mask && !saved_mask && !split && !refilter && (save.name != (wave32 ? "s_and_saveexec_b32" : "s_and_saveexec_b64") ||
                            save.src[0] != 106)) continue;
             auto &skip = program.code[k + 1 + split];
             if (!skip.branch() || skip.op != 8 || skip.target() <= skip.next) continue;
             const auto join = program.at.at(skip.target());
             const auto &capture = program.code[join];
+            if (!vertex && cmpx) {
+                // GFX10 CMPX updates EXEC, not VCC. A lane-local pixel arm
+                // followed by the exact restore can branch on its own bit
+                // when no downstream observer needs helpers or a wave vote.
+                // An ordinary image_load has no implicit derivatives. Keep
+                // implicit sampling, wave reads and writes outside this rule.
+                if (capture.name != mov || capture.dst != 126 ||
+                    std::any_of(program.code.begin(), program.code.begin() + k, [](const Inst &i) {
+                        return i.branch() || i.name.find("wqm") != Name::npos;
+                    }) ||
+                    !preserves_exec(program, 0, k) ||
+                    !std::all_of(program.code.begin() + k + 2, program.code.begin() + join, [](const Inst &i) {
+                        return local_alu(i) || (i.enc == Encoding::Image && i.op == 0) ||
+                            (i.enc == Encoding::Smem && i.dst + memory_count(i) <= 106) ||
+                            (i.enc == Encoding::Vopc && i.dst == 106 && i.name.substr(0,6) == "v_cmp_") ||
+                            i.name == "s_waitcnt" || i.name == "s_nop";
+                    }) || !std::all_of(program.code.begin() + join + 1, program.code.end(), [](const Inst &i) {
+                        return local_alu(i) || (i.enc == Encoding::Export && ((i.a >> 4) & 63) < 8) ||
+                            i.name == "s_waitcnt" || i.name == "s_endpgm";
+                    }))
+                    continue;
+            }
             const bool captured = cmpx && capture.name == "s_and_b64" && capture.dst <= 104 && !(capture.dst & 1) &&
                 ((capture.src[0] == 106 && capture.src[1] == 126) || (capture.src[0] == 126 && capture.src[1] == 106));
             const auto middle = join + captured;
@@ -713,8 +812,24 @@ struct GraphicsMaskRegions {
             // gfx2hlsl.py's EXECZ analysis both require that scalar effects
             // of a skipped arm cannot escape. Here the branch guards reads
             // and the merge invalidates scalar definitions from either arm.
-            const bool branched = cmpx || from_mask || saved_mask || (vertex && std::any_of(program.code.begin()+begin,program.code.begin()+end,
+            // A pixel material selection can load different scalar records on the
+            // two sides of SAVEEXEC. The loads are read-only, and each invocation
+            // needs only the VGPR values selected by its own bit after reconvergence.
+            bool pixel_records = !vertex && two_arms && !cmpx && !from_mask && !saved_mask && !split;
+            bool has_scalar_load = false;
+            for (size_t j=begin; pixel_records && j<end; ++j) {
+                if (j==middle || j==middle+1) continue;
+                const auto &v=program.code[j];
+                const bool load=v.enc==Encoding::Smem && v.op>=8 && v.dst+memory_count(v)<=106;
+                has_scalar_load |= load;
+                pixel_records = load || local_alu(v) || v.name=="s_waitcnt" || v.name=="s_nop" || v.name=="s_clause" ||
+                    (v.name=="s_add_u32" && v.dst<=105) ||
+                    (v.enc==Encoding::Vopc && v.dst<=106 && !(v.dst&1) && v.name.substr(0,6)=="v_cmp_" &&
+                     !v.subword && !v.scale && !v.clamp && !v.dpp_control);
+            }
+            const bool branched = (pixel_records && has_scalar_load) || cmpx || from_mask || saved_mask || (vertex && std::any_of(program.code.begin()+begin,program.code.begin()+end,
                 [&](const Inst &i) {return i.branch() && (!two_arms || i.pc != else_skip.pc);}));
+            if (refilter && !(pixel_records && has_scalar_load)) continue;
             if (branched) {
                 for (auto it = entries.upper_bound(save.pc); it != entries.end() && it->first <= restore.pc; ++it) {
                     const unsigned dst = it->first, src = it->second;
@@ -724,7 +839,9 @@ struct GraphicsMaskRegions {
                     if (src < start || src >= limit || dst < start || dst > limit || dst <= src)
                         refuse(dst, "branch enters or crosses a masked vertex arm");
                 }
-                std::set<unsigned> first_writes{106,107,128}, second_writes{106,107,128};
+                const std::set<unsigned> implicit_writes = pixel_records && has_scalar_load ?
+                    std::set<unsigned>{128} : std::set<unsigned>{106,107,128};
+                auto first_writes = implicit_writes, second_writes = implicit_writes;
                 for (size_t j=begin; j<end; ++j) {
                     const auto &v=program.code[j];
                     if (two_arms && (j == middle || j == middle+1)) continue;
@@ -789,7 +906,15 @@ struct GraphicsMaskRegions {
                 if (split) skip_proven(program.code[k+1]);
                 if (two_arms) {
                     branch_merges.emplace(inverse.pc, condition);
-                    lane_branches.emplace(else_skip.pc,std::make_pair(condition,true));
+                    if (pixel_records && has_scalar_load) {
+                        // These two straight-line arms partition exactly the saved
+                        // coverage. A lane completing THEN goes straight to the
+                        // join. A lane entering ELSE must execute its record load.
+                        then_fallthroughs.emplace(program.code[middle-1].pc,restore.pc);
+                        skip_proven(else_skip);
+                    } else {
+                        lane_branches.emplace(else_skip.pc,std::make_pair(condition,true));
+                    }
                     expired[inverse.pc].insert(first_writes.begin(),first_writes.end());
                 }
                 branch_merges.emplace(restore.pc, condition);
@@ -944,6 +1069,7 @@ struct GraphicsMaskRegions {
             k = end;
         }
         if (vertex && !wave32) vertex_scalar_tails(program,entries);
+        if (!vertex && !wave32) pixel_class_arms(program,entries);
     }
 };
 std::map<unsigned, GraphicsBlock> graphics_blocks(const Program &program, const GraphicsMaskRegions &regions) {
@@ -1285,10 +1411,11 @@ struct GraphicsFullWave {
 };
 
 #include "gfx1013_graphics_wqm.inl"
+#include "gfx1013_pixel_waterfall.inl"
 
 NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv = 0, unsigned first_sampler = 0,
                                    const GraphicsConstantLayout *linked_constants = nullptr,
-                                   const D3D12_ROOT_SIGNATURE_DESC1 &layout = {}, unsigned first_uav = 0) {
+                                   const D3D12_ROOT_SIGNATURE_DESC1 &layout = {}, unsigned first_uav = 0, bool pixel_heap = false) {
     Program program;
     Emit emitter{{}, program, layout};
     emitter.srv = first_srv;
@@ -1296,7 +1423,9 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     emitter.first_sampler = first_sampler;
     DirectCompute alu{emitter};
     const bool pixel = stage.stage == GpuStage::ps;
+    alu.graphics_interface = &stage;
     alu.pixel_stage = pixel;
+    alu.pixel_heap_enabled = pixel_heap && pixel;
     alu.perspective_center_pair = pixel && (stage.pixel_input_address & 3) == 2 && (stage.pixel_input_enable & 2) != 0;
     if (pixel && !(stage.pixel_input_address >> 16))
         for (unsigned b = 0; b < 16; ++b)
@@ -1312,6 +1441,23 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     std::set<unsigned> assigned;
     for (const auto &input : stage.inputs) {
         unsigned at = input.user_data;
+        if (input.type == 5 && alu.pixel_heap_enabled) {
+            if (!(layout.Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) ||
+                at >= 106 || input.sgpr_count != 1 || input.offset_dwords || !assigned.insert(at).second)
+                refuse(0, "invalid graphics resource heap input");
+            initial[at] = {Symbol::Type::table, compute_resource_heap};
+            continue;
+        }
+        if (input.type == 6) {
+            // Offline single-stage jobs may omit the root signature. An unused
+            // heap does not require a binding; any actual load stays unbound.
+            if (!(layout.Flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))
+                continue;
+            if (at >= 106 || input.sgpr_count != 1 || input.offset_dwords || !assigned.insert(at).second)
+                refuse(0, "invalid graphics sampler heap input");
+            initial[at].type = Symbol::Type::sampler_heap;
+            continue;
+        }
         if (input.type == 1) {
             bind_root_address(initial, input, 106);
             assigned.insert(at);
@@ -1405,6 +1551,8 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             }
         }
     }
+    PixelWaterfalls waterfalls;
+    if (pixel) waterfalls.find(program,stage.wave32);
     PixelWqm wqm;
     if (pixel) {
         wqm.raster_guard(program,stage.wave32);
@@ -1449,7 +1597,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     auto terminal_mask = std::find_if_not(program.code.rbegin(),program.code.rend(),color_tail);
     auto lane_local = [](const Inst &i) {
         if (i.enc == Encoding::Sopp) return !i.branch();
-        if (i.enc == Encoding::Interp || i.enc == Encoding::Export) return true;
+        if (i.enc == Encoding::Interp || i.enc == Encoding::Export || i.enc == Encoding::Mix) return true;
         if (i.enc == Encoding::Sop1) return i.name == "s_mov_b64" || i.name == "s_mov_b32";
         if (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vop3 || i.enc == Encoding::Vopc)
             return !i.dpp_control && i.name.find("lane") == Name::npos && i.name.find("mbcnt") == Name::npos;
@@ -1466,6 +1614,11 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     bool scalar_entry = true;
     std::set<string> uniform_vector_values;
     std::set<string> uniform_vcc_values;
+    // A slot index needs a finite material range for relocation. Track bounds
+    // by SSA value so SGPR/VGPR clobbers and control-flow joins cannot reuse
+    // a proof about an earlier definition of the same register.
+    struct IndexRange { unsigned first, last, zero_bits; };
+    std::map<string,IndexRange> heap_ranges;
     auto scalar_operand = [](unsigned s) { return s <= 105 || (s >= 128 && s <= 248) || s == 255; };
     auto covered_lane = [&] {
         auto helper = alu.ir.invoke("i1","isHelperLane.i1",221,{},"nounwind readonly");
@@ -1475,6 +1628,28 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     GraphicsFullWave full_wave{alu, stage.wave32 ? 32u : 64u};
     auto instruction = [&](const Inst &i, const State &state) {
         const auto pc = alu.graphics_pc = graphics.pc = i.pc;
+        if (waterfalls.restores.count(pc)) return;
+        if (auto dead=waterfalls.poisoned.find(pc);dead!=waterfalls.poisoned.end())
+            for (unsigned reg:dead->second) alu.write(reg,{});
+        if (waterfalls.exits.count(pc)) alu.write(128,"0"); // no remaining lanes
+        if (auto access=waterfalls.accesses.find(pc);access!=waterfalls.accesses.end()) {
+            const auto &which=access->second;
+            auto key=alu.read(which.key);
+            auto range=heap_ranges.find(key);
+            if (range==heap_ranges.end() || (which.key_is_bytes && (range->second.zero_bits & 31)!=31))
+                refuse(pc,"waterfall requires a bounded aligned material index");
+            unsigned first=range->second.first, last=range->second.last;
+            if (which.key_is_bytes) {
+                key=alu.ir.binary("lshr",key,"5"); first >>= 5; last >>= 5;
+            } else if (last>0x07ffffffu) {
+                refuse(pc,"waterfall slot range crosses a 32-bit descriptor-byte wrap");
+            }
+            const auto &descriptor=state.at(((i.b>>16)&31)*4);
+            if (descriptor.definition!=which.descriptor_pc || !alu.graphics_predicate.empty())
+                refuse(pc,"waterfall requires the selected descriptor and its enclosing pixel coverage");
+            alu.image_io(i,state,DirectCompute::PixelHeapIndex{key,first,last,true});
+            return;
+        }
         if (pixel && full_wave.emit(i,program)) return;
         if (wqm.packed.count(pc) && (whole_quad || exact_after_wqm || !alu.graphics_predicate.empty()))
             refuse(pc, "numeric EXEC region requires exact pixel entry coverage");
@@ -1584,6 +1759,11 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
         auto vertex_compare_bit = [&] {
             return alu.ir.value("zext i1 " + alu.comparison(i) + " to i32");
         };
+        if (auto at=regions.inverted_compare.find(pc);at!=regions.inverted_compare.end()) {
+            alu.write(1024+pc,alu.ir.binary("xor",alu.read(at->second),"1"));
+            alu.write(i.dst,{}); alu.write(i.dst+1,{}); alu.write(128,{});
+            return;
+        }
         if (regions.vertex_mask_compares.count(pc)) {
             alu.write(1024+pc,vertex_compare_bit());
             alu.write(i.dst,{}); alu.write(i.dst+1,{});
@@ -1717,7 +1897,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
         if (!straight && pc >= prologue_end && exact_after_wqm && !exact_sample_region)
             refuse(pc, "exact pixel mask crosses a control-flow edge");
         if (move_exec && (short_mask ? i.dst <= 105 : i.dst <= 104 && !(i.dst & 1)) &&
-            i.src[0] == 126 && pc < prologue_end) {
+            i.src[0] == 126 && (pc < prologue_end || waterfalls.saves.count(pc))) {
             saved_exec[i.dst] = whole_quad && !exact_after_wqm;
             // Numeric use of either half needs actual wave-mask lowering.
             alu.write(i.dst,{});
@@ -1797,6 +1977,15 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                 refuse(pc, "DPP fetch-inactive source requires a proven whole quad");
             if (!whole_quad || exact_after_wqm)
                 refuse(pc, "pixel quad permutation without whole-quad entry");
+            if (i.enc == Encoding::QuadCompare) {
+                if (!pixel || !alu.graphics_predicate.empty())
+                    refuse(pc,"DPP compare requires all four source lanes");
+                const auto first = graphics.quad_source(i);
+                const auto pred = alu.comparison(i,first,alu.operand32(i,i.src[1]));
+                alu.write(106,alu.ir.value("zext i1 "+pred+" to i32"));
+                if (!stage.wave32) alu.write(107,{});
+                return;
+            }
             const auto op = alu_rules.find(i.name);
             if (i.name != "v_mov_b32" && (op == alu_rules.end() || op->second.arity > 2))
                 refuse(pc, "unsupported DPP arithmetic");
@@ -1819,7 +2008,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                 return r.name == "X2W_RAW_VERTEX" && r.semantic_index == i.literal;
             });
             unsigned row = prior != inputs.end() ? prior->row : static_cast<unsigned>(inputs.size());
-            const auto id = graphics.row(true, "X2W_RAW_VERTEX", i.literal, 0, i.op == 4 ? 9 : 5,
+            const auto id = graphics.row(true, "X2W_RAW_VERTEX", i.literal, 0, i.a ? 9 : 5,
                                          row, (1u << i.op) - 1, 0);
             for (unsigned c = 0; c < i.op; ++c) alu.write(i.dst + c, graphics.load(id, c));
             emitter.result.vertex_fetch=true;
@@ -1973,7 +2162,46 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                 const unsigned count = mac || i.name == "v_fmamk_f32" || i.name == "v_fmaak_f32" ? 2 : rule->second.arity;
                 uniform_vertex = std::all_of(i.src.begin(),i.src.begin()+count,uniform) && (!mac || uniform(i.dst));
             }
+            // Two complementary packed FMAs under the same EXEC define
+            // the entire VGPR. Its incoming bits are dead when neither operation
+            // also reads it as an explicit operand (Victory lower.rs: mixlo/mixhi).
+            const bool low = i.name == "v_fma_mixlo_f16";
+            if (pixel && (low || i.name == "v_fma_mixhi_f16") && alu.graphics_predicate.empty() &&
+                !alu.graphics_registers.count(i.dst) && !graphics.partial.count(i.dst)) {
+                for (size_t k = program.at.at(i.pc) + 1; k < program.code.size(); ++k) {
+                    const auto &j = program.code[k];
+                    if (std::find(j.src.begin(), j.src.end(), i.dst) != j.src.end())
+                        break;
+                    // A scheduled FP32 FMA accesses exactly three scalar-width
+                    // sources and one destination. It cannot change EXEC.
+                    if (j.name == "v_fma_f32" && j.dst != i.dst)
+                        continue;
+                    if (j.dst == i.dst && j.name == (low ? "v_fma_mixhi_f16" : "v_fma_mixlo_f16") &&
+                        std::find(i.src.begin(), i.src.end(), i.dst) == i.src.end())
+                        alu.graphics_registers.emplace(i.dst, "0");
+                    break;
+                }
+            }
+            std::optional<IndexRange> heap_range;
+            if (pixel && !waterfalls.accesses.empty() && alu.graphics_predicate.empty() && !i.subword &&
+                !i.abs && !i.neg && !i.clamp && !i.scale && !i.dpp_control &&
+                (i.name=="v_and_b32" || i.name=="v_or_b32" || i.name=="v_lshlrev_b32")) {
+                for (unsigned n=0;n<2;++n) {
+                    auto scalar=source(i,i.src[n],state);
+                    if (scalar.type!=Symbol::Type::constant) continue;
+                    unsigned c=scalar.value;
+                    if (i.name=="v_and_b32") heap_range=IndexRange{0,c,~c};
+                    else if (auto in=heap_ranges.find(alu.operand32(i,i.src[1-n]));in!=heap_ranges.end()) {
+                        const auto r=in->second;
+                        if (i.name=="v_or_b32" && (r.zero_bits & c)==c)
+                            heap_range=IndexRange{r.first|c,r.last|c,r.zero_bits & ~c};
+                        if (i.name=="v_lshlrev_b32" && n==0 && c<32 && r.last<=(UINT_MAX>>c))
+                            heap_range=IndexRange{r.first<<c,r.last<<c,(r.zero_bits<<c)|((1u<<c)-1)};
+                    }
+                }
+            }
             alu.arithmetic(i, state);
+            if (heap_range) heap_ranges[alu.read(i.dst)]=*heap_range;
             if (uniform_vertex || (pixel && i.name == "v_med3_f32" && alu.graphics_predicate.empty() &&
                 std::all_of(i.src.begin(), i.src.end(), scalar_operand))) {
                 auto value = alu.read(i.dst);

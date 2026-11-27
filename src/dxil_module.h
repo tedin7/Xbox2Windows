@@ -9,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace x2w {
@@ -21,10 +22,12 @@ class DxilModule {
         unsigned cls, reg, kind, component, width, bytes;
         unsigned count = 1;
         bool comparison = false;
+        unsigned space = 0;
     };
     std::ostringstream body, setup, globals;
     bool uses_wave = false;
     bool heap_used = false;
+    unsigned mesh_vertices = 0, mesh_primitives = 0;
     unsigned features = 0;
     struct Signature {
         Text name;
@@ -110,9 +113,10 @@ class DxilModule {
     Text handle(Resource r, const Text &offset = {}) {
         const Text reg = std::to_string(r.reg), cls = std::to_string(r.cls);
         const auto found = std::find_if(resources.begin(), resources.end(), [&](const Resource &other) {
-            return other.cls == r.cls && other.reg == r.reg;
+            return other.cls == r.cls && other.reg == r.reg && other.space == r.space;
         });
         Text h = "%h" + cls + "_" + reg;
+        if (r.space) h += "_s" + std::to_string(r.space);
         if (found != resources.end()) {
             if (found->kind != r.kind || found->width != r.width || found->component != r.component ||
                 found->bytes != r.bytes || found->count != r.count || found->comparison != r.comparison)
@@ -135,7 +139,7 @@ class DxilModule {
         }
         const unsigned props = r.cls == 2 ? r.bytes : r.component + r.width * 256;
         out << "  " << h << "b = call %dx.types.Handle @dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind { i32 "
-            << reg << ", i32 " << r.reg + r.count - 1 << ", i32 0, i8 " << cls << " }, i32 " << index << ", i1 "
+            << reg << ", i32 " << r.reg + r.count - 1 << ", i32 " << r.space << ", i8 " << cls << " }, i32 " << index << ", i1 "
             << (offset.empty() ? "false" : "true") << ")\n"
             << "  " << h << " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle " << h
             << "b, %dx.types.ResourceProperties { i32 " << (r.kind + (r.cls == 1 ? 4096 : 0) + (r.comparison ? 32768 : 0)) << ", i32 " << props
@@ -145,11 +149,15 @@ class DxilModule {
     // A handle taken from the descriptor heap at a run-time index (SM 6.6 ResourceDescriptorHeap[index]), annotated with
     // the view class the shader reads: `kind` is the DXIL resource kind (11 raw buffer, 2 Texture2D) and `props` the
     // second ResourceProperties word. No resource record is declared: the binding is the whole heap.
-    Text heap_handle(const Text &index, unsigned kind, unsigned props, bool uav = false) {
+    Text heap_handle(const Text &index, unsigned kind, unsigned props, bool uav = false, bool nonuniform = true) {
         heap_used = true;
         const Text h = "%heap" + std::to_string(sequence++);
+        if (track_inputs) {
+            if (auto it = dependencies.find(index); it != dependencies.end()) dependencies[h] = it->second;
+            if (loop_dependencies) consumers[index].push_back(h);
+        }
         body << "  " << h << "b = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 " << index
-             << ", i1 false, i1 true)\n"
+             << ", i1 false, i1 " << (nonuniform ? "true" : "false") << ")\n"
              << "  " << h << " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle " << h
              << "b, %dx.types.ResourceProperties { i32 " << (kind + (uav ? 4096 : 0)) << ", i32 " << props << " })\n";
         return h;
@@ -194,16 +202,20 @@ class DxilModule {
         };
         std::vector<Text> groups[4];
         std::sort(resources.begin(), resources.end(),
-                  [](const auto &a, const auto &b) { return std::pair{a.cls, a.reg} < std::pair{b.cls, b.reg}; });
+                  [](const auto &a, const auto &b) {
+                      return std::tie(a.cls, a.space, a.reg) < std::tie(b.cls, b.space, b.reg);
+                  });
         for (auto &r : resources) {
-            const Text type = "%res" + std::to_string(r.cls) + "_" + std::to_string(r.reg);
+            const Text type = "%res" + std::to_string(r.cls) + "_" + std::to_string(r.reg) +
+                              (r.space ? "_s" + std::to_string(r.space) : "");
             Text scalar = r.component == 9 ? "float" : "i32";
             Text member = r.cls == 2    ? "[" + std::to_string(r.bytes / 16) + " x <4 x i32>]"
                           : r.width > 1 ? "<" + std::to_string(r.width) + " x " + scalar + ">"
                                         : scalar;
             out << type << " = type { " << member << " }\n";
             const Text symbol = r.count == 1 ? type : "[" + std::to_string(r.count) + " x " + type + "]";
-            Text md = "i32 " + std::to_string(groups[r.cls].size()) + ", " + symbol + "* undef, !\"\", i32 0, i32 " +
+            Text md = "i32 " + std::to_string(groups[r.cls].size()) + ", " + symbol + "* undef, !\"\", i32 " +
+                      std::to_string(r.space) + ", i32 " +
                       std::to_string(r.reg) + ", i32 " + std::to_string(r.count) + ", i32 " +
                       std::to_string(r.cls == 2   ? r.bytes
                                      : r.cls == 3 ? unsigned(r.comparison)
@@ -234,6 +246,13 @@ class DxilModule {
                 properties = node("i32 0, i64 " + std::to_string(flags));
             if (stage == "gs")
                 properties = node("i32 1, " + node("i32 3, i32 6, i32 1, i32 5, i32 1"));
+            if (stage == "ms") {
+                const auto size = node("i32 " + std::to_string(x) + ", i32 " + std::to_string(y) +
+                                       ", i32 " + std::to_string(z));
+                const auto mesh = node(size + ", i32 " + std::to_string(mesh_vertices) + ", i32 " +
+                                       std::to_string(mesh_primitives) + ", i32 2, i32 0");
+                properties = node((flags ? "i32 0, i64 " + std::to_string(flags) + ", " : "") + "i32 9, " + mesh);
+            }
             auto signature_list = [&](const std::vector<Signature> &rows, unsigned &scalars) {
                 std::vector<Text> ids;
                 for (const auto &r : rows) {
@@ -267,6 +286,8 @@ class DxilModule {
                         matrix.at(2 + i * stride + output / 32) |= 1u << (output % 32);
             if (stage == "gs")
                 matrix.resize(matrix.size() + 3); // no outputs on streams 1 to 3
+            if (stage == "ms")
+                matrix.push_back(0); // no per-primitive signature elements
             Text values;
             for (auto word : matrix) {
                 if (!values.empty())

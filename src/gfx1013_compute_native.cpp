@@ -46,7 +46,7 @@ string hexword(Word n) {
     snprintf(s, sizeof(s), "0x%08xu", n);
     return s;
 }
-enum class Encoding { Sopp, Sop1, Sop2, Sopc, Sopk, Vop1, Vop2, Vopc, Vop3, Mix, Smem, Image, Mubuf, Lds, Export, Interp, Fetch, FixedSetup, FixedFetch };
+enum class Encoding { Sopp, Sop1, Sop2, Sopc, Sopk, Vop1, Vop2, Vopc, QuadCompare, Vop3, Mix, Smem, Image, Mubuf, Lds, Export, Interp, Fetch, FixedSetup, FixedFetch };
 #include "gfx1013_compute_opcodes.inl"
 struct Inst {
     unsigned pc = 0, next = 0, op = 0, dst = 0;
@@ -197,11 +197,20 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "formatted store needs an index-only linear view and supported component count");
             i.name = "buffer_store_format";
         } else if (i.op >= 0x1c && i.op <= 0x1f) {
-            if ((a & 0x3e000u) || (i.b & 0xe00000u))
+            if ((a & (direct && !graphics ? 0x32000u : 0x3e000u)) ||
+                (i.b & (direct && !graphics ? 0xa00000u : 0xe00000u)))
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
-            if ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u)
+            const unsigned soffset = i.b >> 24;
+            if (direct && (!graphics || !(a & 0x2000u))) {
+                // Linear MUBUF uses an optional OFFEN VGPR, scalar byte offset and OFFSET12.
+                if ((a & 0x02032000u) || (i.b & 0x00a00000u) || (soffset > 105 && soffset != 128))
+                    refuse(pc, graphics ? "raw graphics load requires linear addressing without LDS or TFE"
+                                        : "raw compute load requires linear addressing without LDS or TFE");
+            } else if (!(direct && graphics && (a & 0x0203f000u) == 0x2000u &&
+                        (i.b & 0xffe00000u) == 0x80000000u) &&
+                       ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u))
                 refuse(pc, "raw buffer load needs offen with zero scalar offset and no modifiers");
             i.name = "buffer_load_dword";
         } else {
@@ -268,7 +277,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         if (direct && half_alu && i.src[0] == 250)
             refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
-        const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
+        const bool sdwa_class = i.enc == Encoding::Vopc && (i.op == 0x88 || (direct && i.op == 0x8f));
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
         const unsigned sdwa_mask_limit = direct && !graphics && !wave64 ? 107 : 106;
         if (direct && i.src[0] == 249 && (sdwa_compare || i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2)) {
@@ -361,7 +370,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.src_select[0] = (ext >> 16) & 7u;
             i.src[0] = 256 + (ext & 255);
             lit = false;
-        } else if (direct && i.src[0]==250 && i.enc!=Encoding::Vopc && !lit) {
+        } else if (direct && i.src[0]==250 && (graphics || i.enc!=Encoding::Vopc) && !lit) {
             auto control=take();
             // DPP_CTRL[8] selects patterns outside a quad; bit 17 is
             // reserved. FI and BOUND_CTRL are independent of the pattern.
@@ -411,6 +420,13 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "invalid scalar lane read destination");
         }
     }
+    // Keep permuted VCC compares separate from unpermuted compare/EXEC proofs.
+    if (i.enc == Encoding::Vopc && i.dpp_control) {
+        if (i.dst != 106 || i.name.substr(0,6) != "v_cmp_" || i.name.substr(i.name.size()-4) != "_f32" ||
+            i.name.find("_class_") != Name::npos || *i.dpp_control > 255)
+            refuse(pc,"unsupported DPP pixel compare");
+        i.enc = Encoding::QuadCompare;
+    }
     if(i.next-pc!=encoded.size)refuse(pc,"instruction extent mismatch for "+string(encoded.name));
     return i;
 }
@@ -424,7 +440,7 @@ static std::optional<unsigned> carry_destination(const Inst &i) {
     return {};
 }
 struct Symbol {
-    enum class Type { unknown, constant, masked, table, descriptor, indexed_descriptor, root_address, primitive_mask,
+    enum class Type { unknown, constant, masked, table, descriptor, indexed_descriptor, sampler_heap, sampler_word, root_address, root_stride_one_high, primitive_mask,
                       stride, byte_stride, zero_stride_word, byte_count, clear_oob, byte_oob, lane_mask, uniform_mask, unbound } type{};
     Word value = 0, offset = 0;
     unsigned index_mask = 0, definition = 0;
@@ -480,6 +496,12 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
     }
     if (a.type == T::constant) std::swap(a,b);
     if (b.type != T::constant) return {};
+    // Address bits occupy the low halfword. Setting bit 16 in the high
+    // address word constructs a buffer descriptor with byte stride one.
+    if (i.name == "s_or_b32" && a.type == T::root_address && a.offset == 1 && b.value == 0x10000) {
+        a.type = T::root_stride_one_high;
+        return a;
+    }
     if (i.name == "s_max_u32" && a.type == T::stride && b.value == 1) return field(a, T::byte_stride);
     if (i.name == "s_and_b32" && b.value == 0xc000ffff && component(a,1)) return field(a,T::zero_stride_word);
     if (i.name == "s_and_b32" && b.value == 0xcfffffff && component(a,3)) return field(a,T::clear_oob);
@@ -519,7 +541,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         unsigned n = memory_count(i);
         for (unsigned j = 0; j < n; ++j) {
             Symbol v{};
-            if (i.op == 2 && i.b >> 25 != 125 && base.type == Symbol::Type::table) {
+            if (graphics && i.op == 3 && base.type == Symbol::Type::table && base.value == compute_resource_heap) {
+                const bool fixed = offset_reg == 125 || index.type == Symbol::Type::constant;
+                const Word offset = (i.b & 0xfffff) + (offset_reg != 125 && fixed ? index.value : 0);
+                v = {Symbol::Type::indexed_descriptor, base.value, offset + 4*j,
+                     fixed ? 0u : index.type == Symbol::Type::masked ? index.value : ~0u, i.pc};
+            } else if (i.op == 2 && base.type == Symbol::Type::sampler_heap) {
+                v = {Symbol::Type::sampler_word, i.dst, j, 0, i.pc};
+            } else if ((i.op == 2 || (graphics && i.op == 3)) && offset_reg != 125 && base.type == Symbol::Type::table) {
                 v = {Symbol::Type::indexed_descriptor, base.value, (i.b & 0xfffff) + 4*j,
                      index.type == Symbol::Type::masked || index.type == Symbol::Type::constant ? index.value : ~0u, i.pc};
             } else if (i.op < 8 && base.type == Symbol::Type::table)
@@ -563,16 +592,36 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
+<<<<<<< HEAD
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
                i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
                i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
+||||||| ca6593968
+    } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
+               i.name == "v_readlane_b32")
+=======
+    } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare ||
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
+               i.name == "v_readlane_b32")
+>>>>>>> a48d39dc1
     {
         set(i.dst, {});
+<<<<<<< HEAD
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
              i.name.substr(i.name.size() - 4) == "_u64") &&
             i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
+||||||| ca6593968
+        if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+            i.name.size() >= 4 && (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64")) ||
+            i.name == "s_bitreplicate_b64_b32")
+=======
+        if ((wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+            i.name.size() >= 4 && (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64")) ||
+            i.name == "s_bitreplicate_b64_b32")
+>>>>>>> a48d39dc1
             set(i.dst + 1, {});
     }
     return s;
@@ -634,14 +683,26 @@ std::map<unsigned, Inst> fixed_vertex_loads(const string &code) {
     while (pc + 8 <= code.size()) {
         const Word a = word(code,pc), b = word(code,pc+4);
         const Word form = a & ~4095u;
-        if (form != 0xe0342000u && form != 0xe03c2000u && form != 0xe9c32000u) break;
+        unsigned width, alignment;
+        bool normalized;
+        switch (form) {
+        case 0xe0342000u: width = 2; alignment = 4; normalized = false; break;
+        case 0xe0382000u: width = 4; alignment = 4; normalized = false; break; // buffer_load_dwordx4 idxen
+        case 0xe03c2000u: width = 3; alignment = 4; normalized = false; break;
+        case 0xe8282000u: width = 1; alignment = 1; normalized = false; break; // BUF_FMT_8_UINT
+        case 0xe8082000u: width = 1; alignment = 1; normalized = true; break; // BUF_FMT_8_UNORM
+        case 0xe8712000u: width = 2; alignment = 2; normalized = true; break; // BUF_FMT_8_8_UNORM
+        case 0xe9c32000u: width = 4; alignment = 4; normalized = true; break; // BUF_FMT_8_8_8_8_UNORM
+        default: return found ? result : std::map<unsigned, Inst>{};
+        }
         if (overwrote_index || (b & 0xffff00ffu) != (0x80000000u | ((desc / 4) << 16))) return {};
         Inst i{};
         i.pc = pc; i.next = pc + 8; i.enc = Encoding::FixedFetch; i.name = "fixed_vertex_fetch";
         i.dst = 256 + ((b >> 8) & 255);
-        i.op = form == 0xe0342000u ? 2 : form == 0xe03c2000u ? 3 : 4;
+        i.op = width;
+        i.a = normalized;
         i.literal = a & 4095u;
-        if (i.literal % 4 || i.literal >= 2048 || i.dst+i.op > 512) return {};
+        if (i.literal % alignment || i.literal >= 2048 || i.dst+i.op > 512) return {};
         result.emplace(pc, i);
         found = true; overwrote_index = i.dst == 256; pc += 8;
     }
@@ -768,9 +829,17 @@ struct Emit {
         if (sym.value == compute_sampler_heap)
             refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
+<<<<<<< HEAD
                                  (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
                                   (i.name == "buffer_store_raw" ||
                                    (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
+||||||| ca6593968
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
+=======
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
+                                  (i.name == "buffer_store_raw" ||
+                                   (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x3000))) &&
+>>>>>>> a48d39dc1
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
@@ -788,7 +857,7 @@ struct Emit {
         if (sym.value == compute_resource_heap)
             refuse(i.pc, "whole-heap buffer access needs a matching descriptor at the GPU-selected index");
         if (indexed) {
-            if (width != 4 || compute_uav(kind) || (sym.index_mask & 31))
+            if ((width != 4 && width != 8) || compute_uav(kind) || (sym.index_mask & 31))
                 refuse(i.pc, "indexed descriptor requires a bounded 32-byte-aligned SRV offset");
             const unsigned first = sym.offset / 32, count = 1 + sym.index_mask / 32;
             if (sym.value >= layout.NumParameters || layout.pParameters[sym.value].ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
@@ -822,12 +891,12 @@ struct Emit {
                 refuse(i.pc, "indexed SRV span exceeds its declared root range");
             auto span = std::find_if(list.begin(), list.end(), [&](const auto &b) {
                 return b.kind == kind && b.root_parameter == sym.value && b.byte_offset == sym.offset &&
-                       b.array_count == count && !b.array_position;
+                       b.array_count == count && b.image_dimension == dimension && !b.array_position;
             });
             unsigned first_reg = srv;
             if (span == list.end()) {
                 for (unsigned j = 0; j < count; ++j)
-                    list.push_back({kind, sym.value, sym.offset + j * 32, srv++, bytes, count, j});
+                    list.push_back({kind, sym.value, sym.offset + j * 32, srv++, bytes, count, j, dimension});
             } else {
                 first_reg = span->shader_register;
                 for (unsigned j = 0; j < count; ++j)
@@ -1462,6 +1531,7 @@ void lower_blocks(Emit &e) {
 }
 #include "gfx1013_direct_compute.inl"
 #include "gfx1013_direct_graphics.inl"
+#include "gfx1013_direct_mesh.inl"
 } // namespace
 static NativeComputeShader translate_program(const ComputeRequest &request, unsigned entry, bool direct_dxil, const GuestShaderStage *stage,
                                              HeapViewContract heap_view) {
@@ -1494,11 +1564,14 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> sig;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *layout = &empty;
-    if ((!stage || !request.root.empty()) && (FAILED(D3D12CreateVersionedRootSignatureDeserializer(request.root.data(), request.root.size(),
-                                                             IID_PPV_ARGS(&sig))) ||
-        FAILED(sig->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &layout)) ||
-        layout->Desc_1_1.NumParameters > 16))
-        refuse(entry, "invalid root layout");
+    if (!stage || !request.root.empty()) {
+        HRESULT hr = D3D12CreateVersionedRootSignatureDeserializer(request.root.data(), request.root.size(),
+                                                                   IID_PPV_ARGS(&sig));
+        if (SUCCEEDED(hr)) hr = sig->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &layout);
+        if (hr == E_INVALIDARG) refuse(entry, "invalid root layout");
+        if (FAILED(hr)) throw std::runtime_error("invalid root layout: deserializer HRESULT " + std::to_string(hr));
+        if (layout->Desc_1_1.NumParameters > 16) refuse(entry, "invalid root layout");
+    }
     unsigned next = 4;
     State initial{};
     for (unsigned k = 0; k <= 105; ++k)
@@ -1566,9 +1639,19 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
     if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
         initial[next] = {Symbol::Type::table, compute_resource_heap};
+<<<<<<< HEAD
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
     const bool wave64 = stage && !stage->wave32;
+||||||| ca6593968
+    const bool wave64 = stage && !stage->wave32;
+=======
+    // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
+    // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
+    const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
+                              word(request.sa,4)==0x6c090102;
+    const bool wave64 = stage ? !stage->wave32 : packed_state && !(word(request.sa,16)&(1u<<20));
+>>>>>>> a48d39dc1
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
@@ -1598,7 +1681,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
                 return i.enc == Encoding::Vopc || i.enc == Encoding::Lds || carry_destination(i) ||
                        i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32" || i.name == "s_barrier";
             });
-            if (branches && synchronizes) refuse(entry, "multi-wave64 exchange requires converged group control flow");
+            if (branches && synchronizes) {
+                if (!packed_state) refuse(entry, "multi-wave64 exchange requires converged group control flow");
+                compiler.virtual_waves = static_cast<unsigned>(threads / 64);
+            }
         }
         auto translated = compiler.lower(entry,user,rsrc2,x,y,z);
         for (auto &binding : translated.bindings) {
@@ -1729,12 +1815,13 @@ bool x2w::apply_reflected_table_use(ComputeViewBinding &binding, const GuestShad
         match = &use;
     }
     if (!match) return false;
-    const bool scalar = binding.kind == ComputeViewKind::buffer_srv;
+    const bool scalar = accepts_cbv_window(binding.kind);
     const bool buffer = scalar || compute_buffer_uav(binding.kind) || binding.kind == ComputeViewKind::raw_vector_srv ||
-                        binding.kind == ComputeViewKind::typed_buffer_srv || binding.kind == ComputeViewKind::byte_window_srv;
+                        binding.kind == ComputeViewKind::typed_buffer_srv || binding.kind == ComputeViewKind::byte_window_srv ||
+                        binding.kind == ComputeViewKind::indexed_raw_srv;
     if (match->dwords != (buffer ? 4u : 8u) ||
         (match->type != (compute_uav(binding.kind) ? 3u : 0u) && !(scalar && match->type == 2)))
-        throw UnsupportedComputeShader("raw load disagrees with reflected table record");
+        throw UnsupportedComputeShader("raw load disagrees with reflected table record at root " + std::to_string(binding.root_parameter) + " offset " + std::to_string(binding.byte_offset) + " kind " + std::to_string(static_cast<unsigned>(binding.kind)) + " reflected type " + std::to_string(match->type) + " width " + std::to_string(match->dwords));
     if (scalar)
         binding.scalar_table = match->type == 2 ? ComputeViewBinding::ScalarTable::reflected_cbv
                                                 : ComputeViewBinding::ScalarTable::srv;
@@ -1743,7 +1830,7 @@ bool x2w::apply_reflected_table_use(ComputeViewBinding &binding, const GuestShad
 
 void x2w::apply_scalar_table_layout(ComputeViewBinding &binding, const D3D12_ROOT_DESCRIPTOR_TABLE1 &table) {
     using Table = ComputeViewBinding::ScalarTable;
-    if (binding.kind != ComputeViewKind::buffer_srv || binding.scalar_table != Table::unknown || binding.byte_offset % 32)
+    if (!accepts_cbv_window(binding.kind) || binding.scalar_table != Table::unknown || binding.byte_offset % 32)
         return;
     uint64_t end = 0;
     const auto slot = binding.byte_offset / 32;
@@ -1791,6 +1878,29 @@ x2w::NativeComputeShader x2w::translate_graphics_container(const std::string &by
     return lower_graphics(*selected);
 }
 
+x2w::NativeComputeShader x2w::translate_mesh_program(const std::string &code, const MeshStageLayout &layout) {
+    return lower_mesh(code,layout);
+}
+
+x2w::NativeComputeShader x2w::translate_mesh_program(const std::string &code, const MeshStageLayout &layout,
+                                                      const D3D12_ROOT_SIGNATURE_DESC1 &root) {
+    return lower_mesh(code,layout,nullptr,root);
+}
+
+x2w::NativeComputeShader x2w::translate_mesh_container(const std::string &bytes, bool validate_uint_heap_reads) {
+    const auto stages=read_guest_shader_container(bytes);
+    const GuestShaderStage *mesh=nullptr;
+    for (const auto &s : stages) if (s.stage==GpuStage::ms) {
+        if (mesh) refuse(0,"ambiguous mesh stage");
+        mesh=&s;
+    }
+    if (!mesh) refuse(0,"missing mesh stage");
+    MeshStageLayout layout{mesh->threads[0],mesh->max_vertices,mesh->max_primitives,
+                           mesh->topology,mesh->mesh_group_stride,mesh->wave32};
+    layout.validate_uint_heap_reads=validate_uint_heap_reads;
+    return lower_mesh(mesh->code,layout,mesh);
+}
+
 x2w::DirectGraphicsPair x2w::translate_graphics_pair(std::string_view a,std::string_view b) {
     return translate_graphics_pair(a, b, {});
 }
@@ -1806,15 +1916,15 @@ static bool raw_center_inputs(unsigned enable_mask) {
     return (enable_mask & ~position_inputs) == 2;
 }
 static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_ROOT_SIGNATURE_DESC1 &layout,
-                                         unsigned enable_mask, unsigned address_mask) {
+                                         unsigned enable_mask, unsigned address_mask, bool mesh_pixel = false) {
     if (bytes.empty() || bytes.size() % 4 || bytes.size() > (1u << 20))
         throw UnsupportedComputeShader("invalid raw graphics extent");
     GuestShaderStage stage{};
     unsigned extent = 0;
     bool position = false, color = false, ended = false;
     struct Parameter { unsigned exported = 0, smooth = 0, flat = 0; };
-    std::array<Parameter, 7> params{};
-    const bool has_params = raw_center_inputs(enable_mask);
+    std::vector<Parameter> params(mesh_pixel ? 31 : 7);
+    const bool has_params = raw_center_inputs(enable_mask) || mesh_pixel;
     std::map<unsigned, unsigned> visited;
     std::deque<unsigned> pending{0};
     while (!pending.empty()) {
@@ -1875,12 +1985,14 @@ static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_RO
         const auto &p = params[attr];
         if ((position && (p.smooth || p.flat)) || (color && p.exported) || (p.smooth & p.flat))
             refuse(0, "ambiguous raw varying interface");
+        if (mesh_pixel && p.smooth && p.flat)
+            refuse(0, "mixed interpolation modes in one packed mesh PARAM");
         // A PARAM may mix smooth channels and provoking-vertex fetches.
         for (unsigned ch = 0; ch < 4; ++ch) {
             const uint8_t bit = uint8_t(1u << ch);
             if (!((p.exported | p.smooth | p.flat) & bit)) continue;
             const unsigned index = 4 * attr + ch;
-            const uint8_t row = uint8_t(index + 1);
+            const uint8_t row = uint8_t(1 + (mesh_pixel ? attr : index));
             (position ? stage.outputs : stage.attributes).push_back({6,row,bit,attr,0,uint8_t(bool(p.flat & bit))});
             (position ? stage.output_signature : stage.input_signature).push_back({"TEXCOORD",index,0,3,row,bit,bit});
         }
@@ -1898,13 +2010,33 @@ static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_RO
             stage.inputs.push_back({table ? 3u : constants ? 0u : 1u,0,count,0,uint8_t(sgpr),uint8_t(j)});
         sgpr+=count;
     }
+    if (layout.Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+        if (sgpr >= 106) refuse(0, "resource heap outside graphics user data");
+        stage.inputs.push_back({5,0,1,0,uint8_t(sgpr++),0});
+    }
+    if (layout.Flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+        if (sgpr >= 106) refuse(0, "sampler heap outside graphics user data");
+        stage.inputs.push_back({6,0,1,0,uint8_t(sgpr),0});
+    }
     return stage;
+}
+
+x2w::NativeComputeShader x2w::translate_mesh_pixel_program(std::string_view code, unsigned enable, unsigned address,
+                                                           unsigned wave_size, const D3D12_ROOT_SIGNATURE_DESC1 *root) {
+    if (address > 0xffff || (enable & ~address) || (wave_size != 32 && wave_size != 64))
+        refuse(0,"invalid fixed mesh pixel entry");
+    const D3D12_ROOT_SIGNATURE_DESC1 layout = root ? *root : D3D12_ROOT_SIGNATURE_DESC1{};
+    auto ps = read_raw_graphics(code, layout, enable, address, true);
+    if (ps.stage != GpuStage::ps) refuse(0,"mesh pixel program has no color export");
+    ps.wave32 = wave_size == 32;
+    return lower_graphics(ps, 0, 0, nullptr, layout, 0, root != nullptr);
 }
 
 x2w::DirectGraphicsPair x2w::translate_graphics_pair(std::string_view a,std::string_view b,
                                                      const D3D12_ROOT_SIGNATURE_DESC1 &layout, std::string_view pixel_entry,
                                                      std::optional<GpuStage> first_stage,
-                                                     const std::array<unsigned char, 8> &target_components) {
+                                                     const std::array<unsigned char, 8> &target_components,
+                                                     std::optional<std::array<bool,2>> stage_wave32) {
     const bool raw = a.substr(0,4)!="DXBC" && b.substr(0,4)!="DXBC";
     unsigned enable_mask=0, address_mask=0;
     if (!pixel_entry.empty()) {
@@ -1926,6 +2058,10 @@ x2w::DirectGraphicsPair x2w::translate_graphics_pair(std::string_view a,std::str
     if(vs->stage==GpuStage::ps)std::swap(vs,ps);
     if(vs->stage!=GpuStage::vs || ps->stage!=GpuStage::ps)refuse(0,"expected vertex and pixel stages");
     ps->target_components=target_components;
+    if (raw && stage_wave32) {
+        vs->wave32 = (*stage_wave32)[0];
+        ps->wave32 = (*stage_wave32)[1];
+    }
     return translate_reflected_graphics(*vs,*ps,layout);
 }
 x2w::DirectGraphicsPair x2w::translate_reflected_graphics(GuestShaderStage &vs, GuestShaderStage &ps,
@@ -1941,6 +2077,10 @@ x2w::DirectGraphicsPair x2w::translate_reflected_graphics(GuestShaderStage &vs, 
                                 static_cast<unsigned>(vertex.samplers.size()), &constants, layout, vertex_uavs);
     for (auto &binding : vertex.bindings) apply_reflected_table_use(binding, vs);
     for (auto &binding : pixel.bindings) apply_reflected_table_use(binding, ps);
+    validate_raster_link(vertex, pixel);
+    return {std::move(vertex),std::move(pixel)};
+}
+void x2w::validate_raster_link(const NativeComputeShader &vertex, const NativeComputeShader &pixel) {
     for(const auto &input:pixel.inputs){
         if(input.name=="SV_IsFrontFace" || input.kind==28) continue;
         auto producer=std::find_if(vertex.outputs.begin(),vertex.outputs.end(),[&](auto &out){
@@ -1949,5 +2089,4 @@ x2w::DirectGraphicsPair x2w::translate_reflected_graphics(GuestShaderStage &vs, 
         });
         if(producer==vertex.outputs.end())refuse(0,"graphics stages disagree on "+input.name+to_string(input.index));
     }
-    return {std::move(vertex),std::move(pixel)};
 }

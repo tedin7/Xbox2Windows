@@ -42,6 +42,11 @@ bool lower_hex(std::string_view text) {
             return false;
     return true;
 }
+void check_compute_extents(const Bytes &desc, size_t code, size_t data, size_t sa, size_t sb) {
+    if (desc.size() != 96 || read<uint64_t>(desc, 48) != code || read<uint64_t>(desc, 64) != data ||
+        read<uint64_t>(desc, 16) != sa || read<uint64_t>(desc, 32) != sb)
+        throw std::runtime_error("inconsistent compute request");
+}
 uint64_t parse_request_stem(std::string_view stem, const char *error_message) {
     const std::string_view digits = stem.substr(4);
     uint64_t expected = 0;
@@ -190,6 +195,14 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
         request.input_layout = part(marker, ".ia", 1 << 20);
     if (fs::exists(fs::path(marker).replace_extension(".psin")))
         parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
+    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
+        if (!request.pixel_entry.empty())
+            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
+        request.pixel_entry = part(marker, ".ps57in", 12);
+        if (request.pixel_entry.size() != 12 || request.pixel_entry.compare(0, 4, "PSI1"))
+            throw std::runtime_error("invalid slot-57 pixel entry record");
+        request.pixel_input_description = request.pixel_entry;
+    }
     const auto request_key = [&](std::string_view revision) {
         uint64_t key = 1469598103934665603ull;
         hash_bytes(key, revision.data(), revision.size());
@@ -217,9 +230,7 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     auto code = part(marker, ".c67", 1 << 20), data = part(marker, ".data", 1 << 20),
          root = part(marker, ".root", 16 << 20);
     auto desc = part(marker, ".desc", 96), sa = part(marker, ".sa", 4096), sb = part(marker, ".sb", 4096);
-    if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
-        read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
-        throw std::runtime_error("inconsistent compute request");
+    check_compute_extents(desc, code.size(), data.size(), sa.size(), sb.size());
     const auto request_key = [&](std::string_view revision) {
         uint64_t key = 1469598103934665603ull;
         hash_bytes(key, revision.data(), revision.size());
@@ -233,10 +244,18 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     constexpr char revision[] = "x2w-startup-shader-29cs";
     if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
-    if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
-        throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
-                                                 : "inconsistent compute request");
-    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
+    ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
+    validate_compute_request_shape(request);
+    return request;
+}
+
+void x2w::validate_compute_request_shape(const ComputeRequest &r) {
+    check_compute_extents(r.description, r.code.size(), r.data.size(), r.sa.size(), r.sb.size());
+    if (r.root.size() > (16u << 20) || r.code.size() > (1u << 20) ||
+        r.data.size() > (1u << 20) || r.sa.size() > 4096 || r.sb.size() > 4096)
+        throw std::runtime_error("inconsistent compute request");
+    if (r.root.empty() || r.sa.size() != 28 || r.code.empty() || r.data.empty() || r.code.size() % 4)
+        throw std::runtime_error(r.sa.size() != 28 ? "compute state block A is not 28 bytes" : "inconsistent compute request");
 }
 
 std::string x2w::read_shader_container_bytes(const fs::path &file) {

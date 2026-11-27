@@ -87,6 +87,29 @@ def built_root_readback(work, gpu, sdk):
     print("Root-built scalar x8 matched 16 words and all guards at each offset; shifting by one dword changed all 16.")
 
 
+    # The byte address in v8 overlaps the first destination of the x3 load.
+    # Select a different source window in each group and keep all guard words.
+    words = [sop1(3, 16, 4), scalar(0x10, 17, 5, 255), 0x10000,
+             sop1(3, 18, 193), sop1(3, 19, 255), 0x11014fac,
+             sop1(3, 20, 6), sop1(3, 21, 128), 0xf4080000 | 40 << 6 | 10, 0xfa000020,
+             scalar(0x1e, 12, 7, 132), vmove(8, 12), vmove(11, 12),
+             # The replay fixture creates the smallest raw SRV requested by the
+             # program. A scalar load at byte 24 provisions the seven-word view.
+             0xf4200000 | (25 << 6) | 8, 0xfa000018,
+             0xe03c1000, 0x80040808, sop1(3, 126, 129)]
+    for j in range(3):
+        words.extend([0xe0701000 | 4*j, 0x800a000b | (8+j) << 8])
+    marker = write_request(work, words + [0xbf810000], root.read_bytes(), sa)
+    subprocess.run([gpu, sdk, marker, work / "cache", "0", dest, "--direct"], check=True)
+    expected = [0x69696969] * 2064
+    for group in range(2):
+        for j in range(3):
+            expected[8 + group * 4 + j] = 0x51aa0000 + group * 4 + j
+    actual = struct.unpack("<2064I", dest.read_bytes())
+    assert list(actual) == expected, [(i,a,b) for i,(a,b) in enumerate(zip(actual,expected)) if a!=b][:10]
+    print("Root descriptor with byte stride one: x3 load matches both source windows and all guards.")
+
+
 def vector_carry_readback(work, gpu, sdk):
     def vop2(op, dst, a, b):
         return op << 25 | dst << 17 | b << 9 | a

@@ -1,4 +1,5 @@
 #include "gfx1013_compute_ir.h"
+#include "gfx1013_compute_native.h"
 #include <charconv>
 #include <cstdint>
 #include <optional>
@@ -25,6 +26,7 @@ LocalDataAccess decode_local_data(uint32_t instruction, uint32_t operands) {
     case 0x0a: case 0x2a: access.atomic_ir = "or"; access.atomic_hlsl = "Or"; break;
     case 0x0b: case 0x2b: access.atomic_ir = "xor"; access.atomic_hlsl = "Xor"; break;
     case 0x2d: access.atomic_ir = "xchg"; access.atomic_hlsl = "Exchange"; break;
+    case 0x30: access.compare_exchange = true; break;
     case 0x36: access.read = true; break; // read_b32
     case 0x76: access.read = true; access.count = 2; break;
     case 0xfe: access.read = true; access.count = 3; break;
@@ -41,12 +43,12 @@ LocalDataAccess decode_local_data(uint32_t instruction, uint32_t operands) {
         access.stride64 = (op & 0x3f) == 0x0f || (op & 0x3f) == 0x38;
         break;
     default:
-        throw std::runtime_error("unsupported local DS opcode " + std::to_string(op));
+        throw UnsupportedComputeShader("unsupported local DS opcode " + std::to_string(op));
     }
-    access.return_old = access.atomic_ir && op >= 0x20;
+    access.return_old = access.compare_exchange || (access.atomic_ir && op >= 0x20);
     const unsigned first_width = access.pair_words ? access.pair_words : access.count;
     if (access.read ? data0 || data1 || dst + access.count > 256 :
-        (!access.return_old && dst) || (!access.pair_words && data1) ||
+        (!access.return_old && dst) || (!access.compare_exchange && !access.pair_words && data1) ||
         data0 + first_width > 256 || data1 + access.pair_words > 256)
         throw std::runtime_error("invalid local DS register tuple");
     return access;
@@ -59,7 +61,10 @@ static std::string lower_lds(uint32_t instruction, uint32_t operands) {
     for (unsigned i = 0; i < access.count; ++i) {
         auto location = "lds[(ds_addr + " + std::to_string(access.byte_offset(i)) + "u) >> 2]";
         auto reg = "v" + std::to_string(access.read ? access.destination + i : access.data_register(i));
-        if (access.atomic_ir) {
+        if (access.compare_exchange) {
+            out += "InterlockedCompareExchange(" + location + ", " + reg + ", v" + std::to_string(access.data1) +
+                   ", v" + std::to_string(access.destination) + "); ";
+        } else if (access.atomic_ir) {
             auto value = access.subtract ? "(0u - " + reg + ")" : reg;
             out += std::string("Interlocked") + access.atomic_hlsl + "(" + location + ", " + value;
             if (access.return_old)
