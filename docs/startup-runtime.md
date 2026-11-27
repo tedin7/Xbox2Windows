@@ -531,23 +531,33 @@ six out-of-range calls. The switched case clears both inputs to the shader.
 
 ## Null bindings in translated draws
 
-The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
-`(entry, buffer, token, wrapper, dimension)`. Each null binding falls in exactly one cause, so
-the five parts add up to N:
+The `x2w-render totals` line reports `null bindings N` and its six causes: `entry`,
+`buffer`, `token`, `wrapper`, `dimension`, and `ring_full`. A ring-full event
+contributes to these totals when the upload failure refuses a translated draw.
 
-- entry: the descriptor table entry is null, empty or unreadable.
-- buffer: the buffer address or size is missing or unreadable, or the frame copy failed.
-- token: the descriptor memory names a view id the wrapper never issued.
-- wrapper: the texture's resource is missing or is not a resource wrapper.
-- dimension: the view dimension does not match the shader, so a null texture is bound.
+The always-on `x2w-render null input` lines show cumulative calls and first/last
+frames by pipeline key, shader input index and cause. The 512-row census
+keeps the first event's input kind, render-target-0 and depth-view formats,
+and cause details. Each totals or 10-second report emits up to 24 changed
+input rows ranked by calls. A separate 64-row census counts recorded translated
+draws by render-target-0 resource since the previous census report. Each
+`x2w-render target` line gives the frame span, total draws and draws that
+bound at least one null input. A refused draw contributes no target draw.
+The overflow line gives cumulative input events and window target draws
+that could not fit in their respective tables. The tester archive includes
+these rows and the percentage of draws with null inputs per target window
+in `null-inputs.txt`.
 
-The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
-`startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
-valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
-by reading a render log. The device prints the counts by cause value, so
-`ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
-checks without a device that each cause lands in the slot printed under its label, and that the
-header's names follow the same order. The control swaps the buffer and token slots and must fail.
+The WARP fixture checks synthetic pixels with valid inputs, an unknown
+texture token and an unreadable buffer. It also fills the upload ring and
+checks that a clear survives the refused draw. A second unknown token on
+a different input exercises the key's input-index field. The control
+requires the readbacks and baseline census to pass before checking for
+the expected index failure.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(null_cause_labels(_buffer_token_control)?|null_views_census(_omit_index_control)?_warp|tester_pack)$'
+```
 
 ### Refused slot 70 calls and token nulls in the five-second report
 
