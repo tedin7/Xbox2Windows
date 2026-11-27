@@ -16110,6 +16110,13 @@ flat-parameter runner binds only entry constants, so the fixture supplies the
 buffer bytes through an HLSL load function after checking the translated
 resource key and load calls.
 
+For a proven wave32 program, a move can also take the low lane mask from a
+pair with an older descriptor word above it. The translator follows the
+control flow and requires the copied upper word to be dead until a full VCC
+write. The WARP variant draws two triangles into a 4×4 target and requires
+the inverted-mask shader to differ at all 16 pixels. The Python check
+covers wave64, missing wave-size proof and upper-word reads.
+
 ## Startup translator: SMEM offset operands
 
 `tools/startup/gfx2hlsl.py` accepts these offset operands for the scalar memory loads ([issue #1674](https://github.com/R0Y00/Xbox2Windows/issues/1674)):
@@ -17496,6 +17503,19 @@ Linux controls, `form_coverage_check.check_f16_exact_extra_forms`, and Python re
 
 ```powershell
 ctest --test-dir out/build/release --no-tests=error -R "^startup_gfx2hlsl_cvt_pk_int16_(controls|warp|hardware)$" -V
+```
+
+### Signed normalized packing and compressed export
+
+The [RDNA 2 signed normalized pack](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+rounds the exact clamped product by 32767 to nearest even and maps NaN to zero.
+A compressed export of the packed word uses the declared 16-bit UNORM,
+SNORM or float target format. Missing and other target formats are refused.
+The WARP fixture reads raw R16_UNORM texels from an 8×1 draw, including a
+constant-buffer NaN and a halfway value that a truncating shader must miss.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_(cvt_pknorm_i16_warp|desc_vcc_warp)$' -V
 ```
 
 ## Binary32 conversion, frexp_exp, and packed-RTZ SDWA forms in pixel_aot

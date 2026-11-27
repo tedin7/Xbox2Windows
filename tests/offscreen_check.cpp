@@ -1517,7 +1517,14 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
     std::vector<std::uint32_t> pixels(expected.size());
     const std::string_view operation = ctx.argv[2];
-    if (operation == "--raster-reference") {
+    if (operation == "--startup-r16-unorm") {
+        char* end = nullptr;
+        const auto input = std::strtoul(ctx.argv[8], &end, 16);
+        if (end == ctx.argv[8] || *end != '\0') return {OutcomeKind::fail, "invalid constant word"};
+        const std::uint32_t constants[4] = {0, static_cast<std::uint32_t>(input), 0, 0};
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
+                                D3D12_CULL_MODE_NONE, FALSE, 3, constants, 4, {}, 1, DXGI_FORMAT_R16_UNORM);
+    } else if (operation == "--raster-reference") {
         const std::string_view mode = ctx.argv[8], winding = ctx.argv[9];
         const auto cull = mode == "none" ? D3D12_CULL_MODE_NONE :
                           mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
@@ -1789,6 +1796,7 @@ const OperationSpec kOperations[] = {
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-r16-unorm", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).

@@ -4,6 +4,8 @@
                                        provenance, encoding-guard and refusal controls, pure Python
   binary <llvm-mc>                     reassemble every fixture and instruction spelling and compare with recorded words
   decode <libLLVM>                     disassemble the VOP3A words with LLVM's C API and compare with disasm_rdna2.py
+  draw-snorm <dxc> <offscreen_check> warp
+                                       read raw R16_UNORM words from a compressed signed-pack export
   draw-unorm <dxc> <offscreen_check> warp
                                        draw normalized packs and require the truncation mutant to fail
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
@@ -27,8 +29,9 @@ sys.path.insert(0, str(HERE.parent / 'tools'))
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import disasm_rdna2 as D  # noqa: E402
+import gpu_case_runner  # noqa: E402
 import gfx2hlsl as G  # noqa: E402
-from startup_flat_param_check import assemble, compile_hlsl, draw, root_blob  # noqa: E402
+from startup_flat_param_check import VS_WORDS, assemble, compile_hlsl, draw, root_blob  # noqa: E402
 from startup_gfx2hlsl_bit_alu_check import (  # noqa: E402
     MASK,
     POST_SOURCE,
@@ -43,6 +46,9 @@ from startup_gfx2hlsl_bit_alu_check import (  # noqa: E402
     vs_words,
     words_text,
 )
+
+from startup_gfx2hlsl_scalar_m0_check import root_with_one_constant  # noqa: E402
+
 
 OPCODES = {
     'v_cvt_pk_u16_u32': 0x36a,
@@ -613,16 +619,112 @@ def check_unorm_draw(dxc, renderer, adapter):
         print(f'{adapter}: {len(cases)} normalized packs matched, {rejected} truncation draws rejected')
 
 
+# Convert packed pixel x to float, scale and clamp it, and use root word s8 at x=4.
+# Pack v3 and -0.5 into v7, then export its first channel pair.
+SNORM_PS = bytes.fromhex(
+    '000d067eff0606102549123e030057d50301c9038400847d08020a7e030b0602'
+    '070068d703e30100030c00f807000000000081bf'
+)
+SNORM_TRUNCATION = 'packed = q + (guard & uint(sticky || (q & 1u) != 0u));'
+
+
+def snorm_source(fmt=56, code=SNORM_PS):
+    formats = () if fmt is None else (fmt,)
+    return G.Pipeline(VS_WORDS, code, root_with_one_constant(), rtv_formats=formats,
+                      ps_hw_inputs=(0x8000, 0x8000)).hlsl_ps()
+
+
+def snorm_reference(bits, truncate=False):
+    value = struct.unpack('<f', struct.pack('<I', bits))[0]
+    scaled = 0.0 if math.isnan(value) else min(1.0, max(-1.0, value)) * 32767
+    return (int(scaled) if truncate else round(scaled)) & 0xffff
+
+
+def snorm_controls():
+    source = snorm_source()
+    assert 'v7 = pknorm_i16(v3) | (pknorm_i16(0xbf000000u) << 16u);' in source
+    assert 'float((v7) & 0xffffu) / 65535.0' in source and 'v5 = ud1;' in source
+    assert 'asint((v7) << 16u) >> 16) / 32767.0' in snorm_source(58)
+    assert 'f16tof32(v7)' in snorm_source(54)
+    move = struct.pack('<I', 0x7e120307)  # v_mov_b32_e32 v9, v7
+    moved = SNORM_PS[:40] + move + SNORM_PS[40:44] + bytes((9, 0, 0, 0)) + SNORM_PS[48:]
+    assert 'float((v9) & 0xffffu) / 65535.0' in snorm_source(code=moved)
+    overwrite = struct.pack('<I', 0x7e0e0280)  # v_mov_b32_e32 v7, 0
+    assert 'f16tof32(v7)' in snorm_source(code=SNORM_PS[:40] + overwrite + SNORM_PS[40:])
+    for fmt, code, message in (
+        (None, SNORM_PS, 'with RTV format 0'),
+        (28, SNORM_PS, 'with RTV format 28'),
+        (56, SNORM_PS[:32] + vop3a(0x368, 7, 8, 241) + SNORM_PS[40:],
+         'source s8 is not a lane register or constant'),
+        (56, SNORM_PS[:32] + vop3a(0x368, 7, 259, 241, src2=1) + SNORM_PS[40:],
+         'with reserved operand or modifier bits'),
+    ):
+        try:
+            snorm_source(fmt, code)
+        except G.Unsupported as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError(message)
+    midpoint = f32_bits(0.5)
+    assert [snorm_reference(x) for x in (midpoint - 1, midpoint, midpoint + 1)] == [16383, 16384, 16384]
+    assert snorm_reference(midpoint, truncate=True) == 16383
+    assert snorm_reference(f32_bits(-1.0)) == 0x8001
+    assert snorm_reference(0x7fc12345) == 0
+
+
+def check_snorm_draw(dxc, renderer, adapter):
+    snorm_controls()
+    out = HERE.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        vertex = """float4 main(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+}
+"""
+        vs = compile_hlsl(dxc, 'dxc', vertex, 'vs', 'vs_6_0', directory)
+        source = snorm_source()
+        assert source.count(SNORM_TRUNCATION) == 1
+        ps = compile_hlsl(dxc, 'dxc', source, 'ps', 'ps_6_0', directory)
+        mutant = compile_hlsl(dxc, 'dxc', source.replace(SNORM_TRUNCATION, 'packed = q;'),
+                              'truncate', 'ps_6_0', directory)
+        expected = directory / 'expected.bin'
+
+        def run(shader, input_word):
+            result = gpu_case_runner.run(renderer, adapter, (
+                '--startup-r16-unorm', vs, shader, 8, 1, expected, f'{input_word:08x}'))
+            print(result.stdout, end='')
+            if result.returncode == 77:
+                raise SystemExit(77)
+            return result
+
+        for input_word in (f32_bits(4 / 7), f32_bits(0.5), 0x7fc12345, f32_bits(-1.0)):
+            inputs = [f32_bits(x / 7) for x in range(8)]
+            inputs[4] = input_word
+            expected.write_bytes(b''.join(struct.pack('<4I', snorm_reference(bits), 0, 0, 0) for bits in inputs))
+            result = run(ps, input_word)
+            assert result.returncode == 0, (input_word, result.stdout, result.stderr)
+            if input_word == f32_bits(0.5):
+                # Match the mutant at the other sample points so the comparator isolates the tie.
+                expected.write_bytes(b''.join(struct.pack('<4I', snorm_reference(bits, truncate=x != 4), 0, 0, 0)
+                                              for x, bits in enumerate(inputs)))
+                result = run(mutant, input_word)
+                assert result.returncode == 1 and '1 of 8 pixels differ' in result.stderr, result.stderr
+                assert 'pixel mismatch (4,0): expected 00004000,00000000,00000000,00000000 actual 00003fff,' in result.stderr
+
 def main():
     if len(sys.argv) == 1:
         controls()
         unorm_controls()
+        snorm_controls()
         return
     mode, *args = sys.argv[1:]
     if mode == 'binary' and len(args) == 1:
         check_binary(args[0])
     elif mode == 'decode' and len(args) == 1:
         check_decode(args[0])
+    elif mode == 'draw-snorm' and len(args) == 3:
+        check_snorm_draw(*args)
     elif mode == 'draw-unorm' and len(args) == 3:
         check_unorm_draw(*args)
     elif mode == 'draw' and len(args) in (3, 4):
