@@ -37,6 +37,11 @@ WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only stra
                            'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 CONST_EXEC_WAVE_SIZE = 'compute constant EXEC requires a proven wave size for groups larger than 32 threads'
+CONST_EXEC_SALU = re.compile(r's_(mov|not|and|or|xor|andn2|orn2)(_saveexec)?_b(32|64)$')
+CONST_EXEC_BINARY = {
+    'and': lambda a, b: a & b, 'or': lambda a, b: a | b, 'xor': lambda a, b: a ^ b,
+    'andn2': lambda a, b: a & ~b, 'orn2': lambda a, b: a | ~b,
+}
 
 
 class Unsupported(Exception):
@@ -4851,13 +4856,20 @@ class Stage:
                 del self.low16_generation[n]
 
     def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
-        const_values = getattr(self, 'const_exec_values', None)
-        const_definition = (n in getattr(self, 'const_exec_defs', ())
-                            and all(int(v) in const_values for v in re.findall(r'\bv(\d+)\b', expr)))
-        if const_definition:
-            recompute = re.sub(r'\bv(\d+)\b', lambda m: const_values[int(m[1])], expr)
-        if const_values is not None:
-            const_values.pop(n, None)
+        pieces = getattr(self, 'const_exec_pieces', None)
+        recompute = None
+        if n in getattr(self, 'const_exec_defs', ()) and not low16_only and not ignore_exec:
+            mask = self.const_exec_mask
+            values = {v: self.const_exec_value(int(v), mask) for v in re.findall(r'\bv(\d+)\b', expr)}
+            if None not in values.values():
+                recompute = re.sub(r'\bv(\d+)\b', lambda m: values[m[1]], expr)
+        if recompute is not None:
+            # The expression may read the old destination, so resolve its inputs before replacing any piece.
+            temp = 'ul%x_%d' % (self.pc, n)
+            pieces[n] = [(lanes & ~mask, value) for lanes, value in pieces.get(n, ()) if lanes & ~mask]
+            pieces[n].append((mask, temp))
+        elif pieces is not None and (ignore_exec or self.const_exec_mask != 0):
+            pieces.pop(n, None)
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
@@ -4883,11 +4895,12 @@ class Stage:
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known or ignore_exec else 'if (exec & 1) v%d = %s;' % (n, expr))
         temps = getattr(self, 'uniform_temps', None)
-        if const_definition or temps is not None:  # every lane keeps the uniform value in a separate temporary
-            temps = const_values if const_definition else temps
-            temps[n] = 'ul%x_%d' % (self.pc, n)
-            self.uniform_load_temps.add(temps[n])
-            self.emit('%s = %s;' % (temps[n], recompute if const_definition else expr))
+        if recompute is not None or temps is not None:  # every lane keeps a copy of the uniform value
+            temp = 'ul%x_%d' % (self.pc, n)
+            if temps is not None:
+                temps[n] = temp
+            self.uniform_load_temps.add(temp)
+            self.emit('%s = %s;' % (temp, recompute if recompute is not None else expr))
 
     def f_mods(self, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
@@ -6422,7 +6435,8 @@ class Stage:
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.exec_generation = 0
             self.const_exec_mask = None
-            self.const_exec_values = {} if getattr(getattr(self, 'pipe', None), 'retry_const_exec', False) else None
+            self.const_exec_width = None
+            self.const_exec_pieces = {} if getattr(getattr(self, 'pipe', None), 'retry_const_exec', False) else None
             self.used_const_exec_read = False
             self.low16_generation = {}
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
@@ -6813,6 +6827,7 @@ class Stage:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
                     self.exec_generation += 1
+                    self.clear_const_exec()
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
@@ -7408,15 +7423,20 @@ class Stage:
 
     def clear_const_exec(self):
         self.const_exec_mask = None
-        if getattr(self, 'const_exec_values', None) is not None:
-            self.const_exec_values.clear()
+        if getattr(self, 'const_exec_pieces', None) is not None:
+            self.const_exec_pieces.clear()
+
+    def const_exec_value(self, reg, mask):
+        """Return a temporary for a single definition covering every requested lane."""
+        if mask:
+            return next((temp for lanes, temp in self.const_exec_pieces.get(reg, ()) if lanes & mask == mask), None)
 
     def const_exec_source(self, tok):
         reg = reg_range(tok)
         if reg:
             kind, lo, hi = reg
             if kind == 'v':
-                return lo == hi and lo in self.const_exec_values
+                return lo == hi and self.const_exec_value(lo, self.const_exec_mask) is not None
             if lo not in self.defined_uniform_s:
                 return False
         return self.uniform_source(tok)
@@ -7457,16 +7477,13 @@ class Stage:
                 return range(dst[1], dst[2] + 1), None
             addr = reg_range(ops[1])
             if addr and addr[0] == 'v' and self.const_exec_source(ops[1]):
-                return range(dst[1], dst[2] + 1), self.const_exec_values[addr[1]]
+                return range(dst[1], dst[2] + 1), self.const_exec_value(addr[1], self.const_exec_mask)
         return (), None
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         if writes_exec(name, ops):
             self.exec_generation += 1
-            self.clear_const_exec()
-        if name.startswith(('s_branch', 's_cbranch', 's_setpc')):
-            self.clear_const_exec()
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
             return self.lower_image_instruction(image, name, asm, ops, mods)
@@ -7989,7 +8006,7 @@ class Stage:
             restore = None  # the OR would add lanes the copy does not hold
         if writes_exec(name, ops) and not narrows and restore is None:
             self.uniform_expr.clear()
-            if getattr(self, 'const_exec_values', None) is None or name not in ('s_mov_b32', 's_mov_b64'):
+            if getattr(self, 'const_exec_pieces', None) is None or name not in ('s_mov_b32', 's_mov_b64'):
                 copies.clear()
             self.exec_mask = len(self.exec_mask_parent)  # a mask nothing is known about: a new root
             self.exec_mask_parent[self.exec_mask] = None
@@ -8229,6 +8246,12 @@ class Stage:
             if mask_sources & ballot_regs:
                 raise Unsupported('slot 57 mesh: %s on a materialized mask word is not covered' % base)
         self.current_asm = asm      # named by scc_refusal
+        if getattr(self, 'const_exec_pieces', None) is not None:
+            old_exec = self.const_exec_mask
+            if writes_exec(base, ops):
+                self.const_exec_mask = None
+            if not mods and self.const_exec_scalar(base, ops, old_exec):
+                return None
         if self.group_vote:
             self.group_written_masks = {}
         if self.wave_reduction(base, ops):
@@ -9262,54 +9285,112 @@ class Stage:
                 pending.extend((target, bounds[target][0]) for target in succ[block])
         return True
 
-    def const_exec_move(self, base, ops):
-        if (getattr(self, 'const_exec_values', None) is None or len(ops) != 2 or
-                (base, ops[0]) not in (('s_mov_b64', 'exec'), ('s_mov_b32', 'exec_lo'))):
-            return False
-        src = ops[1]
-        pair = base.endswith('_b64')
-        if pair and (reg := reg_range(src)):
-            if reg[0] != 's' or reg[2] != reg[1] + 1 or reg[2] > 105:
-                raise Unsupported(READFIRSTLANE_UNIFORM)
+    def const_exec_operand(self, tok, bits, mask):
+        if tok in ('exec', 'exec_lo', 'exec_hi'):
+            if mask is None or (bits == 64) != (tok == 'exec'):
+                return None
+            if tok != 'exec_lo' and self.const_exec_width != 64:
+                return None  # the proof does not track the unused high word in wave32
+            return mask if bits == 64 else (mask >> (32 if tok == 'exec_hi' else 0)) & 0xffffffff
+        reg = reg_range(tok)
+        if reg:
+            if reg[0] != 's' or reg[2] - reg[1] != bits // 32 - 1 or reg[2] > 105:
+                return None
             words = [self.const_u32('s%d' % n) for n in range(reg[1], reg[2] + 1)]
-            mask = None if None in words else words[0] | (words[1] << 32)
-        else:
-            mask = self.const_u32(src)
-            if pair and re.fullmatch(r'-\d+', src) and -16 <= int(src) < 0:
-                # SOP1 inline negative integers sign extend. A literal dword zero extends.
-                mask |= 0xffffffff00000000
-        width = self.pipe.wave_size
+            return None if None in words else sum(word << (32 * i) for i, word in enumerate(words))
+        if bits == 64 and re.fullmatch(r'-\d+', tok) and -16 <= int(tok) < 0:
+            return int(tok)  # inline negatives sign extend; a literal dword zero extends
+        return self.const_u32(tok)
+
+    def const_exec_layout(self):
+        width = self.const_exec_width or self.pipe.wave_size
         if width is None:
             width = 32 if wave32_exec_proof(self.ins) else 64 if wave64_exec_proof(self.ins) else None
         x, y, z = self.pipe.group
         threads = x * y * z
         if width not in (32, 64) and threads > 32:
             raise Unsupported(CONST_EXEC_WAVE_SIZE)
-        width = 64 if width == 64 else 32
+        self.const_exec_width = 64 if width == 64 else 32
+        return x, y, threads, self.const_exec_width
+
+    def emit_const_exec(self, mask, layout, *, restore=None, pair=False):
+        x, y, threads, width = layout
         lane = '((tid.x + %du * (tid.y + %du * tid.z)) & %du)' % (x, y, width - 1)
-        # AMD RDNA 2 ISA §3.3 EXECute mask: each guest lane uses its own bit, and EXEC_LO writes leave EXEC_HI intact.
         has_high_lanes = width == 64 and threads > 32
-        if mask is None:
-            if self.exec_restore_copy(base, ops) is None:
-                raise Unsupported(READFIRSTLANE_UNIFORM)
-            bit = '(%s & 1u)' % self.S(reg_range(src)[1])
+        if restore is not None:
+            bit = '(%s & 1u)' % self.S(restore)
+            if has_high_lanes and not pair:
+                bit = '(%s < 32u ? %s : exec)' % (lane, bit)
         else:
-            mask &= (1 << width) - 1
             word = '0x%08xu' % (mask & 0xffffffff)
             shift = lane
             if has_high_lanes:
                 shift = '(%s & 31u)' % lane
-                if pair:
-                    word = '(%s < 32u ? %s : 0x%08xu)' % (lane, word, mask >> 32)
+                word = '(%s < 32u ? %s : 0x%08xu)' % (lane, word, mask >> 32)
             bit = '((%s >> %s) & 1u)' % (word, shift)
-            # A tail wave must also contain the first set bit. For EXEC_LO, a set low bit precedes every
-            # bit in the preserved high word. C == 0 gives no proof of a fresh first-lane value.
-            tail = threads % width or width
-            self.const_exec_mask = mask if mask & ((1 << tail) - 1) else 0
-        if has_high_lanes and not pair:
-            bit = '(%s < 32u ? %s : exec)' % (lane, bit)
         self.emit('exec = %s;' % bit)
+        self.const_exec_mask = mask
         self.exec_known = self.exec_narrow_only = False
+
+    def set_const_exec_words(self, reg, value):
+        for n in range(reg[1], reg[2] + 1):
+            word = (value >> (32 * (n - reg[1]))) & 0xffffffff
+            self.set_s(n, '0x%08xu' % word, ('const', word))
+            self.mask_high.discard(n)
+
+    def const_exec_scalar(self, base, ops, old):
+        match = CONST_EXEC_SALU.fullmatch(base)
+        if not match or not ops:
+            return False
+        op, save, size = match.groups()
+        bits = int(size)
+        pair = bits == 64
+        dst = ops[0]
+        exec_dst = dst == 'exec' if pair else dst in ('exec_lo', 'exec_hi')
+        reg = reg_range(dst)
+        scalar_dst = reg and reg[0] == 's' and reg[2] - reg[1] == bits // 32 - 1 and reg[2] <= 105
+        unary = op in ('mov', 'not')
+        if len(ops) != (2 if save or unary else 3):
+            return False
+        if not save and not exec_dst:
+            if op == 'mov' and scalar_dst and ops[1] in ('exec', 'exec_lo', 'exec_hi'):
+                value = self.const_exec_operand(ops[1], bits, old)
+                if value is not None:
+                    self.set_const_exec_words(reg, value)
+                    return True
+            return False
+        if save and (unary or not scalar_dst):
+            return False
+
+        layout = self.const_exec_layout()
+        width = layout[3]
+        if width == 32 and (dst == 'exec_hi' or save and pair):
+            raise Unsupported(READFIRSTLANE_UNIFORM)
+        word_mask = (1 << bits) - 1
+        values = [self.const_exec_operand(tok, bits, old) for tok in ops[1:]]
+        if save:
+            # RDNA 2 ISA SOP1 SAVEEXEC: capture S0 before writing the destination, then compute S0 op EXEC.
+            values.append(None if old is None else old & word_mask)
+        if None in values:
+            if op == 'mov' and dst != 'exec_hi' and self.exec_restore_copy(base, ops) is not None:
+                # An entry EXEC copy still holds each thread's bit, even when we have no constant for the wave.
+                self.emit_const_exec(None, layout, restore=reg_range(ops[1])[1], pair=pair)
+                return True
+            raise Unsupported(READFIRSTLANE_UNIFORM)
+        value = values[0] if op == 'mov' else ~values[0] if op == 'not' else CONST_EXEC_BINARY[op](*values)
+        value &= word_mask
+        if save:
+            self.set_const_exec_words(reg, old)
+        if width == 64 and not pair:
+            if old is None:
+                raise Unsupported(READFIRSTLANE_UNIFORM)
+            shift = 32 if dst == 'exec_hi' else 0
+            mask = (old & ~(word_mask << shift)) | (value << shift)
+        else:
+            mask = value & ((1 << width) - 1)
+        self.emit_const_exec(mask, layout)
+        if op != 'mov':
+            self.set_scc('true' if value else 'false')
         return True
 
     def scalar(self, base, ops, mods=()):
@@ -9320,8 +9401,6 @@ class Stage:
             raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
-        if not mods and self.const_exec_move(base, ops):
-            return None
         text, scc = SCA[base]
         dst = reg_range(ops[0])
         if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
@@ -10605,7 +10684,7 @@ class Stage:
             offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
-        const_exec_retry = getattr(self, 'const_exec_values', None) is not None
+        const_exec_retry = getattr(self, 'const_exec_pieces', None) is not None
         if const_exec_retry:
             uniform = self.const_exec_source(token) and self.const_exec_descriptor(ops[1])
         for i in range(count):
@@ -13085,8 +13164,12 @@ class Stage:
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         valid = (not mods and dst and dst[0] == 's' and dst[1] == dst[2]
                  and src and src[0] == 'v' and src[1] == src[2])
-        if getattr(self, 'const_exec_mask', None) is not None:
-            value = self.const_exec_values.get(src[1]) if valid else None
+        mask = getattr(self, 'const_exec_mask', None)
+        if mask is not None:
+            first = mask & -mask
+            width = self.const_exec_width
+            tail = math.prod(self.pipe.group) % width or width
+            value = self.const_exec_value(src[1], first) if valid and first < (1 << tail) else None
             if value is None:
                 raise Unsupported(READFIRSTLANE_UNIFORM)
             # AMD RDNA 2 ISA §12.8 VOP1: read the lowest active lane, or lane zero for empty EXEC. The temporary
@@ -16785,8 +16868,8 @@ class ComputePipeline(Pipeline):
         code, refusals, decoded = self._stage_args
         ins = decoded if refusals is not None and decoded is not None else decode(
             strip_header(code), [] if refusals is not None else None)
-        destinations = {'s_mov_b64': 'exec', 's_mov_b32': 'exec_lo'}
-        if not any(name in destinations and parse(asm)[1][:1] == [destinations[name]] for _, _, name, asm in ins):
+        if not any(CONST_EXEC_SALU.fullmatch(name) and writes_exec(name, parse(asm)[1])
+                   for _, _, name, asm in ins):
             return False
         self.retry_group_vote = False
         self.retry_const_exec = True
