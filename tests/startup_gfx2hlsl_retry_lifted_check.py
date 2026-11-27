@@ -46,6 +46,7 @@ def touch(path, data, mtime):
 
 # One refusal text per family, as an older build wrote it, and reasons outside every family.
 LIFTED = {
+    'f16-unary': 'SDWA form of v_exp_f16',
     'mrtz': 'unsupported: MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC',
     'rw-buffer': "unsupported: descriptor (('table', 3), 0) used for a load and a store",
     'cube': 'unsupported: image dimension SQ_RSRC_IMG_CUBE',
@@ -58,6 +59,9 @@ OTHER = ('unsupported: v_readfirstlane_b32 requires a proven uniform source',
          'unsupported: s_cbranch_execz skips code with effects outside active lanes')
 for family, reason in LIFTED.items():
     expect('family of %r' % reason, G.lifted_family(reason), family)
+for op in ('v_exp_f16', 'v_rcp_f16'):
+    for reason in ('SDWA form of ' + op, op + '_e32'):
+        expect('family of %r' % reason, G.lifted_family(reason), 'f16-unary')
 for reason in OTHER:
     expect('family of %r' % reason, G.lifted_family(reason), None)
 
@@ -65,7 +69,7 @@ for reason in OTHER:
 def fixture(d, built):
     """Keys 1-3: old refusals of lifted families; 4: a lifted family, .fail newer than this build; 5: an old compute refusal
     and 6: an old graphics refusal, other reasons."""
-    reasons = {1: LIFTED['cube'], 2: LIFTED['tg-size'], 3: LIFTED['dmask'], 4: LIFTED['rw-buffer'], 5: OTHER[0],
+    reasons = {1: LIFTED['cube'], 2: LIFTED['tg-size'], 3: LIFTED['dmask'], 4: LIFTED['f16-unary'], 5: OTHER[0],
                6: OTHER[1]}
     retried = d / G.RETRIED_NAME  # a fresh cache: no build retried anything in it yet
     if retried.exists():
