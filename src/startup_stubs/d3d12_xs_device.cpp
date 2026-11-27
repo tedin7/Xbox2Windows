@@ -8216,8 +8216,24 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // The raw plane sample is that plane's own surface, not the composited window picture.
         if (raw_surface) read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), raw_surface, static_cast<int>(raw_plane));
     }
+    static const bool caption_recent_fps = x2w_local::env_on("X2W_PRESENT_RECENT_FPS");
+    static ULONGLONG previous_caption_tick;
+    if (caption_recent_fps && frame % 30 == 0) {
+        // Measure each block even when the output window misses the caption frame.
+        if (shown_in_window) {
+            const ULONGLONG recent_ms = now - (frame == 30 ? started : previous_caption_tick);
+            const ULONGLONG run_ms = now - started;
+            const double recent_fps = (frame == 30 ? 29 : 30) * 1000.0 / (recent_ms ? recent_ms : 1);
+            const double run_fps = (frame - 1) * 1000.0 / (run_ms ? run_ms : 1);
+            wchar_t text[256];
+            swprintf(text, 256, L"Xbox2Windows %ls - frame %ld, %.1f fps (last 30), %.1f fps (run average), %ld translated draws (title bar is diagnostics, picture is game output)",
+                     x2w_build_rev_w, frame, recent_fps, run_fps, translated_draws);
+            SetWindowTextW(output_window(), text);
+        }
+        previous_caption_tick = now;
+    }
     if (shown_in_window) {
-        if (frame % 30 == 0) {
+        if (!caption_recent_fps && frame % 30 == 0) {
             // About 100 fixed characters, the revision (at most 46) and three numbers fit in 256.
             wchar_t text[256];
             swprintf(text, 256, L"Xbox2Windows %ls - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
