@@ -303,11 +303,11 @@ static bool stencil_census_check(ID3D12Device* device, const D3D12_HEAP_PROPERTI
     stencil.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
     stencil.Texture2D.PlaneSlice = 1;
     log_lines = 0;
-    // The typed remap retains the existing refusal and writes a null descriptor.
-    if (x2w_startup::x2w_create_srv(device, resource.Get(), &stencil, dest, "fixture-stencil", capture_format_log) ||
+    // A planar depth-stencil backing now creates the stencil SRV on plane 1 and logs the census line.
+    if (!x2w_startup::x2w_create_srv(device, resource.Get(), &stencil, dest, "fixture-stencil", capture_format_log) ||
         log_lines != 1 || std::strcmp(last_log,
             "x2w-d3d12 SRV census size=2560x1440x1 resource_format=45 view_format=47 "
-            "plane_requested=1 plane_used=-1 count=1")) return false;
+            "plane_requested=1 plane_used=1 count=1")) return false;
 
     // A typeless depth-stencil backing can carry a stencil SRV using plane 1.
     desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
