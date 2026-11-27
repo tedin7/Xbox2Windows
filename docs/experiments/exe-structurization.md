@@ -204,6 +204,14 @@ count. See the
 [slot 57 wave block](startup-mesh57-wave-block.md#group-uniform-values-and-guarded-exports)
 and [Partial Control-Flow Linearization, §3](https://doi.org/10.1145/3192366.3192413).
 
+The slot 57 fallback proves forward wave-load blocks with one guest-wave
+program counter. EXEC and VCC tests vote across 64 lanes. Scalar work ignores
+EXEC and uses wave-uniform inputs. Vector work uses each lane's EXEC bit.
+The export proof follows saved EXEC bits through narrowing, complements and
+restores. [RDNA 2 Instruction Set Architecture, pp. 20 and 125](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+[Partial Control-Flow Linearization, §3, pp. 543–556](https://doi.org/10.1145/3192366.3192413)
+[Convergence And Uniformity, Uniformity of Values and Instructions](https://llvm.org/docs/ConvergenceAndUniformity.html)
+
 ### Phase 3: `v_readfirstlane` and waterfalls
 
 Trace the per-lane source of a first-lane read through `v_cndmask_b32`, an if/else whose arms set
