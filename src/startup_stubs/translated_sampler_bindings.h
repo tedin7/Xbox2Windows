@@ -117,7 +117,8 @@ inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 
 // Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
-                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
+                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0,
+                                      bool input_assembler = false)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -138,7 +139,8 @@ inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT
     }
     const auto statics = decode_statics(samplers);
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, static_cast<UINT>(statics.size()), statics.data(),
-                                         D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                                         input_assembler ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                                                         : D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob;
     HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, nullptr);
     if (SUCCEEDED(hr)) hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(out));

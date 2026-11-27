@@ -9,6 +9,28 @@
 // TABL (descriptor table binds), PRES (present). tools read it with out/gamerun/capture.py.
 
 struct Translation;
+bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept;
+using FixedMeshBytes = std::shared_ptr<const std::vector<unsigned char>>;
+// GPU recordings can outlive guest Release. Share immutable inputs by content until the validated
+// request is durably published. The index holds no strong ownership of its own.
+FixedMeshBytes intern_fixed_mesh_bytes(std::vector<unsigned char> bytes)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_multimap<u64, std::weak_ptr<const std::vector<unsigned char>>> index;
+    u64 hash = 1469598103934665603ull;
+    for (auto byte : bytes) hash = (hash ^ byte) * 1099511628211ull;
+    x2w_startup::ExclusiveNoteLock guard(lock);
+    const auto range = index.equal_range(hash);
+    for (auto it = range.first; it != range.second;) {
+        if (auto existing = it->second.lock()) {
+            if (*existing == bytes) return existing;
+            ++it;
+        } else it = index.erase(it);
+    }
+    auto stage = std::make_shared<const std::vector<unsigned char>>(std::move(bytes));
+    index.emplace(hash, stage);
+    return stage;
+}
 struct PipelineInfo {
     Translation* stream_translation = nullptr;
     bool has_stream_blend = false;
@@ -22,6 +44,10 @@ struct PipelineInfo {
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
     std::vector<unsigned char> state_a, state_b;  // slot 57: the two state blocks, copied at creation (the title frees them)
+    mutable FixedMeshBytes fixed_ms, fixed_ps;
+    mutable std::vector<x2w::PixelHeapSpan> mesh57_pixel_spans;
+    mutable UINT mesh57_heap_word = UINT_MAX; // R32_UINT at guest root constant[heap_word] & 1023.
+    mutable std::vector<x2w_startup::Mesh57BufferRead> mesh57_reads; // Host SRV register order.
 };
 struct ViewRecord {
     std::uint32_t id, slot;          // slot: 17 CBV, 18 SRV, 19 UAV, 20 RTV, 21 DSV, 22 sampler
@@ -209,6 +235,25 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     info.base = as_wrapper(base);
     const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
     if (have) info.desc.assign(static_cast<const unsigned char*>(desc), static_cast<const unsigned char*>(desc) + have);
+    if (path == 57 && have >= 15 * sizeof(u64)) {
+        u64 words[15];
+        std::memcpy(words, info.desc.data(), sizeof(words));
+        const auto snapshot = [&](int field, FixedMeshBytes& stage) {
+            const auto bytes = words[field + 1];
+            if (!bytes) return !words[field];
+            const auto* data = reinterpret_cast<const void*>(words[field]);
+            if (bytes > (1u << 20) || !x2w_local::readable(data, bytes)) return false;
+            std::vector<unsigned char> copy(static_cast<size_t>(bytes));
+            if (!copy_title_bytes(copy.data(), data, copy.size())) return false;
+            stage = intern_fixed_mesh_bytes(std::move(copy));
+            return true;
+        };
+        if (!words[9] && !words[10] && words[14] &&
+            (!snapshot(5, info.fixed_ps) || !snapshot(13, info.fixed_ms))) {
+            info.fixed_ps.reset();
+            info.fixed_ms.reset();
+        }
+    }
     if (path == 57 && have >= 0x28) {
         u64 words[5];
         std::memcpy(words, desc, sizeof(words));

@@ -7,6 +7,7 @@
 #include "desktop_gpu.h"
 #include "xmem_section_lease.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/mesh57_profile.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -599,7 +600,7 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
+                     mesh_pixel_array, mesh_pixel_hole, mesh_wrong_heap_format, mesh_empty_heap_slot, mesh_outside_heap, mesh_short_table, mesh_bad_root_address, incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -748,13 +749,139 @@ void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT wo
                  converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
 }
 
+// Two table bases in a shader-visible guest heap and an independent guest root address.
+// Each source contributes different bits to the output color. The raw records keep byte bounds.
+static bool bind_fixed_mesh_buffers(ID3D12Device* device, ID3D12Device* guest, IUnknown* list, Refusal refusal,
+                                    const x2w_startup::Mesh57Profile& profile, int variant, ComPtr<ID3D12Resource>& heap_resource,
+                                    ComPtr<ID3D12DescriptorHeap>& heap, std::vector<ComPtr<ID3D12Resource>>& textures)
+{
+    using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+    using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+    using Root = void (WINAPI*)(IUnknown*, UINT, UINT64);
+    constexpr UINT bytes = 16384, bank = 4096;
+    alignas(64) static UINT table[bytes / 4];
+    std::fill_n(table, bytes / 4, 0u);
+    const UINT step = guest->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!step || bank % step) return false;
+    struct { D3D12_DESCRIPTOR_HEAP_DESC desc; UINT64 address, bytes; } desc{
+        {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, bytes / step, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+        reinterpret_cast<UINT64>(table),bytes};
+    using Handle = UINT64 (WINAPI*)(IUnknown*);
+    if (FAILED(guest->CreateDescriptorHeap(&desc.desc,IID_PPV_ARGS(&heap))) ||
+        slot<Handle>(heap.Get(),9)(heap.Get()) != desc.address) return false;
+    const auto gpu = slot<Handle>(heap.Get(),10)(heap.Get());
+    auto* native = heap.Get();
+    slot<Heaps>(list,32)(list,1,&native);
+    slot<Root>(list,36)(list,0,gpu);
+    slot<Root>(list,36)(list,1,gpu + bank);
+    const auto alloc = [&](unsigned value) {
+        auto* data = static_cast<UINT*>(slot<Allocate>(list,148)(list,16,256));
+        if (data) { std::fill_n(data,4,0u); data[1] = value; }
+        return reinterpret_cast<UINT64>(data);
+    };
+    const auto a = alloc(0x00400000), b = alloc(0x00200000), c = alloc(0x00100000), d = alloc(0x00080000);
+    if (!a || !b || !c || !d) return false;
+    const auto record = [&](UINT at, UINT64 address, UINT size) {
+        table[at/4] = static_cast<UINT>(address);
+        table[at/4+1] = static_cast<UINT>(address >> 32);
+        table[at/4+2] = size;
+        table[at/4+3] = 0x31016fac;
+    };
+    record(2848,a,16);
+    record(bank + 32,d,16);
+    record(bank + 96,b,refusal == Refusal::mesh_short_table ? 4 : 16);
+    const bool pixel_heap = !std::memcmp(profile.magic,"X2WM576",8);
+    if (pixel_heap || !std::memcmp(profile.magic,"X2WM575",8)) {
+        // Seed one actual desktop buffer. Distinct nonzero view bases and element 1 distinguish
+        // selecting the wrong slot, losing FirstElement, or fetching the first element.
+        heap_resource = make_gpu_table_buffer(guest,48);
+        auto buffer = native_object<ID3D12Resource>(device,guest,heap_resource.Get());
+        auto upload = make_buffer(device,48,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        D3D12_RANGE none{};
+        check(upload->Map(0,&none,&mapped),"map typed heap fixture input");
+        auto* values = static_cast<UINT*>(mapped);
+        std::fill_n(values,12,0u);
+        values[4] = 0x3e800000;
+        values[8] = 0x3f400000;
+        upload->Unmap(0,nullptr);
+        ComputeCommands seed(device,nullptr,D3D12_COMMAND_LIST_TYPE_DIRECT);
+        seed.list->CopyBufferRegion(buffer.Get(),0,upload.Get(),0,48);
+        seed.submit_and_wait(device);
+        using View = void (WINAPI*)(IUnknown*,IUnknown*,const D3D12_SHADER_RESOURCE_VIEW_DESC*,UINT64);
+        for (const UINT index : {147u,151u}) {
+            if (index == 147 && refusal == Refusal::mesh_empty_heap_slot) continue;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{index == 147 && refusal == Refusal::mesh_wrong_heap_format ?
+                DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_BUFFER,D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            view.Buffer.FirstElement = index == 147 && variant != 4 ? 3 : 7;
+            view.Buffer.NumElements = variant == 5 ? 1 : 2;
+            // Create on a guest API descriptor boundary, then copy its recorded bytes into
+            // the shader-native heap, whose independently indexed descriptors are 32 bytes.
+            const UINT scratch = index == 147 ? 0 : step;
+            slot<View>(guest,18)(guest,heap_resource.Get(),&view,desc.address + scratch);
+            std::memcpy(table + index * 8,reinterpret_cast<char*>(table) + scratch,32);
+        }
+    }
+    if (pixel_heap) {
+        using View = void (WINAPI*)(IUnknown*,IUnknown*,const D3D12_SHADER_RESOURCE_VIEW_DESC*,UINT64);
+        using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*,
+            UINT, const void*, void*, UINT, const void*, REFIID, void**);
+        for (UINT index=32; index<=36; ++index) {
+            if (index==34 && refusal==Refusal::mesh_pixel_hole) continue;
+            ComPtr<ID3D12Resource> wrapped;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_SRV_DIMENSION_TEXTURE2D,D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            view.Texture2D.MostDetailedMip=1;
+            view.Texture2D.MipLevels=1;
+            if (GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_WATERFALL",nullptr,0)) {
+                view.Texture2D.MostDetailedMip=0;
+                view.Texture2D.MipLevels=2;
+            }
+            if ((index==32 && variant!=5) || index==36) {
+                const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+                const D3D12_RESOURCE_DESC texture{D3D12_RESOURCE_DIMENSION_TEXTURE2D,0,2,2,1,2,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+                check(slot<Create>(guest,127)(guest,&props,0,&texture,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,
+                    0,nullptr,IID_PPV_ARGS(&wrapped)), "create material texture");
+                auto resource=native_object<ID3D12Resource>(device,guest,wrapped.Get());
+                D3D12_DESCRIPTOR_HEAP_DESC rtv{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2};
+                ComPtr<ID3D12DescriptorHeap> views;
+                check(device->CreateDescriptorHeap(&rtv,IID_PPV_ARGS(&views)), "create material RTVs");
+                auto handle=views->GetCPUDescriptorHandleForHeapStart();
+                ComputeCommands seed(device,nullptr,D3D12_COMMAND_LIST_TYPE_DIRECT);
+                transition(seed.list.Get(),resource.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+                for (UINT mip=0;mip<2;++mip) {
+                    const float color[]{float(mip && index==32),float(mip && index==36),float(!mip),1.f};
+                    D3D12_RENDER_TARGET_VIEW_DESC output{texture.Format,D3D12_RTV_DIMENSION_TEXTURE2D};
+                    output.Texture2D.MipSlice=mip;
+                    device->CreateRenderTargetView(resource.Get(),&output,handle);
+                    seed.list->ClearRenderTargetView(handle,color,0,nullptr);
+                    handle.ptr+=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                }
+                transition(seed.list.Get(),resource.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
+                seed.submit_and_wait(device);
+                textures.push_back(wrapped);
+            } else { view.Texture2D.MostDetailedMip=0; view.Texture2D.MipLevels=1; }
+            if (index==36 && refusal==Refusal::mesh_pixel_array) {
+                view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                view.Texture2DArray.ArraySize=1;
+            }
+            slot<View>(guest,18)(guest,wrapped.Get(),&view,desc.address+index*step);
+            std::memmove(table+index*8,reinterpret_cast<char*>(table)+index*step,32);
+        }
+    }
+    // A readable CPU address outside the GPU allocations must fail even when it holds the right word.
+    slot<Root>(list,44)(list,3,refusal == Refusal::mesh_bad_root_address ? desc.address : c);
+    return true;
+}
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
+         int fixed_mesh_pixels = 0, const x2w_startup::Mesh57Profile* fixed_profile = nullptr)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -803,7 +930,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     constexpr float clear[]{0, 0, 0, 1};
     D3D12_CLEAR_VALUE clear_value{target_format, {0, 0, 0, 1}};
     if (cached_depth_only) clear_value.DepthStencil = {1, 0};
-    const UINT target_count = cached_mesh_targets ? cached_mesh_targets : 1;
+    const UINT target_count = fixed_profile ? fixed_profile->targets.NumRenderTargets : cached_mesh_targets ? cached_mesh_targets : 1;
     std::vector<ComPtr<ID3D12Resource>> targets;
     const auto heap_kind = cached_depth_only ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{heap_kind, target_count,
@@ -822,7 +949,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         rtv = heap->GetCPUDescriptorHandleForHeapStart();
     }
     for (UINT i = 0; i < target_count; ++i) {
-        targets.push_back(resource(device, target_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &clear_value));
+        auto attachment = target_desc;
+        auto initial_color = clear_value;
+        if (fixed_profile) attachment.Format = initial_color.Format = fixed_profile->targets.RTFormats[i];
+        targets.push_back(resource(device, attachment, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &initial_color));
         if (cached_depth_only) {
             D3D12_DEPTH_STENCIL_VIEW_DESC depth_view{};
             depth_view.Format = target_format;
@@ -831,6 +961,24 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         } else guest->CreateRenderTargetView(targets.back().Get(), nullptr, rtv);
         rtvs.push_back(rtv);
         rtv.ptr += device->GetDescriptorHandleIncrementSize(heap_kind);
+    }
+    ComPtr<ID3D12Resource> fixed_depth;
+    ComPtr<ID3D12DescriptorHeap> fixed_depth_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE fixed_dsv{}, desktop_fixed_dsv{};
+    if (fixed_profile && fixed_profile->depth_format != DXGI_FORMAT_UNKNOWN) {
+        auto desc = target_desc;
+        desc.Format = fixed_profile->depth_format;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE initial_depth{};
+        initial_depth.Format = desc.Format;
+        initial_depth.DepthStencil = {0.25f, 3};
+        fixed_depth = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &initial_depth);
+        const D3D12_DESCRIPTOR_HEAP_DESC descriptors{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+        check(guest->CreateDescriptorHeap(&descriptors,IID_PPV_ARGS(&fixed_depth_heap)), "create fixture DSV heap");
+        using GetCpu = UINT64(WINAPI*)(IUnknown*, void*);
+        fixed_dsv.ptr = slot<GetCpu>(fixed_depth_heap.Get(),9)(fixed_depth_heap.Get(),nullptr);
+        desktop_fixed_dsv = native_object<ID3D12DescriptorHeap>(device,guest,fixed_depth_heap.Get())->GetCPUDescriptorHandleForHeapStart();
+        guest->CreateDepthStencilView(fixed_depth.Get(), nullptr, fixed_dsv);
     }
 
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -925,7 +1073,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Scissor = void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*);
     using Index = void (WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
-    const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
+    const bool material_waterfall = fixed_profile &&
+        GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_WATERFALL",nullptr,0)!=0;
+    // NDC vertices (0,0), (1,0), (0,1) map to (0,2), (8,2), (0,-6).
+    // All eight target pixel centers lie strictly inside the triangle.
+    const D3D12_VIEWPORT viewport = material_waterfall ? D3D12_VIEWPORT{-8,-6,16,16,0,1} :
+        D3D12_VIEWPORT{0,0,width,height,0,1};
     const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
     if (cached_depth_only) {
         slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
@@ -947,13 +1100,31 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         }
         for (const auto target_view : rtvs) slot<Clear>(wrapped, 52)(wrapped, target_view.ptr, clear, 0, nullptr);
         const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
-        slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
+        slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, fixed_depth ? &fixed_dsv : nullptr);
+        if (fixed_depth) {
+            list->ClearDepthStencilView(desktop_fixed_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.25f, 3, 0, nullptr);
+            using StencilRef = void(WINAPI*)(IUnknown*,UINT);
+            slot<StencilRef>(wrapped,24)(wrapped,7);
+        }
     }
+    std::vector<ComPtr<ID3D12Resource>> fixed_textures;
+    ComPtr<ID3D12Resource> fixed_heap_resource;
+    ComPtr<ID3D12DescriptorHeap> fixed_source_heap;
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
     if (leased) {
         using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
         slot<RootSrv>(wrapped, 44)(wrapped, 0, leased->address);
+    } else if (fixed_profile && (!std::memcmp(fixed_profile->magic, "X2WM573", 8) || !std::memcmp(fixed_profile->magic, "X2WM574", 8) ||
+                                 !std::memcmp(fixed_profile->magic, "X2WM575", 8) || !std::memcmp(fixed_profile->magic, "X2WM576", 8))) {
+        // Guest root4 is b5/space2. DXIL expects the first word of host b0/space0.
+        using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+        const bool heap = !std::memcmp(fixed_profile->magic, "X2WM575", 8) || !std::memcmp(fixed_profile->magic, "X2WM576", 8);
+        const bool buffers = heap || !std::memcmp(fixed_profile->magic, "X2WM574", 8);
+        if (buffers && !bind_fixed_mesh_buffers(device, guest, wrapped, refusal, *fixed_profile, fixed_mesh_pixels, fixed_heap_resource, fixed_source_heap, fixed_textures)) return false;
+        const UINT value = heap ? 0x3e000000u + (refusal == Refusal::mesh_outside_heap ? 490u : fixed_mesh_pixels == 3 ? 151u : 147u) : buffers ? 0x3e000000 : fixed_mesh_pixels == 3 ? 0x3f400000 : 0x3e800000; // 0.75 or 0.25 in PARAM12.y / green
+        if (refusal != Refusal::incomplete_mesh_constants)
+            slot<Constants>(wrapped, 40)(wrapped, 4, 1, &value, 0);
     } else if (cached_mesh_targets || cached_depth_only) {
         using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
         const UINT values[]{17, 29};
@@ -1075,6 +1246,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
                                external_arguments ? leased->argument_offset : offset, nullptr, 0);
+    // Slot 61 has already frozen the desktop heap and retained its backing. Release the guest
+    // resource before closing/submitting the list, including for the positive readbacks.
+    fixed_source_heap.Reset();
+    fixed_heap_resource.Reset();
     if (restore_compute) {
         // Leave the previously forwarded root + SRV alone. Only install the
         // consumer PSO and the output UAV that this fixture owns.
@@ -1180,8 +1355,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 bytes = 0;
-    device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
     for (const auto& target : targets) {
+        const auto desc = target->GetDesc();
+        device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
         const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         ComputeCommands copy(device, kept_direct_queue(device), nullptr);
         transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1205,10 +1381,38 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 const bool covered = (cached_depth_only && !cached_depth_pixel) ||
                     (indexed ? right_half == draw_right : translated || !right_half || draw_right);
                 const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
-                const std::uint32_t background = cached_depth_only ? 0xffff : black;
+                const std::uint32_t background = cached_depth_only ? 0xffff : desc.Format == DXGI_FORMAT_R16G16_FLOAT ? 0 : black;
                 const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
                 auto wanted = drawn ? (cached_depth_only ? depth_word :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (fixed_mesh_pixels) {
+                    const bool white = (fixed_mesh_pixels == 1 || fixed_mesh_pixels >= 3) && target.Get() == targets.front().Get() && x == 2 && y == 0;
+                    if (target.Get() == targets.front().Get() && x == 2 && y == 0)
+                        std::printf("%s: target zero (2,0) packed RGBA = 0x%08x\n", label, actual);
+                    wanted = background;
+                    if (white) {
+                        const auto mask = fixed_profile->blend.RenderTarget[0].RenderTargetWriteMask;
+                        const bool linked = !std::memcmp(fixed_profile->magic, "X2WM572", 8);
+                        const bool heap = !std::memcmp(fixed_profile->magic, "X2WM575", 8) || !std::memcmp(fixed_profile->magic, "X2WM576", 8);
+                        if (heap) wanted = 0; // This fixture writes all four channels, including alpha.
+                        for (UINT channel=0; channel<4; ++channel)
+                            if ((mask & (1u<<channel)) && !(linked && channel == 1))
+                                wanted |= (heap ? (channel == 1 ? 62u : fixed_mesh_pixels == 5 ? 0u : fixed_mesh_pixels >= 3 ? 191u : 64u) :
+                                           channel == 1 && !std::memcmp(fixed_profile->magic, "X2WM574", 8) ? 62u :
+                                           channel == 1 && !std::memcmp(fixed_profile->magic, "X2WM573", 8) ?
+                                           (fixed_mesh_pixels == 3 ? 0xbfu : 0x40u) : 0xffu) << (8*channel);
+                        if (!std::memcmp(fixed_profile->magic,"X2WM576",8))
+                            wanted = fixed_mesh_pixels==5 ? 0 : fixed_mesh_pixels==3 ? 0xff00ff00u : 0xff0000ffu;
+                    }
+                    if (material_waterfall && target.Get()==targets.front().Get() && fixed_mesh_pixels!=2) {
+                        // floor(SV_Position.x) selects slot 32 on even pixels
+                        // and 36 on odd ones. Variant 5 binds typed null at 32.
+                        const bool fine=GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_FINE_LOD",nullptr,0)!=0;
+                        wanted=!(x&1) && fixed_mesh_pixels==5 ? 0u :
+                            fine ? 0xffff0000u : (x&1) ? 0xff00ff00u : 0xff0000ffu;
+                        if (!y) std::printf("waterfall x=%u RGBA=%08x\n",x,actual);
+                    }
+                }
                 if (leased) wanted = right_half ? leased->expected_right.value_or(leased->expected) : leased->expected;
                 if (rect) {
                     // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
@@ -1229,6 +1433,43 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
             return false;
         }
+    }
+    if (fixed_depth) {
+        const auto desc = fixed_depth->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT planes[2]{};
+        UINT64 row_sizes[2]{};
+        device->GetCopyableFootprints(&desc, 0, 2, 0, planes, nullptr, row_sizes, &bytes);
+        const auto rb = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComputeCommands copy(device, kept_direct_queue(device), nullptr);
+        transition(copy.list.Get(), fixed_depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (UINT plane=0; plane<2; ++plane) {
+            D3D12_TEXTURE_COPY_LOCATION src{fixed_depth.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,{}};
+            src.SubresourceIndex=plane;
+            D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(),D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{}};
+            dst.PlacedFootprint=planes[plane];
+            copy.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        }
+        copy.submit_and_wait(device);
+        const D3D12_RANGE range{0,static_cast<SIZE_T>(bytes)};
+        check(rb->Map(0,&range,&memory),"map depth/stencil planes");
+        bool match=true;
+        for (UINT y=0;y<height;++y) for (UINT x=0;x<width;++x) {
+            const auto texel=[&](UINT plane) {
+                return static_cast<const unsigned char*>(memory)+planes[plane].Offset+
+                    y*planes[plane].Footprint.RowPitch+x*row_sizes[plane]/width;
+            };
+            float z; std::memcpy(&z,texel(0),sizeof(z));
+            const auto stencil=*texel(1);
+            const bool hit=fixed_mesh_pixels==1 && x==2 && y==0;
+            if (z!=(hit?0.5f:0.25f) || stencil!=(hit?7:3)) {
+                std::fprintf(stderr,"%s: depth/stencil (%u,%u) got %.3f/%u, row sizes %llu/%llu\n",label,x,y,z,stencil,row_sizes[0],row_sizes[1]);
+                match=false;
+            }
+        }
+        rb->Unmap(0,&untouched);
+        if (!match) return false;
+        std::printf("%s: 8 depth/stencil texels matched, selected pixel %.2f/%u\n",
+            label,fixed_mesh_pixels==1?0.5:0.25,fixed_mesh_pixels==1?7:3);
     }
     return true;
 }
@@ -1718,6 +1959,297 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
 #include "startup_indirect_mesh_lease.inl"
 }  // namespace
 
+static int native_fixed_mesh_fixture(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer)
+{
+    const bool mrt = GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_MRT", nullptr, 0) != 0;
+    const bool waterfall=GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_WATERFALL",nullptr,0)!=0;
+    const bool pixel_heap=waterfall || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_PIXEL_HEAP",nullptr,0)!=0;
+    const bool heap = pixel_heap || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_UINT_HEAP",nullptr,0) != 0;
+    const bool buffers = heap || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_BUFFERS", nullptr, 0) != 0;
+    const bool constants = buffers || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_CONSTANT", nullptr, 0) != 0;
+    const bool varying = constants || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_VARYING", nullptr, 0) != 0;
+    // Windows recycles process IDs. Retain failed runs for inspection without reading an old archive.
+    const auto prefix = "mesh57-native-" + std::to_string(GetCurrentProcessId()) + "-";
+    std::filesystem::path cache;
+    for (unsigned attempt = 0; ; ++attempt) {
+        cache = std::filesystem::current_path() / (prefix + std::to_string(attempt));
+        if (std::filesystem::create_directory(cache)) break;
+    }
+    check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "native mesh cache");
+    ComPtr<ID3DBlob> blob;
+    D3D12_ROOT_SIGNATURE_DESC empty{};
+    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    if (constants) {
+        for (UINT i = 0; i < 5; ++i) {
+            params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            params[i].Constants = {i + 1, 2, 1};
+        }
+        if (buffers) {
+            for (UINT i = 0; i < 2; ++i) {
+                ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 128, 0, i, 0};
+                params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                params[i].DescriptorTable = {1, &ranges[i]};
+            }
+            params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            params[3].Descriptor = {0, 3};
+        }
+        if (pixel_heap) params[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+        empty.NumParameters = 5;
+        empty.pParameters = params;
+        empty.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    }
+    const auto root = create_root(guest, empty, &blob);
+    // Guest ALU derives positions (0,0), (1,0), (0,1) from lane indices and exports triangle 0,1,2.
+    std::vector<UINT> ms{0xbefc03ff, 0x1003,     0xbf900009, 0xd7650000, 0x100c1,    0x36020081,
+                    0x2c040081, 0x7e020d01, 0x7e040d02, 0x7e0602f0, 0x7e0802f2, 0xf80008cf,
+                    0x04030201, 0x7e0a02ff, 0x200400,   0xf8000941, 0x80808005, 0xbf810000};
+    std::vector<UINT> ps{0x7e0002f2, 0xf800180f, 0, 0xbf810000};
+    if (varying) {
+        // Export PARAM12.xy = (1,0). The PS reads p0.x and p0.y back as (x,y,x,x).
+        ms.insert(ms.end()-1, {constants ? 0x7e0c020cu : 0x7e0c0280u, 0xf80002c3, heap ? 0x0000060au : 0x00000604u});
+        ps = {0xc8023002, 0xc8063102, 0xf800180f, 0x00000100, 0xbf810000};
+    }
+    if (buffers) {
+        // s_load_dwordx4 table0+2848 and table1+32/+96; s_buffer_load_dword at +4 of each SRV.
+        // Read root3+4 through its synthesized byte descriptor. Combine their disjoint bits with root4 in s12.
+        ms.insert(ms.begin(), {0xbe910380, 0xbe930380, 0xf4080608, 0xfa000b20, 0xf4080709, 0xfa000060,
+                               0xf420080c, 0xfa000004, 0xf420084e, 0xfa000004, 0xbe960390, 0xbe9703ff, 0x31016fac, 0xf420088a, 0xfa000004,
+                               0xf4080a09, 0xfa000020, 0xf42008d4, 0xfa000004,
+                               0x880c200c, 0x880c210c, 0x880c220c, 0x880c230c});
+    }
+    if (heap) {
+        // Guest slot = root4[0] & 1023. Read typed element 1 into v10.
+        ms.insert(ms.begin(), {0xbe9e032f,0xbe9f0380,0x872dff0c,1023,0x8f2d852d,
+                               0xf408080f,0x5a000000,0x7e020281,0xe0002000,0x80080a01});
+    }
+    if (pixel_heap) {
+        // ((root4 & 4) << 5) + 1024 selects slot 32 or 36. Both views begin at mip 1.
+        ps={0xbe8f0380,0x8712840d,0x8f128512,0xf40c0507,0x24000400,
+            0xbe9c0380,0xbe9d03ff,0x00fff000,0xbe9e03ff,0x04000000,0xbe9f0380,
+            0x7e0002f0,0x7e0202f0,0xf09c0f08,0x00e50000,0xf800180f,0x03020100,0xbf810000};
+    }
+    if (waterfall) {
+        // slot = 32 | ((uint(SV_Position.x) & 1) << 2). Each iteration
+        // samples exactly the lanes with the first active lane's slot.
+        // Preserve the incoming float position before converting v0 to a slot
+        // selector. A unit texcoord gradient on a 2x2 view selects mip 1;
+        // constant coordinates select the blue mip 0 with the same sampler.
+        const bool fine=GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_FINE_LOD",nullptr,0)!=0;
+        ps={fine ? 0x7e0a02f0u : 0x7e0a0300u,0xbe8f0380,0x7e000f00,0x362e0081,0x342e2e82,0x382e2ea0,
+            0x7e0c02f0,0xbe9c0380,0xbe9d03ff,0x00fff000,0xbe9e03ff,0x04000000,0xbe9f0380,
+            0xbebc047e,0xbeb4047e,
+            0x7e240517,0x7d242e12,0x8f128512,0xf40c0507,0x24000000,
+            0xf0800f08,0x00e50005,0xbeb43a34,0xbf85fff7,0xbefe043c,
+            0xf800180f,0x03020100,0xbf810000};
+    }
+    const auto ms_size = ms.size()*sizeof(UINT), ps_size = ps.size()*sizeof(UINT);
+    const std::array<UINT, 2> expected_a{0x12345678, 0x9abcdef0};
+    const bool masked = GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_MASK", nullptr, 0) != 0;
+    const std::array<UINT, 1> expected_b{masked ? 0x55aa5501u : 0x55aa55aau};
+    auto state_a = expected_a;
+    auto state_b = expected_b;
+    UINT64 fields[0x300 / sizeof(UINT64)]{};
+    fields[2] = sizeof(state_a);
+    fields[4] = sizeof(state_b);
+    fields[6] = ps_size;
+    fields[14] = ms_size;
+    const auto fold = [](UINT64 key, const void* data, size_t n) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < n; ++i)
+            key = (key ^ p[i]) * 1099511628211ull;
+        return key;
+    };
+    const char revision[] = "x2w-startup-mesh-57-3";
+    auto key = fold(1469598103934665603ull, revision, sizeof(revision) - 1);
+    const auto extend = [&](UINT64 base, const void* data, UINT64 n) { return fold(fold(base, &n, sizeof(n)), data, n); };
+    const auto part = [&](const void* data, UINT64 n) { key = extend(key,data,n); };
+    part(ms.data(), ms_size);
+    part(ps.data(), ps_size);
+    part(blob->GetBufferPointer(), blob->GetBufferSize());
+    char name[64];
+    const auto variant = [&] {
+        return extend(extend(extend(key,fields,sizeof(fields)),state_a.data(),sizeof(state_a)),state_b.data(),sizeof(state_b));
+    };
+    std::snprintf(name, sizeof(name), "%016llx.mesh57-state", variant());
+    x2w_startup::Mesh57Profile profile{};
+    std::memcpy(profile.magic, pixel_heap ? "X2WM576" : heap ? "X2WM575" : buffers ? "X2WM574" : constants ? "X2WM573" : varying ? "X2WM572" : "X2WM571", 8);
+    profile.lengths[0] = sizeof(fields);
+    profile.lengths[3] = static_cast<UINT>(blob->GetBufferSize());
+    profile.lengths[1] = sizeof(state_a);
+    profile.lengths[2] = sizeof(state_b);
+    profile.lengths[4] = static_cast<UINT>(ms_size);
+    profile.lengths[5] = static_cast<UINT>(ps_size);
+    profile.threads = 64;
+    profile.vertices = 3;
+    profile.primitives = 1;
+    profile.topology = 2;
+    profile.group_stride = 64;
+    profile.wave_size = 64;
+    profile.targets.NumRenderTargets = 1;
+    profile.targets.RTFormats[0] = format;
+    profile.samples.Count = 1;
+    profile.sample_mask = UINT_MAX;
+    profile.rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+    profile.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+    profile.rasterizer.DepthClipEnable = TRUE;
+    auto& blend = profile.blend.RenderTarget[0];
+    blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    profile.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    if (mrt) {
+        const DXGI_FORMAT formats[]{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, format, format, format, DXGI_FORMAT_R16G16_FLOAT, format};
+        profile.targets.NumRenderTargets = static_cast<UINT>(std::size(formats));
+        std::copy(std::begin(formats), std::end(formats), profile.targets.RTFormats);
+        profile.blend.IndependentBlendEnable = TRUE;
+        for (UINT i=1; i<profile.targets.NumRenderTargets; ++i) profile.blend.RenderTarget[i]=blend;
+        profile.blend.RenderTarget[4].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+        if (masked) profile.blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        profile.rasterizer.CullMode = D3D12_CULL_MODE_BACK;
+        profile.rasterizer.FrontCounterClockwise = TRUE;
+        profile.depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        profile.depth.DepthEnable = TRUE;
+        profile.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        profile.depth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        profile.depth.StencilEnable = TRUE;
+        profile.depth.StencilReadMask = profile.depth.StencilWriteMask = 0xff;
+        profile.depth.FrontFace = profile.depth.BackFace = {
+            D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+    }
+    {
+        std::ofstream out(cache / name, std::ios::binary);
+        const auto put = [&](const void* data, size_t n) { out.write(static_cast<const char*>(data), n); };
+        put(&profile, sizeof(profile));
+        if (varying) {
+            const UINT position_x = waterfall ? 1u<<8 : 0;
+            const x2w_startup::Mesh57PixelEntry entry{position_x,position_x,64};
+            put(&entry,sizeof(entry));
+            if (constants) {
+                const x2w_startup::Mesh57ConstantEntry mapping{12,4,1};
+                put(&mapping,sizeof(mapping));
+                if (buffers) {
+                    const UINT count = 3;
+                    const x2w_startup::Mesh57ViewEntry inputs[]{{16,0,0},{18,1,0},{20,3,1}};
+                    put(&count,sizeof(count));
+                    put(inputs,sizeof(inputs));
+                    if (heap) { const UINT sgpr = 47; put(&sgpr,sizeof(sgpr)); }
+                }
+            }
+        }
+        put(fields, sizeof(fields));
+        put(state_a.data(), sizeof(state_a));
+        put(state_b.data(), sizeof(state_b));
+        put(blob->GetBufferPointer(), blob->GetBufferSize());
+        put(ms.data(), ms_size);
+        put(ps.data(), ps_size);
+        if (!out)
+            return 1;
+    }
+    fields[15]=1;
+    char other_name[64];
+    std::snprintf(other_name,sizeof(other_name),"%016llx.mesh57-state",variant());
+    std::filesystem::copy_file(cache/name,cache/other_name,std::filesystem::copy_options::overwrite_existing);
+    fields[15]=0;
+    fields[0] = reinterpret_cast<UINT64>(root.Get());
+    fields[1] = reinterpret_cast<UINT64>(state_a.data());
+    fields[3] = reinterpret_cast<UINT64>(state_b.data());
+    fields[5] = reinterpret_cast<UINT64>(ps.data());
+    fields[13] = reinterpret_cast<UINT64>(ms.data());
+    const auto create = [&] {
+        ComPtr<IUnknown> pso;
+        using Create = HRESULT(WINAPI*)(IUnknown*, const void*, REFIID, void**);
+        check(slot<Create>(guest, 57)(guest, fields, __uuidof(ID3D12PipelineState),
+                                      reinterpret_cast<void**>(pso.GetAddressOf())),
+              "create native fixed mesh");
+        return pso;
+    };
+    const auto pso = create();
+    fields[15] = 1; // Same stages and root, unreviewed fixed pipeline state.
+    const auto mismatched = create();
+    state_a.fill(0);
+    state_b.fill(0);
+    check(SetEnvironmentVariableA("X2W_MESH57_CAPTURE_STATE", "1") ? S_OK : E_FAIL, "enable fixed-state archive");
+    D3D12_INDIRECT_ARGUMENT_DESC arg{};
+    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &arg, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    check(guest->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "mesh signature");
+    const auto work = writer_pipeline(device, writer, "write_one_mesh_group");
+    const bool ok = run(device, guest, writer, work.Get(), root.Get(), pso.Get(), signature.Get(), DrawKind::mesh, false,
+                        Refusal::none, "native fixed mesh triangle", nullptr, false, nullptr, false, false, 0, false, false,
+                        nullptr, nullptr, false, 1, &profile) &&
+                    run(device, guest, writer, work.Get(), root.Get(), mismatched.Get(), signature.Get(), DrawKind::mesh,
+                        false, Refusal::none, "unreviewed fixed mesh state", nullptr, false, nullptr, false, false, 0, false,
+                        false, nullptr, nullptr, false, 2, &profile);
+    if (ok && mrt && !run(device, guest, writer, work.Get(), root.Get(), pso.Get(), signature.Get(), DrawKind::mesh,
+        false, Refusal::mesh_attachment_count, "native fixed mesh missing color attachment", nullptr, false, nullptr, false,
+        false, 0, false, false, nullptr, nullptr, false, 2, &profile)) return 1;
+    if (ok && constants && (!buffers || heap) && !run(device, guest, writer, work.Get(), root.Get(), pso.Get(), signature.Get(), DrawKind::mesh,
+        false, Refusal::none, "native fixed mesh changed root4", nullptr, false, nullptr, false,
+        false, 0, false, false, nullptr, nullptr, false, 3, &profile)) return 1;
+    if (ok && pixel_heap && !run(device,guest,writer,work.Get(),root.Get(),pso.Get(),signature.Get(),DrawKind::mesh,false,
+        Refusal::mesh_pixel_hole,"PS bounded range has an unregistered slot",nullptr,false,nullptr,false,false,0,false,false,
+        nullptr,nullptr,false,2,&profile)) return 1;
+    if (ok && pixel_heap && !run(device,guest,writer,work.Get(),root.Get(),pso.Get(),signature.Get(),DrawKind::mesh,false,
+        Refusal::mesh_pixel_array,"PS Texture2DArray supplied to Texture2D",nullptr,false,nullptr,false,false,0,false,false,
+        nullptr,nullptr,false,2,&profile)) return 1;
+    if (ok && heap) {
+        for (int variant : {4,5}) {
+            if (!run(device,guest,writer,work.Get(),root.Get(),pso.Get(),signature.Get(),DrawKind::mesh,false,Refusal::none,
+                     variant == 4 ? "heap slot 147 replaced view" : pixel_heap ? "PS explicit typed null" : "heap element beyond view",nullptr,false,nullptr,false,
+                     false,0,false,false,nullptr,nullptr,false,variant,&profile)) return 1;
+        }
+        for (auto failure : {Refusal::mesh_wrong_heap_format,Refusal::mesh_empty_heap_slot,Refusal::mesh_outside_heap}) {
+            const char* label = failure == Refusal::mesh_wrong_heap_format ? "heap R32_FLOAT" :
+                                failure == Refusal::mesh_empty_heap_slot ? "heap empty slot" : "heap index out of range";
+            if (!run(device,guest,writer,work.Get(),root.Get(),pso.Get(),signature.Get(),DrawKind::mesh,false,failure,
+                     label,nullptr,false,nullptr,false,false,0,false,false,nullptr,nullptr,false,2,&profile)) return 1;
+        }
+    }
+    if (ok && buffers) {
+        for (auto failure : {Refusal::mesh_short_table, Refusal::mesh_bad_root_address})
+            if (!run(device, guest, writer, work.Get(), root.Get(), pso.Get(), signature.Get(), DrawKind::mesh, false, failure,
+                     failure == Refusal::mesh_short_table ? "short table1 SRV" : "unbacked root3 address", nullptr, false,
+                     nullptr, false, false, 0, false, false, nullptr, nullptr, false, 2, &profile)) return 1;
+    }
+    if (ok && constants && !run(device, guest, writer, work.Get(), root.Get(), pso.Get(), signature.Get(), DrawKind::mesh,
+        false, Refusal::incomplete_mesh_constants, "native fixed mesh missing root4", nullptr, false, nullptr, false,
+        false, 0, false, false, nullptr, nullptr, false, 2, &profile)) return 1;
+    if (!ok)
+        return 1;
+    for (const auto i : {0, 1, 3, 5, 13})
+        fields[i] = 0;
+    const UINT sizes[]{sizeof(fields), sizeof(expected_a), sizeof(expected_b)};
+    std::vector<char> expected;
+    const auto append = [&](const void* p, size_t n) {
+        const auto bytes = static_cast<const char*>(p);
+        expected.insert(expected.end(), bytes, bytes + n);
+    };
+    append(&key, sizeof(key));
+    append(sizes, sizeof(sizes));
+    append(fields, sizeof(fields));
+    append(expected_a.data(), sizeof(expected_a));
+    append(expected_b.data(), sizeof(expected_b));
+    auto valid = expected;
+    std::fill_n(valid.begin() + sizeof(key) + sizeof(sizes) + 15 * sizeof(UINT64), sizeof(UINT64), 0);
+    bool saw_valid = false, saw_other = false;
+    for (const auto& f : std::filesystem::directory_iterator(cache))
+        if (f.path().extension() == ".s57") {
+            std::ifstream in(f.path(), std::ios::binary);
+            const std::vector<char> persisted(std::istreambuf_iterator<char>(in), {});
+            if (persisted == valid && !saw_valid) saw_valid = true;
+            else if (persisted == expected && !saw_other) saw_other = true;
+            else return 1;
+        }
+    std::printf("fixed mesh state archives matching creation bytes: accepted=%d refused=%d\n", saw_valid, saw_other);
+    if (!saw_valid || !saw_other) return 1;
+    std::filesystem::remove_all(cache);
+    return 0;
+}
+
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
@@ -1842,6 +2374,8 @@ int main(int argc, char** argv) try
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
+    if (mesh && GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57", nullptr, 0))
+        return native_fixed_mesh_fixture(device.Get(), guest.Get(), writer.Get());
     wchar_t mesh86_dir[MAX_PATH]{};
     if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
         const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
@@ -2056,18 +2590,24 @@ int main(int argc, char** argv) try
         const auto ms_size = exchange_size ? source_ms.size() : sizeof(default_ms);
         const auto ps_size = exchange_size ? source_ps.size() : sizeof(default_ps);
         const auto make_pso = [&](bool with_pixel, bool with_vertex, bool incomplete_pixel) {
+            const auto* ms_begin = static_cast<const unsigned char*>(ms);
+            const auto* ps_begin = static_cast<const unsigned char*>(ps);
+            std::vector<unsigned char> caller_ms(ms_begin, ms_begin + ms_size);
+            std::vector<unsigned char> caller_ps(ps_begin, ps_begin + ps_size);
             std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
             fields[0] = reinterpret_cast<UINT64>(root.Get());
-            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[5] = with_pixel ? reinterpret_cast<UINT64>(caller_ps.data()) : 0;
             fields[6] = with_pixel && !incomplete_pixel ? ps_size : 0;
             fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps) : 0;
             fields[10] = with_vertex ? ps_size : 0;
-            fields[13] = reinterpret_cast<UINT64>(ms);
+            fields[13] = reinterpret_cast<UINT64>(caller_ms.data());
             fields[14] = ms_size;
             using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
             ComPtr<IUnknown> pso;
             check(slot<Create>(guest.Get(), 57)(guest.Get(), fields.data(), __uuidof(ID3D12PipelineState),
                 reinterpret_cast<void**>(pso.GetAddressOf())), "create fixed mesh placeholder");
+            std::fill(caller_ms.begin(), caller_ms.end(), 0xcc);
+            std::fill(caller_ps.begin(), caller_ps.end(), 0xcc);
             return pso;
         };
         D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{};

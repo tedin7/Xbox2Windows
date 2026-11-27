@@ -26,6 +26,7 @@ available.
 """
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,7 +47,41 @@ def mismatch(got, expected, result):
         wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
 
 
+def scalar_window_case(consumer, dxc_dir, adapter):
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        _, env = prepare_case(directory, adapter)
+        env.update(X2W_NATIVE_SHADERS=dxc_dir, X2W_NATIVE_SHADERS_ONLY='1')
+        program = directory / 'program'
+        words = program.read_bytes()
+        op = {instruction: offset for offset, _, instruction, _ in G.decode(words)}
+        # Keep case A's output address calculation. Read the scalar pair at +36
+        # through the three-record input at table byte 64, then store s10.
+        load_descriptors = bytes.fromhex('050308f4400000fa 050408f4200000fa')
+        read_scalar = bytes.fromhex('860224f4240000fa 7fc08cbf 0a020a7e')
+        wait = next(row[0] for row in G.decode(words) if row[2] == 's_waitcnt')
+        program.write_bytes(words[:op['s_load_dwordx8']] + load_descriptors +
+                            words[wait:op['buffer_load_dword']] + read_scalar + words[op['buffer_store_dword']:])
+        source = directory / 'input'
+        env['X2W_TEST_DISPATCH_IN'] = str(source)
+        for value in (1024, 0x45678):
+            data = [0x11000000 + i for i in range(C.WORDS)]
+            data[9] = value
+            source.write_bytes(struct.pack(f'<{C.WORDS}I', *data))
+            expected = [value] * 288 + [C.SENTINEL] * 32
+            got, result = dispatch(directory, consumer, env, 'dispatch-scalar-window')
+            if lines(result, NO_WAVES):
+                assert got == [C.SENTINEL] * C.WORDS
+                return
+            assert not mismatch(got, expected, result), mismatch(got, expected, result)
+            assert lines(result, 'translated natively'), result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, env, 'dispatch-scalar-window-short')
+        assert got == [C.SENTINEL] * C.WORDS, result.stderr[-3000:]
+        assert lines(result, 'refused: an input is in title memory outside any placed buffer'), result.stderr[-3000:]
+
+
 def main(consumer, dxc_dir, adapter):
+    scalar_window_case(consumer, dxc_dir, adapter)
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare_case(directory, adapter)

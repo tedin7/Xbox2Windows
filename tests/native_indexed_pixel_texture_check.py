@@ -22,8 +22,13 @@ def texture_program(original, mask, opposite, base_offset=32):
 
     # Explicit words of the fixture's point sampler (2 bits set at bit 54).
     sampler = [0xbeac0380, 0xbead03ff, 0x00c00000, 0xbeae0380, 0xbeaf0380]
-    # Define untouched halves of the fixture's packed export VGPRs.
-    initial = [0x7e000280 | (dst << 17) for dst in (47, 80, 81)]
+    # Interleave a different destination between the two writes defining v80.
+    # Only v47 and v81 need initial upper halves for their partial exports.
+    initial = [0x7e000280 | (dst << 17) for dst in (47, 81)]
+    lo = source.index(0xcc214000 | 80)
+    high, other_low = source[lo+2:lo+4], source[lo+4:lo+6]
+    assert high[0] == 0xcc224000 | 80 and other_low[0] == 0xcc214000 | 81
+    source[lo+2:lo+6] = other_low + high
 
     def and_mask(dst, src):
         return 0x87000000 | (dst << 16) | ((128 + mask) << 8) | src

@@ -426,6 +426,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
     void* vertex_resource = nullptr;
+    void* copied_vertex_memory = nullptr;
     if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
@@ -554,15 +555,37 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         corners(positions + 3, {-0.75f, 0.5f, -0.25f, -0.5f});
         corners(texcoords + 9, {-0.25f, -0.5f, 0.0f, -1.0f});
         corners(positions + 9, {-1.0f, 1.0f, -0.75f, -1.0f});
+        // Keep the interpolated fixed-stream color at the center of an RGBA8 quantization bin.
+        if (GetEnvironmentVariableW(L"X2W_TEST_FIXED_COLOR", nullptr, 0))
+            for (auto& vertex : texcoords) vertex[2] = 64.0f / 255.0f;
         static const std::uint16_t indices[6] = {4, 5, 6, 7, 8, 9};
-        const D3D12_VERTEX_BUFFER_VIEW views[2] = {
+        D3D12_VERTEX_BUFFER_VIEW views[2] = {
             {reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(texcoords), sizeof(texcoords), sizeof(texcoords[0])},
             {reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(positions), sizeof(positions), sizeof(positions[0])}};
         const D3D12_INDEX_BUFFER_VIEW index_view{reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(indices), sizeof(indices), DXGI_FORMAT_R16_UINT};
+        const bool fixed_rect = GetEnvironmentVariableW(L"X2W_TEST_FIXED_RECT", nullptr, 0) != 0;
+        if (fixed_rect) {
+            // A byte offset of four prevents an existing-heap alias. The CPU vertices
+            // are written after placement, so reading its separate desktop buffer fails.
+            copied_vertex_memory = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!copied_vertex_memory) return 73;
+            auto* data = static_cast<unsigned char*>(copied_vertex_memory) + 4;
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1,0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(data), arg(&desc), D3D12_RESOURCE_STATE_COMMON,
+                    0, arg(&__uuidof(ID3D12Resource)), arg(&vertex_resource)))) || !vertex_resource) return 74;
+            std::memcpy(data, texcoords, sizeof(texcoords));
+            views[0].BufferLocation = arg(data);
+        }
         invoke(list, 48, 0, 2, arg(views));
-        invoke(list, 12, 6, 1, 3, 0);
-        invoke(list, 47, arg(&index_view));
-        invoke(list, 13, 6, 1, 0, 5, 0);
+        if (fixed_rect) {
+            invoke(list, 20, 0x11);
+            invoke(list, 12, 3, 1, 3, 0);
+        } else {
+            invoke(list, 12, 6, 1, 3, 0);
+            invoke(list, 47, arg(&index_view));
+            invoke(list, 13, 6, 1, 0, 5, 0);
+        }
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
@@ -730,6 +753,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (const int rc = submit(last)) return rc;
     if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
     if (vertex_resource) invoke(vertex_resource, 2);
+    if (copied_vertex_memory) VirtualFree(copied_vertex_memory, 0, MEM_RELEASE);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
         extern int report_pixel_uavs(const char*);
         if (const int rc = report_pixel_uavs(pixels)) return rc;

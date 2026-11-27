@@ -1876,6 +1876,38 @@ endforeach()
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 
 if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${DXC_BIN_DIR}/dxil.dll")
+    foreach(backend warp hardware)
+        add_test(NAME native_fixed_mesh57_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_mrt_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_mrt_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_MRT=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_varying_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_varying_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_MRT=1;X2W_TEST_NATIVE_MESH57_VARYING=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_uint_heap_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_uint_heap_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_UINT_HEAP=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_pixel_heap_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_pixel_heap_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_PIXEL_HEAP=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_waterfall_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_waterfall_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_WATERFALL=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_waterfall_fine_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_waterfall_fine_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_WATERFALL=1;X2W_TEST_NATIVE_MESH57_FINE_LOD=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_buffers_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_buffers_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_BUFFERS=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_constant_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_constant_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_CONSTANT=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+        add_test(NAME native_fixed_mesh57_mask_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+        set_tests_properties(native_fixed_mesh57_mask_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_TEST_NATIVE_MESH57=1;X2W_TEST_NATIVE_MESH57_MRT=1;X2W_TEST_NATIVE_MESH57_MASK=1;X2W_NATIVE_SHADERS=${DXC_BIN_DIR}")
+    endforeach()
     add_executable(native_store_replay tests/native_store_replay.cpp tests/desktop_gpu.cpp)
     target_include_directories(native_store_replay PRIVATE src tests)
     target_link_libraries(native_store_replay PRIVATE x2w_shader_compiler d3d12 dxgi d3dcompiler)
@@ -1931,6 +1963,12 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_native_graphics_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_native_graphics_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}" ${adapter} "$<TARGET_FILE:compile_dxil>")
+        set_tests_properties(startup_native_graphics_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME native_direct_container
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
@@ -1951,6 +1989,10 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
     add_test(NAME native_compute_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_pack_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:native_compute_pack_check>" "${DXC_BIN_DIR}")
+    add_test(NAME native_compute_pack_hardware COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_compute_pack_check.py" hardware "$<TARGET_FILE:compile_dxil>"
+        "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_compute_pack_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME native_dpp_mirror_hardware COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_dpp_mirror_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:native_store_replay>" "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")

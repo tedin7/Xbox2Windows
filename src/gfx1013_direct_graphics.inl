@@ -957,7 +957,7 @@ struct GraphicsMaskRegions {
             bool sampled = false;
             for (; end < code.size(); ++end) {
                 const auto &i = code[end];
-                if (i.enc == Encoding::Image && i.op >= 0x20 && i.op <= 0x3f) sampled = true;
+                if (i.enc == Encoding::Image && (i.op == 0 || (i.op >= 0x20 && i.op <= 0x3f))) sampled = true;
                 else if (i.name != "s_waitcnt" && i.name != "s_nop") break;
             }
             if (!sampled || end == code.size() || !restore_mask(code[end]) || code[end].src[0] == start.src[0]) continue;
@@ -1604,6 +1604,40 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
         return false;
     };
     const auto last_lane_observer = std::find_if_not(program.code.rbegin(), program.code.rend(), lane_local);
+    // A later lane observer matters only if the new value can reach it.
+    // Conservatively record every potential touch up to the final observer,
+    // including inputs to ordinary instructions that could propagate the value.
+    std::array<unsigned,256> last_helper_touch{};
+    if (pixel && straight && last_lane_observer != program.code.rend()) {
+        for (const auto &op : program.code) {
+            if (op.pc > last_lane_observer->pc) break;
+            auto touch = [&](unsigned r) {
+                if (r >= 256 && r < 512) last_helper_touch[r-256] = op.pc;
+            };
+            if (op.enc == Encoding::Sopp || op.enc == Encoding::Smem ||
+                op.enc == Encoding::Sop1 || op.enc == Encoding::Sop2) continue;
+            if (op.enc == Encoding::Interp) {
+                touch(256 + (op.a & 255));
+                touch(256 + ((op.a >> 18) & 255));
+            } else if (op.name == "v_readfirstlane_b32" || op.name == "v_cvt_i32_f32" ||
+                       op.name == "v_mov_b32" || op.name == "v_and_b32") {
+                for (auto r : op.src) touch(r);
+                touch(op.dst);
+            } else if (op.enc == Encoding::Image && !(op.a & 6) &&
+                       ((op.op == 32 && ((op.a >> 3) & 7) == 1) ||
+                        (op.op == 0 && ((op.a >> 3) & 7) == 5))) {
+                // Plain 2D sample or 2D-array load; no NSA address list.
+                unsigned count = op.op == 32 ? 2 : 3;
+                for (unsigned j = 0; j < count; ++j) touch(256 + (op.b & 255) + j);
+                for (unsigned j = 0; j < 4; ++j) touch(256 + op.dst + j);
+            } else {
+                last_helper_touch.fill(op.pc);
+            }
+        }
+    }
+    alu.helper_result_unobserved = [&](unsigned r) {
+        return straight && r >= 256 && r < 512 && alu.graphics_pc >= last_helper_touch[r-256];
+    };
     bool whole_quad = false;
     bool exact_after_wqm = false;
     bool exact_sample_region = false;
@@ -1744,8 +1778,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                 i.name.find("_b64") != Name::npos || i.enc == Encoding::Vopc ? 2 : 1;
             if (i.dst < mask_reg + 2 && mask_reg < i.dst + width) discard_lane.clear();
         }
-        alu.helper_result_unobserved = straight &&
-            (last_lane_observer == program.code.rend() || pc >= last_lane_observer->pc);
+
         if (auto it = regions.expired.find(pc); it != regions.expired.end())
             for (auto reg : it->second) alu.write(reg, {});
         if (regions.vertex_anchors.count(pc) || regions.captures.count(pc)) {
@@ -1951,7 +1984,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             i.enc != Encoding::Sop1 && i.enc != Encoding::Sop2 && i.enc != Encoding::Sopk &&
             i.enc != Encoding::Export &&
             !(i.name == "v_mov_b32" && i.dst >= 256 && !i.dpp_control && !i.subword) &&
-            !(i.enc==Encoding::Image && i.op>=0x20 && i.op<=0x3f))
+            !(i.enc==Encoding::Image && (i.op==0 || (i.op>=0x20 && i.op<=0x3f))))
             refuse(pc,"unsupported exact-mask operation after whole-quad entry");
         if ((i.name == "s_wqm_b32" || i.name == "s_wqm_b64") && i.dst == 126 && i.src[0] == 126) {
             if (!stage.wave32 && i.name == "s_wqm_b32")
@@ -2174,7 +2207,8 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                         break;
                     // A scheduled FP32 FMA accesses exactly three scalar-width
                     // sources and one destination. It cannot change EXEC.
-                    if (j.name == "v_fma_f32" && j.dst != i.dst)
+                    if ((j.name == "v_fma_f32" || j.name == "v_fma_mixlo_f16" ||
+                         j.name == "v_fma_mixhi_f16" || j.name == "v_mul_f32" || j.name == "s_waitcnt") && j.dst != i.dst)
                         continue;
                     if (j.dst == i.dst && j.name == (low ? "v_fma_mixhi_f16" : "v_fma_mixlo_f16") &&
                         std::find(i.src.begin(), i.src.end(), i.dst) == i.src.end())
@@ -2202,7 +2236,9 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             }
             alu.arithmetic(i, state);
             if (heap_range) heap_ranges[alu.read(i.dst)]=*heap_range;
-            if (uniform_vertex || (pixel && i.name == "v_med3_f32" && alu.graphics_predicate.empty() &&
+            const bool uniform_conversion = pixel && straight && alu.graphics_predicate.empty() &&
+                i.name == "v_cvt_i32_f32" && !i.dpp_control && !i.subword && i.src[0] <= 105;
+            if (uniform_vertex || uniform_conversion || (pixel && i.name == "v_med3_f32" && alu.graphics_predicate.empty() &&
                 std::all_of(i.src.begin(), i.src.end(), scalar_operand))) {
                 auto value = alu.read(i.dst);
                 if (alu.ir.dependencies[value].none()) uniform_vector_values.insert(value);

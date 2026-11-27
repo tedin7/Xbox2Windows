@@ -481,7 +481,25 @@ int draw_formatted_view(void* guest, void* list)
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     void* placed = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(bytes), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+    char indexed_stride[16]{};
+    const bool indexed = GetEnvironmentVariableA("X2W_TEST_INDEXED_STRIDE", indexed_stride, sizeof(indexed_stride)) != 0;
+    if (indexed) {
+        unsigned stride = 0;
+        if (std::sscanf(indexed_stride, "%u", &stride) != 1 || !stride || stride > 64 || 64 % stride) return 48;
+        auto* upload = reinterpret_cast<void*>(invoke(list, 148, 64, 256));
+        if (!upload || ptr(upload) >> 48) return 47;
+        std::memcpy(upload, bytes, 64);
+        alignas(64) static std::array<unsigned, 64> descriptors{};
+        Word cpu = 0;
+        const Word increment = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (increment < 32 || increment > sizeof(descriptors) ||
+            !bind_view_table(guest, list, cpu, 1, ptr(descriptors.data()), increment) || cpu != ptr(descriptors.data())) return 42;
+        descriptors[0] = static_cast<unsigned>(ptr(upload));
+        descriptors[1] = static_cast<unsigned>(ptr(upload) >> 32) | stride << 16;
+        descriptors[2] = 64 / stride;
+        invoke(list, 12, 3, 1);
+        return 0;
+    } else if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(bytes), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
                                            0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;

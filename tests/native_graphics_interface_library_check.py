@@ -80,6 +80,22 @@ def main(compiler, sdk):
             publish(folder, code, words(*vp), root, slot57_inputs=(2, count))
             batch(folder, base / f"linked-{attr}-{count}", expected=error)
 
+        # The library PS consumes x only. A fixed variant also reads y,
+        # which is valid only when the actual VS exports that channel.
+        narrow = [(6, row, 1, row, 0, 0, row, 2) for row in range(2)]
+        (fixed / "smooth.cdxil").write_bytes(patched_pixel(
+            len(template), template, input_address=2, attributes=narrow))
+        code = words(*template, interpolate(0, 1, 0, 5, 0), interpolate(0, 1, 1, 5, 1),
+                     0xf800180f, 0x05040504, end)
+        for mask in (15, 1):
+            producer = vp.copy()
+            producer[3] = (producer[3] & ~15) | mask
+            (fixed / "varying.cdxil").write_bytes(vertex(program=producer))
+            run("--index-graphics-interfaces", fixed, cache)
+            folder = base / f"raw-channels-{mask}"
+            publish(folder, code, words(*producer), root, slot57_inputs=(2, 1))
+            batch(folder, base / f"raw-linked-{mask}", expected=None if mask == 15 else "graphics stages disagree")
+
         # An exact VS writes a four-component image through the second
         # guest slot. The serialized root covers just the first slot.
         # The FSSM offset, descriptor width, class and SGPR establish the

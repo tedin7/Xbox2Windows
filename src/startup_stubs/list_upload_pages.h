@@ -14,7 +14,12 @@ struct Page {
     unsigned char* cpu = nullptr;
     UINT64 gpu = 0, size = 0, cursor = 0;
 };
-inline HRESULT make_page(ID3D12Device* device, UINT64 bytes, Page& page) {
+struct UploadFailure {
+    const char* stage = nullptr;
+    HRESULT hr = S_OK;
+    UINT64 requested_page = 0;
+};
+inline HRESULT make_page(ID3D12Device* device, UINT64 bytes, Page& page, UploadFailure* failure = nullptr) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_UPLOAD;
     heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -25,16 +30,26 @@ inline HRESULT make_page(ID3D12Device* device, UINT64 bytes, Page& page) {
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource));
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {
+        if (failure) *failure = {"CreateCommittedResource", hr, bytes};
+        return hr;
+    }
     x2w_budget::committed(device, page.resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     D3D12_RANGE no_reads{};
     void* mapped = nullptr;
     hr = page.resource->Map(0, &no_reads, &mapped);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {
+        if (failure) *failure = {"Map", hr, bytes};
+        return hr;
+    }
     page.cpu = static_cast<unsigned char*>(mapped);
     page.gpu = page.resource->GetGPUVirtualAddress();
     page.size = bytes;
-    return page.cpu && page.gpu ? S_OK : E_FAIL;
+    if (!page.cpu || !page.gpu) {
+        if (failure) *failure = {page.cpu ? "null GPU address" : "null mapped address", E_FAIL, bytes};
+        return E_FAIL;
+    }
+    return S_OK;
 }
 struct Allocation { uintptr_t cpu; UINT64 gpu, bytes; ID3D12Resource* resource; UINT64 offset; };
 struct Arena {
@@ -44,23 +59,29 @@ struct Arena {
     // The caller must retire all recordings and GPU submissions before releasing their pages.
     void reset() { allocations.clear(); pages.clear(); }
 
-    Allocation range(UINT64 cpu, UINT64 bytes) const {
+    Allocation range(UINT64 cpu, UINT64 bytes, bool remaining = false) const {
         if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
             if (offset < it->bytes && bytes <= it->bytes - offset)
-                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, remaining ? it->bytes - offset : bytes, it->resource, it->offset + offset};
         }
         return {};
     }
     UINT64 translate(UINT64 cpu, UINT64 bytes) const {
         return range(cpu, bytes).gpu;
     }
-    Allocation allocate(ID3D12Device* device, UINT64 bytes, UINT64 alignment) {
-        if (!device || !bytes || !alignment || (alignment & (alignment - 1))) return {};
+    Allocation allocate(ID3D12Device* device, UINT64 bytes, UINT64 alignment, UploadFailure* failure = nullptr) {
+        if (!device || !bytes || !alignment || (alignment & (alignment - 1))) {
+            if (failure) *failure = {"invalid request", E_INVALIDARG};
+            return {};
+        }
         alignment = (std::max)(alignment, UINT64{16});
-        if (bytes > UINT64_MAX - alignment) return {};
+        if (bytes > UINT64_MAX - alignment) {
+            if (failure) *failure = {"size overflow", E_INVALIDARG};
+            return {};
+        }
         auto take = [&](Page& page) -> Allocation {
             const auto base = reinterpret_cast<uintptr_t>(page.cpu);
             const UINT64 mask = alignment - 1;
@@ -79,10 +100,14 @@ struct Arena {
             if (a.cpu) return a;
         }
         auto page = std::make_unique<Page>();
-        if (FAILED(make_page(device, (std::max)(UINT64{65536}, bytes + alignment - 1), *page))) return {};
+        const auto page_bytes = (std::max)(UINT64{65536}, bytes + alignment - 1);
+        if (FAILED(make_page(device, page_bytes, *page, failure))) return {};
         pages.push_back(std::move(page));
         Allocation a = take(*pages.back());
-        if (!a.cpu) pages.pop_back();
+        if (!a.cpu) {
+            pages.pop_back();
+            if (failure) *failure = {"new page alignment", E_FAIL, page_bytes};
+        }
         return a;
     }
 };

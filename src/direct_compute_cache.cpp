@@ -686,6 +686,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     std::map<GpuStage, GuestShaderStage> interfaces;
     std::optional<GpuStage> first_stage;
     bool exact_pair = reflected;
+    bool exact_pixel_code = false;
     Bytes entry;
     const bool fixed_entry = pixel_entry.size() == 12 && pixel_entry.substr(0,4) == "PSI1";
     if (fixed_entry && !reflected)
@@ -699,6 +700,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             auto matched = match_graphics_stage(raw[i],companions[i],exact);
             exact_pair &= exact;
             auto stage = matched.stage;
+            if (stage == GpuStage::ps) exact_pixel_code = exact;
             if (i == 0) first_stage = stage;
             if (!interfaces.emplace(stage, std::move(matched)).second)
                 throw UnsupportedComputeShader("duplicate reflected graphics stage");
@@ -781,8 +783,12 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             channels[r.index / 4] |= 1u << r.first;
         }
         for (const auto &attr : attrs) {
+            // A specialized raw PS can read more components of the same PARAM
+            // than its library variant. The raw VS/PS link above has already
+            // checked every consumed component against a matching VS export.
+            const bool linked_raw_row = fixed_entry && !exact_pixel_code && attr.row == attr.location;
             if (attr.usage != 6 || attr.location >= channels.size() || attr.flags != 2 ||
-                (channels[attr.location] & ~attr.mask) || !attr.mask)
+                (!linked_raw_row && (channels[attr.location] & ~attr.mask)) || !attr.mask)
                 throw UnsupportedComputeShader("raw and reflected interpolation channels disagree at location " +
                     std::to_string(attr.location) + " (usage " + std::to_string(attr.usage) + ", flags " +
                     std::to_string(attr.flags) + ", reflected mask " + std::to_string(attr.mask) +
@@ -921,8 +927,9 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
-                       (b.image_dimension == 1 || b.image_dimension == 5) && b.array_count == 1) {
-                uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
+                       (b.image_dimension == 1 || b.image_dimension == 5 ||
+                        (b.kind == ComputeViewKind::texture_uav && b.image_dimension == 2)) && b.array_count == 1) {
+                uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : b.image_dimension == 2 ? " tex3d" : " tex2d")
                           << " float table " << b.root_parameter << ' ' << b.byte_offset << " channels 4\n";
             } else {
                 return std::nullopt;

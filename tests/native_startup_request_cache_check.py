@@ -4,6 +4,7 @@ usage:
   native_startup_request_cache_check.py controls <compile_dxil> <sdk>
   native_startup_request_cache_check.py e2e <compile_dxil> <startup_stream_consumer> <offscreen_check> <sdk> <warp|hardware>
 """
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -305,9 +306,52 @@ def check_controls(cli: Path, sdk: Path) -> int:
     return 0
 
 
+def fixed_vertex_draw(work: Path, consumer: Path, sdk: Path, backend: str):
+    from native_direct_container_check import words
+    cache = work / "fixed-vertex"
+    interfaces = cache / "interfaces"
+    interfaces.mkdir(parents=True)
+    vs_id = [0xd5800000, 255, 0x123, 0xd5800000, 255, 0x456]
+    ps_id = [0xd5800000, 255, 0x789, 0xd5800000, 255, 0xabc]
+    # xyz at slot-zero offset 0; export it as position with W=1, and export Z as a varying.
+    vs = words(*vs_id, 0xbe8c0400, 0x938dff0d, 0x80000, 0xf4080406, 0xfa000000,
+               0x4a000002, 0xbf8cc07f, 0xe03c2000, 0x80040100, 0x7e0802f2,
+               0xf80008cf, 0x04030201, 0xf8000201, 0x03030303, 0xbf810000)
+    ps = words(*ps_id, 0xc8100000, 0xc8110001, 0xf800180f, 0x04040404, 0xbf810000)
+    for name, raw, interface in (
+            ("vs", vs, container_vertex(program=vs_id+[0xbf810000], varying=True)),
+            ("ps", ps, patched_pixel(7, ps_id+[0x7e0002f2], input_address=2, attributes=[(6,0,1,0,0,0,0,2)]))):
+        (cache/name).write_bytes(raw)
+        (interfaces/(hashlib.sha256(raw).hexdigest()+".cdxil")).write_bytes(interface)
+    for rectangle in (False, True):
+        env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+                   X2W_D3D12_DEBUG="1", X2W_SHADER_CACHE=str(cache), X2W_NATIVE_SHADERS=str(sdk),
+                   X2W_TEST_VERTEX_FETCH="1", X2W_TEST_FIXED_COLOR="1")
+        env.pop("X2W_TEST_FIXED_RECT", None)
+        if rectangle:
+            env["X2W_TEST_FIXED_RECT"] = "1"
+        result = subprocess.run([consumer, cache/"vs", cache/"ps", cache/"root", backend, cache/"pixels",
+                                 "slot57", "58:2,5c:1"], env=env, capture_output=True, text=True)
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and "ready=1" in result.stderr and "-> drawn;" in result.stderr, result.stderr
+        assert not re.search(r"x2w-d3d12-debug .* sev=[01] ", result.stderr), result.stderr
+        if rectangle:
+            assert "not aliased" in result.stderr and "topology 0x11 -> drawn" in result.stderr, result.stderr
+        # The rectangle draws four pixels. The indexed call in the list case adds (3,3).
+        expected = {(x, 0) for x in range(4)}
+        if not rectangle:
+            expected.add((3, 3))
+        assert (cache/"pixels").read_bytes() == b"".join(
+            bytes((64,)*4) if (x,y) in expected else bytes((0,0,255,255)) for y in range(4) for x in range(8))
+    return 0
+
+
 def check_e2e(cli: Path, consumer: Path, offscreen: Path, sdk: Path, backend: str) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
+        if fixed_vertex_draw(work, consumer, sdk, backend) == 77:
+            return 77
         frontend = work / "frontend"
 
         # Part 1: .psin VS/PS requests compiled by compile_dxil --requests and executed on GPU.

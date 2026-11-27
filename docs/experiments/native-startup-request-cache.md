@@ -6,6 +6,44 @@ and compute (`x2w-startup-shader-29cs`, `req_<key>.c67`) requests, publishes run
 manifests (`<key>.vs.cso` / `<key>.ps.cso` or `<key>.cs.cso`, followed by `<key>.txt`), and loads directly through
 the startup runtime cache loaders on WARP and hardware without manual renaming or conversion.
 
+## First dispatch of a slot-67 compute request
+
+With `X2W_NATIVE_SHADERS` enabled, the runtime retains the six immutable parts
+used to publish each new compute key. First dispatch takes those bytes and checks
+their extents before invoking the ordinary C++ translator. Evicted requests use
+the disk reader, which also verifies the key. The capture files remain available
+for independent replay.
+
+`X2W_NATIVE_COMPUTE_REQUEST_CACHE_MIB` sets the per-process byte budget from 0
+through 256 MiB. The default is 32 MiB. Zero selects disk reads. The queue holds
+at most 4,096 keys, evicts the oldest retained request first and releases each
+snapshot on consumption. The render totals report hits, misses, evictions,
+retained bytes and retained requests every 300 frames. Run
+`ctest --preset dev --no-tests=error -R '^native_frozen_request$'` for the
+ownership, budget, eviction and malformed-description controls.
+
+### Prewarming captured compute requests
+
+`compile_dxil --prepare-compute-pack REQUEST_DIRECTORY CACHE_DIRECTORY 0` validates
+the six capture parts and prepares the same entry-zero frontend used at first dispatch.
+It writes `CACHE_DIRECTORY/compute-0.pack` atomically. Each record contains either
+DXIL IR with its binding layout or the exact typed frontend refusal. Other errors
+are printed per request, omitted from the pack, and cause a nonzero command status.
+If every input fails with an ordinary error, an existing pack is preserved.
+
+Set `X2W_NATIVE_COMPUTE_PACK` to the absolute pack path before startup. The runtime
+loads the index once when native compute requests are published. At first use it
+checks the frontend revision, entry offset and SHA-256 of all six frozen parts.
+A miss takes the ordinary translation path. A matched refusal proceeds to the
+existing published-translation loader. Successful hits run the usual binding
+checks, device capability checks, bytecode compilation/cache lookup and PSO creation.
+The heartbeat reports prepared hits, matched refusals and pack misses.
+
+```powershell
+cmake --build --preset release --target compile_dxil native_compute_pack_check startup_stream_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^native_compute_pack(_hardware)?$'
+```
+
 ## Alignment between `compile_dxil --requests` and the startup cache
 
 1. **Request keys and `.psin` stream descriptions (`src/shader_compute_request.cpp`):**

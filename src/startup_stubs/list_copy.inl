@@ -218,6 +218,8 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     if (!self->own().list_open) return;
     const CopyEndpoint to = copy_endpoint(destination);
     const CopyEndpoint from = copy_endpoint(source);
+    trace_compute_output_use(self, OutputUse::copy_source, "copy-source-attempt", from.wrapper, 0, source_offset, bytes);
+    trace_compute_output_use(self, OutputUse::copy_destination, "copy-destination-attempt", to.wrapper, 0, destination_offset, bytes);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
     if (to.resource) to_desc = to.resource->GetDesc();
     if (from.resource) from_desc = from.resource->GetDesc();
@@ -234,6 +236,8 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
+    trace_compute_output_use(self, OutputUse::copy_read_recorded, "copy-read-recorded", from.wrapper, 0, source_offset, bytes);
+    trace_compute_output_use(self, OutputUse::copy_write_recorded, "copy-write-recorded", to.wrapper, 0, destination_offset, bytes);
     if (mesh_xmem_tracking()) {
         D3D12_HEAP_TYPE source_heap;
         const bool upload = fixed_heap(from.resource, source_heap) && source_heap == D3D12_HEAP_TYPE_UPLOAD;

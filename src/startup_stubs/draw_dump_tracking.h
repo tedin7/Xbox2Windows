@@ -38,7 +38,10 @@ class DrawReadbacks {
         Microsoft::WRL::ComPtr<ID3D12Fence> fence;
         DrawDump dump;
     };
-    static constexpr unsigned limit = 48;
+    static unsigned limit() {
+        static const unsigned n = GetEnvironmentVariableW(L"X2W_SCENE_ARGUMENT_PROBE", nullptr, 0) ? 768 : 48;
+        return n;
+    }
     std::mutex mutex_;
     std::vector<Entry> entries_;
     unsigned consumed_ = 0;
@@ -48,13 +51,13 @@ public:
     bool full()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return entries_.size() + consumed_ >= limit;
+        return entries_.size() + consumed_ >= limit();
     }
 
     bool record(ID3D12CommandList* list, DrawDump dump)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.size() + consumed_ >= limit) return false;
+        if (entries_.size() + consumed_ >= limit()) return false;
         dump.index = ++sequence_;
         entries_.push_back({list, {}, std::move(dump)});
         return true;
@@ -67,7 +70,7 @@ public:
     bool record_for_test(Microsoft::WRL::ComPtr<ID3D12Resource> buffer, Microsoft::WRL::ComPtr<ID3D12Fence> fence)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.size() + consumed_ >= limit) return false;
+        if (entries_.size() + consumed_ >= limit()) return false;
         DrawDump dump;
         dump.buffer = std::move(buffer);
         dump.index = ++sequence_;
@@ -88,11 +91,17 @@ public:
         return nullptr;
     }
 
-    void discard(ID3D12CommandList* list)
+    unsigned discard(ID3D12CommandList* list)
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        unsigned probes = 0;
         entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-            [list](const Entry& e) { return e.recording == list; }), entries_.end());
+            [&](const Entry& e) {
+                if (!list || e.recording != list) return false;
+                if (!e.dump.rows && e.dump.count < 32) probes |= 1u << e.dump.count;
+                return true;
+            }), entries_.end());
+        return probes;
     }
 
     HRESULT execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)

@@ -56,7 +56,7 @@ struct DirectCompute {
     unsigned graphics_pc = 0;
     bool perspective_center_pair = false;
     bool exact_pixel_entry = false;
-    bool helper_result_unobserved = false;
+    std::function<bool(unsigned)> helper_result_unobserved;
     unsigned pixel_entry_vgprs = 0;
     std::function<bool(unsigned)> untouched_pixel_register;
     // P1/P2 consume the entry IJ pair symbolically. After an exact-mask
@@ -126,7 +126,7 @@ struct DirectCompute {
                  (!graphics_registers.count(r) || (guarded_ij.count(r) && guarded_ij.at(r).first == graphics_predicate))) {
             write(r, {});
             guarded_ij.emplace(r, std::make_pair(graphics_predicate, value));
-        } else if (exact_pixel_entry && helper_result_unobserved && pixel_entry_vgprs && r >= 256 + pixel_entry_vgprs &&
+        } else if (exact_pixel_entry && helper_result_unobserved(r) && pixel_entry_vgprs && r >= 256 + pixel_entry_vgprs &&
                    !graphics_registers.count(r) && untouched_pixel_register(r)) {
             // Only covered lanes can observe this result. In particular no
             // subsequent implicit LOD or quad operation can inspect helpers.

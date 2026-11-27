@@ -35,6 +35,10 @@ struct ComputeTranslation {
         Source source = root_constant;
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
         bool root = false;
+        bool array = false;
+        unsigned half_typed_bytes = 0;
+        bool packed_d16_x = false;
+        unsigned scalar_window = 0;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -44,6 +48,7 @@ struct ComputeTranslation {
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
+    bool logged_token_output = false, logged_bound_token_output = false;
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     const char* first_refusal = nullptr;   // reason of the first refused call
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
@@ -98,6 +103,10 @@ const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, st
 const char* load_compute_translation(ComputeTranslation& tr)
 {
     tr.state = 2;
+    if (native_shaders_only()) {
+        tr.manifest_retry.found();
+        return nullptr;
+    }
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt") || !read_text(path, manifest)) {
@@ -211,24 +220,58 @@ bool translate_compute_natively(ComputeTranslation& tr)
     const DWORD length = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
     if (!length || length >= MAX_PATH) return false;
     if (!cache_path(path, L"req_", tr.key, L".c67")) return false;
+    auto refuse_native = [&](const char* reason) {
+        tr.uds.clear();
+        tr.srvs.clear();
+        tr.uavs.clear();
+        tr.root.Reset();
+        tr.pipeline.Reset();
+        static LONG logged;
+        if (first_calls(logged, 16))
+            log("x2w-draw compute pipeline %016llx not translated natively: %s", tr.key, reason);
+        return false;
+    };
     try {
         // The request as this runtime published it. The reader checks the six parts against the key in the name.
         // Entry 0: a source-built program starts there, and the frontend reads a capture's v_nop prefix as code.
-        auto program = x2w::translate_compute(x2w::read_compute_request(path), 0, true);
+        auto frozen = frozen_compute_requests().take(tr.key);
+        if (frozen) x2w::validate_compute_request_shape(*frozen);
+        else frozen.emplace(x2w::read_compute_request(path));
+        x2w::NativeComputeShader program;
+        auto result = x2w::ComputePackResult::miss;
+        if (const auto* pack = runtime_compute_pack()) {
+            std::string diagnostic;
+            result = pack->lookup(*frozen, 0, program, diagnostic);
+            if (result == x2w::ComputePackResult::unsupported) {
+                InterlockedIncrement(&compute_pack_refused);
+                return refuse_native(diagnostic.c_str());
+            }
+            InterlockedIncrement(result == x2w::ComputePackResult::prepared ? &compute_pack_prepared : &compute_pack_misses);
+        }
+        if (result == x2w::ComputePackResult::miss)
+            program = x2w::translate_compute(*frozen, 0, true);
         for (const auto& block : program.constants)
             for (unsigned word = 0; word < block.count; ++word)
                 tr.uds.push_back({static_cast<int>(block.root_parameter), static_cast<int>(word)});
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {
-            // The two kinds a fixture has run through this path: a raw buffer read per lane, and one written.
-            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav;
+            const bool packed_x = view.kind == x2w::ComputeViewKind::packed_d16_x_uav;
+            const bool half_typed = packed_x || view.kind == x2w::ComputeViewKind::half_buffer_uav;
+            const bool texture_input = view.kind == x2w::ComputeViewKind::texture_srv && view.image_dimension == 1;
+            const bool volume = view.kind == x2w::ComputeViewKind::texture_uav && view.image_dimension == 2;
+            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume;
             auto& slots = output ? tr.uavs : tr.srvs;
-            if ((!output && view.kind != x2w::ComputeViewKind::raw_vector_srv) || view.array_count != 1 ||
+            if ((!output && !texture_input && view.kind != x2w::ComputeViewKind::raw_vector_srv && !x2w::accepts_cbv_window(view.kind)) || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
                 throw std::runtime_error("view kind " + std::to_string(static_cast<unsigned>(view.kind)) +
                                          " is not bound for a natively translated program");
-            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset)});
+            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset), volume || texture_input});
+            if (volume) slots.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
+            slots.back().packed_d16_x = packed_x;
+            if (x2w::accepts_cbv_window(view.kind))
+                slots.back().scalar_window = view.required_bytes;
         }
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
@@ -244,19 +287,12 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                               x2w::ShaderSourceFormat::dxil_ir);
         if (const char* failure = create_compute_pipeline(tr, shader.dxil.data(), shader.dxil.size()))
             throw std::runtime_error(failure);
-        log("x2w-draw compute pipeline %016llx translated natively: %zu entry values, %zu inputs, %zu outputs", tr.key,
-            tr.uds.size(), tr.srvs.size(), tr.uavs.size());
+        log("x2w-draw compute pipeline %016llx translated natively: %zu entry values, %zu inputs, %zu outputs (frontend %s)", tr.key,
+            tr.uds.size(), tr.srvs.size(), tr.uavs.size(),
+            result == x2w::ComputePackResult::prepared ? "prepared" : "live");
         return true;
     } catch (const std::exception& error) {
-        tr.uds.clear();
-        tr.srvs.clear();
-        tr.uavs.clear();
-        tr.root.Reset();
-        tr.pipeline.Reset();
-        static LONG logged;
-        if (first_calls(logged, 16))
-            log("x2w-draw compute pipeline %016llx not translated natively: %s", tr.key, error.what());
-        return false;
+        return refuse_native(error.what());
     }
 #else
     (void)tr;
@@ -330,6 +366,97 @@ IndirectBufferView compute_root_srv_buffer(Wrapper* self, const Pass& pass, int 
         return refuse("a compute root SRV range is outside its desktop buffer");
     words[2] = static_cast<std::uint32_t>(bytes);
     return {native, offset, bytes, 0, false};
+}
+
+// A slot-19 token identifies a view, not a four-dword gfx1013 buffer descriptor.
+struct ComputeTokenOutput {
+    ID3D12Resource* resource{};
+    u64 offset{}, bytes{};
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    D3D12_RESOURCE_DESC backing{};
+    Placement placement{};
+    bool created{};
+    u64 guest_base{}, guest_resource{}, counter{}, desktop_gpuva{};
+    UINT description_bytes{};
+};
+
+const char* compute_token_output(Wrapper* list, const std::uint32_t* words, ComputeTokenOutput& output)
+{
+    ViewRecord record{};
+    AcquireSRWLockShared(&note_lock);
+    if (words[1] < view_records().size()) {
+        record = view_records()[words[1]];
+        output.created = view_materialized()[words[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    if (words[2] != 19 || words[3] || record.slot != 19)
+        return "an output token does not identify a slot-19 UAV";
+    output.guest_resource = record.resource;
+    output.description_bytes = record.desc_bytes;
+    output.counter = record.counter;
+    if (record.desc_bytes >= sizeof(output.view)) std::memcpy(&output.view, record.desc, sizeof(output.view));
+    auto* owner = as_wrapper(reinterpret_cast<void*>(record.resource));
+    auto* resource = owner && owner->own().kind == resource_kind ? static_cast<ID3D12Resource*>(owner->own().real) : nullptr;
+    const ResourceInfo* info = owner && owner->own().kind == resource_kind ? resource_info(owner) : nullptr;
+    if (info) {
+        output.placement = info->placement;
+        output.guest_base = reinterpret_cast<u64>(owner->own().title_memory);
+        output.backing = info->console;
+    }
+    if (!output.created || !record.resource || record.counter || record.desc_bytes < sizeof(output.view))
+        return "an output token lacks a materialized explicit counterless UAV";
+    if (output.view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || !info ||
+        info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return "a raw buffer writer was bound to a non-buffer UAV";
+    if (!resource) return "an output token has no desktop resource";
+    output.backing = resource->GetDesc();
+    if (output.backing.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return "a raw buffer writer was bound to a non-buffer backing";
+    if (!(output.backing.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return "an output token's backing lacks tracked UAV access";
+    if (trace_compute_outputs()) output.desktop_gpuva = resource->GetGPUVirtualAddress();
+    const auto& view = output.view.Buffer;
+    const bool raw = view.Flags == D3D12_BUFFER_UAV_FLAG_RAW && output.view.Format == DXGI_FORMAT_R32_TYPELESS &&
+                     !view.StructureByteStride;
+    const bool structured = view.Flags == D3D12_BUFFER_UAV_FLAG_NONE && output.view.Format == DXGI_FORMAT_UNKNOWN &&
+                            view.StructureByteStride;
+    const bool typed = view.Flags == D3D12_BUFFER_UAV_FLAG_NONE && !view.StructureByteStride;
+    const UINT element = raw ? 4 : structured ? view.StructureByteStride :
+                         typed ? x2w_startup::typed_buffer_format_bytes(desktop_format(output.view.Format)) : 0;
+    if (!element || view.CounterOffsetInBytes || view.FirstElement > UINT64_MAX / element)
+        return "an output UAV has no supported byte interval";
+    output.offset = view.FirstElement * element;
+    output.bytes = u64{view.NumElements} * element;
+    if (!output.bytes || output.bytes % 4 || output.bytes > (16u << 20) ||
+        output.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT || output.offset > output.backing.Width ||
+        output.bytes > output.backing.Width - output.offset)
+        return "an output UAV interval is unaligned, oversized or outside its buffer";
+    const auto base = reinterpret_cast<u64>(owner->own().title_memory);
+    if (base) {
+        if (output.offset > UINT64_MAX - base) return "an output UAV placement address overflows";
+        const auto placed = placed_buffer_range(list->own().list_device, base + output.offset, output.bytes);
+        if (placed.reject) return "an output UAV range overlaps or crosses active placements";
+        if (placed.owner != owner) return "an output UAV range no longer resolves to its token owner";
+        // A slot-19 token identifies an object. For a complete view its committed
+        // backing is the host buffer used by subsequent object-based GPU commands.
+        // This mode does not imply CPU aliasing or make a partial view authoritative.
+        static const bool copied_views = x2w_local::env_on("X2W_COPIED_OBJECT_UAV");
+        const bool whole_copy = copied_views && info->placement == Placement::copied_buffer &&
+            output.offset == 0 && output.bytes == info->bytes && output.bytes == output.backing.Width;
+        if (placed.alias != resource && !whole_copy)
+            return "an output token's backing does not uniquely alias its guest byte interval";
+    } else {
+        D3D12_HEAP_PROPERTIES heap{};
+        D3D12_HEAP_FLAGS flags{};
+        if (FAILED(resource->GetHeapProperties(&heap, &flags)) || heap.Type != D3D12_HEAP_TYPE_DEFAULT)
+            return "an output UAV without guest shadow is not on the default heap";
+    }
+    x2w_startup::ComPtr<ID3D12Device> device;
+    if (FAILED(resource->GetDevice(IID_PPV_ARGS(device.GetAddressOf()))) || device.Get() != device_of(list->own().list_device))
+        return "an output UAV belongs to a different device";
+    output.resource = resource;
+    return nullptr;
 }
 
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
@@ -523,7 +650,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
+            auto view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
+            if (reason && slot.scalar_window && words[0] != view_token_magic &&
+                !std::strcmp(reason, "an input is in title memory outside any placed buffer")) {
+                const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+                const UINT stride = (words[1] >> 16) & 0x3fff;
+                const u64 extent = u64{stride ? stride : 1} * words[2];
+                const u64 bytes = extent;
+                u64 start{};
+                ID3D12Resource* chunk{};
+                if (bytes >= slot.scalar_window && bytes <= 65536 && bytes % 4 == 0 &&
+                    readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &start, &chunk) && chunk) {
+                    view = {chunk, start, bytes, stride, true};
+                    reason = nullptr;
+                }
+            }
             if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
@@ -533,12 +674,62 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        if (words[0] == view_token_magic) {
+            ComputeTokenOutput token{};
+            reason = compute_token_output(self, words, token);
+#ifdef X2W_NATIVE_SHADERS
+            if (!reason && slot.half_typed_bytes) {
+                const auto kind = slot.packed_d16_x ? x2w::ComputeViewKind::packed_d16_x_uav : x2w::ComputeViewKind::half_buffer_uav;
+                const x2w::ComputeViewBinding binding{kind, 0, 0, 0, slot.half_typed_bytes};
+                token.view.Format = desktop_format(token.view.Format);
+                if (!x2w::native_buffer_store_view(binding, token.view, token.backing.Width))
+                    reason = "formatted D16 write has an incompatible typed buffer UAV";
+            }
+#endif
+            if (reason && token.placement == Placement::copied_buffer &&
+                trace_copied_compute_output(key, token.guest_resource, token.guest_base, token.offset, token.bytes)) {
+                log("x2w-compute-output-watch key=%016llx groups=%u,%u,%u indirect=%u owner=0x%llx gpuva=0x%llx",
+                    key, x, y, z, dispatch.signature != nullptr, token.guest_resource, token.desktop_gpuva);
+                for (const auto& ud : tr->uds)
+                    if (ud.source == ComputeTranslation::root_constant)
+                        log("x2w-compute-output-constant key=%016llx root=%d word=%d value=0x%08x", key, ud.a, ud.b,
+                            pass.compute_constants.word(ud.a, ud.b));
+            }
+            for (const auto& ud : tr->uds)
+                if (ud.source >= ComputeTranslation::output_word3 && ud.a == static_cast<int>(i - inputs) && !reason)
+                    reason = "an output token has no original ISA descriptor words for entry constants";
+            for (std::size_t input = 0; input < inputs && !reason; ++input)
+                if (views[input].resource == token.resource) reason = "an output buffer is also an input";
+            if (!reason && !retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(token.resource)))
+                reason = "an output token's backing could not be retained with the recording";
+            if (!tr->logged_token_output || (!reason && !tr->logged_bound_token_output)) {
+                tr->logged_token_output = true;
+                if (!reason) tr->logged_bound_token_output = true;
+                log("x2w-draw compute UAV %016llx table=%d+%d entry=0x%llx token=%u created=%u dim=%u fmt=%u "
+                    "first=%llu elements=%u stride=%u flags=%u backing-dim=%u backing-bytes=%llu backing-flags=%u "
+                    "placement=%u owner=0x%llx guest-base=0x%llx counter=0x%llx desc-bytes=%u offset=%llu bytes=%llu result=%s",
+                    key, slot.a, slot.b, entry, words[1], token.created, token.view.ViewDimension, token.view.Format,
+                    token.view.Buffer.FirstElement, token.view.Buffer.NumElements, token.view.Buffer.StructureByteStride,
+                    token.view.Buffer.Flags, token.backing.Dimension, token.backing.Width, token.backing.Flags,
+                    static_cast<unsigned>(token.placement), token.guest_resource, token.guest_base, token.counter,
+                    token.description_bytes, token.offset, token.bytes, reason ? reason : "bound");
+            }
+            views[i] = {token.resource, token.offset, token.bytes, true};
+            if (!reason && slot.half_typed_bytes) {
+                views[i].described = true;
+                std::memcpy(views[i].desc, &token.view, sizeof(token.view));
+            }
+            continue;
+        }
+        if (slot.half_typed_bytes) {
+            reason = "formatted D16 write needs the original typed buffer view";
+            break;
+        }
+        // Hardware descriptors address guest memory directly and must name a unique writable alias.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
+        const auto placed = !bytes || bytes % 4 || bytes > (16u << 20)
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
@@ -547,6 +738,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an output is not an aliased placed buffer range with unordered access";
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
+        if (reason && !tr->first_refusal)
+            log("x2w-draw compute raw UAV %016llx table=%d+%d entry=0x%llx words=%08x/%08x/%08x/%08x "
+                "stride=%u bytes=%llu result=%s", key, slot.a, slot.b, entry, words[0], words[1], words[2], words[3],
+                stride, bytes, reason);
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
@@ -618,7 +813,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             continue;
         }
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (view.texture) {
+        if (view.texture || view.described) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
@@ -708,3 +903,65 @@ void log_compute_census()
 
 // Fixtures: the census without waiting for the frame that logs it.
 extern "C" __declspec(dllexport) void x2w_d3d12_compute_census() { log_compute_census(); }
+
+void scene_argument_probe(Wrapper* self, unsigned event, void* argument, u64 offset, const char* refused) {
+    static const bool enabled = GetEnvironmentVariableW(L"X2W_SCENE_ARGUMENT_PROBE",nullptr,0) != 0;
+    if (!enabled || !recording(self) || !draw_dump_frame() || frame_number != draw_dump_frame()) return;
+    auto& pass = pass_of(self);
+    if (!pass.pipeline) return;
+    const u64 key = pass.pipeline->own().compute_request_key;
+    static const u64 input_key = probe_key("X2W_ARGUMENT_INPUT_KEY");
+    static const u64 output_key = probe_key("X2W_ARGUMENT_OUTPUT_KEY");
+    static const u64 indirect_key = probe_key("X2W_ARGUMENT_INDIRECT_KEY");
+    if (!key || (event == 17 && key != input_key) || (event == 22 && key != output_key) ||
+        (event == 27 && key != indirect_key)) return;
+    static volatile LONG seen[28]{};
+    LONG previous = seen[event];
+    if (previous == frame_number || InterlockedCompareExchange(&seen[event],frame_number,previous)!=previous) return;
+    ID3D12Resource* resource{}; bool upload = false;
+    u64 entry = 0; UINT words[4]{}; UINT bytes = event == 17 ? 4 : 12;
+    if (event != 27) {
+        entry = pass.compute_tables.table(1).record(event == 17 ? 64 : 32,16);
+        if (!entry || !x2w_local::readable(reinterpret_cast<void*>(entry),16)) return;
+        std::memcpy(words,reinterpret_cast<void*>(entry),16);
+        if (event == 17) {
+            const char* why{};
+            auto v = indirect_table_buffer(self,words,false,&why);
+            const u64 guest = words[0] | (u64{words[1]&0xffff}<<32);
+            UINT scalar = 0; SIZE_T got = 0;
+            if (words[0]!=view_token_magic)
+                ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(guest+36),&scalar,4,&got);
+            log("x2w-argument-probe input frame=%ld guest=%llx cpuBytes=%zu cpu=%08x resolve=%s",frame_number,guest,got,scalar,why?why:"bound");
+            if (v.bytes < 40) return;
+            resource=v.resource; offset=v.offset+36; upload=v.upload;
+        } else {
+            ComputeTokenOutput token{};
+            const char* why = words[0]==view_token_magic ? compute_token_output(self,words,token) : "no token";
+            log("x2w-argument-probe after frame=%ld token=%u owner=%llx dispatch=%s view=%s",frame_number,words[1],token.guest_resource,refused?refused:"recorded",why?why:"bound");
+            if (token.view.Buffer.FirstElement != 0 || token.backing.Dimension!=D3D12_RESOURCE_DIMENSION_BUFFER) return;
+            auto* w=as_wrapper(reinterpret_cast<void*>(token.guest_resource));
+            if (!w || w->own().kind != resource_kind) return;
+            resource=static_cast<ID3D12Resource*>(w->own().real);
+        }
+    } else {
+        auto* w=as_wrapper(argument);
+        if (!w || w->own().kind != resource_kind) return;
+        resource=static_cast<ID3D12Resource*>(w->own().real);
+    }
+    if (!resource || draw_dumps().full()) return;
+    auto desc=resource->GetDesc();
+    if (desc.Dimension!=D3D12_RESOURCE_DIMENSION_BUFFER || offset>desc.Width || bytes>desc.Width-offset) return;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rd{}; rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width=bytes; rd.Height=1; rd.DepthOrArraySize=1; rd.MipLevels=1; rd.SampleDesc.Count=1; rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    DrawDump dump{};
+    if(FAILED(device_of(the_device)->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(dump.buffer.GetAddressOf())))) return;
+    auto* dst=dump.buffer.Get(); dump.frame=frame_number; dump.count=event; dump.key=key;
+    auto* list=recording(self);
+    if (!retain_with_recording(self,x2w_startup::ComPtr<ID3D12Resource>(resource)) || !draw_dumps().record(list,std::move(dump))) return;
+    auto state=D3D12_RESOURCE_STATE_COMMON;
+    for (auto& st:pass.states) if (st.first==resource) state=st.second;
+    if (!upload) require_state(self,resource,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(dst,0,resource,offset,bytes);
+    if (!upload) require_state(self,resource,state);
+    log("x2w-argument-probe copied frame=%ld event=%u owner=%p gpu=%llx offset=%llu bytes=%u",frame_number,event,argument,resource->GetGPUVirtualAddress(),offset,bytes);
+}

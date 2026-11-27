@@ -318,6 +318,20 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     }
+    if (mode == "dispatch-scalar-window" || mode == "dispatch-scalar-window-short") {
+        // An unplaced, three-record view at table byte 64. Only this
+        // descriptor names the scalar input; byte 0 still names a decoy.
+        std::memcpy(reinterpret_cast<void*>(between), buffers[0], 48);
+        // Point the placed decoy four words further into the source so that
+        // taking table byte 0 instead of byte 64 produces a distinct value.
+        const UINT64 decoy = reinterpret_cast<UINT64>(buffers[0] + 4);
+        const UINT decoy_view[]{static_cast<UINT>(decoy), static_cast<UINT>(decoy >> 32) | (16u << 16), 3, 0x2403c};
+        std::memcpy(reinterpret_cast<void*>(cpu), decoy_view, sizeof(decoy_view));
+        const UINT window[]{static_cast<UINT>(between), static_cast<UINT>(between >> 32) | (16u << 16),
+                            mode == "dispatch-scalar-window-short" ? 2u : 3u, 0x2403c};
+        std::memcpy(reinterpret_cast<void*>(cpu + 64), window, sizeof(window));
+        std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
+    }
     if (mode == "dispatch-records32") {  // the output's descriptor at table byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
@@ -326,6 +340,37 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (change_table_heap &&
         (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)),
                  word(&other_heap)))) || !other_heap || other_heap == heap)) return 72;
+    void* copied_token_output = nullptr;
+    if (mode.rfind("dispatch-uav-token-", 0) == 0) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.FirstElement = 4;
+        view.Buffer.NumElements = words - 8;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        if (mode == "dispatch-uav-token-structured") {
+            view.Format = DXGI_FORMAT_UNKNOWN;
+            view.Buffer.StructureByteStride = 8;
+            view.Buffer.FirstElement /= 2;
+            view.Buffer.NumElements /= 2;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        }
+        if (mode == "dispatch-uav-token-typed") {
+            view.Format = DXGI_FORMAT_R32_UINT;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        }
+        void* output = placed[1];
+        if (mode == "dispatch-uav-token-copied") {
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+            if (FAILED(static_cast<HRESULT>(invoke(device, 133, between, word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                    word(&__uuidof(ID3D12Resource)), word(&output))))) return 71;
+        }
+        if (mode == "dispatch-uav-token-copied") copied_token_output = output;
+        invoke(device, 19, word(output), 0, word(&view), cpu + 32);
+        if (mode == "dispatch-uav-token-wrong-slot")
+            reinterpret_cast<UINT*>(cpu + 32)[2] = 18;
+    }
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})
@@ -461,6 +506,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode != "dispatch-none" && mode != "dispatch-root-srv-none") invoke(list, 14, 3, 2, 2);
+    if (copied_token_output) {
+        // An attempted read of the very placement whose UAV could not be made guest-visible.
+        invoke(list, 15, word(placed[1]), 16, word(copied_token_output), 16, 16);
+    }
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
@@ -479,6 +528,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             return 78;
         }
         Sleep(1);
+    }
+    if (copied_token_output) {
+        D3D12_RANGE range{16, 32}, none{};
+        void* mapped = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(copied_token_output, 8, 0, word(&range), word(&mapped)))) ||
+            mapped != reinterpret_cast<void*>(between)) return 83;
+        invoke(copied_token_output, 9, 0, word(&none));
     }
     if (indirect && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
