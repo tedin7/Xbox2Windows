@@ -131,6 +131,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
             throw std::runtime_error("Invalid multi-primitive draw fixture");
         trace_stride = static_cast<UINT>(input.size() - draw_bytes - image_bytes);
     }
+    const bool indexed_heap = mode == MeshDrawMode::heap;
     const bool mesh_texture = mode == MeshDrawMode::mesh_texture_load;
     const bool textured = mode == MeshDrawMode::textured || mesh_texture;
     const bool depth_pair = mode == MeshDrawMode::depth_pair;
@@ -166,6 +167,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     const UINT texture_slot = separate_roots ? vertex_slot : vertex_slot + 1;
     layout.NumParameters = input_slots + fallback;
     layout.pParameters = params;
+    if (indexed_heap) layout.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     ComPtr<ID3D12RootSignature> export_root;
     if (separate_roots) {
         // Compute reads a buffer at t0. Graphics keeps the CBVs and uses t1 for
@@ -335,6 +337,36 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     }
     if (vertices && !fallback) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
+    ComPtr<ID3D12DescriptorHeap> indexed_heap_descriptors;
+    ComPtr<ID3D12Resource> alternate_buffer;
+    if (indexed_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = 2;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&indexed_heap_descriptors)), "Create indexed mesh heap");
+        alternate_buffer = make_buffer(device, 512, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(alternate_buffer->Map(0, &empty, &mapped), "Map alternate mesh buffer");
+        std::memcpy(mapped, input.data() + 2 * cb_bytes, 512);
+        auto* bytes = static_cast<char*>(mapped);
+        for (UINT i = 0; i < 12; ++i)
+            for (UINT j = 0; j < 4; ++j) std::swap(bytes[192 + 16 * i + j], bytes[200 + 16 * i + j]);
+        alternate_buffer->Unmap(0, nullptr);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = 128;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        const auto first = indexed_heap_descriptors->GetCPUDescriptorHandleForHeapStart();
+        device->CreateShaderResourceView(alternate_buffer.Get(), &view, first);
+        view.Buffer.FirstElement = 2 * cb_bytes / 4;
+        auto second = first;
+        second.ptr += device->GetDescriptorHandleIncrementSize(desc.Type);
+        device->CreateShaderResourceView(upload.Get(), &view, second);
+        ID3D12DescriptorHeap* heaps[]{indexed_heap_descriptors.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+    }
     ComPtr<ID3D12Resource> sampled, texture_upload;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> compute_root;

@@ -10,6 +10,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py group <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py heap <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -30,6 +31,7 @@ that does not discard, must each fail.
 early-exit null export (entered by s_cbranch_execz, and in the demote form by s_cbranch_scc0 after s_cselect),
 and compares both with the CPU rasteriser without the killed triangles; the same mesh with the pixel stage that
 does not kill must differ at exactly the killed pixels.
+The heap mode compares a root-selected raw heap buffer with the CPU image and a slot-zero shader mutant.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
@@ -63,6 +65,38 @@ GROUP_MESH = MESH[:_group_at] + [
     'd70f6a04', '0002081e',  # v_add_co_u32 v4, vcc, s30, v4
 ] + MESH[_group_at:]
 GROUP_CONTROL = [word if word != '7e280505' else '7e280507' for word in GROUP_MESH]
+
+# A root-selected heap record is loaded and used inside a uniform branch arm.
+HEAP_SETUP = [
+    'be980314',  # s_mov_b32 s24, s20
+    'be930380',  # s_mov_b32 s19, 0
+    'be9a0315',  # s_mov_b32 s26, s21
+    'be9b0380',  # s_mov_b32 s27, 0
+    '8718ff18', '000003ff',  # s_and_b32 s24, s24, 0x3ff
+    '8f188518',  # s_lshl_b32 s24, s24, 5
+]
+HEAP_ARM = [
+    'bf008080',  # s_cmp_eq_i32 0, 0
+    'bf840004',  # s_cbranch_scc0 past the two loads
+    'f408070d', '30000000',  # s_load_dwordx4 s[28:31], s[26:27], s24
+    'e03810c0', '80071404',  # buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
+]
+HEAP_MESH = MESH.copy()
+_heap_at = HEAP_MESH.index('e03810c0')
+del HEAP_MESH[_heap_at:_heap_at + 2]  # colour comes from the pre-exchange heap read
+HEAP_MESH[1:1] = HEAP_SETUP + [
+    '7e080280',  # v_mov_b32 v4, 0 (the first colour)
+    '7e280280', '7e2a0280', '7e2c0280', '7e2e0280',  # initialise v20..v23 for the skipped arm
+] + HEAP_ARM + ['bf800000']  # s_nop 0, the join before the exchange
+
+
+def heap_root():
+    params = [(1, 0, 60), (0, 0, 72), (1, 0, 80)]
+    rts = (struct.pack('<6I', 2, 3, 24, 0, 0, 0x400)
+           + b''.join(struct.pack('<3I', *p) for p in params)
+           + struct.pack('<3I', 0, 0, 2) + struct.pack('<2I', 0, 0) + struct.pack('<3I', 0, 1, 2))
+    return b'DXBC' + bytes(16) + struct.pack('<4I', 1, 44 + len(rts), 1, 36) + b'RTS0' + struct.pack('<I', len(rts)) + rts
+
 
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
@@ -914,8 +948,8 @@ def scalar_position_mesh(shape, control=None):
 SCALAR_POSITION_SHAPES = ('scalar-only', 'inner EXEC skip', 'inner VCC and EXEC skips')
 
 
-def request(directory, mesh, pixel=PIXEL):
-    ms, ps, blob = code(mesh), code(pixel), root()
+def request(directory, mesh, pixel=PIXEL, root_blob=None):
+    ms, ps, blob = code(mesh), code(pixel), root_blob or root()
     key = G.mesh57_key(ms, ps, blob)
     for ext, data in (('.root', blob), ('.ps57', ps), ('.m57', ms)):
         (Path(directory) / ('req_%016x%s' % (key, ext))).write_bytes(data)
@@ -1387,6 +1421,52 @@ def mesh_root_layout_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, HEAP_MESH, root_blob=heap_root())
+        expect('heap branch translates', result, 'ok')
+        if result == 'ok':
+            pipe = G.MeshPipeline(code(HEAP_MESH), code(PIXEL), heap_root())
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text()
+            expect('heap helper emitted', 'ResourceDescriptorHeap' in text and 'x2w_heap_load' in text, True)
+            expect('heap manifest', 'dynamic_heap\n' in manifest, True)
+            expect('heap profile', pipe.mesh_profile(), 'ms_6_6')
+        profiles = []
+        def fake_dxc(args, **kwargs):
+            profiles.append(args[args.index('-T') + 1])
+            Path(args[args.index('-Fo') + 1]).write_bytes(b'synthetic bytecode')
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with patch.dict(os.environ, {'X2W_FXC': 'enabled'}), \
+             patch.object(G, 'find_dxc', return_value='dxc'), \
+             patch.object(G, 'has_complete_mesh57_bytecode', return_value=True), \
+             patch('subprocess.run', side_effect=fake_dxc):
+            expect('heap compile dispatch', request(tmp, HEAP_MESH, root_blob=heap_root())[1], 'ok')
+        expect('heap compiler profiles', profiles, ['ms_6_6', 'ps_6_6'])
+        lane_mask = HEAP_MESH.copy()
+        lane_mask.insert(lane_mask.index('bf008080'), 'be98036a')  # s_mov_b32 s24, vcc_lo
+        expect('lane-mask index refused', request(tmp, lane_mask, root_blob=heap_root())[1],
+               'unsupported: slot 57 mesh: s_mov_b32 on a wave mask is not covered')
+        # Isolate the existing uniformity guard: the fixture supplies the load, while the
+        # proof result is made negative for its offset register.
+        original_uniform = G.Stage.uniform_source
+        with patch.object(G.Stage, 'uniform_source',
+                          lambda stage, token: False if token == 's24' else original_uniform(stage, token)):
+            expect('nonuniform heap index refused', request(tmp, HEAP_MESH, root_blob=heap_root())[1],
+                   "unsupported: s_load with a register offset through ('resheap',)")
+        high_word = HEAP_MESH.copy()
+        high_word[high_word.index('be9b0380')] = 'be9b0381'  # s_mov_b32 s27, 1
+        expect('nonzero heap high word refused', request(tmp, high_word, root_blob=heap_root())[1],
+               "unsupported: s_load with a register offset through ('resheap',)")
+        advanced = HEAP_MESH.copy()
+        advanced.insert(advanced.index('f408070d'), '801aa01a')  # s_add_u32 s26, s26, 32
+        # Keep the branch target after both loads after adding one instruction.
+        advanced[advanced.index('bf840004')] = 'bf840005'
+        expect('advanced heap refused', request(tmp, advanced, root_blob=heap_root())[1],
+               "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
+        formatted = HEAP_MESH.copy()
+        formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
+        expect('formatted heap refused', request(tmp, formatted, root_blob=heap_root())[1],
+               'unsupported: dynamic resource heap views require a raw buffer load')
     with tempfile.TemporaryDirectory() as group_tmp:
         key, group_result = request(group_tmp, GROUP_MESH)
         expect('numeric group index translates', group_result, 'ok')
@@ -1638,6 +1718,18 @@ def binary(mc):
            'v_readfirstlane_b32 s30, v5\ns_mov_b32 s18, s17\ns_mov_b32 s19, 0\n'
            's_mov_b32 s21, s20\ns_mov_b32 s22, s20'),
            '80188108 7e3c0505 be920311 be930380 be950314 be960314'.split())
+    expect('heap setup and branch words', assemble(mc, """
+s_mov_b32 s24, s20
+s_mov_b32 s19, 0
+s_mov_b32 s26, s21
+s_mov_b32 s27, 0
+s_and_b32 s24, s24, 0x3ff
+s_lshl_b32 s24, s24, 5
+s_cmp_eq_i32 0, 0
+s_cbranch_scc0 4
+s_load_dwordx4 s[28:31], s[26:27], s24
+buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
+"""), HEAP_SETUP + HEAP_ARM)
     lane_mask_binary(mc)
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
@@ -2720,6 +2812,52 @@ def draw_group(dxc, renderer, adapter):
     return 0
 
 
+def draw_heap(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    colours = [colours[0]] * len(colours)
+    alternate = [(b, g, r, a) for r, g, b, a in colours]
+    correct = rasterise(points, colours, indices, len(points), len(indices))
+    zero = rasterise(points, alternate, indices, len(points), len(indices))
+    different = sum(a != b for a, b in zip(correct, zero))
+    assert different > 0
+    with tempfile.TemporaryDirectory() as tmp:
+        key, status = request(tmp, HEAP_MESH, root_blob=heap_root())
+        if status != 'ok':
+            raise AssertionError(status)
+        base = Path(tmp) / ('%016x' % key)
+        pipe = G.MeshPipeline(code(HEAP_MESH), code(PIXEL), heap_root())
+        constants = bytearray(1024)
+        for source, value in ((('rootconst', 0, 0), len(indices)),
+                              (('rootconst', 0, 1), len(points)), (('rootconst', 2, 1), 1)):
+            struct.pack_into('<I', constants, 4 * pipe.uds.index(source), value)
+        struct.pack_into('<I', constants, 4 * len(pipe.uds), 2)  # heap_count follows user data
+        head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+        source = base.with_suffix('.ms57.hlsl').read_text()
+        mutant_source, replacements = re.subn(r'(heap_index_[0-9a-f]+ = )\(s24 \+ 0u\) >> 5;', r'\g<1>0u;', source)
+        assert replacements == 1
+        mutant_hlsl = Path(tmp) / 'heap-zero.hlsl'
+        mutant_hlsl.write_text(mutant_source)
+        mutant = Path(tmp) / 'heap-zero.cso'
+        subprocess.run([dxc, '-T', 'ms_6_6', '-E', 'main', '-Fo', mutant, mutant_hlsl], check=True)
+        case = Path(tmp) / 'heap.bin'
+        for shader, image, mismatch in ((base.with_suffix('.ms57.cso'), correct, 0),
+                                        (mutant, correct, different), (mutant, zero, 0)):
+            case.write_bytes(head + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed-heap', shader,
+                                  base.with_suffix('.ps57.cso'), case], capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(mismatch)) or
+                    not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatch}\b', run.stdout)):
+                raise AssertionError(run.stdout + run.stderr)
+            print(f'{shader.name}: {mismatch} pixels differ from the reference')
+    return 0
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
@@ -2736,6 +2874,8 @@ def main(argv):
         status = draw_kill_exit(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
+    elif argv[1:2] == ['heap'] and len(argv) == 5:
+        status = draw_heap(*argv[2:])
     elif argv[1:2] == ['group'] and len(argv) == 5:
         status = draw_group(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:

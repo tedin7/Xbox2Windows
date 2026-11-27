@@ -982,6 +982,16 @@ OperationResult run_mesh_indexed(const OperationContext& ctx)
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
 }
 
+OperationResult run_mesh_indexed_heap(const OperationContext& ctx)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+        return {OutcomeKind::skip, "direct heap indexing requires resource binding tier 3"};
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true,
+                                              MeshConstantBinding::root, MeshDrawMode::heap));
+}
+
 bool validate_mesh_indexed_groups_args(int, char** argv)
 {
     unsigned groups = 0;
@@ -1917,6 +1927,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
     {"--mesh-shader-pipeline-fallback", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline_fallback},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-indexed-heap", 6, 6, nullptr, kNoGate, run_mesh_indexed_heap},
     {"--mesh-indexed-groups", 7, 7, validate_mesh_indexed_groups_args, kNoGate, run_mesh_indexed_groups},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},

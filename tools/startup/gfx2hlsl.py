@@ -10342,18 +10342,18 @@ class Stage:
             return self.heap_record(dst, base, token, imm, count)
         if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) == 'ps':
             return self.dynamic_heap_image_record(dst, base, token, imm)
-        if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
+        if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps', 'ms'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
                                             "s_load with a register offset through ('resheap',)")
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
     def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
         r = reg_range(token)
-        # A vertex stage may load the record inside a branch arm: the index lives in a temporary that is declared at
+        # A vertex or mesh stage may load the record inside a branch arm: the index lives in a temporary that is declared at
         # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
-        # it. Only the vertex stage does this; the pixel and compute stages keep refusing the load in a branch.
+        # it. Pixel and compute stages keep refusing the load in a branch.
         in_branch = self.has_branches
-        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) != 'vs')
+        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) not in ('vs', 'ms'))
                 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
                 or self.sym.get(base[2]) != ('const', 0)):
             raise Unsupported(refusal)
@@ -16994,6 +16994,9 @@ class MeshPipeline(Pipeline):
     """A slot 57 mesh pipeline with an optional pixel stage. The mesh stage is self.vs."""
     vertex_kind = 'ms'
 
+    def mesh_profile(self):
+        return 'ms_6_6' if self.uses_dynamic_heap else 'ms_6_5'
+
     def hlsl_ms(self):
         s = self.vs
         lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
@@ -17619,9 +17622,10 @@ def translate_mesh57(out_dir, key):
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
     pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
-    sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
+    mesh_hlsl = pipe.hlsl_ms()
+    sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
     if ps:
-        sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
+        sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
     manifest = pipe.manifest()
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
