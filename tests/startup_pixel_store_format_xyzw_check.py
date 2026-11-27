@@ -2,6 +2,7 @@
 from pathlib import Path
 import struct
 import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,12 @@ def controls():
     assert 'uav 0 raw table 0 64' in manifest
     for name in ('uav_descword3', 'uav_stride', 'uav_numrecords'):
         assert f'udsrc {pipeline.uds.index((name, 0))} {name} 0' in manifest
+    # The runtime must reject the same format fields as the compute validator.
+    runtime = (Path(__file__).resolve().parent.parent / 'src/startup_stubs/d3d12_draw.inl').read_text()
+    check = runtime.split('const bool supported = combined ?', 1)[1].split(';', 1)[0]
+    combined, legacy = check.split(':', 1)
+    assert {int(x) for x in re.findall(r'format == (\d+)', combined)} == set(G.STORE_FORMAT_XYZW_FORMATS)
+    assert {int(x) for x in re.findall(r'format == (\d+)', legacy)} == set(G.STORE_FORMAT_XYZW_LEGACY_FORMATS)
     for options, fragment in (
         ({'indices': (0, 0)}, STORE + ' pixel stores have overlapping indices'),
         ({'nonuniform': True}, STORE + ' data not proven wave-uniform'),
