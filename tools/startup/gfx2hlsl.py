@@ -848,6 +848,12 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
+def effect_destinations(base, ops):
+    """Split the decoded operands into destination and source fields."""
+    count = 2 if base.startswith(TWO_DESTINATIONS) or base == 'v_swap_b32' else 1
+    return ops[:count], ops[count:]
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -862,11 +868,10 @@ def scalar_effects(name, asm):
         return scalar_tokens(' '.join(ops)) | ({'m0'} if 'movrel' in base else set()), set(), set()
     if base.startswith(('s_cmp', 's_bitcmp')):
         return scalar_tokens(' '.join(ops)), {'scc'}, {'scc'}
-    two = base.startswith(TWO_DESTINATIONS)
-    dests, srcs = ops[:2] if two else ops[:1], ops[2:] if two else ops[1:]
+    dests, srcs = effect_destinations(base, ops)
     writes = scalar_tokens(' '.join(dests))
     reads = scalar_tokens(' '.join(srcs))
-    if base.startswith(READ_MODIFY_WRITE):
+    if base.startswith(READ_MODIFY_WRITE) or base == 'v_swap_b32':
         reads |= writes
     if base.startswith(SCC_READERS) or (base in SCA and 'scc' in SCA[base][0]):
         reads.add('scc')
@@ -1462,8 +1467,61 @@ LDS_EXCHANGE_OPS = {
 }
 
 
+def lds_vgpr_writes(base, ops):
+    """VGPR may-writes, including register spans and both destinations of a swap."""
+    if base.startswith(INTERP_STORE_PREFIXES + ('s_', 'v_cmp', 'v_readlane', 'v_readfirstlane')):
+        return set()
+    if base.startswith('v_movrel'):
+        return set(range(256))
+    dests, _ = effect_destinations(base, ops)
+    return {reg for tok in dests if (r := reg_range(tok)) and r[0] == 'v'
+            for reg in range(r[1], r[2] + 1)}
+
+
+def lds_literal(tok):
+    return int(tok, 0) if re.fullmatch(r'0x[0-9a-f]+|0|[1-9][0-9]*', tok) else None
+
+
+def lds_affine(base, src, values, lanes):
+    """Recover (byte stride, byte offset, local-ID definition) from plain integer address ALU."""
+    if base == 'v_mov_b32' and len(src) == 1:
+        return values.get(_lds_single(src[0]))
+    if len(src) == 2:
+        for literal, register in (src, src[::-1]):
+            n = lds_literal(literal)
+            value = values.get(_lds_single(register))
+            if n is None or value is None or n > 0xffffffff:
+                continue
+            stride, offset, origin = value
+            if base == 'v_lshlrev_b32' and literal == src[0] and n < 32:
+                return stride << n, offset << n, origin
+            if base == 'v_mul_lo_u32' or (
+                    base == 'v_mul_u32_u24' and max(n, offset + (lanes - 1) * stride) < 1 << 24):
+                return stride * n, offset * n, origin
+            if base == 'v_add_nc_u32':
+                return stride, offset + n, origin
+    if base == 'v_lshl_add_u32' and len(src) == 3:
+        value = values.get(_lds_single(src[0]))
+        shift, add = map(lds_literal, src[1:])
+        if value is not None and shift is not None and shift < 32 and add is not None:
+            stride, offset, origin = value
+            return stride << shift, (offset << shift) + add, origin
+    return None
+
+
+def lds_mask_addresses(mask):
+    """All possible results of AND with a literal, without guessing the input VGPR."""
+    address = mask
+    while address:
+        yield address
+        address = (address - 1) & mask
+    yield 0
+
+
 def check_lds_exchange(ins, group, words):
-    """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
+    """Prove a race-free LDS fill, one uniform barrier, then reads of initialized dwords.
+
+    Return the groupshared size in dwords. Strided qword fills use the extent of the verified slots.
 
     RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
     ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4), and
@@ -1479,17 +1537,23 @@ def check_lds_exchange(ins, group, words):
     if not 0 < words <= 8192:
         raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
+    qword_slots = []
+    qword_words = set()
+    addresses = {0: (1, 0, -1)}
+    saved_ids = {}
+    first_x_write = None
     published = False
     read = False
     prev = (None, [], [])
     for i, (_, _, _, asm) in enumerate(ins):
         name, ops, mods = parse(asm)
         base = name.removesuffix('_e32').removesuffix('_e64')
-        if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc')) or writes_exec(base, ops)
+        if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_rfe', 's_trap'))
+                or writes_exec(base, ops)
                 or base == 's_endpgm' and i + 1 < len(ins)):
             raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
         if base == 's_barrier':
-            if (not fill_spans or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
+            if (not (fill_spans or qword_slots) or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
@@ -1511,24 +1575,45 @@ def check_lds_exchange(ins, group, words):
             producer, args, modifiers = prev
             if write:
                 offset, = offsets
-                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
-                # 8-byte / 16-byte alignment is not required for LDS dword-addressed writes.
-                end = offset + group[0] * width
-                if (offset % 4 or end > words * 4 or published
-                        or fill_spans and (base != 'ds_write_b32' or producer != 'ds_write_b32')):
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
-                if fill_spans:
-                    if len(fill_spans) != 1:
-                        raise Unsupported('LDS exchange allows at most two consecutive bounded dword fills')
-                    # Consecutive DS writes preserve the proven address VGPR.
-                    if addr_op != args[0]:
-                        raise Unsupported('LDS dword fills must use the same byte address VGPR')
-                    start0, end0 = fill_spans[0]
-                    if offset < end0 and start0 < end:
-                        raise Unsupported('LDS dword fills must be disjoint')
-                elif producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0'] or modifiers:
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
-                fill_spans.append((offset, end))
+                reason = 'LDS exchange needs one bounded %s per local X ID' % unit_name
+                address = addresses.get(_lds_single(addr_op))
+                if first_x_write is not None and (address is None or address[2] not in saved_ids.values()):
+                    raise Unsupported('LDS fill needs the unchanged entry local X ID: ' + first_x_write)
+                if published or offset % 4:
+                    raise Unsupported(reason)
+                if base == 'ds_write_b64':
+                    if fill_spans or address is None:
+                        raise Unsupported(reason)
+                    stride, start, _ = address
+                    start += offset
+                    end = start + (group[0] - 1) * stride + width
+                    if (stride % 4 or start % 4 or end > words * 4 or stride < width * (len(qword_slots) + 1)
+                            or qword_slots and stride != qword_slots[0][0]):
+                        raise Unsupported(reason)
+                    slot = {word for addr in range(start, end - width + 1, stride)
+                            for word in range(addr, addr + width, 4)}
+                    if slot & qword_words:
+                        raise Unsupported(reason)
+                    qword_words.update(slot)
+                    qword_slots.append((stride, start, end))
+                else:
+                    # Preserve the existing narrow/quad-dword layouts and the two consecutive dword banks.
+                    end = offset + group[0] * width
+                    if (qword_slots or end > words * 4
+                            or fill_spans and (base != 'ds_write_b32' or producer != 'ds_write_b32')):
+                        raise Unsupported(reason)
+                    if fill_spans:
+                        if len(fill_spans) != 1:
+                            raise Unsupported('LDS exchange allows at most two consecutive bounded dword fills')
+                        if addr_op != args[0]:
+                            raise Unsupported('LDS dword fills must use the same byte address VGPR')
+                        start0, end0 = fill_spans[0]
+                        if offset < end0 and start0 < end:
+                            raise Unsupported('LDS dword fills must be disjoint')
+                    elif (producer != 'v_lshlrev_b32' or args[:2] != [addr_op, shift]
+                          or modifiers or address is None or address[:2] != (width, 0)):
+                        raise Unsupported(reason)
+                    fill_spans.append((offset, end))
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
                     raise Unsupported('LDS read needs a bounded address after the fill barrier')
@@ -1539,26 +1624,55 @@ def check_lds_exchange(ins, group, words):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
-                # Each read must fit entirely within one initialized span, even when the banks have a gap.
-                if (low % 4 or high % 4
-                        or any(offset % 4 or not any(start <= low + offset and high + offset + width <= end
-                                                     for start, end in fill_spans)
-                               for offset in offsets)):
+                # Contiguous legacy fills keep their original read proof. Strided slots may
+                # leave holes, so test every possible masked start against the initialized dwords.
+                spans = fill_spans
+                if len(qword_slots) == 1 and qword_slots[0][0] == 8:
+                    spans = [qword_slots[0][1:]]
+                if low % 4 or high % 4 or any(offset % 4 for offset in offsets):
+                    raise Unsupported('LDS read outside the aligned, initialized span')
+                if spans:
+                    initialized = all(any(start <= low + offset and high + offset + width <= end
+                                          for start, end in spans) for offset in offsets)
+                else:
+                    starts = (low,) if low == high else lds_mask_addresses(high)
+                    initialized = high < words * 4 and all(
+                        addr + offset + word in qword_words
+                        for addr in starts for offset in offsets for word in range(0, width, 4))
+                if not initialized:
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
                 read = True
         elif base.startswith('ds_') or 'lds' in mods:
             raise Unsupported('LDS exchange does not cover ' + asm)
-        elif not fill_spans and not base.startswith('s_'):
-            # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
-            # can also change a source. After the fill, each read proves its own address without the entry X ID.
-            if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
-                    or not ops or not re.fullmatch(r'v[0-9]+', ops[0]) or ops[0] == 'v0'):
-                raise Unsupported('LDS fill needs the unchanged entry local X ID')
+        elif not published:
+            if not (fill_spans or qword_slots) and (
+                    base.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane', 'v_permlane', 'v_movrel',
+                                     's_sendmsg', 's_sethalt')) or base.endswith(('_dpp', '_dpp8'))):
+                raise Unsupported('LDS fill needs the unchanged entry local X ID: ' + name)
+            written = lds_vgpr_writes(base, ops)
+            dest = _lds_single(ops[0]) if ops else None
+            value = lds_affine(base, ops[1:], addresses, group[0]) if dest in written and not mods else None
+            if 0 in written and first_x_write is None:
+                first_x_write = name
+            for reg in written:
+                addresses.pop(reg, None)
+                saved_ids.pop(reg, None)
+            if value is not None:
+                stride, offset, origin = value
+                if offset + (group[0] - 1) * stride <= 0xffffffff:
+                    # A saved ID gets its own definition. Derivations keep that definition
+                    # so a later overwrite of the saved register invalidates the proof.
+                    if first_x_write is None and base == 'v_mov_b32' and value[:2] == (1, 0) and dest != 0:
+                        origin = saved_ids[dest] = i
+                    addresses[dest] = stride, offset, origin
         prev = base, ops, mods
     if not read:
         raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
+    if qword_slots and (len(qword_slots) > 1 or qword_slots[0][0] != 8):
+        return max(end for _, _, end in qword_slots) // 4
+    return words
 
 
 # ---- slot 57 mesh stage: the group-memory count exchange (#2413) --------------------------------
@@ -5464,7 +5578,7 @@ class Stage:
                 try:
                     if getattr(self, 'pipe', None) is None:
                         raise Unsupported('LDS exchange needs pipeline metadata')
-                    check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                    self.lds_exchange_words = check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
@@ -12664,7 +12778,9 @@ class ComputePipeline(Pipeline):
         if s.exports:
             raise Unsupported('export in a compute program')
         body = s.body()
-        shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        shared = []
+        if getattr(s, 'uses_lds', False):
+            shared.append('groupshared uint lds[%d];' % getattr(s, 'lds_exchange_words', self.lds_words))
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         if getattr(s, 'uses_mask_ballot', False):
@@ -13718,6 +13834,8 @@ LIFTED_REASONS = (
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),
+    ('lds-fill', r'LDS fill needs the unchanged entry local X ID'),
+    ('lds-qword', r'LDS exchange needs one bounded qword per local X ID'),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
