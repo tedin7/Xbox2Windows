@@ -85,7 +85,9 @@ std::uint64_t shader_key(const void* vs, std::size_t vs_bytes, const void* ps, s
                          const void* root, std::size_t root_bytes)
 {
     constexpr char rev[] = "x2w-startup-shader-29";
+    constexpr char feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
     auto h = fnv_bytes(rev, sizeof(rev) - 1);
+    h = fnv_bytes(feature, sizeof(feature) - 1, h);
     h = fnv_bytes(vs, vs_bytes, h);
     h = fnv_bytes(ps, ps_bytes, h);
     return fnv_bytes(root, root_bytes, h);

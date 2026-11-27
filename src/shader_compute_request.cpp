@@ -190,9 +190,12 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
         request.input_layout = part(marker, ".ia", 1 << 20);
     if (fs::exists(fs::path(marker).replace_extension(".psin")))
         parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
-    const auto request_key = [&](std::string_view revision) {
+    // The runtime hashes a feature tag after the revision while extended buffer formats are on (the default): accept both.
+    constexpr char feature[] = "extended-buffer-formats1";
+    const auto request_key = [&](std::string_view revision, bool tagged = false) {
         uint64_t key = 1469598103934665603ull;
         hash_bytes(key, revision.data(), revision.size());
+        if (tagged) hash_bytes(key, feature, sizeof(feature) - 1);
         for (const auto *p : {&request.a, &request.b, &request.root, &request.input_layout, &request.pixel_entry})
             hash_bytes(key, p->data(), p->size());
         return key;
@@ -201,7 +204,8 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
         throw std::runtime_error("graphics request key mismatch or missing root");
     // Match new runtime captures and keep revision-28 archives replayable.
     constexpr char revision[] = "x2w-startup-shader-29";
-    if (request_key(revision) != expected && request_key("x2w-startup-shader-28") != expected) {
+    if (request_key(revision) != expected && request_key(revision, true) != expected &&
+        request_key("x2w-startup-shader-28") != expected && request_key("x2w-startup-shader-28", true) != expected) {
         if (!request.pixel_entry.empty())
             throw std::runtime_error("stale pixel input description: graphics request key mismatch");
         throw std::runtime_error("graphics request key mismatch or missing root");
@@ -220,9 +224,11 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
         read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
         throw std::runtime_error("inconsistent compute request");
-    const auto request_key = [&](std::string_view revision) {
+    constexpr char feature[] = "extended-buffer-formats1";  // hashed after the revision while extended buffer formats are on
+    const auto request_key = [&](std::string_view revision, bool tagged = false) {
         uint64_t key = 1469598103934665603ull;
         hash_bytes(key, revision.data(), revision.size());
+        if (tagged) hash_bytes(key, feature, sizeof(feature) - 1);
         for (const auto *p : {&code, &data, &root, &desc, &sa, &sb}) {
             uint64_t size = p->size();
             hash_bytes(key, &size, sizeof(size));
@@ -231,7 +237,8 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
         return key;
     };
     constexpr char revision[] = "x2w-startup-shader-29cs";
-    if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
+    if (request_key(revision) != expected && request_key(revision, true) != expected &&
+        request_key("x2w-startup-shader-28cs") != expected && request_key("x2w-startup-shader-28cs", true) != expected)
         throw std::runtime_error("compute request key mismatch");
     if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
         throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
