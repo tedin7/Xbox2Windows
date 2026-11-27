@@ -325,6 +325,14 @@ def coherent_words(parts):
     return ' '.join(words)
 
 
+SCC_COMPARE = '7d840081'  # v_cmp_eq_u32_e32 vcc, 1, v0
+SCC_AND = {'SCC move': '87967e6a', 'SCC branch': '878c7e6a', 'SCC delayed select': '87927e6a'}
+SCC_MOVE = 'be9403fd 9396ff14 00010000'  # s_mov_b32 s20, src_scc; s_bfe_u32 s22, s20, 0x10000
+SCC_VALU = '7e9c0280'  # v_mov_b32 v78, 0
+SCC_SELECT = '85148081'  # s_cselect_b32 s20, 1, 0
+SCC_RED = '7e280c14'  # v_cvt_f32_u32_e32 v20, s20
+
+
 def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=False, live_mask=False,
                   numeric_pair=False):
     # Wave 0 has six then lanes. Wave 1 has zero or 64. The enclosing prefix covers both waves.
@@ -334,6 +342,21 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
     at_else = ['8afe7e34', (0xbf88, 'join')]  # exec = s[52:53] & ~exec; skip empty else
     otherwise = [COHERENT_ELSE]
     join = ['80288028', 'f4200bc4 520001e0 bf8cc07f', 'befe0434']
+    if shape in SCC_AND:
+        before.append(SCC_COMPARE)
+        if control == 'SCC writer skipped':
+            before.append((0xbf88, 'SCC reader'))
+        before.append(SCC_AND[shape])
+        if control == 'SCC overwritten on one path':
+            before.extend(((0xbf88, 'SCC reader'), '803a8106'))  # s_add_u32 s58, s6, 1
+        before.append('SCC reader:')
+        if shape == 'SCC move':
+            before.append(SCC_MOVE)
+        elif shape == 'SCC branch':
+            before.extend(((0xbf84, 'SCC zero'), '80148114', 'SCC zero:'))  # s_add_u32 s20, s20, 1
+        else:
+            # Both edges carry the AND's SCC to the select, including the empty-wave skip.
+            before.extend(((0xbf88, 'SCC select'), SCC_VALU, 'SCC select:', SCC_SELECT))
     if control == 'backward':
         then.append((0xbf82, 'head'))
     elif control == 'constant-trip':
@@ -392,6 +415,9 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
         prefix = prefix.replace('beaa03ff 00000080', 'be960311').replace(' beaa0380', '')
         prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da80016')
     exports = '7e280228 7e2a0307'
+    if shape in SCC_AND:
+        prefix += ' 87148006'  # s_and_b32 s20, s6, 0 (including on the outer skip path)
+        exports = SCC_RED + ' 7e2a0307'
     if live_mask:
         prefix += ' bebe0480'  # s[62:63] = 0 on the outer skip
         body.insert(-1, 'bebe047e')  # save the else EXEC, including zero when the else was skipped
@@ -411,7 +437,7 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
     return mesh
 
 
-COHERENT_DRAWS = ('S5', 'S6')
+COHERENT_DRAWS = ('S5', 'S6', *SCC_AND)
 COHERENT_CONTROLS = (
     ('S5', 'backward', 'a backward branch inside the block'),
     ('S5', 'constant-trip', 'a backward branch inside the block'),
@@ -420,6 +446,8 @@ COHERENT_CONTROLS = (
     ('S5', 'EXEC half', 'an unsupported EXEC write or half access (s_mov_b32)'),
     ('S7', 'numeric VCC', 'VCC vote does not read a pure lane mask'),
     ('S5', 'mask SCC', 'SCC of a mask operation is read'),
+    ('SCC move', 'SCC overwritten on one path', 'SCC of a mask operation is read'),
+    ('SCC move', 'SCC writer skipped', 'SCC of a mask operation is read'),
     ('S5', 'varying address', 'a scalar load address is not wave-uniform'),
     ('S5', 'varying SCC', 'SCC is not proven wave-uniform'),
 )
@@ -1329,7 +1357,13 @@ def coherent_controls(tmp):
             ('S7', 'S7', {}, (5, 0)), ('S7 nonzero votes', 'S7', {'nonzero': True}, (3, 2)),
             ('S8', 'S8', {}, (8, 0)), ('S5 position exports', 'S5', {'positions': True}, (2, 0)),
             ('S5 live mask', 'S5', {'live_mask': True}, (2, 0)),
-            ('S5 numeric scalar pair', 'S5', {'numeric_pair': True}, (2, 0))):
+            ('S5 numeric scalar pair', 'S5', {'numeric_pair': True}, (2, 0)),
+            ('SCC move', 'SCC move', {}, (2, 1)),
+            ('SCC branch', 'SCC branch', {}, (3, 0)),
+            ('SCC delayed select', 'SCC delayed select', {}, (3, 1)),
+            ('SCC move full', 'SCC move', {'full': True}, (2, 1)),
+            ('SCC branch full', 'SCC branch', {'full': True}, (3, 0)),
+            ('SCC delayed select full', 'SCC delayed select', {'full': True}, (3, 1))):
         key, result = request(tmp, coherent_mesh(shape, **options))
         expect(label, result, 'ok')
         if result != 'ok':
@@ -1346,6 +1380,10 @@ def coherent_controls(tmp):
                 _, wrong = coherent_reference(shape, full, mutant)
                 expect(label + ' ' + mutant + ' changes source and pixels', (changed != source, wrong != guest),
                        (True, True))
+        if shape in SCC_AND:
+            _, wrong = coherent_reference(shape, full, 'always true')
+            expect(label + ' false wave changes pixels', guest != wrong, True)
+            print(f'{label}: {result}')
     for label, mesh, votes in COHERENT_LEGACY_CASES:
         key, result = request(tmp, mesh)
         expect(label, result, 'ok')
@@ -1657,6 +1695,17 @@ s_cmp_eq_u32 s6, 0
 s_cselect_b64 vcc, -1, 0
 v_cndmask_b32_e64 v7, 0, 1.0, vcc
 """), STANDALONE_SELECT.split())
+    expect('mask SCC fixture words', assemble(mc, """
+v_cmp_eq_u32_e32 vcc, 1, v0
+s_and_b64 s[22:23], vcc, exec
+s_and_b64 s[12:13], vcc, exec
+s_and_b64 s[18:19], vcc, exec
+s_mov_b32 s20, src_scc
+s_bfe_u32 s22, s20, 0x10000
+v_mov_b32 v78, 0
+s_cselect_b32 s20, 1, 0
+v_cvt_f32_u32_e32 v20, s20
+"""), ' '.join((SCC_COMPARE, *SCC_AND.values(), SCC_MOVE, SCC_VALU, SCC_SELECT, SCC_RED)).split())
     expect('re-narrowed EXEC words',
            assemble(mc, 'v_cmp_gt_u32_e64 s[60:61], 64, v0\ns_and_b64 exec, s[54:55], s[60:61]'),
            'd4c4003c 000200c0 87fe3c36'.split())
@@ -1909,6 +1958,10 @@ def coherent_reference(shape, full, mutant=None):
                 active = [e and bit for e, bit in zip(active, vcc)]
         then_runs = any(active)
         red = then_red[wave] if then_runs else 64
+        if shape in SCC_AND:
+            mask_result = [e and 64 * wave + lane == 1 for lane, e in enumerate(active)]
+            vote = mask_result[0] if mutant == 'lane 0 only' else any(mask_result)
+            red = 255 * (vote or mutant == 'always true')
         green = [then_red[wave] if e else 0 for e in active]
         if mutant == 'wrong complement':
             other = active
@@ -1926,6 +1979,12 @@ def coherent_reference(shape, full, mutant=None):
 
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label in SCC_AND:
+        word = {'SCC move': 's22', 'SCC branch': 's12', 'SCC delayed select': 's18'}[label]
+        pattern = r'(mesh_first_active\(tid, pc == \d+ && )(\(' + word + r' & 1u\) != 0u)'
+        changed, sites = re.subn(pattern, r'\1(tid & 63u) == 0u && \2', source)
+        expect(label + ' mask SCC vote is unique', sites, 1)
+        return [('lane 0 only', changed)]
     if label in COHERENT_DRAWS:
         expect(label + ' inner EXEC vote is present', 'mesh_vote == 0u' in source, True)
         mutants = [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
