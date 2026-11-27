@@ -3904,7 +3904,7 @@ class Stage:
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.whole_quad_sites = set()
-        if (getattr(self, 'kind', None) == 'ps' and not self.fetched and
+        if (getattr(self, 'kind', None) == 'ps' and not getattr(self, 'fetched', False) and
                 any(name == 'v_add_f32_dpp' for _, _, name, _ in self.ins)):
             self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
         self.entry_wqm_sites = (self.entry_wqm_exec_sites()
