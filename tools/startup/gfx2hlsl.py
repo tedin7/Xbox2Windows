@@ -5664,8 +5664,10 @@ class Stage:
                         if getattr(self, 'phi_regs', {}).get(b_target):
                             self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        # Only what is proven here: a register can be marked varying without leaving since_join.
                         edge_since.setdefault(b_target, []).append(
-                            None if getattr(self, 'since_join', None) is None else set(self.since_join))
+                            None if getattr(self, 'since_join', None) is None
+                            else self.since_join - self.varying_s - self.masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                         if self.firstlane_cfg and self.uniform_cf:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join

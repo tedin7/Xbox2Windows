@@ -148,6 +148,10 @@ ELSE_VS = HEAD + ELSE_ARM + EXPORTS
 ELSE_VARYING_VS = HEAD + bytes.fromhex(
     '80038bbe8002167e7e039ebe8000247d010088bf81038cbe1e03febe0e038cbe098006bf020085bf0e038cbe070082bf'
     '0c850c8f050408f4000000187fc08cbf001030e00b080480703f8cbf08030c7e08030e7e0803127e') + EXPORTS
+# The first arm falls into the else block (no s_branch, s_cbranch_scc1 skips one word): the block is entered by two
+# paths, one of which wrote the index from the undefined register, so the load stays refused.
+ELSE_FALLS_VS = HEAD + ELSE_ARM.replace(bytes.fromhex('020085bf0e038cbe070082bf'),
+                                        bytes.fromhex('010085bf0e038cbe')) + EXPORTS
 
 REFUSAL = "s_load with a register offset through ('resheap',)"
 
@@ -233,6 +237,9 @@ def else_arm_controls():
     expect('else arm translates', 'dynamic_heap\n' in pipe.manifest() and 'x2w_heap_load(' in vs_source)
     reason = refusal(ELSE_VARYING_VS)
     expect('else arm: index varying before the branch refused', reason == REFUSAL, str(reason))
+    expect('else arm: fall-through fixture changed', len(ELSE_FALLS_VS) == len(ELSE_VS) - 4)
+    reason = refusal(ELSE_FALLS_VS)
+    expect('else arm: first arm falls into it, refused', reason == REFUSAL, str(reason))
     print('heap record in an else arm: controls matched')
 
 
@@ -260,8 +267,9 @@ def mutate(source, old, new):
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
-    for label, words, cond, unit in (('branch', vertex_copy(ARM), 2, 32), ('rewrite', vertex_copy(REWRITE_ARM), 2, 32),
-                                     ('else arm', ELSE_VS, 0, 1)):
+    # second: the root constant that names record 1 (a byte offset in the first two, an index shifted by 5 in the third)
+    for label, words, cond, second in (('branch', vertex_copy(ARM), 2, 32),
+                                       ('rewrite', vertex_copy(REWRITE_ARM), 2, 32), ('else arm', ELSE_VS, 0, 1)):
         pipe, vs_source, ps_source = translate(words)
         count = len(pipe.uds)
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,9 +277,9 @@ def warp(offscreen, dxc):
             vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
             ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
             draw(offscreen, vs, ps, 0, 0x3fa00000, count, cond=cond)
-            draw(offscreen, vs, ps, 32 // unit, 0x40200000, count, cond=cond)
+            draw(offscreen, vs, ps, second, 0x40200000, count, cond=cond)
             wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(vs_source, ') >> 5;', ') >> 6;'))
-            draw(offscreen, wrong, ps, 32 // unit, 0x40200000, count, negative=True, cond=cond)
+            draw(offscreen, wrong, ps, second, 0x40200000, count, negative=True, cond=cond)
         print('heap record %s: readback and mutant matched' % label)
 
 
