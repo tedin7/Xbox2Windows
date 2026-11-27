@@ -606,14 +606,14 @@ int draw_descriptor_count(void* guest, void* list)
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu, 2)) return 42;
     const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if (stride != 32) return 42;
+    if (stride < 32) return 42;  // a desktop adapter may answer 64: the shader reads the record 32 bytes into the table
     alignas(16) static const std::uint32_t buffer[16]{};
     const Word address = ptr(buffer);
     std::uint32_t words[4]{static_cast<std::uint32_t>(address),
         static_cast<std::uint32_t>(address >> 32) | (4u << 16), 1u, (22u << 12) | 4u};
     std::memcpy(reinterpret_cast<void*>(cpu), words, sizeof(words));
     words[2] = count;
-    std::memcpy(reinterpret_cast<void*>(cpu + stride), words, sizeof(words));
+    std::memcpy(reinterpret_cast<void*>(cpu + 32), words, sizeof(words));
     invoke(list, 12, 3, 1);
     return 0;
 }
