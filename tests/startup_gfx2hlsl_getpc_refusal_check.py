@@ -201,7 +201,8 @@ DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
     return o;
 }
 """
-    pixel = 'float4 main(nointerpolation float4 color : COLOR) : SV_Target { return color; }'
+    # SV_Position first: the vertex outputs it at o0, so COLOR must be register 1 in both stages.
+    pixel = 'float4 main(float4 position : SV_Position, nointerpolation float4 color : COLOR) : SV_Target { return color; }'
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         model = '5_1' if kind == 'fxc' else '6_0'
