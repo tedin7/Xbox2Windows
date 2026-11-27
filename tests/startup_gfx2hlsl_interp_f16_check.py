@@ -1366,13 +1366,14 @@ def check_draw(dxc, renderer, adapter):
 
 def varying_vertex_words(right_x=3.0, bottom_y=-3.0, near=False):
     # Default: only vertex 1 has x = right_x and attr0.x's high half = 3; the others have x = -1 and high half 1.
-    # near: attr0.x high varies from 1 to the next binary16 value, so at eight pixel centers the interpolant
-    # is exactly (2*x+1)/16 half ULP above 1.
+    # With the fullscreen triangle (-1,1), (3,1), (-1,-3) at pixel column x of an 8-wide target the weight of vertex 1
+    # is (x + 0.5) / 16. attr0.x high is 1.0 at vertices 0 and 2; near: 1 + 2^-9 at vertex 1, so the interpolant is
+    # 1 + (x + 0.5) / 8 binary16 ULPs of 1.0, i.e. 1/16 .. 15/16 ULP.
     def select(dst, original, replacement):
         return words(0x02000000 | dst << 17 | replacement << 9 | (256 + original))  # v_cndmask_b32
 
     return (mov(6, f32_bits(right_x)) + mov(7, f32_bits(bottom_y)) + mov(8, 0xbf800000) + mov(9, 0x3f800000)
-            + mov(15, 0x3c004000) + mov(16, 0x3c014000 if near else 0x42004000) + mov(17, 0x42003800)
+            + mov(15, 0x3c004000) + mov(16, 0x3c024000 if near else 0x42004000) + mov(17, 0x42003800)
             + words(0x7d840081) + select(2, 8, 6) + select(15, 15, 16)  # v_cmp_eq_u32 1, v0
             + words(0x7d840082) + select(3, 9, 7)                       # v_cmp_eq_u32 2, v0
             + mov(4, 0) + mov(5, 0x3f800000)
