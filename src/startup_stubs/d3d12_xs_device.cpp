@@ -98,6 +98,7 @@
 #include "null_texture_view.h"
 #include "clear_value_format.h"
 #include "debug_drain_budget.h"
+#include "debug_level.h"
 #include "descriptor_heap_rules.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
@@ -481,7 +482,7 @@ void log_sysmem_fallback(const void* address, const D3D12_RESOURCE_DESC& desc, c
         desc.MipLevels, desc.Format, desc.SampleDesc.Count);
 }
 
-// X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
+// X2W_D3D12_DEBUG=1 or 2: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
 ID3D12InfoQueue* info_queue;
 ID3D12Device* removal_device;
@@ -9409,16 +9410,37 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     hex_text(parameters, 0x40, block, sizeof(block));
     if (!out) return E_POINTER;
     *out = nullptr;
-    const bool debug = [] {
-        char value[4]{};
-        return GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value)) && value[0] == '1';
-    }();
-    if (debug) {
+    using x2w_startup::DebugLevel;
+    char value[4]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value));
+    const auto debug_level = x2w_startup::d3d12_debug_level(length < sizeof(value) ? value[0] : '\0');
+    const bool debug = debug_level != DebugLevel::off;
+    const auto enable_debug_layer = [](bool gpu_validation) {
         ID3D12Debug* layer = nullptr;
         const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&layer));
         if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
+        if (gpu_validation) {
+            ID3D12Debug1* layer1 = nullptr;
+            const HRESULT gbv_hr = layer ? layer->QueryInterface(IID_PPV_ARGS(&layer1)) : debug_hr;
+            if (SUCCEEDED(gbv_hr)) {
+                layer1->SetEnableGPUBasedValidation(TRUE);
+                layer1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+                layer1->Release();
+                log("x2w-d3d12 GPU-based validation: enabled");
+            } else {
+                log("x2w-d3d12 GPU-based validation: unavailable (0x%08lx)", static_cast<unsigned long>(gbv_hr));
+            }
+        }
+        if (layer) layer->Release();
+    };
+    if (debug_level == DebugLevel::gpu_validation) {
+        // Changing GBV after creating the desktop device causes device removal.
+        static const bool configured = (enable_debug_layer(true), true);
+        (void)configured;
+    } else if (debug) {
+        enable_debug_layer(false);
     }
     ID3D12Device* device = nullptr;
     const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)

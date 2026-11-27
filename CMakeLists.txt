@@ -698,6 +698,12 @@ add_executable(startup_subresource_states tests/startup_subresource_states_check
 target_include_directories(startup_subresource_states PRIVATE src)
 target_compile_features(startup_subresource_states PRIVATE cxx_std_17)
 add_test(NAME startup_subresource_states COMMAND startup_subresource_states)
+
+add_executable(startup_gpu_validation_level_check tests/startup_gpu_validation_level_check.cpp)
+target_include_directories(startup_gpu_validation_level_check PRIVATE src)
+target_compile_features(startup_gpu_validation_level_check PRIVATE cxx_std_17)
+add_test(NAME startup_gpu_validation_level_check COMMAND startup_gpu_validation_level_check)
+
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_srv_wrapper_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_srv_wrapper_check.py")
@@ -2047,6 +2053,19 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_resource_desc_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+
+add_executable(startup_gpu_validation tests/startup_gpu_validation.cpp)
+target_compile_features(startup_gpu_validation PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_validation PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    foreach(case IN ITEMS hazard clean)
+        add_test(NAME startup_gpu_validation_${case}_${backend} COMMAND startup_gpu_validation ${backend} ${case})
+        set_tests_properties(startup_gpu_validation_${case}_${backend} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=2")
+    endforeach()
+endforeach()
+set_tests_properties(startup_gpu_validation_hazard_hardware startup_gpu_validation_clean_hardware
+    PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(startup_debug_noise_device tests/startup_debug_noise_device.cpp)
 target_compile_features(startup_debug_noise_device PRIVATE cxx_std_17)
