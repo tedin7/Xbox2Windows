@@ -7,7 +7,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -26,8 +28,14 @@ inline bool span_contains(const std::vector<ReservedSpan>& spans, u64 address)
     return at != spans.begin() && address < std::prev(at)->end;
 }
 
+// A title heap the player opens for placements: what its placements use of it.
+struct HeapExtent {
+    u64 id, used, bytes;
+};
+
 struct PageReplay {
     std::vector<ReservedSpan> spans;  // sorted, disjoint, 64 KiB aligned
+    std::vector<HeapExtent> heap_extents;
     std::vector<ReservedSpan> map_spans;  // only ranges whose contents are restored by MAP
     std::size_t next_map = 0;
     u64 maps_applied = 0, pages_written = 0, zero_pages = 0, missing_pages = 0, bad_maps = 0;
@@ -59,6 +67,31 @@ inline void merge_spans(std::vector<ReservedSpan>& spans)
     spans.resize(count);
 }
 
+// Per heap ID, the end of what its placements use: the highest placement offset plus the buffer's width from its
+// recorded description (argument 1), or the heap's end when a placement's description is not in the file.
+inline std::unordered_map<u64, u64> used_heap_ends(const Recording& r)
+{
+    constexpr u64 width_at = 16, desc_bytes = 56;  // D3D12_RESOURCE_DESC::Width, sizeof(D3D12_RESOURCE_DESC)
+    std::unordered_map<u64, u64> ends;
+    for (const Step& step : r.steps) {
+        const HeapPlacement& placed = step.placement;
+        if (!placed.id) continue;
+        u64 width = placed.bytes - placed.offset;
+        for (const ArgMemory& m : step.memory) {
+            if (m.arg != 1 || m.bytes < desc_bytes) continue;
+            const auto blob = r.blobs.find(m.hash);
+            if (blob == r.blobs.end() || blob->second.bytes < desc_bytes) continue;
+            u64 recorded = 0;
+            std::memcpy(&recorded, blob->second.data + width_at, sizeof(recorded));
+            if (recorded && recorded <= width) width = recorded;
+            break;
+        }
+        u64& end = ends[placed.id];
+        end = (std::max)(end, placed.offset + width);
+    }
+    return ends;
+}
+
 // Reserves and commits MAP and descriptor backing ranges at their recorded addresses.
 inline bool reserve_page_ranges(const Recording& r, std::string& problem)
 {
@@ -73,14 +106,22 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     std::vector<ReservedSpan> wanted = state.map_spans;
     for (const Step& step : r.steps)
         if (step.descriptor_bytes) wanted.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
-    // Reserve whole recorded allocations, even when only interior pages were captured.
+    // Reserve whole recorded allocations, even when only interior pages were captured. A heap's allocation ends where
+    // its placements end: OpenExistingHeapFromAddress takes the whole allocation, and on WARP every opened byte counts
+    // against the adapter's memory budget. The rest of the recorded heap is a separate allocation.
     std::vector<u64> boundaries;
+    const auto used_ends = used_heap_ends(r);
+    state.heap_extents.clear();
     for (const auto& entry : r.placement_heaps) {
         const HeapPlacement& heap = entry.second;
         const u64 end = (heap.base + heap.bytes + granule - 1) & ~(granule - 1);
         wanted.push_back({heap.base, end});
         boundaries.push_back(heap.base);
         boundaries.push_back(end);
+        const auto used = used_ends.find(entry.first);
+        const u64 used_end = used == used_ends.end() ? end : (heap.base + used->second + granule - 1) & ~(granule - 1);
+        if (used_end < end) boundaries.push_back(used_end);
+        state.heap_extents.push_back({entry.first, (std::min)(used_end, end) - heap.base, end - heap.base});
     }
     std::sort(boundaries.begin(), boundaries.end());
     boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());

@@ -72,6 +72,25 @@ def pre_install_device():
     return data
 
 
+def placed_heap():
+    """One buffer placed by device slot 133 in an 8 MiB title heap (HPLC) at offset 1 MiB, 1 MiB wide: the player opens
+    the heap only up to the end that placement uses."""
+    base, heap_bytes, offset, width = 0x30000000000, 8 << 20, 1 << 20, 1 << 20
+    data = chunk(b"XREC", struct.pack("<IIQ", 3, CALL[3].size, 10_000_000))
+    data += chunk(b"XENV", data=b"X2W_D3D12_PERMISSIVE=1\0")
+    desc_at, out_at = 0x7253F600, 0x7253F6A0
+    args = [base + offset, desc_at, 0, 0, 0, out_at] + [0] * 5
+    data += chunk(b"CALL", CALL[3].pack(1, 1, 0, 133, DEVICE, *args, 0, 0.0, 0, 0))
+    # D3D12_RESOURCE_DESC of a row-major buffer (56 bytes), and the out pointer's 8 bytes.
+    desc = struct.pack("<IIQQIHHIIIII", 1, 0, 0, width, 1, 1, 1, 0, 1, 0, 1, 0) + bytes(4)
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 1, 1, 0, desc_at, len(desc), 0xDE5C))
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 1, 5, 0, out_at, 8, 0x0007))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0xDE5C, len(desc)), desc)
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x0007, 8), bytes(8))
+    data += chunk(b"HPLC", struct.pack("<5Q", 1, 7, base, heap_bytes, offset))
+    return data
+
+
 def play(player, directory, name, data):
     path = directory / f"{name}.x2wr"
     path.write_bytes(data)
@@ -122,6 +141,12 @@ def main(player):
                      "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1",
                      "skip census 7:8 dependent of failed create: 1", "x2w-replay: commit at failed create 1 "):
             assert line in text, (line, text[-2500:])
+
+        code, text, out = play(player, directory, "placed-heap", placed_heap())
+        assert code == 0, (code, text[-2500:])
+        summary = json.loads((out / "replay_summary.json").read_text())
+        assert summary["played"] == 1 and summary["missing_blob"] == 0, summary
+        assert "x2w-replay: heap 7 opened 2 of 8 MiB" in text, text[-2500:]
     return 0
 
 

@@ -900,6 +900,9 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
     }
+    for (const HeapExtent& heap : page_replay().heap_extents)
+        say("x2w-replay: heap %llu opened %llu of %llu MiB", static_cast<unsigned long long>(heap.id),
+            static_cast<unsigned long long>(heap.used >> 20), static_cast<unsigned long long>(heap.bytes >> 20));
     if (o.dump_bytes && !page_replay().reserved(o.dump_address, o.dump_bytes)) {
         say("x2w-replay: dump range 0x%llx + %llu is outside the recording's title pages", o.dump_address, o.dump_bytes);
         return 3;
