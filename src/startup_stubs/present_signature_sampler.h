@@ -43,6 +43,17 @@ inline bool layout_of(DXGI_FORMAT format, Layout& layout)
     }
 }
 
+inline void copy_sample(ID3D12GraphicsCommandList* list, ID3D12Resource* source, UINT subresource,
+                        ID3D12Resource* readback, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+                        const D3D12_BOX* box)
+{
+    D3D12_TEXTURE_COPY_LOCATION from{source, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    from.SubresourceIndex = subresource;
+    D3D12_TEXTURE_COPY_LOCATION to{readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    to.PlacedFootprint = footprint;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, box);
+}
+
 inline constexpr int onset_rgb_tolerance = 4;
 
 class Sampler {
@@ -110,19 +121,13 @@ public:
             return published;
         }
         barrier(surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION from{};
-        from.pResource = surface;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         for (int row = 0; row < rows; ++row) {
             const int band = row < cells_y ? row : row - cells_y;
             const UINT y = sampled_row(band, desc.Height, row < cells_y ? cells_y : fine_y);
-            D3D12_TEXTURE_COPY_LOCATION to{};
-            to.pResource = readback_;
-            to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            to.PlacedFootprint.Offset = stride * row;
-            to.PlacedFootprint.Footprint = {desc.Format, width, 1, 1, static_cast<UINT>(pitch)};
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{
+                stride * row, {desc.Format, width, 1, 1, static_cast<UINT>(pitch)}};
             const D3D12_BOX box{0, y, 0, width, y + 1, 1};
-            list_->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+            copy_sample(list_, surface, 0, readback_, footprint, &box);
         }
         barrier(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (FAILED(list_->Close())) {

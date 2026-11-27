@@ -28,7 +28,9 @@ class RedProducers {
         u64 key;
     };
     std::mutex lock_;
-    std::vector<Resource> surfaces_, inputs_;
+    std::vector<Resource> surfaces_;
+    std::array<Resource, 32> inputs_;
+    unsigned input_count_ = 0;
     std::vector<Entry> entries_;
     LONG first_ = 0, last_ = 0;
     LONG auto_min_ = 0, auto_count_ = 0;
@@ -41,6 +43,17 @@ class RedProducers {
     std::size_t history_next_ = 0, history_count_ = 0;
     unsigned submit_order_ = 0;
     bool full_logged_ = false;
+    std::unique_ptr<x2w_red::Tree> tree_;
+
+    void enable_tree()
+    {
+        if (!enabled()) return;
+        try {
+            tree_ = std::make_unique<x2w_red::Tree>(log);
+        } catch (const std::bad_alloc&) {
+            log("x2w-red table full: could not allocate writer tables");
+        }
+    }
 
 public:
     struct Disabled {};
@@ -67,6 +80,7 @@ public:
                     rgb[0] > 255 || rgb[1] > 255 || rgb[2] > 255) {
                     auto_min_ = auto_count_ = 0;
                     log("x2w-red producer auto disabled: X2W_RED_PRODUCER_RGB needs three decimal components from 0 to 255");
+                    enable_tree();
                     return;
                 }
                 std::copy_n(rgb, 3, target_rgb_);
@@ -76,10 +90,47 @@ public:
         } else {
             auto_min_ = auto_count_ = 0;
         }
+        enable_tree();
     }
 
     bool enabled() const { return first_ || auto_count_; }
     bool onset() const { return enabled() && onset_; }
+    bool tracks_writers(LONG record = frame_number + 1) const
+    {
+        return tree_ && (record <= last_ || (auto_count_ && (!auto_last_ || record <= auto_last_)));
+    }
+
+    void writer(ID3D12GraphicsCommandList* list, x2w_red::Input target, const char* op, u64 key,
+                const x2w_red::Input* inputs = nullptr, unsigned count = 0)
+    {
+        if (!tracks_writers() || !target.resource) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        const LONG record = frame_number + 1;
+        if (tracks_writers(record))
+            tree_->record(record, list, target, op, key, inputs, interested() ? count : 0);
+    }
+
+    void forget(ID3D12Resource* resource)
+    {
+        if (!tree_ || !resource || !tracks_writers()) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        tree_->forget(resource);
+    }
+
+    void end_frame(ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG record)
+    {
+        if (!tracks_writers(record)) {
+            frame_number = record;
+            return;
+        }
+        // Serialize the frame boundary with ExecuteCommandLists and its writer publication.
+        std::lock_guard<std::mutex> guard(lock_);
+        if (surface && ((record >= first_ && record <= last_) || (record >= auto_first_ && record <= auto_last_)))
+            tree_->present(device_of(the_device), queue, surface, record);
+        frame_number = record;
+        if (!tracks_writers(record + 1)) tree_->finish();
+    }
+
     bool matches(const unsigned char* rgba, bool flat) const
     {
         if (onset_ && !flat) return false;
@@ -142,7 +193,7 @@ public:
         }
     }
 
-    void follow_inputs(const Pass& pass, ID3D12Resource* const* textures, std::size_t count, u64 key)
+    void follow_inputs(const Pass& pass, const x2w_red::Input* textures, std::size_t count, u64 key)
     {
         if (!count || !pass.targets_bound) return;
         std::lock_guard<std::mutex> guard(lock_);
@@ -151,11 +202,11 @@ public:
             if (std::none_of(surfaces_.begin(), surfaces_.end(), [=](const Resource& r) { return r.Get() == target; }))
                 continue;
             for (std::size_t j = 0; j < count; ++j) {
-                auto* input = textures[j];
-                if (input == target || std::any_of(inputs_.begin(), inputs_.end(),
+                auto* input = textures[j].resource;
+                if (!input || input == target || std::any_of(inputs_.begin(), inputs_.begin() + input_count_,
                     [=](const Resource& r) { return r.Get() == input; })) continue;
-                if (inputs_.size() == 32) return;
-                inputs_.emplace_back(input);
+                if (input_count_ == inputs_.size()) return;
+                inputs_[input_count_++] = input;
                 log("x2w-red input record=%ld target=%p source=%p key=%016llx", frame_number + 1, target, input, key);
             }
         }
@@ -167,7 +218,7 @@ public:
         if (!may_record() || !surface || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return 0;
         std::lock_guard<std::mutex> guard(lock_);
         const auto found = std::find_if(surfaces_.begin(), surfaces_.end(), [=](const Resource& r) { return r.Get() == surface; });
-        if (found == surfaces_.end() && std::none_of(inputs_.begin(), inputs_.end(),
+        if (found == surfaces_.end() && std::none_of(inputs_.begin(), inputs_.begin() + input_count_,
             [=](const Resource& r) { return r.Get() == surface; })) return 0;
         if (wants_history()) {
             history_[history_next_] = {list, surface, frame_number + 1, attachment, operation, key};
@@ -215,15 +266,13 @@ private:
     {
         ID3D12Resource* surface = entry.surface.Get();
         const auto desc = surface->GetDesc();
-        D3D12_TEXTURE_COPY_LOCATION to{entry.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        to.PlacedFootprint.Offset = offset;
-        to.PlacedFootprint.Footprint = {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
-        const D3D12_TEXTURE_COPY_LOCATION from{surface, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{
+            offset, {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}};
         const UINT x = static_cast<UINT>(desc.Width / 2);
         const UINT y = x2w_present_signature::sampled_row(x2w_present_signature::cells_y / 2, desc.Height, x2w_present_signature::cells_y);
         const D3D12_BOX pixel{x, y, 0, x + 1, y + 1, 1};
         require_state(owner, surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        entry.list->CopyTextureRegion(&to, 0, 0, 0, &from, &pixel);
+        x2w_present_signature::copy_sample(entry.list, surface, 0, entry.readback.Get(), footprint, &pixel);
         require_state(owner, surface, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
@@ -233,6 +282,7 @@ public:
         if (!enabled()) return;
         std::lock_guard<std::mutex> guard(lock_);
         for (Entry& entry : entries_) if (entry.list == list) entry.live = false;
+        if (tree_) tree_->discard(list);
     }
 
     template <class Invoke>
@@ -244,7 +294,10 @@ public:
         invoke();
         Fence fence;
         bool tried = false;
+        const LONG record = frame_number + 1;
         for (ID3D12CommandList* list : lists) {
+            if (tracks_writers(record)) tree_->submit(record, queue, list,
+                (record >= first_ && record <= last_) || (record >= auto_first_ && record <= auto_last_));
             for (Entry& entry : entries_) {
                 if (!entry.live || entry.list != list) continue;
                 if (!tried) {
@@ -269,6 +322,7 @@ public:
     {
         if (!enabled()) return;
         std::lock_guard<std::mutex> guard(lock_);
+        if (tree_) tree_->flush();
         flush_locked();
     }
 
@@ -315,11 +369,13 @@ struct RedDrawSamples {
     unsigned count = 0;
 };
 
-RedDrawSamples red_producer_draw_before(Wrapper* self, ID3D12GraphicsCommandList* list, const char* operation, u64 key)
+RedDrawSamples red_producer_draw_before(Wrapper* self, ID3D12GraphicsCommandList* list, const char* operation, u64 key,
+                                        const x2w_red::Input* inputs = nullptr, unsigned count = 0,
+                                        bool depth_writes = true)
 {
     RedDrawSamples samples;
     auto& tracker = red_producers();
-    if (!tracker.may_record()) return samples;
+    if (!tracker.may_record() && !tracker.tracks_writers()) return samples;
     const Pass& pass = pass_of(self);
     if (!pass.targets_bound) return samples;
     if (tracker.interested())
@@ -330,9 +386,12 @@ RedDrawSamples red_producer_draw_before(Wrapper* self, ID3D12GraphicsCommandList
             pass.trace_targets[4], pass.target_formats[4], pass.trace_targets[5], pass.target_formats[5],
             pass.trace_targets[6], pass.target_formats[6], pass.trace_targets[7], pass.target_formats[7]);
     for (UINT i = 0; i < pass.target_count; ++i) {
+        tracker.writer(list, {pass.trace_targets[i], i, pass.target_formats[i]}, operation, key, inputs, count);
         if (const unsigned mark = tracker.before(self, list, pass.trace_targets[i], operation, key, i))
             samples.marks[samples.count++] = mark;
     }
+    if (depth_writes && pass.depth_view_writable)
+        tracker.writer(list, {pass.trace_depth, 8, pass.dsv_format}, operation, key, inputs, count);
     return samples;
 }
 

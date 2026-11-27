@@ -74,11 +74,34 @@ graphics draw to a known present target. They include the submitting queue and
 operation order. Present samples use the same texel, and attachment rows identify
 the bound render targets and depth view. A queue fence guards the readbacks.
 Recording history gives candidate commands. Attribution requires a completed
-producer read and a matching presentation resource. The trace covers direct-list
+producer read and a matching presentation resource. The paired trace covers direct-list
 graphics writes to previously seen single-sample present targets and eligible
 inputs in onset mode. Compute writes and alias writes require separate evidence.
 The diagnostic retains up to eight present resources and 512 paired readbacks in
 an opted-in process.
+
+Within either capture window, `x2w-red tree` follows the last present writer
+through three levels of texture inputs. Each input lists the last writer submitted
+before the reader. `UNWRITTEN` marks inputs with no writer in the frame. The log
+can identify an older write from the 256-entry texture history. Attachment slot
+32 identifies a depth-test input. The sampler reports a center texel and
+per-channel minimum, maximum, and mean across a 4×4 grid in the stored format.
+For depth, it copies the whole plane as required by D3D12 and reduces the same grid.
+Values reflect the end of the frame. `WRITTEN LATER IN FRAME` marks an input whose
+sample may differ from what the reader saw. Submissions spanning multiple
+queues keep writer attribution and report readback unavailable. Multisampled
+and unsupported subresources report an unreadable format. A repeated writer
+tree and zero pattern prints a reference to the preceding record.
+
+The WARP fixture compares the tree and all 64 back-buffer pixels with CPU
+references. It runs the same scene with a draw and a dispatch in the middle,
+checks the duplicate-frame marker, compares the disabled path against a
+fixture instantiation without instrumentation, and omits the dispatch writer
+in a mutant that must fail attribution while producing identical pixels.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_present_producer_(tree_)?warp$'
+```
 
 `startup_present_producer` uses a 16×16 source-built texture and known clears. It
 checks exact colors on both sides of each clear, compared to subsequent presents,

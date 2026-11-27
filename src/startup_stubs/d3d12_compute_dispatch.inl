@@ -726,6 +726,34 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } else {
         list->Dispatch(x, y, z);
     }
+    if (red_producers().tracks_writers()) {
+        x2w_red::Input textures[32];
+        unsigned texture_count = 0;
+        if (red_producers().interested()) {
+            for (std::size_t i = 0; i < inputs; ++i) {
+                const View& view = views[i];
+                if (!view.texture) continue;
+                D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+                if (view.described) std::memcpy(&desc, view.desc, sizeof(desc));
+                textures[texture_count++] = x2w_red::shader_input(view.resource, static_cast<UINT>(i),
+                                                                view.described ? &desc : nullptr);
+            }
+        }
+        for (std::size_t i = inputs; i < count; ++i) {
+            const View& view = views[i];
+            x2w_red::Input output{view.resource, static_cast<UINT>(i - inputs)};
+            if (view.texture && view.described) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+                std::memcpy(&desc, view.desc, sizeof(desc));
+                output.format = desc.Format;
+                if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) {
+                    output.mip = desc.Texture2D.MipSlice;
+                    output.plane = desc.Texture2D.PlaneSlice;
+                }
+            }
+            red_producers().writer(list, output, "translated-dispatch", key, textures, texture_count);
+        }
+    }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

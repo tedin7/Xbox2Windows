@@ -3352,12 +3352,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
-    const bool trace_inputs = red_producers().onset();
-    ID3D12Resource* sampled_textures[32];
+    const bool trace_inputs = red_producers().interested();
+    x2w_red::Input sampled_textures[33];
     unsigned sampled_count = 0;
-    const auto follow_inputs = [&] {
-        red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
-    };
+
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT srv_count = n + tr->integer_srvs.descriptors();
     const UINT views = srv_count + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
@@ -3624,7 +3622,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             } else {
                 device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &desc, dest);
             }
-            if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
+            if (trace_inputs)
+                sampled_textures[sampled_count++] = x2w_red::shader_input(texture, i, view);
             continue;
         }
         if (indirect) {
@@ -4015,10 +4014,28 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
+    const auto producer_before = [&](const char* operation) {
+        if (!red_producers().tracks_writers())
+            return RedDrawSamples{};
+        if (trace_inputs && red_producers().onset())
+            red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
+        const auto& depth = bound->depth_stencil;
+        const bool depth_test = bound->has_depth_stencil && (depth.DepthEnable || depth.StencilEnable);
+        const bool depth_writes = bound->has_depth_stencil &&
+            ((depth.DepthEnable && depth.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) ||
+             (depth.StencilEnable && depth.StencilWriteMask != 0));
+        unsigned input_count = sampled_count;
+        if (trace_inputs && depth_test && pass.trace_depth)
+            sampled_textures[input_count++] = {pass.trace_depth, 32, pass.dsv_format};
+        for (UINT j = 0; j < tr->uavs.size(); ++j) {
+            const auto& binding = uav_bindings[j];
+            red_producers().writer(list, {binding.resource, j, binding.view.Format}, "translated-draw-uav",
+                                   tr->key, sampled_textures, input_count);
+        }
+        return red_producer_draw_before(self, list, operation, tr->key, sampled_textures, input_count, depth_writes);
+    };
     if (indirect) {
-        follow_inputs();
-        const auto red_samples = trace_inputs
-            ? red_producer_draw_before(self, list, "translated-indirect-draw", tr->key) : RedDrawSamples{};
+        const auto red_samples = producer_before("translated-indirect-draw");
         if (validated) {
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
@@ -4050,15 +4067,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);
-            follow_inputs();
-            const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
+            const auto red_samples = producer_before("translated-draw");
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
             red_producer_draw_after(self, red_samples);
             drawn = true;
         }
     } else {
-        follow_inputs();
-        const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
+        const auto red_samples = producer_before("translated-draw");
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         red_producer_draw_after(self, red_samples);
         drawn = true;
