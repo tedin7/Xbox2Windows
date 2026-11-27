@@ -14,6 +14,14 @@ When a write covers a saved quad mask, a subsequent read under a proven
 subset can use the replacement value. A write under the live-pixel mask
 alone leaves the saved quad's helper lanes uncovered.
 
+An ordinary binary16 or 16-bit integer VALU source reads the low half by
+default. The scan also checks each source's `op_sel` bit. A fixture writes
+only the low half of an omitted interpolant, then uses it in a compare and
+an add. The fixture hit the stale-read refusal on `f18dedec3` and passes
+the scan with source-half tracking. The controls select the stale high
+half and require the liveness refusal. Ignoring `op_sel` makes that
+control fail. The draw compares both results with a CPU reference.
+
 Binary16 VOPC SDWA supports the existing `lt`, `eq`, `le`, `gt`, `ge`
 and `neq` relations with `WORD_0` and `WORD_1`. The synthetic fixtures
 exercise VCC, scalar and EXEC destinations, with register pairs that cover
