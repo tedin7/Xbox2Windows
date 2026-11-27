@@ -3289,7 +3289,6 @@ class Stage:
     loads_after_wide_exec_write = ()  # the same for a writer that is not a v_cmpx
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
-    defined_v = ()            # VGPRs fully written since the last block boundary (their upper half holds a known value)
     exec_generation = 0      # advances on every EXEC write and basic-block boundary
     low16_generation = None  # first outstanding low-half write, per VGPR
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
@@ -3927,10 +3926,6 @@ class Stage:
             self.low16_generation.setdefault(n, self.exec_generation)
         else:
             self.clear_low16(n)
-            if isinstance(self.defined_v, set) and (self.exec_known or ignore_exec):
-                self.defined_v.add(n)
-        if low16_only and isinstance(self.defined_v, set):
-            self.defined_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known or ignore_exec else 'if (exec & 1) v%d = %s;' % (n, expr))
         temps = getattr(self, 'uniform_temps', None)
@@ -5345,7 +5340,6 @@ class Stage:
             self.scc_def, scc_in = None, {}
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
-            self.defined_v = set()
             self.exec_generation = 0
             self.low16_generation = {}
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
@@ -5396,7 +5390,6 @@ class Stage:
                 if off in splits and off != start:
                     self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
-                    self.defined_v.clear()
                     self.align4_v.clear()
                     self.align4_s.clear()
                     self.blocks.append((start, self.lines, None))
@@ -5701,7 +5694,6 @@ class Stage:
                 if term:
                     self.exec_generation += 1
                     self.pinned_low16_v.update(self.low16_only_v)
-                    self.defined_v.clear()
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
                     self.descriptor_block_first = instruction_index + 1
@@ -10086,13 +10078,7 @@ class Stage:
             for i in range(0, len(halves), 2):
                 odd_tail = i + 1 == len(halves)
                 expr = halves[i] if odd_tail else '%s | (%s << 16)' % (halves[i], halves[i + 1])
-                reg = dst[1] + i // 2
-                if odd_tail and not sample_d16 and isinstance(self.defined_v, set) and reg in self.defined_v:
-                    # The load writes only the low half; the upper half keeps the value the register held. Lanes
-                    # that are off keep the whole old word, so the same expression is right under any EXEC.
-                    self.set_v(reg, '(v%d & 0xffff0000u) | %s' % (reg, expr))
-                    continue
-                self.set_v(reg, expr, low16_only=odd_tail)
+                self.set_v(dst[1] + i // 2, expr, low16_only=odd_tail)
         else:
             n = dst[1]
             for bit, comp in enumerate('xyzw'):
