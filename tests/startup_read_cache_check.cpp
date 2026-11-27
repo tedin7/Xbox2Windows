@@ -10,7 +10,7 @@ int wmain(int argc, wchar_t** argv)
     const bool enabled = std::wcscmp(argv[2], L"off") != 0;
     const auto* cache = x2w_local::read_cache();
     if (enabled != (cache != nullptr)) return 3;
-    constexpr SIZE_T page = 4096, slots = 96;
+    static constexpr SIZE_T page = 4096, slots = 96;
     auto* base = static_cast<unsigned char*>(VirtualAlloc(nullptr, slots * 2 * page, MEM_RESERVE, PAGE_NOACCESS));
     if (!base) return 4;
     for (SIZE_T i = 0; i < slots; ++i) {
