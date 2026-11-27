@@ -2145,6 +2145,8 @@ output. For an output buffer that aliases title memory, record with
 `X2W_REPLAY_TITLE_RANGES=1` and `X2W_REPLAY_PAGES_AT_SUBMIT=1` to capture raw heap descriptors and placed buffers.
 Play with `--dump HEX_ADDRESS:BYTES` to write up to 64 MiB of a reserved title range to `dump.bin` after the recorded calls
 and before trailing page updates. Wait for GPU completion in the recorded workload before either readback.
+Recorded descriptor increments are declared to the layer before replay. Title CPU and GPU handles map by descriptor index to the replay device’s heaps, and unknown CPU handles are refused.
+
 Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
 The recorder uses the layouts in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h)

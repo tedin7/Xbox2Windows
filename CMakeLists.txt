@@ -1979,6 +1979,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+# Replay title descriptor increments on a device with a different stride.
+add_executable(startup_title_stride_heap tests/startup_title_stride_heap.cpp)
+target_compile_features(startup_title_stride_heap PRIVATE cxx_std_17)
+target_link_libraries(startup_title_stride_heap PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_title_stride_heap_${backend} COMMAND startup_title_stride_heap ${backend})
+    set_tests_properties(startup_title_stride_heap_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 # Resource slot 10: GetDesc on console resource wrappers.
 add_executable(startup_resource_desc tests/startup_resource_desc.cpp)
 target_compile_features(startup_resource_desc PRIVATE cxx_std_17)
