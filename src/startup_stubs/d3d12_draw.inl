@@ -3822,9 +3822,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         };
         if (zero_missing_buffer && srv.kind == 0 && !address && (!buffer_token || empty_buffer_token) &&
             !placed.owner && !placed.reject) {
-            // A completely empty slot declares no size. Use one DWORD for that case.
-            constexpr std::size_t max_raw_bytes = std::size_t{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
-            const std::size_t padded = bytes <= max_raw_bytes ? ((bytes ? bytes : 4) + 3) & ~std::size_t{3} : 0;
+            // A completely empty slot declares no size. Use one DWORD for that case. Reads past the end of a
+            // buffer view return zero, so a declared size above 64 KiB is backed by only 64 KiB of zeros
+            // instead of a huge upload (a huge declared size must not turn the placeholder into a refusal).
+            constexpr std::size_t zero_cap_bytes = std::size_t{64} << 10;
+            const std::size_t sized = bytes <= zero_cap_bytes ? (bytes ? bytes : 4) : zero_cap_bytes;
+            const std::size_t padded = (sized + 3) & ~std::size_t{3};
             auto zero = reserve_upload_ring(self, padded);
             if (!zero.mapped && padded > upload_ring_max_bytes() / 4)
                 zero = reserve_large_upload(self, padded, big_binding_buffers);
