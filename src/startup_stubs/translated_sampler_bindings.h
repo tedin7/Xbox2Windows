@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 #include "heap_indexed_root.h"
 
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <cstdint>
@@ -22,11 +23,8 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-// lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
-// 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json,
-// SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170 encodes them as S_FIXED(x, 8)), so MinLOD and MaxLOD are the fields
-// divided by 256. dynamic_sampler() sets it for every heap entry. Without it MinLOD stays 0 and MaxLOD unbounded, as
-// for the other sample forms.
+// lod_limits carries the unsigned 4.8 MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12)
+// for heap entries and smpl static samplers.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
                                                 bool lod_limits = false)
 {
@@ -101,6 +99,13 @@ struct TranslatedSamplers {
     }
 };
 
+// RDNA 2 ISA Table 46: word 2 bits 13:0 are the signed primary LOD bias with eight fractional bits.
+inline float decode_sampler_lod_bias(const SamplerWords& words)
+{
+    const int bias = static_cast<int>(words[2] & 0x3fffu);
+    return static_cast<float>((bias ^ 0x2000) - 0x2000) / 256.0f;
+}
+
 // The static sampler bound at register i, in manifest order.
 inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSamplers& samplers)
 {
@@ -110,11 +115,8 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
         const auto& words = samplers.statics[i];
         auto sampler = decode_sampler(words, i, i < samplers.comparison.size() && samplers.comparison[i], limits);
         if (limits) {
-            // RDNA 2 ISA §8.2.7, sampler descriptor: signed primary LOD bias,
-            // bits 13:0 of word 2, with eight fractional bits. The translator
-            // validates the D3D12 range and requires zero secondary bias.
-            const int bias = static_cast<int>(words[2] & 0x3fffu);
-            sampler.MipLODBias = static_cast<float>((bias ^ 0x2000) - 0x2000) / 256.0f;
+            // The translator validates the D3D12 range and requires zero secondary bias.
+            sampler.MipLODBias = decode_sampler_lod_bias(words);
         }
         statics.push_back(sampler);
     }
@@ -208,17 +210,23 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
     // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
-    const auto s = decode_sampler(words, 0, false, true);
+    auto s = decode_sampler(words, 0, false, true);
+    // MIP_FILTER 0 selects the view's base level for title heap descriptors.
+    if (((words[2] >> 26) & 3u) == 0) {
+        s.MinLOD = 0.0f;
+        s.MaxLOD = 0.0f;
+    }
     const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
     const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
                          s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
-    return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
+    const float bias = std::clamp(decode_sampler_lod_bias(words), D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX);
+    return {s.Filter, s.AddressU, s.AddressV, s.AddressW, bias, s.MaxAnisotropy, s.ComparisonFunc,
             {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
-    // Not a title descriptor: its zero word 1 is not a LOD clamp, so the full mip range stays available.
+    // The synthetic fallback keeps the full mip range despite its zero MIP_FILTER field.
     auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
     s.MaxLOD = D3D12_FLOAT32_MAX;
     return s;
