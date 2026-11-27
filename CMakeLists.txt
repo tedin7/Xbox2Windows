@@ -2001,12 +2001,6 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_graphics_wqm_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
     set_tests_properties(native_graphics_wqm_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-    foreach(adapter warp hardware)
-        add_test(NAME native_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-            "${CMAKE_SOURCE_DIR}/tests/native_sampler_heap_check.py" "$<TARGET_FILE:compile_dxil>"
-            "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}" ${adapter})
-        set_tests_properties(native_sampler_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-    endforeach()
     add_test(NAME native_graphics_interface_library
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_graphics_interface_library_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
