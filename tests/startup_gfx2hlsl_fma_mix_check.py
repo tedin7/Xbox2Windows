@@ -211,7 +211,7 @@ for src, value in enumerate((0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0), 240):
 expect('low-half binary16 inline 1.0 in mixlo',
        encode(MIXLO_F16, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]',
-       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(F(v2), 1.0, F(v4)));')
+       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(F(v2), 1.0, F(v4)));')
 expect_refused('high half of inline 1.0',
                encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0)),
                'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel:[0,1,0] op_sel_hi:[0,1,0]')
