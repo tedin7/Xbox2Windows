@@ -3499,6 +3499,32 @@ struct PlaceholderDraws {
     u64 draws = 0;
     std::vector<PlaceholderTarget> targets;  // draws per render target (size + format), depth buffer marked
 };
+// The state of a depth-writing draw that decides whether it leaves pixels (depth_clear_census.h): the bound depth resource,
+// the test, viewport 0 and scissor 0 as the title set them, and the rasterizer the desktop pipeline gets (without a decoded
+// one: cull none, depth clip on, as pipeline_for builds it).
+x2w_depth_census::DepthWrite depth_write_state(const Pass& pass, const BoundPipeline& bound)
+{
+    x2w_depth_census::DepthWrite write;
+    write.width = pass.depth_surface.width, write.height = pass.depth_surface.height;
+    write.format = static_cast<int>(pass.dsv_format);
+    write.func = static_cast<int>(bound.depth_stencil.DepthFunc);
+    write.viewport_set = pass.viewport_set;
+    if (pass.viewport_set) {
+        const auto& v = pass.viewport0;
+        write.vp_x = v.TopLeftX, write.vp_y = v.TopLeftY, write.vp_width = v.Width, write.vp_height = v.Height;
+        write.min_depth = v.MinDepth, write.max_depth = v.MaxDepth;
+    }
+    write.scissor_set = pass.scissor_set;
+    if (pass.scissor_set) {
+        const auto& s = pass.scissor0;
+        write.sc_left = s.left, write.sc_top = s.top, write.sc_right = s.right, write.sc_bottom = s.bottom;
+    }
+    write.cull = bound.has_rasterizer ? static_cast<int>(bound.rasterizer.CullMode) : static_cast<int>(D3D12_CULL_MODE_NONE);
+    write.front_ccw = bound.has_rasterizer && bound.rasterizer.FrontCounterClockwise;
+    write.depth_clip = !bound.has_rasterizer || bound.rasterizer.DepthClipEnable;
+    return write;
+}
+
 SRWLOCK placeholder_draw_lock = SRWLOCK_INIT;
 
 auto& placeholder_draws()
@@ -4629,6 +4655,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 : bound->depth_stencil.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO ? debug_present::depth_test_only
                 : debug_present::depth_writes;
             debug_present::note_draw(pass.bound_targets, pass.target_count, pass.bound_depth, depth_class);
+            if (depth_class == debug_present::depth_writes) {
+                depth_clear_census().depth_write_draw(pass.bound_depth, depth_write_state(pass, *bound));
+            }
             if (depth_state && bound->depth_from_registers && bound->depth_stencil.DepthEnable)
                 depth_clear_census().depth_draw(pass.bound_depth, static_cast<int>(bound->depth_stencil.DepthFunc));
         }

@@ -3247,8 +3247,13 @@ These are measured on one executable; treat them as hypotheses for others.
   whether a decoded GREATER test can pass: `x2w-render depth clear census:` lines name each of the
   first 8 (depth, flags) pairs a title clears with, the clears the stand-in skipped by reason, and,
   for draws with a decoded GREATER or GREATER_EQUAL test, how many met a depth view last cleared
-  to 1.0 (nothing passes), to 0.0, to another value, or never cleared. Each line prints when its
-  count reaches a power of two (`startup_depth_clear_census`).
+  to 1.0 (nothing passes), to 0.0, to another value, or never cleared. `x2w-render depth writer
+  census:` lines describe the draws that write depth (debug present's "depth writes" class): the
+  bound depth resource with its size and DSV format, the depth test, viewport 0 with its depth
+  range, scissor 0, cull mode and winding, depth clip, the value the view was last cleared to, and
+  whether a fragment inside the viewport depth range can pass the test against that clear (a LESS
+  test on a view cleared to 0.0 passes nowhere). The first 32 such states are counted alone, later
+  ones together. Each line prints when its count reaches a power of two (`startup_depth_clear_census`).
 - Rasterizer state (#1999, item B) has a decoder for the register value only:
   `src/startup_stubs/rasterizer_state_decode.h` turns a `PA_SU_SC_MODE_CNTL` value into the cull mode,
   front-face winding and fill mode of a `D3D12_RASTERIZER_DESC`, with the field positions of the amdgpu
