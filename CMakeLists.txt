@@ -3816,9 +3816,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The 64-bit vector shifts (#1815).
     add_test(NAME startup_gfx2hlsl_b64_shift COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_b64_shift_check.py")
-    # The scalar shift-and-add forms s_lshl1..4_add_u32 (Run 20 census #16).
+    # Scalar shift-and-add controls and WARP tests for numeric lane-mask words.
     add_test(NAME startup_gfx2hlsl_s_lshl_add COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py")
+    if(TARGET offscreen_check)
+        add_test(NAME startup_gfx2hlsl_s_lshl_add_pixel_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>")
+        add_test(NAME startup_gfx2hlsl_s_lshl_add_compute_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_mask_data_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>")
+        set_tests_properties(startup_gfx2hlsl_s_lshl_add_pixel_warp startup_gfx2hlsl_s_lshl_add_compute_warp
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
     # SOPK 16-bit immediates: s_movk_i32 and s_cmpk_*_i32 sign-extend, s_cmpk_*_u32 zero-extend.
     add_test(NAME startup_gfx2hlsl_sopk_signext COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sopk_signext_check.py")

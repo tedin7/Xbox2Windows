@@ -4940,6 +4940,57 @@ class Stage:
         group = getattr(getattr(self, 'pipe', None), 'group', None)
         return getattr(self, 'kind', None) == 'cs' and bool(group) and group[0] * group[1] * group[2] == 1
 
+    def compute_shift_mask_exact(self, tok):
+        """Recognize a low word whose per-thread bits are the guest compare or entry EXEC bits."""
+        if tok in ('exec', 'exec_lo'):
+            return True
+        r = reg_range(tok)
+        if r and self.sym.get(r[1]) == ('execcopy',):
+            return True
+        word = scalar_tokens(tok)
+        for pc, _, name, asm in reversed(self.ins):
+            if pc >= self.pc:
+                continue
+            if name.startswith('s_movreld'):
+                return False
+            _, _, writes = scalar_effects(name, asm)
+            if word & writes:
+                return name.startswith('v_cmp_')
+        return False
+
+    def shift_add_mask_word(self, base, tok, index):
+        """Materialize the numeric word while the original lane predicate is still live."""
+        high = tok in ('exec_hi', 'vcc_hi') or self.reads_mask_high((tok,))
+        if not high and not self.is_lane_mask(tok):
+            return self.u(tok)
+        r = reg_range(tok)
+        joined = r and r[0] == 's' and r[1] in getattr(self, 'join_masks', ())
+        entry = (getattr(self, 'exec_known', False) and not getattr(self, 'past_entry', True)
+                 and not self.wqm_count and not self.lane_exec_breaks)
+        name = 'shift_mask_%x_%d' % (getattr(self, 'pc', 0) or 0, index)
+        if not joined and not high:
+            if self.lane_mask_exact():
+                return self.u(tok)
+            if entry and self.kind == 'ps':
+                if tok in ('exec', 'exec_lo') or (r and self.sym.get(r[1]) == ('execcopy',)):
+                    self.needs_sm6 = True
+                    self.emit('uint %s = WaveActiveBallot(true).x;' % name)
+                    return name
+            if entry and self.kind == 'cs' and self.quad_flow_straight() and self.compute_shift_mask_exact(tok):
+                x, y, z = self.pipe.group
+                count = x * y * z
+                if count <= 32:
+                    # Publish in guest lane order, independent of the desktop wave width.
+                    flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                    self.uses_quad_shared = True
+                    self.emit('x2w_quad[%s] = (%s & 1u) << %s;' % (flat, self.u(tok), flat))
+                    self.emit('GroupMemoryBarrierWithGroupSync();')
+                    self.emit('uint %s = 0u;' % name)
+                    self.emit('for (uint lane = 0u; lane < %du; ++lane) %s |= x2w_quad[lane];' % (count, name))
+                    self.emit('GroupMemoryBarrierWithGroupSync();')
+                    return name
+        raise Unsupported('%s on a lane mask: wave word not available in this stage' % base)
+
     def reads_mask_high(self, toks):
         """First single-register operand that is the high word of a wave64 lane mask, else None."""
         high = getattr(self, 'mask_high', ())
@@ -4962,9 +5013,10 @@ class Stage:
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
-        if base.startswith('s_') and not MASK_AWARE_SALU_RE.match(base):
+        # Shift-and-add supplies or refuses its mask words in scalar(), before writing the result.
+        if base.startswith('s_') and base not in SHIFT_ADD and not MASK_AWARE_SALU_RE.match(base):
             masks = [t for t in (ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:]) if self.is_lane_mask(t.strip())]
-        if base.startswith(('v_', 's_')) and not masks:   # the high word of a wave64 mask has no one-lane value
+        if base.startswith(('v_', 's_')) and base not in SHIFT_ADD and not masks:   # the high word of a wave64 mask has no one-lane value
             skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
             high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
             masks = [high] if high else []
@@ -5836,7 +5888,9 @@ class Stage:
         # s_mul_hi_{u,i}32 need the whole 32-bit word of each source, like the halfword pack.
         word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_mul_hi_i32')
         word_absdiff = base == 's_absdiff_i32'
-        if shift_add or word_complement or word_pack or word_absdiff:
+        if shift_add and dname in self.MASK_NAMES_LOW + self.MASK_NAMES_HIGH:
+            raise Unsupported('%s on a lane mask: wave word not available in this stage' % base)
+        if word_complement or word_pack or word_absdiff:
             # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_{u,i}32 into an
             # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
@@ -5997,7 +6051,18 @@ class Stage:
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
-        values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
+        numeric_mask = shift_add and (any(self.is_lane_mask(t) for t in srcs)
+                                      or (self.reads_mask_high(srcs) and not self.lane_mask_exact()))
+        incoming_scc, result_uniform = None, None
+        if numeric_mask:
+            values = [self.shift_add_mask_word(base, tok, i) for i, tok in enumerate(srcs)]
+            if 'src_scc' in srcs:
+                # Both the sum and its carry read the incoming SCC.
+                incoming_scc = 'shift_scc_%x' % (getattr(self, 'pc', 0) or 0)
+                self.emit('uint %s = scc ? 1u : 0u;' % incoming_scc)
+                values[srcs.index('src_scc')] = incoming_scc
+        else:
+            values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
         expr = text.format(*values)
         if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
             for tok in srcs:
@@ -6025,7 +6090,10 @@ class Stage:
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
-            self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
+            carry = '(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1])
+            if incoming_scc and self.tracks_uniformity():
+                result_uniform = self.scalar_expr_uniform(expr.replace(incoming_scc, 'scc'))
+            self.set_scc(carry, proof=carry.replace(incoming_scc, 'scc') if incoming_scc else None)
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -6126,7 +6194,8 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
-        self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4,
+                   uniform=result_uniform)
         if deferred_scc is not None:
             self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
