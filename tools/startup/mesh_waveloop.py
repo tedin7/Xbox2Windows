@@ -173,21 +173,36 @@ class ControlFlow:
             empty, active = self.successors[start]
             if name == 's_cbranch_execnz':
                 empty, active = active, empty
-            if empty == active:
+            # An EXECNZ fallthrough can contain a branch-only block that
+            # skips the active arm. Follow it while the edge stays exclusive.
+            edge = (start, empty)
+            target, skipped = empty, {start}
+            while (target not in skipped and self.predecessors[target] == [edge[0]]
+                   and self.blocks[target] == target + 1 and instructions[target][2] == 's_branch'):
+                skipped.add(target)
+                edge = (target, self.successors[target][0])
+                target = edge[1]
+            if active == target or target in skipped:
                 continue
-            # The skipped region's definitions stand in for undef on the
-            # empty edge. The emitter leaves the skipped registers untouched.
-            seen, todo, writes = {empty, start}, [active], set()
+            # Only definitions on active paths that rejoin the empty successor
+            # can stand in for undef there. Stop both searches at this branch.
+            rejoins, pending = {target}, [target]
+            while pending:
+                for predecessor in self.predecessors[pending.pop()]:
+                    if predecessor not in skipped and predecessor not in rejoins:
+                        rejoins.add(predecessor)
+                        pending.append(predecessor)
+            seen, todo, writes = skipped | {target}, [active], set()
             while todo:
                 block = todo.pop()
-                if block in seen:
+                if block in seen or block not in rejoins:
                     continue
                 seen.add(block)
                 for index in range(block, self.blocks[block]):
                     writes.update(reg for reg in self.effects[index][1]
                                   if re.fullmatch(r'[sv]\d+', reg))
                 todo.extend(self.successors[block])
-            self.exec_zero_edges[start, empty] = writes
+            self.exec_zero_edges[edge] = writes
 
     def definedness(self, entry, elided_scc=()):
         def transfer(state, index):

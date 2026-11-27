@@ -19,5 +19,19 @@ def check_descriptor_shift_add():
     assert '(ud%s << 2) + 0x00000001u' % word in hlsl, hlsl
 
 
+def check_exec_zero_non_rejoining_exit():
+    prefix = SERIAL_MESH[:8]
+    suffix = ['7e020214'] + SERIAL_MESH[8:]  # v_mov_b32 v1, s20
+    write = 'be940380'  # s_mov_b32 s20, 0
+    for skip in (['bf880002'], ['bf890001', 'bf820002']):
+        # EXEC zero skips the write and lands at the use. The active arm
+        # either branches there as well or terminates at its own s_endpgm.
+        status, _ = run(prefix + skip + [write, 'bf820000'] + suffix, 'force')
+        assert status == 'ok', status
+        status, _ = run(prefix + skip + [write, 'bf810000'] + suffix, 'force')
+        assert 's20 may be read before it is written' in status, status
+
+
 if __name__ == '__main__':
     check_descriptor_shift_add()
+    check_exec_zero_non_rejoining_exit()
