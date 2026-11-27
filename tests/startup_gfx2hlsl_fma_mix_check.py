@@ -22,6 +22,7 @@ The instruction bytes are **constructed here** from the VOP3P layout the checked
       [10:8] abs (neg_hi on other VOP3P), [7:0] vdst
   w1: [8:0] src0, [17:9] src1, [26:18] src2, [28:27] op_sel_hi[1:0], [31:29] neg (neg_lo)
 """
+import math
 import os
 import re
 import struct
@@ -172,15 +173,15 @@ expect('control: an unnegated literal on a binary32 source still translates',
 expect('mixlo writes the low half',
        encode(MIXLO_F16, 1, (v2, v3, v4), op_sel_hi=(1, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]',
-       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(f16tof32(v2), f16tof32(v3), F(v4)));')
+       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(f16tof32(v2), f16tof32(v3), F(v4)));')
 expect('mixlo with a negated inline 0 on a binary16 source',
        encode(MIXLO_F16, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1), neg=(0, 0, 1)),
        'v_fma_mixlo_f16 v1, v2, v3, -0 op_sel_hi:[1,1,1]',
-       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(f16tof32(v2), f16tof32(v3), (-0.0)));')
+       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(f16tof32(v2), f16tof32(v3), (-0.0)));')
 expect('mixhi writes the high half from a high-half source',
        encode(MIXHI_F16, 1, (v2, v3, v4), op_sel=(0, 0, 1), op_sel_hi=(0, 0, 1)),
        'v_fma_mixhi_f16 v1, v2, v3, v4 op_sel:[0,0,1] op_sel_hi:[0,0,1]',
-       'v1 = (v1 & 0xffffu) | (f32tof16(mix32(F(v2), F(v3), f16tof32(v4 >> 16))) << 16);')
+       'v1 = (v1 & 0xffffu) | (f16rn(mix32(F(v2), F(v3), f16tof32(v4 >> 16))) << 16);')
 
 # A register whose upper 16 bits are undefined (odd-dmask D16 image_load) can feed a low-half read.
 expect('low half of a register with undefined upper bits',
@@ -250,7 +251,7 @@ expect_refused('unverified high half of inline constant',
 def compile_translated(fxc):
     """Compile every translated line in one ps_5_1 entry point; returns FXC's exit status and output."""
     regs = sorted({int(n) for line in translated for n in re.findall(r'\bv(\d+)\b', line)})
-    body = ['#define F asfloat', '#define U asuint', G.MIX32,
+    body = ['#define F asfloat', '#define U asuint', G.MIX32, G.F16RN,
             'uint main(nointerpolation uint4 p : TEXCOORD0) : SV_Target {',
             '    uint s5 = p.y;']
     body += ['    uint v%d = p.x + %du;' % (r, r) for r in regs]
@@ -270,8 +271,8 @@ def compile_translated(fxc):
 # The reference decodes each VOP3P word itself (layout in the module docstring), without
 # tools/disasm_rdna2.py or gfx2hlsl, and applies the LLVM 15 reading: op_sel_hi = binary16 source,
 # op_sel = its high half, abs then neg after widening, clamp = saturate. Inputs have short mantissas,
-# so the product and sum are exact in binary32 and binary16, and a fused and an unfused multiply-add
-# give the same word.
+# so the product and sum are exact in binary32 and a fused and an unfused multiply-add give the same
+# word. The rounding cases exercise sums that need rounding when stored as binary16.
 
 INLINE_F32 = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0}
 F32_INPUT = {'v2': 1.25, 'v3': -0.75, 'v4': 3.0, 's5': 0.5}                                # binary32 reads
@@ -280,13 +281,34 @@ V1_BEFORE = 0x13579bdf  # mixlo/mixhi keep one half of the destination
 # The -0 case needs a zero product: a +0 addend would give +0, the -0 addend keeps -0.
 OVERRIDES = {'negated inline 0 addend keeps a -0 product': {'v2': 0x80000000}}
 
+# Each row is v2 * 1.0 + v4, run with both destination halves.
+ROUNDING_INPUTS = (
+    ('below midpoint', 1.0, 2**-12),
+    ('even lower neighbor tie', 1.0, 2**-11),
+    ('odd lower neighbor tie', 1.0 + 2**-10, 2**-11),
+    ('above midpoint', 1.0, 3 * 2**-12),
+    ('carry into exponent', 2047.0, 0.5),
+    ('largest finite', 65504.0, 0.0),
+    ('rounds to largest finite', 65504.0, 15.0),
+    ('overflow midpoint', 65504.0, 16.0),
+    ('above overflow midpoint', 65504.0, 17.0),
+    ('denormal even lower neighbor tie', 2**-23, 2**-25),
+    ('denormal odd lower neighbor tie', 2**-24, 2**-25),
+    ('negative above midpoint in magnitude', -1.0, -3 * 2**-12),
+)
+
 
 def f32_word(value):
     return struct.unpack('<I', struct.pack('<f', value))[0]
 
 
 def f16_word(value):
-    return struct.unpack('<H', struct.pack('<e', value))[0]
+    try:
+        packed = struct.pack('<e', value)
+    except OverflowError:
+        # struct raises when rounding a finite input to infinity.
+        packed = struct.pack('<e', math.copysign(math.inf, value))
+    return struct.unpack('<H', packed)[0]
 
 
 def decode_mix(code):
@@ -372,7 +394,7 @@ def raw_fill(index):
 
 def dispatch_source(rows, lines, helper=G.MIX32):
     """One thread: per case, load opaque inputs, run the translated line, store v1."""
-    body = ['#define F asfloat', '#define U asuint', helper, 'RWByteAddressBuffer data : register(u0);',
+    body = ['#define F asfloat', '#define U asuint', helper, G.F16RN, 'RWByteAddressBuffer data : register(u0);',
             '[numthreads(1, 1, 1)]', 'void main() {']
     for index, ((_label, words), line) in enumerate(zip(rows, lines)):
         base = index * 6
@@ -405,9 +427,17 @@ def run_dispatch(dxc, runner, adapter, source, words_total, directory, tag):
 
 def check_dispatch(dxc, runner, adapter):
     runner = os.path.abspath(runner)
+    dispatch_cases = cases.copy()
     rows = [(label, case_inputs(label, decode_mix(code))) for label, code, _line in cases]
-    expected = [reference(decode_mix(code), words) for (_l, code, _), (_, words) in zip(cases, rows)]
-    lines = [line for _l, _c, line in cases]
+    for op, name in ((MIXLO_F16, 'mixlo'), (MIXHI_F16, 'mixhi')):
+        code = encode(op, 1, (v2, v3, v4))
+        _, line = translate(code)
+        for label, base, addend in ROUNDING_INPUTS:
+            label = f'{name}: {label}'
+            dispatch_cases.append((label, code, line))
+            rows.append((label, {'v1': V1_BEFORE, 'v2': f32_word(base), 'v3': f32_word(1.0), 'v4': f32_word(addend)}))
+    expected = [reference(decode_mix(code), words) for (_l, code, _), (_, words) in zip(dispatch_cases, rows)]
+    lines = [line for _l, _c, line in dispatch_cases]
     # Information, not a check: 4097 * 4097 = 16785409 rounds to 16785408 in binary32, so a fused mad
     # returns 1.0 and an unfused one 0.0. mix32 allows either (#2729).
     rows.append(('cancellation', {'v2': f32_word(4097.0), 'v3': f32_word(4097.0), 'v4': f32_word(-16785408.0)}))
@@ -417,11 +447,11 @@ def check_dispatch(dxc, runner, adapter):
     with tempfile.TemporaryDirectory(dir=out_dir) as directory:
         words = run_dispatch(dxc, runner, adapter, dispatch_source(rows, lines), len(rows) * 6, directory,
                              'fma_mix')
-        for index, (label, _c, _l) in enumerate(cases):
+        for index, (label, _c, _l) in enumerate(dispatch_cases):
             got = words[index * 6 + 5]
             check('%s: %s readback' % (adapter, label), got == expected[index],
                   'expected %08x, got %08x' % (expected[index], got))
-        fused = words[len(cases) * 6 + 5]
+        fused = words[len(dispatch_cases) * 6 + 5]
         print('%s: mad(4097, 4097, -16785408) = %08x (%s)' % (
             adapter, fused, {0x3f800000: 'fused', 0: 'unfused'}.get(fused, 'neither fused nor unfused')))
         # Negative control: a helper that clears the sign of a zero result, as the RDNA 1 and RDNA 4 drivers
@@ -430,7 +460,7 @@ def check_dispatch(dxc, runner, adapter):
         assert lossy != G.MIX32
         lost = run_dispatch(dxc, runner, adapter, dispatch_source(rows, lines, lossy), len(rows) * 6, directory,
                             'fma_mix_sign_control')
-        caught = [label for i, (label, _c, _l) in enumerate(cases) if lost[i * 6 + 5] != expected[i]]
+        caught = [label for i, (label, _c, _l) in enumerate(dispatch_cases) if lost[i * 6 + 5] != expected[i]]
         check('%s: control that clears a -0 result fails only the -0 product case' % adapter,
               caught == ['negated inline 0 addend keeps a -0 product'], repr(caught))
         # Negative control: drop the high-half shift, so the device reads the low half. The readback must
@@ -442,7 +472,7 @@ def check_dispatch(dxc, runner, adapter):
                                'fma_mix_control')
         low_reads = []
         for i in changed:
-            fields = decode_mix(cases[i][1])
+            fields = decode_mix(dispatch_cases[i][1])
             fields['op_sel'] = [0, 0, 0]
             low_reads.append(reference(fields, rows[i][1]))
         follows = all(control[i * 6 + 5] == want for i, want in zip(changed, low_reads))

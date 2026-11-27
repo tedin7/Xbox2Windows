@@ -48,7 +48,8 @@ unless noted:
   refused, because that path reaches the block without the compare.
 - **Implicit EXEC writers** (`v_cmpx`, `s_*_saveexec`) between the reset and the compare end the
   reset search. The EXEC tracker of `mesh_skeleton` then refuses them with its own messages.
-- **A block ending at the count exchange** keeps the exchange refusal of #2643.
+- **A block with a scalar load that skips to the count exchange** keeps the
+  exchange refusal of #2643.
 
 ## Tests
 
@@ -187,3 +188,176 @@ reference pixels. The mesh, compute and pixel controls, the mesh and
 compute LLVM 19 assembly checks, and docs links passed on Linux. A
 before/after check against `cf0e0c388` matched 517 legacy HLSL and manifest
 outputs across seven scripts. Windows readback remains pending.
+
+
+## Group-uniform values and guarded exports
+
+Forward value numbering tracks reaching SGPR words, SCC, VGPRs and known
+full EXEC between the exchanges. The GS ES+GS entry layout places per-draw
+user data in s8–s39. The proof uses these values only before any program
+write to their word. Uniform SALU operands yield uniform results. Uniform
+addresses, descriptors and offsets preserve uniformity through read-only
+scalar loads. A full-EXEC buffer load with an all-lane uniform address can
+establish an all-lane uniform VGPR, which a first-lane read can turn into a
+group-uniform scalar. The exchanged group index is also group-uniform when
+the original v5 reaches the read. The numeric entry value of v5 still
+requires a runtime source. The synthetic draw supplies the scalar arm's
+index as draw data. [RDNA 2 Instruction Set Architecture, §3.12.2 p. 24,
+ch. 7 p. 51 and V_READFIRSTLANE_B32 p. 137](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+A join can merge distinct uniform values under group-uniform SCC. A join
+at or inside the post-dominator interval of a divergent branch provides no
+such proof. EXEC-zero and VCC branches are conservative divergent edges.
+A backward edge disables value numbering for the entire pre-count region.
+A memory write in either shader disables the load-based proof. [Convergence
+And Uniformity, Uniformity](https://llvm.org/docs/ConvergenceAndUniformity.html)
+[RDNA 2 Instruction Set Architecture, S_CBRANCH_EXECZ p. 125](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+At a wave block's full EXEC reset, the walk tags the partially defined
+VGPRs that all lanes of the guard wrote along every path. Joins retain
+only agreeing tags on incomplete definitions. A later VGPR write or
+exchange clobber drops the tag. The export can use a tagged VGPR when the
+published count is the same bound or zero, including an SCC select between
+them. With a signed compare, a bound with the high bit set admits no
+non-negative thread index before the host clamp, and its unsigned
+defining guard covers every thread. Different bounds, incomplete
+definitions and wave-derived values keep the existing refusals. [RDNA 2
+Instruction Set Architecture, S_CSELECT_B32 and S_MIN_U32 pp. 101–102 and
+V_CMPX_GT_U32 / V_CMPX_GT_I32 p. 160](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+Reusing a published count's SGPR preserves the active EXEC mask. A later
+compare of that register loses its count provenance. Allocation and
+primitive clamping use the published snapshot for each reused count. The
+emitter keeps the original register expressions when the program leaves
+the counts intact.
+
+### VGPR bounds and split thread-index construction
+
+The same value numbering tracks a full-EXEC VGPR bound through ordinary
+per-lane arithmetic, read-only buffer loads and uniform branches. A
+conditional move needs a mask whose two words represent one replicated
+bit, from a constant, an SCC select or a full-EXEC compare of uniform
+operands. A first-lane read of an all-lane uniform VGPR preserves its
+value number. The `thread < vBound` wave-load guard can then supply the
+same tag as an SGPR guard. VGPR bounds retain the existing whole-wave
+EXEC vote. [RDNA 2 Instruction Set Architecture, V_CMP p. 20 and
+V_READFIRSTLANE_B32 p. 137](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+A thread index can start with `v_mbcnt_lo_u32_b32` and finish with
+`v_mbcnt_hi_u32_b32` after intervening scalar work. Both use the mask
+`-1`. The low half adds the count below the lane in lanes 0–31 to
+`wave << 6`, and the high half adds the count below it in lanes 32–63.
+The gap must be straight-line and preserve EXEC, the base and the
+destination. [RDNA 2 Instruction Set Architecture, V_MBCNT p. 184](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The offline fixture accepts SCC-selected, constant and uniform-compare
+lane masks. It refuses thread-derived bounds, bounds written under
+narrowed EXEC, per-lane compare masks and a branch or clobber in the
+thread-index gap. The `lanemask` draw also covers both prefix arms with a
+VGPR bound. The formatted-load arm doubles a loaded count of five,
+the scalar arm loads nine, and the primitive count is one in both.
+On Linux, the no-argument check passed. Against `319e68f77`, the three
+split-pair variants and the adjacent-pair VGPR-bound control changed from
+refused to accepted. All seven negative controls remained refused. The
+VGPR-bound clamp mutant changed 72 and 38 CPU pixels in the two arms.
+
+### Primitive indices before the count exchange
+
+A lane-only block can use an unsigned `thread < P` guard and branch
+directly to the count-exchange barrier. The walk tags primitive VGPRs
+written on every lane selected by the guard before clearing pending
+definitions at the exchange. The exchange drops tags for its own VGPR
+clobbers. After the position export, a clamp under the published primitive
+count can read the tagged indices when that count is zero or uses the same
+group-uniform bound.
+
+Against `fb04793a1`, the scalar and VGPR count-entry fixtures changed from
+the undefined-`v54` refusal to acceptance in the no-argument Python
+check. A wave-dependent bound, a count selected from a different SGPR and
+an exchange clobber kept that refusal.
+
+### Synthetic controls and draw
+
+`python3 -B tests/startup_mesh57_skeleton_check.py` exercises the scalar
+diamond, both wave-load blocks, signed and unsigned export guards, and
+count-register reuse. The controls include a wave-dependent bound or load
+address, a system entry word, a store in either stage, a first-lane source
+written under narrowed EXEC, a divergent VCC diamond, a divergent bound or
+count at a wave-load join, a different or widened count, a missing position
+write, a later position overwrite, and a compare of an overwritten count.
+
+`ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton(_lanemask_warp)?$' -V`
+also draws both prefix arms through the mesh path. The CPU reference
+models partial wave 0, empty wave 1, and an index that the guest clamps to
+the last published vertex. The offline mutations mark the wave-derived
+bound uniform (m1) and retain a tag across the later masked write (m2).
+The draw compiles a mutant with the exporter using the decremented count
+(m3) and tests it against both the guest and mutant CPU images. The
+existing widened-export draw runs m4. Windows readback is pending.
+
+
+On Linux, the no-argument check passed. Against `4955e24fb`, the later
+masked write changed from accepted to the existing undefined-VGPR refusal.
+The former dead overwrite of the bound register now passes because the
+count already holds the old value. The bound-rewrite control now feeds the
+replacement value into the count and retains the refusal. The rewritten
+clamp changed 72 CPU pixels in the scalar arm and 38 in the formatted-load
+arm. The widened export changed 80 CPU pixels.
+
+## Wave-coherent blocks
+
+The fallback runs after the earlier mesh proofs decline. It requires a
+full EXEC reset, a thread-index prefix compare and an outer EXEC-zero skip
+to the closing full reset. Every edge inside the block is forward and
+stays inside or reaches the closing reset. Each EXEC-zero, EXEC-nonzero,
+VCC-zero and VCC-nonzero branch tests all 64 lanes of the guest wave.
+The VCC vote includes lanes with clear EXEC. SCC branches keep their
+branches when the emitter proves a wave-uniform scalar comparison. All
+group threads reach each vote call in the generated dispatch, and only
+threads at the matching guest program counter contribute.
+
+Scalar instructions run together for each guest wave, including when
+EXEC is empty. Scalar loads require a wave-uniform resource and offset.
+The first-lane read uses the existing collective. Vector instructions
+retain their lane predicates. Saved EXEC copies, AND-saveexec,
+intersections, compares, complements, OR restores and moves preserve
+the exact bit for each lane. Pure masks can remain live across the closing
+reset. The export proof follows these EXEC transfers to check definitions
+in both arms before the export.
+
+Backward edges, including constant-trip loops, external entries, edges
+that bypass the closing reset, other EXEC writes and half accesses stay
+refused. So do VCC votes with numeric mask uses, reads of SCC from mask
+operations, unproven scalar inputs and operations with external effects
+such as stores, atomics, barriers, messages or LDS accesses.
+[RDNA 2 Instruction Set Architecture, pp. 20 and 125 (§12.5)](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+[Partial Control-Flow Linearization, §3, pp. 543–556](https://doi.org/10.1145/3192366.3192413)
+[Convergence And Uniformity, Uniformity of Values and Instructions](https://llvm.org/docs/ConvergenceAndUniformity.html)
+
+The offline check covers S5 CMPX with a voted else skip, S6 narrowing
+chains with shared restores, S7 nested restores with EXEC and VCC votes,
+and S8 nested if/else under an SCC switch. It also checks mask liveness,
+guarded position definitions, numeric scalar pairs and the named refusals.
+The existing `lanemask` draw runs S5 and S6 with mixed, empty and full then arms.
+After EXEC is restored, every exported lane observes the wave's scalar
+load result. The CPU reference executes scalar work at wave scope and
+predicates vector writes per lane.
+
+```text
+python3 -B tests/startup_mesh57_skeleton_check.py
+ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton(_lanemask_warp)?$'
+```
+
+The draw runs m1 by replacing the first inner EXEC vote with a lane
+test. It runs m2 on S5 by replacing the saved-mask complement with the
+current EXEC. Both mutants must change the HLSL and the expected
+pixels. The renderer checks each mutant against both CPU references.
+The offline m3 control hides the numeric use of VCC from the purity
+proof and verifies that this changes the VCC vote's classification.
+
+On Linux x64 with Python 3.14.8, the no-argument check passed. The CPU
+reference predicted 66 different pixels for m1 in each S5 and S6 draw
+and 259 for m2 in each S5 draw. A before/after run against `ce9f90b7b`
+matched 1,709 HLSL and manifest outputs from the mesh57 and gfx2hlsl
+fixture scripts. A separate byte comparison matched all 215 published
+mesh fixture files. Windows WARP readback is pending.

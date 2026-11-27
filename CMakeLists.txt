@@ -2911,6 +2911,8 @@ target_compile_features(startup_pixel_uav_support_check PRIVATE cxx_std_17)
 add_test(NAME startup_pixel_uav_support COMMAND startup_pixel_uav_support_check)
 add_test(NAME startup_pixel_uav_support_no_load_check_control COMMAND startup_pixel_uav_support_check --mutate no-load-check)
 set_tests_properties(startup_pixel_uav_support_no_load_check_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_pixel_uav_support_accept_sint_control COMMAND startup_pixel_uav_support_check --mutate accept-sint)
+set_tests_properties(startup_pixel_uav_support_accept_sint_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
@@ -4444,6 +4446,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # that reads every texel of the stored image back.
     add_test(NAME startup_pixel_image_store_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_store_check.py")
+    add_test(NAME startup_pixel_image_atomic_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_atomic_check.py")
+    add_test(NAME startup_pixel_image_atomic_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_atomic_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>")
+    set_tests_properties(startup_pixel_image_atomic_warp PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_pixel_image_store_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_store_check.py" draw "${DXC_EXECUTABLE}"
@@ -5636,6 +5644,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_pixel_uav_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_pixel_uav_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_pixel_uav_atomic_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_pixel_uav_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" atomic)
+            set_tests_properties(startup_pixel_uav_atomic_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_frame_copy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})

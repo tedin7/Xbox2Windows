@@ -607,7 +607,6 @@ CMP_REFUSED = (
     ('6a00c9d401050220', 'v_cmp_lt_f16 source -v1'),                    # neg modifier
     ('8104927d', 'v_cmp_lt_f16 source 1'),                              # inline integer 1: a binary16 denormal pattern
     ('01059a7d', 'v_cmp_lg_f16'),                                       # needs the NaN test on the halves
-    ('f904927d01000504', 'v_cmp_lt_f16_sdwa'),
 )
 
 

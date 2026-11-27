@@ -77,6 +77,26 @@ REWRITE_REFUSED = {
     'rewrite in one arm': '80038bbe' + S9_SKIP(3) + ARM_RECORD + S9_SKIP(2) + S12_FROM_S8 + V8_ZERO,
 }
 
+# A zero flag executes the compare and overwrites s10. Its branch skips the
+# heap load, which only the nonzero flag can reach with the entry pointer.
+MASK_ARM = bytes.fromhex('8102107e')  # v_mov_b32 v8, 1
+MASK_ARM += struct.pack('<4I',
+                        0xd4c1000a, 128 | 264 << 9,             # v_cmp_lt_u32_e64 s10, 0, v8
+                        0xd5010004, 240 | 244 << 9 | 10 << 18)  # v_cndmask_b32_e64 v4, 0.5, 2.0, s10
+HEAP_ARM = bytes.fromhex(IMAGE_HEAD + IMAGE_LOAD)
+IMAGE_MASK_BRANCH_PS = (bytes.fromhex('098006bf')  # s_cmp_eq_u32 s9, 0
+                        + struct.pack('<I', 0xbf840000 | (len(MASK_ARM) // 4 + 1))  # s_cbranch_scc0 heap_arm
+                        + MASK_ARM + struct.pack('<I', 0xbf820000 | (len(HEAP_ARM) // 4))  # s_branch export
+                        + HEAP_ARM + bytes.fromhex('0f1800f804040404' '000081bf'))
+
+
+def translate_mask_branch():
+    pipe = G.Pipeline(VS_WORDS, IMAGE_MASK_BRANCH_PS, root_blob())
+    ps = pipe.hlsl_ps()
+    assert pipe.ps_profile() == 'ps_6_6' and 'Texture2D<float4> heap_tex_' in ps
+    assert pipe.uds[1:3] == [('rootconst', 0, 0), ('rootconst', 0, 1)], pipe.uds
+    return pipe, ps
+
 
 def translate_image():
     pipe = G.Pipeline(VS_WORDS, IMAGE_PS, root_blob())
@@ -134,11 +154,13 @@ def mutate(source, old, new):
     return source.replace(old, new)
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False, heap_count=2):
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, heap_count=2, flag=None):
     # Physical descriptor 2 is a poison view outside the buffer heap of the first cases (heap_count 2); the image cases
     # open the whole five-slot heap.
     entry = [0] * count + [heap_count]
     entry[1] = offset
+    if flag is not None:
+        entry[2] = flag
     as_hex = lambda words: ','.join(f'{word:08x}' for word in words)
     expected = reference if isinstance(reference, list) else [reference] * 4
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
@@ -186,12 +208,21 @@ def main(offscreen, dxc):
         stale = compile_shader(dxc, directory, 'ps_6_6', mutate(rewrite_source, 's12 = ud1;', 's12 = ud1 + 32u;'))
         draw(offscreen, vs, stale, 96, first, rewrite_count, negative=True, heap_count=5)
 
+        branch_pipe, branch_source = translate_mask_branch()
+        branch_shader = compile_shader(dxc, directory, 'ps_6_6', branch_source)
+        for flag, expected in ((0, 0x40000000), (1, first[0])):
+            draw(offscreen, vs, branch_shader, 96, expected, len(branch_pipe.uds), heap_count=5, flag=flag)
+        wrong_slot = mutate(branch_source, '(ud1 + 0u) >> 5;', '(ud1 + 32u) >> 5;')
+        mutant = compile_shader(dxc, directory, 'ps_6_6', wrong_slot)
+        draw(offscreen, vs, mutant, 96, first[0], len(branch_pipe.uds), negative=True, heap_count=5, flag=1)
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         translate()
         translate_image()
         translate_rewrite()
+        translate_mask_branch()
     else:
         main(*sys.argv[1:])
     print('dynamic graphics heap: readback and controls matched' if len(sys.argv) > 1

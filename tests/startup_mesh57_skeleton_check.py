@@ -38,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -260,6 +261,126 @@ MASK_CASES = (
                                       'd4c6002e 00010100')),
     ('S4 closure', lane_mask_mesh(otherwise=MASK_ELSE + ' 88fe2e7e')),
 )
+
+COHERENT_THEN = 'f4200a08 520001e0 bf8cc07f 7e0e0228'  # s40 = buffer[480 + 4*wave], v7 = s40
+COHERENT_ELSE = 'f4200f08 520001e8 bf8cc07f 7e0e023c'  # s60 = buffer[488 + 4*wave], v7 = s60
+
+
+def coherent_words(parts):
+    """Resolve SOPP displacements in the synthetic wave64 words."""
+    words, labels, fixups = [], {}, {}
+    for part in parts:
+        if isinstance(part, tuple):
+            fixups[len(words)] = part
+            words.append(None)
+        elif part.endswith(':'):
+            labels[part[:-1]] = len(words)
+        else:
+            words.extend(part.split())
+    for at, (opcode, label) in fixups.items():
+        words[at] = branch(opcode, at, labels[label])
+    return ' '.join(words)
+
+
+def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=False, live_mask=False,
+                  numeric_pair=False):
+    # Wave 0 has six then lanes. Wave 1 has zero or 64. The enclosing prefix covers both waves.
+    threshold = 'bf068006 ' + ('8532ff86 00000080' if full else '8532c086')  # s50 = SCC ? 6 : 128/64
+    before = ['beb4047e bf8cc07f', 'head:', '7da80032']  # save EXEC, wait, CMPX s50 > v0
+    then = [COHERENT_THEN]
+    at_else = ['8afe7e34', (0xbf88, 'join')]  # exec = s[52:53] & ~exec; skip empty else
+    otherwise = [COHERENT_ELSE]
+    join = ['80288028', 'f4200bc8 520001e0 bf8cc07f', 'befe0434']
+    if control == 'backward':
+        then.append((0xbf82, 'head'))
+    elif control == 'constant-trip':
+        # s58 = 3, then add 2 while the counter is below 9.
+        then.extend(('beba0383', 'loop:', '803a823a bf0a893a', (0xbf85, 'loop')))
+    elif control == 'EXEC xor':
+        then.insert(0, '89fe347e')
+    elif control == 'EXEC half':
+        then.insert(0, 'befe0380')
+    elif control == 'mask SCC':
+        before.extend(('7d880032 beb6246a', (0xbf84, 'join')))  # SCC from AND-saveexec
+    elif control == 'varying address':
+        before.append('bebe047e')  # save the narrowed EXEC in s[62:63]
+        then[0] = COHERENT_THEN.replace('520001e0', '7c0001e0')  # use its low word as a numeric offset
+    elif control == 'varying SCC':
+        then[:0] = ['7d880032 bf06806a', (0xbf84, 'join')]  # numeric compare reads VCC_LO
+    if positions:
+        before.insert(1, '87fe7e34 87fe347e')  # both operand orders of EXEC &= saved EXEC
+        then.append(GUARDED_POSITION_LOAD)
+        if control != 'missing position':
+            otherwise.append(GUARDED_POSITION_LOAD)
+
+    if shape == 'S6':
+        # Narrow three times to one shared restore, then run a second chain on the opposite lanes.
+        body = ['8533ff88 00000080 beb4047e 7d880033 beae046a 87fe7e2e', (0xbf88, 'restore'),
+                '7d880032 beb6246a', (0xbf88, 'restore'), 'beb8246a', (0xbf88, 'restore'),
+                *then, 'restore:', 'befe0434 7d860032 beb6246a', (0xbf88, 'done'),
+                'beb8246a', (0xbf88, 'done'), COHERENT_ELSE, 'done:', 'befe0434']
+    elif shape == 'S7':
+        # Keep VCC from before the last narrowing so its vote must also count inactive lanes.
+        numeric = '7e78026a' if control == 'numeric VCC' else ''
+        body = ['beb4047e 7d880032 beb6246a', (0xbf88, 'outer restore'),
+                'beb8246a', (0xbf89 if nonzero else 0xbf88, 'inner compare'), '7e0e02f2', 'inner compare:',
+                '7da80080', (0xbf88, 'inner restore'), '7e0e02f2',
+                'inner restore:', 'befe0438 87ea7e38',  # VCC = saved s[56:57] & EXEC
+                '7da80080', numeric, (0xbf86, 'outer restore'), (0xbf87 if nonzero else 0xbf86, 'load'),
+                '7e0e02f2', 'load:', COHERENT_THEN,
+                'outer restore:', 'befe0436', 'befe0434']
+    else:
+        if shape == 'S8':
+            before = ['7d880032 beb4246a']
+            # The uniform switch can enter either inner if/else. Their saves have separate lifetimes.
+            then = ['bf068006', (0xbf84, 'other case'),
+                    'beb6047e 7da80083', (0xbf88, 'then complement'), COHERENT_THEN,
+                    'then complement:', '8afe7e36', (0xbf88, 'then restore'), COHERENT_ELSE,
+                    'then restore:', 'befe0436', (0xbf82, 'switch join'),
+                    'other case:', 'beb8047e 7da80084', (0xbf88, 'case complement'), COHERENT_THEN,
+                    'case complement:', '8afe7e38', (0xbf88, 'case restore'), COHERENT_ELSE,
+                    'case restore:', 'befe0438', 'switch join:']
+            otherwise = ['beba047e 7da8008c', (0xbf88, 'else complement'), COHERENT_THEN,
+                         'else complement:', '8afe7e3a', (0xbf88, 'else restore'), COHERENT_ELSE,
+                         'else restore:', 'befe043a']
+        body = [*before, (0xbf88, 'else'), *then, 'else:', *at_else, *otherwise, 'join:', *join]
+    prefix = MASK_PREFIX
+    if positions:
+        prefix = prefix.replace('beaa03ff 00000080', 'be8e0309').replace(' beaa0380', '')
+        prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da8000e')
+    exports = '7e280228 7e2a0307'
+    if live_mask:
+        prefix += ' bebe0480'  # s[62:63] = 0 on the outer skip
+        body.insert(-1, 'bebe047e')  # save the else EXEC, including zero when the else was skipped
+        exports = '7e280228 d5010015 00fa0e80'  # v_cndmask_b32_e64 v21, 0, v7, s[62:63]
+    setup = []
+    if numeric_pair:
+        # A 64-bit zero written as scalar data can feed a wave-uniform SCC branch.
+        setup = ['bebe0480 bf06803e', (0xbf84, 'threshold'), 'bf800000', 'threshold:']
+    mesh = wave_load_mesh(prefix, coherent_words([*setup, threshold, *body]), exports=exports)
+    if positions:
+        mesh.pop(mesh.index('be8e0309', mesh.index('be8d0308')))  # count is already set by the prefix
+        mesh = mutate('13121110', '35343332', mesh=mesh)
+    if control == 'outside entry':
+        at = mesh.index('befe04c1', mesh.index('beaa03ff'))  # full reset immediately before the prefix
+        target = mesh.index('beb4047e', at)
+        mesh.insert(at, branch(0xbf84, at, target + 1))
+    return mesh
+
+
+COHERENT_DRAWS = ('S5', 'S6')
+COHERENT_CONTROLS = (
+    ('S5', 'backward', 'a backward branch inside the block'),
+    ('S5', 'constant-trip', 'a backward branch inside the block'),
+    ('S5', 'outside entry', 'a branch from outside lands inside the block'),
+    ('S5', 'EXEC xor', 'an unsupported EXEC write or half access (s_xor_b64)'),
+    ('S5', 'EXEC half', 'an unsupported EXEC write or half access (s_mov_b32)'),
+    ('S7', 'numeric VCC', 'VCC vote does not read a pure lane mask'),
+    ('S5', 'mask SCC', 'SCC of a mask operation is read'),
+    ('S5', 'varying address', 'a scalar load address is not wave-uniform'),
+    ('S5', 'varying SCC', 'SCC is not proven wave-uniform'),
+)
+
 MASK_MEMORY = (
     ('tbuffer', wave_load_mesh(body='f4200a08 520001e0 e8b001e8 80040700 bf8c007f')),
     ('image', wave_load_mesh(body='f4200a08 520001e0 f40c0e05 fa000020 bf8cc07f '
@@ -284,13 +405,14 @@ MASK_CONTROLS = (
      'a saved EXEC mask is live after the if/else'),
     ('c5 mask SCC', lane_mask_mesh(setup='87ae2e7e 85b4c180'),
      'SCC of a mask operation is read'),
-    ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT),
-     'the voted branch is reached through unproven EXEC control flow'),
-    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'),
-     'the else arm has scalar work without a voted EXEC branch'),
     ('undefined VALU on restored lanes',
      lane_mask_mesh(left='beb4047e 7da80084 7e6402f2 befe0434 7e0e0332 ' + MASK_LEFT),
      'a vector input is undefined on the active lanes'),
+)
+
+COHERENT_LEGACY_CASES = (
+    ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT), 2),
+    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'), 1),
 )
 
 
@@ -371,7 +493,7 @@ def guarded_position_mesh(case, setup):
     count_copy = mesh.index('be8e0309', mesh.index('be8d0308'))
     mesh.pop(count_copy)
     if case == 'rewritten bound':
-        mesh.insert(count_copy, 'beaa0384')  # s42 = 4
+        mesh[count_copy:count_copy] = ['beaa0384', 'be8e032a']  # V reads the replacement B, s42 = 4
     if case == 'unsigned export':
         mesh = mutate('7d28000e', '7da8000e', mesh=mesh)
     return mutate('13121110', '35343332', mesh=mesh)  # position uses v[50:53]
@@ -380,6 +502,152 @@ def guarded_position_mesh(case, setup):
 GUARDED_POSITIONS = {case: guarded_position_mesh(case, setup) for case, setup in GUARDED_POSITION_SETUP}
 GUARDED_REFUSAL = ('unsupported: slot 57 mesh: v50 is read where it is not defined for every lane '
                    '(an entry value, or left different per wave by an exchange)')
+
+
+def count_guard_mesh(case='select'):
+    """Two paths to a scalar buffer offset, then separately guarded positions and primitive indices."""
+    before = MESH.index('be8d0308')
+    prefix = 'bf0c8008'.split()                    # s_bitcmp0_b32 s8, 0
+    scalar = ['8f298409']                         # s_lshl_b32 s41, s9, 4 (s9 is the supplied group index)
+    vector = '7e020209 e00021c0 80040101 bf8c3f70 7e520501'.split()
+    # v_mov v1, s9; buffer_load_format_x v1, v1, s[16:19], 0 idxen offset:448;
+    # s_waitcnt vmcnt(0); v_readfirstlane s41, v1
+    if case == 'narrowed first lane':
+        # Initialize v1 for all lanes, then overwrite it under a lane predicate.
+        # The reset restores full EXEC, but that does not prove v1 uniform.
+        vector = '7e020280 7d860086 bea4246a 7e020209 befe04c1'.split() + vector[1:]
+    if case == 'different VCC arms':
+        prefix = ['7d860086']                     # v_cmp_gt_u32 vcc, 6, v0
+    branch_op = 0xbf86 if case == 'different VCC arms' else 0xbf84
+    prefix += [branch(branch_op, 0, len(scalar) + 2)] + scalar + [branch(0xbf82, 0, len(vector) + 1)] + vector
+    # Descriptor reload and scalar buffer read. P is the next byte, B is the low six bits.
+    table = 'f4080405 fa000000 bf8cc07f'.split()
+    bounds = 'f4240a88 520001d0 bf8cc07f 93abff2a 00080008 872abf2a 802a812a 802b812b'.split()
+    if case == 'wave address':
+        bounds[1] = '0c0001d0'                   # use s6 (wave index) as the offset
+    if case == 'wave bound':
+        bounds += ['beaa0306']                    # s_mov_b32 s42, s6
+    if case == 'system bound':
+        bounds += ['beaa0302']                    # s_mov_b32 s42, s2
+    if case == 'memory store':
+        bounds += 'e0701000 80040000'.split()    # buffer_store_dword v0, v0, s[16:19], 0 offen
+    # Address calculation for the position block; s42 = B and s43 = P.
+    # As in the guest, the output counts s13 and s14 are selected after the narrowing.
+    limit = '3608008f 34080884 befe04c1 7da8002a 83ac2b2a bf00802c 850d2b80 850e2a80'.split()
+    if case == 'same':
+        limit[-1] = 'be8e032a'                    # s_mov_b32 s14, s42
+    if case == 'plus one':
+        limit[-1] = '800e812a'                    # s_add_u32 s14, s42, 1
+    if case == 'different SGPR':
+        limit[-1] = 'be8e0309'                    # s_mov_b32 s14, s9
+    # An inner scalar if/else with an EXEC-predicated position load in each arm.
+    left = GUARDED_POSITION_LOAD.split()
+    right = ['bf800000'] if case == 'one arm' else GUARDED_POSITION_LOAD.split()
+    positions = ('f4200a08 fa0001e0 bf8cc07f bf0c8008'.split()
+                 + [branch(0xbf84, 0, len(left) + 2)] + left
+                 + [branch(0xbf82, 0, len(right) + 1)] + right)
+    if case in ('bound overwritten in block', 'count overwritten in block'):
+        positions += ['beaa0384' if case == 'bound overwritten in block' else 'be8e0384']
+    if case == 'bound overwritten in block':
+        # Make the count observe the post-join ID of B.
+        limit[-1] = 'be8e0380'
+    position_block = limit + [branch(0xbf88, 0, len(positions) + 1)] + positions + ['befe04c1']
+    if case == 'bound overwritten in block':
+        position_block += ['be8e032a']
+    # Load three separate indices per primitive. P is at most two in the draw.
+    prim_load = 'f4200a08 fa0001e0 bf8cc07f 34080084 e03c1180 80043604 bf8c3f70'.split()
+    if case == 'different guard rewrites position':
+        prim_load += GUARDED_POSITION_LOAD.split()
+    primitive_block = ['7da8002b', branch(0xbf88, 0, len(prim_load) + 1)] + prim_load + ['befe04c1']
+    exchange = MESH[before + 2:POST_COUNT]
+    pos = ('7da8000e' if case == 'unsigned export' else '7d28000e').split() + (
+        '3608008f 34080884 e03810c0 80041404 bf8c3f70 f80008cf 35343332 f800020f 17161514 befe04c1'.split())
+    # After narrowing by P, replace V by V - 1, clamp each index, then pack the triplet.
+    clamp = ('7d28000d 800ec10e 266c6c0e 266e6e0e 2670700e 346e6e8a 34707094'
+             ' 386c6d37 386c6d38 f8000941 00000036 bf810000').split()
+    if case == 'compare overwritten count':
+        pos.insert(0, '800ec10e')
+    if case == 'rewrite under the same mask':
+        pos.insert(1, '800ec10e')
+    if case == 'rewrite primitive count':
+        clamp.insert(1, '800dc10d')               # s_add_u32 s13, s13, -1
+    if case == 'keep count':
+        clamp[1] = '802cc10e'                     # write V - 1 to s44 instead
+        clamp[2:5] = [word[:-2] + '2c' for word in clamp[2:5]]
+    return MESH[:before] + prefix + table + bounds + position_block + primitive_block + exchange + pos + clamp
+
+
+def count_entry_guard_mesh(case='scalar bound'):
+    """Write primitive indices only on the lanes that fall through to the count exchange."""
+    mesh = count_guard_mesh()
+    at = mesh.index('7da8002b')
+    exchange = mesh.index('bf8a0000', at)
+    # v_lshlrev_b32 v4, 4, v0; buffer_load_dwordx3 v[54:56], v4, s[16:19], 0 offen offset:384.
+    body = '34080084 e03c1180 80043604 bf8c3f70'.split()
+    compare = '7da27d00' if case == 'vector bound' else '7da8002b'
+    mesh[at:exchange] = [compare, branch(0xbf88, 0, len(body) + 1)] + body
+    end_bounds = mesh.index('802b812b') + 1
+    if case == 'vector bound':
+        # v_mov_b32 v62, s43; v_readfirstlane_b32 s43, v62 under full EXEC.
+        # The count-entry compare is v_cmpx_lt_u32_e32 v0, v62.
+        mesh[end_bounds:end_bounds] = '7e7c022b 7e56053e'.split()
+    elif case == 'wave bound':
+        mesh.insert(end_bounds, '80ab062b')  # s_sub_u32 s43, s43, s6
+    elif case == 'different count':
+        mesh = mutate('850d2b80', '850d0980', mesh=mesh)  # s_cselect_b32 s13, 0, s9
+    elif case == 'exchange clobber':
+        mesh = mutate('7e02020d', '7e6c020d', mesh=mesh)  # v_mov_b32 v54, s13
+        mesh = mutate('00000102', '00003602', mesh=mesh)  # ds_write_b32 v2, v54
+    return mesh
+
+
+def vector_count_guard_mesh(case='select mask'):
+    """Derive the two counts in full-EXEC VGPRs and narrow positions by the VGPR bound."""
+    mesh = count_guard_mesh()
+    low = mesh.index('d7650000')
+    high = mesh.index('d7660000')
+    # s_bitcmp0_b32 s8, 0; mbcnt_lo; s_cmp_eq_u32 src_scc, 0;
+    # s_cselect_b64 vcc, -1, 0; s_waitcnt lgkmcnt(0); mbcnt_hi.
+    gap = 'bf0680fd 85ea80c1 bf8cc07f'.split()
+    clear = {'thread clobber': '7e000280', 'EXEC clobber': 'befe04c1', 'base clobber': 'be870380'}
+    if case in clear:
+        gap.insert(0, clear[case])
+    if case == 'branch in gap':
+        gap.insert(0, 'bf840001')  # s_cbranch_scc0 to the VCC select
+    if case != 'adjacent pair':
+        mesh[low:high] = ['bf0c8008'] + mesh[low:high] + gap
+    first = mesh.index('f4240a88')
+    end = mesh.index('850e2a80') + 1
+    # v9 holds the joined scalar offset. The clear-bit arm adds four bytes.
+    mask = 'bf0c8008 85ba80c1'
+    if case == 'uniform compare mask':
+        mask = 'd4c4003a 00010081'  # v_cmp_gt_u32_e64 s[58:59], 1, 0
+    if case == 'per-lane compare mask':
+        mask = 'd4c4003a 00020086'  # v_cmp_gt_u32_e64 s[58:59], 6, v0
+    if case == 'constant mask':
+        mask = 'beba04c1'           # s_mov_b64 s[58:59], -1
+    address = ('7e120229 4e1412c4 ' + mask + ' d5010009 00ea1509').split()
+    # Load B-1 and P-1 in one read, extract seven bits of B-1, and add one to each.
+    loads = 'e03411d0 80043009 bf8c3f70 367860ff 0000007f 4a787881 4a7a6281'.split()
+    # Scale B on the set-bit arm, forming a VGPR phi at the join.
+    adjust = 'bf0c8008 bf850002 d569003c 00027809'.split()
+    if case == 'thread bound':
+        adjust += ['7e780300']      # v_mov_b32_e32 v60, v0
+    if case == 'narrowed bound':
+        adjust += '7d860086 bea4246a 4a787881 befe04c1'.split()
+    # v_readfirstlane s14, v60; v_readfirstlane s13, v61; preserve raw P in s43.
+    # After narrowing by thread < v60, choose either zero or the first-lane counts.
+    narrow = ('7e1c053c 7e1a053d beab030d 3608008f 34080884 befe04c1 7da27900 '
+              '83ac0d0e bf00802c 850d0d80 850e0e80').split()
+    mesh[first:end] = address + loads + adjust + narrow
+    return mesh
+
+
+def rewritten_guarded_position():
+    """Overwriting v50 under the primitive mask invalidates its older position definition."""
+    mesh = GUARDED_POSITIONS['select']
+    at = mesh.index('7d28000e')
+    return mesh[:at] + '7d28000d 7e640280 befe04c1'.split() + mesh[at:]
 
 
 WAVE_LOAD_MESH = wave_load_mesh()
@@ -868,6 +1136,107 @@ def depth_only_controls():
             expect(what + ' (depth-only pair)', request(tmp, mesh, DEPTH_PIXEL)[1], 'unsupported: ' + reason)
 
 
+COUNT_GUARD_ACCEPTED = ('select', 'same', 'unsigned export', 'keep count', 'rewrite under the same mask',
+                        'rewrite primitive count')
+COUNT_GUARD_REFUSED = ('wave bound', 'system bound', 'wave address', 'memory store', 'bound overwritten in block',
+                       'count overwritten in block', 'narrowed first lane', 'different VCC arms', 'plus one',
+                       'different SGPR', 'one arm', 'different guard rewrites position')
+COUNT_COMPARE_REFUSAL = ('unsupported: slot 57 mesh: an EXEC compare other than output count > thread index under '
+                         'exec = -1 is not covered')
+
+
+def count_guard_mutants(tmp):
+    """Make the wave-bound and later-write controls translate by breaking their respective proof."""
+    number = G.mesh_value_numbers
+
+    def ignore_wave_variance(*args):
+        at, uniform, selects = number(*args)
+        instructions = args[0]
+        compare = next(i for i, ins in enumerate(instructions) if ins[3] == 'v_cmpx_gt_u32_e32 s42, v0')
+        return at, uniform | {at[compare][0]['s42']}, selects
+
+    with patch.object(G, 'mesh_value_numbers', ignore_wave_variance):
+        expect('m1 ignoring uniformity fails the wave-index control', request(tmp, count_guard_mesh('wave bound'))[1], 'ok')
+
+    writes = G.mesh_vector_writes
+
+    def miss_later_write(name, asm):
+        return set() if asm == 'v_mov_b32_e32 v50, 0' else writes(name, asm)
+
+    with patch.object(G, 'mesh_vector_writes', miss_later_write):
+        expect('m2 keeping stale tags fails the later-write control', request(tmp, rewritten_guarded_position())[1], 'ok')
+
+
+def vector_count_guard_controls(tmp):
+    for label in ('select mask', 'uniform compare mask', 'constant mask', 'adjacent pair'):
+        key, result = request(tmp, vector_count_guard_mesh(label))
+        expect('VGPR guard with ' + label, result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('position guard compares the thread and VGPR bound', '(v0 < v60)' in source, True)
+            expect('VGPR guard uses the whole-wave EXEC vote', 'uint mesh_vote_' in source, True)
+            expect('VGPR guard uses the published vertex count', 'max(mesh_vertex_count, 1u) - 1u' in source, True)
+    for label in ('thread bound', 'narrowed bound', 'per-lane compare mask'):
+        expect('VGPR guard with ' + label, request(tmp, vector_count_guard_mesh(label))[1], GUARDED_REFUSAL)
+    for label in ('thread clobber', 'EXEC clobber', 'base clobber', 'branch in gap'):
+        expect('mbcnt gap with ' + label, request(tmp, vector_count_guard_mesh(label))[1],
+               'unsupported: ' + WAVE_LOAD_REFUSAL)
+    for bit in (0, 1):
+        _, guest, wrong = count_guard_reference(bit, vector_bound=True)
+        expect('VGPR bound clamp mutant changes prefix arm %d' % bit, guest != wrong, True)
+
+
+def count_entry_guard_controls(tmp):
+    for label in ('scalar bound', 'vector bound'):
+        key, result = request(tmp, count_entry_guard_mesh(label))
+        expect('count-entry primitive guard with ' + label, result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            steps = ('if (exec & 1) v54 = r0.Load(', 'SetMeshOutputCounts(',
+                     'o.pos = ', 'int(s13) > int(v0)', 'if (exec & 1) v54 = min(s14, v54);')
+            offsets = [source.find(step) for step in steps]
+            expect('primitive load before exchange and count-masked clamp after the position export',
+                   offsets == sorted(set(offsets)) and offsets[0] >= 0, True)
+    for label in ('wave bound', 'different count', 'exchange clobber'):
+        expect('count-entry primitive guard with ' + label, request(tmp, count_entry_guard_mesh(label))[1],
+               GUARDED_REFUSAL.replace('v50', 'v54'))
+
+
+def count_guard_controls(tmp):
+    for label in COUNT_GUARD_ACCEPTED:
+        key, result = request(tmp, count_guard_mesh(label))
+        expect('count guard ' + label, result, 'ok')
+        if result != 'ok':
+            continue
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        vert = 's14' if label == 'keep count' else 'mesh_vertex_count'
+        prim = 'mesh_primitive_count' if label == 'rewrite primitive count' else 's13'
+        expect(label + ' allocates using the published counts', f'SetMeshOutputCounts({vert}, {prim});' in source, True)
+        expect(label + ' clamps using the published vertex count', f'max({vert}, 1u) - 1u' in source, True)
+        if label == 'select':
+            expect('m3 rewritten count changes primitive-clamp HLSL', clamp_with_rewritten_count(source) != source, True)
+    for label in COUNT_GUARD_REFUSED:
+        expect('count guard ' + label, request(tmp, count_guard_mesh(label))[1], GUARDED_REFUSAL)
+    expect('write under a later primitive mask', request(tmp, rewritten_guarded_position())[1], GUARDED_REFUSAL)
+    expect('compare the rewritten count', request(tmp, count_guard_mesh('compare overwritten count'))[1],
+           COUNT_COMPARE_REFUSAL)
+
+    # Isolate the count-write rule with the old fully-defined output shape.
+    at = MESH.index('7d28000d') + 1
+    key, result = request(tmp, MESH[:at] + ['800ec10e'] + MESH[at:])
+    expect('count rewrite in the old output shape', result, 'ok')
+    if result == 'ok':
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        expect('legacy shape clamps with the saved count', 'max(mesh_vertex_count, 1u) - 1u' in source, True)
+
+    pixel = PIXEL[:-3] + 'e0701000 80040000'.split() + PIXEL[-3:]  # memory store in the paired stage
+    expect('paired-stage store blocks the mesh load proof', request(tmp, count_guard_mesh(), pixel)[1], GUARDED_REFUSAL)
+    for bit in (0, 1):
+        _, guest, wrong = count_guard_reference(bit)
+        expect('m3 rewritten clamp changes the CPU image, prefix arm %d' % bit, guest != wrong, True)
+    count_guard_mutants(tmp)
+
+
 def lane_mask_controls(tmp):
     for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
         key, result = request(tmp, mesh)
@@ -887,6 +1256,9 @@ def lane_mask_controls(tmp):
             expect('export count mutant changes its source', widen_position_count(source) != source, True)
             _, good, bad = guarded_position_reference()
             expect('export count mutant changes the CPU image', good != bad, True)
+    count_guard_controls(tmp)
+    vector_count_guard_controls(tmp)
+    count_entry_guard_controls(tmp)
     for label, mesh, reason in ROUND2_REFUSED:
         expect(label, reason in request(tmp, mesh)[1], True)
     for label, mesh, reason in MASK_CONTROLS:
@@ -905,6 +1277,62 @@ def lane_mask_controls(tmp):
         return 's[46:47]' in G.lane_mask_webs(ins).get(i, ())
     expect('c1 checks pair purity', compare_web(MASK_CONTROLS[0][1]), False)
     expect('m3 ignoring the whole-word read fails c1', compare_web(MASK_CASES[0][1]), True)
+
+
+def coherent_controls(tmp):
+    for label, shape, options, votes in (
+            ('S5', 'S5', {}, (2, 0)), ('S5 full', 'S5', {'full': True}, (2, 0)),
+            ('S6', 'S6', {}, (5, 0)), ('S6 full', 'S6', {'full': True}, (5, 0)),
+            ('S7', 'S7', {}, (5, 0)), ('S7 nonzero votes', 'S7', {'nonzero': True}, (3, 2)),
+            ('S8', 'S8', {}, (8, 0)), ('S5 position exports', 'S5', {'positions': True}, (2, 0)),
+            ('S5 live mask', 'S5', {'live_mask': True}, (2, 0)),
+            ('S5 numeric scalar pair', 'S5', {'numeric_pair': True}, (2, 0))):
+        key, result = request(tmp, coherent_mesh(shape, **options))
+        expect(label, result, 'ok')
+        if result != 'ok':
+            continue
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        expect(label + ' votes', (source.count('mesh_vote == 0u'), source.count('mesh_vote != 0u')), votes)
+        if label.startswith('S7'):
+            expect(label + ' counts VCC even under zero EXEC',
+                   bool(re.search(r'mesh_first_active\(tid, pc == \d+ && \(vcc & 1u\) != 0u', source)), True)
+        if shape in COHERENT_DRAWS and options.keys() <= {'full'}:
+            full = options.get('full', False)
+            _, guest = coherent_reference(shape, full)
+            for mutant, changed in lane_mask_mutants(shape, source):
+                _, wrong = coherent_reference(shape, full, mutant)
+                expect(label + ' ' + mutant + ' changes source and pixels', (changed != source, wrong != guest),
+                       (True, True))
+    for label, mesh, votes in COHERENT_LEGACY_CASES:
+        key, result = request(tmp, mesh)
+        expect(label, result, 'ok')
+        if result == 'ok':
+            source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect(label + ' votes', source.count('mesh_vote == 0u'), votes)
+    for shape, control, reason in COHERENT_CONTROLS:
+        mesh = coherent_mesh(shape, control=control)
+        if control == 'constant-trip':
+            ins = G.decode(code(mesh))
+            offsets = {item[0]: i for i, item in enumerate(ins)}
+            scc_edges = ((i, offsets[int(G.parse(item[3])[1][0].split('_')[1], 16)])
+                         for i, item in enumerate(ins) if item[2] == 's_cbranch_scc1')
+            latch, header = next((i, j) for i, j in scc_edges if j < i)
+            expect('the control has a proven three-trip loop', G.mesh_constant_trip(ins, header, latch, offsets), (3,))
+        expect(control, request(tmp, mesh)[1],
+               f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
+    expect('one missing position arm',
+           request(tmp, coherent_mesh('S5', positions=True, control='missing position'))[1], GUARDED_REFUSAL)
+
+    # m3 removes the numeric use from the proof's view of the program. The same
+    # VCC purity assertion used by the block must change from refusal to acceptance.
+    ins = G.decode(code(coherent_mesh('S7', control='numeric VCC')))
+    vote = next(i for i, item in enumerate(ins) if item[2] == 's_cbranch_vccz')
+    numeric_read = next(i for i, item in enumerate(ins) if item[3] == 'v_mov_b32_e32 v60, vcc_lo')
+    mutant = ins.copy()
+    mutant[numeric_read] = (*ins[numeric_read][:2], 's_nop', 's_nop 0')
+    expect('m3 control sees impure VCC', 'vcc' in G.lane_mask_webs(ins).get(vote, ()), False)
+    expect('m3 accepting the numeric VCC fails the purity control',
+           'vcc' in G.lane_mask_webs(mutant).get(vote, ()), True)
 
 
 def controls():
@@ -943,6 +1371,7 @@ def controls():
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
     with tempfile.TemporaryDirectory() as tmp:
         lane_mask_controls(tmp)
+        coherent_controls(tmp)
         key, result = request(tmp, WAVE_LOAD_MESH)
         expect('pre-exchange wave load translates', result, 'ok')
         if result == 'ok':
@@ -982,7 +1411,8 @@ def controls():
         expect('scalar defined on both paths to an inner join translates',
                request(tmp, scalar_position_mesh(1, 'defined inner result'))[1], 'ok')
         for control, expected in (
-            ('backward', 'a loop outside the group-memory exchanges is not covered'),
+            ('backward', 's_cbranch_execz skips code with effects outside active lanes '
+                         '(wave-load block: a backward branch inside the block)'),
             ('outside', 's_cbranch_execz skips code with effects outside active lanes'),
             ('exchange', 'a branch enters or crosses a group-memory exchange'),
             ('enters block', 's_cbranch_execz skips code with effects outside active lanes'),
@@ -1009,8 +1439,6 @@ def controls():
                        (block[1].count('.Load('), bool(re.search(r'\bs45 = ', block[1]))), (2, True))
         # The accepted mesh opcodes cannot produce a lane-varying numeric SGPR here.
         # Inject that analysis fact at the Stage boundary to exercise the uniformity refusal.
-        from unittest.mock import patch
-
         uniform_source = G.Stage.uniform_source
         with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's42' and uniform_source(stage, token)):
             expect('non-uniform wave load bound', refusal_head(request(tmp, WAVE_LOAD_MESH)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
@@ -1132,6 +1560,10 @@ v_mov_b32 v7, 0.25
     expect('S1 assembled words', wave_load_mesh(' '.join(assemble(mc, prefix)),
            ' '.join(assemble(mc, 's_cmp_eq_u32' + body))), MASK_CASES[0][1])
     for label, asm, expected in (
+            ('S5 CMPX and complement', 's_mov_b64 s[52:53], exec\nv_cmpx_gt_u32_e32 s50, v0\n'
+             's_andn2_b64 exec, s[52:53], exec', 'beb4047e 7da80032 8afe7e34'),
+            ('S6 narrowing and restore', 's_and_b64 exec, s[46:47], exec\ns_and_saveexec_b64 s[54:55], vcc\n'
+             's_and_saveexec_b64 s[56:57], vcc\ns_mov_b64 exec, s[52:53]', '87fe7e2e beb6246a beb8246a befe0434'),
             ('tbuffer', 'tbuffer_load_format_x v7, off, s[16:19], 0 format:[BUF_FMT_32_FLOAT] offset:488',
              'e8b001e8 80040700'),
             ('image', 'image_load v7, v[50:51], s[56:63] dmask:0x1 dim:SQ_RSRC_IMG_2D',
@@ -1233,6 +1665,8 @@ def rasterise(points, colours, indices, verts, prims):
 
 def lane_mask_reference(label, full, mutant=None):
     """Simulate scalar state per guest wave and VALU under that lane's EXEC."""
+    if label in COHERENT_DRAWS:
+        return coherent_reference(label, full, mutant)
     points, colours, indices = geometry()
     triangles = [tuple(slot + first for slot in tri) for tri, first in zip(indices, (32, 0, 64, 64))]
     data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
@@ -1256,7 +1690,9 @@ def lane_mask_reference(label, full, mutant=None):
             then = outer
         if mutant == 'wrong constant select' and first == 64:
             then = outer
-        if mutant == 'wrong mask select' and first == 0:
+        if mutant == 'wrong mask select':
+            # s54 = 0 clears s46 & s54 in every wave, so its complement opens the then-arm to every outer lane
+            # of both waves (wave 1 too, whose correct then-arm is empty), and v7 there becomes 0.0.
             then = outer
         if mutant == 'per-lane VCC branch' and first == 0:
             then = [active and lane == 0 for lane, active in enumerate(outer)]
@@ -1294,8 +1730,54 @@ def lane_mask_reference(label, full, mutant=None):
     return data, rasterise(points, colours, triangles, 128, len(triangles))
 
 
+def coherent_reference(shape, full, mutant=None):
+    """Interpret the voted arms for two guest wave64s and rasterize their outputs."""
+    points, colours, indices = geometry()
+    triangles = [tuple(slot + base for slot in tri) for tri, base in zip(indices, (32, 0, 64, 64))]
+    data = bytearray(buffer(points, colours, [a | b << 10 | c << 20 for a, b, c in triangles]))
+    then_red, else_green = (255, 192), (64, 96)
+    for wave in (0, 1):
+        struct.pack_into('<f', data, 480 + 4 * wave, then_red[wave] / 255)
+        struct.pack_into('<f', data, 488 + 4 * wave, else_green[wave] / 255)
+        saved = [True] * 64
+        threshold = 6 if wave == 0 else 128 if full else 64
+        cut = (8 if wave == 0 else 128) if shape == 'S6' else threshold
+        active = [e and 64 * wave + lane < cut for lane, e in enumerate(saved)]
+        first_vote = active
+        if shape == 'S6':
+            # The second compare can empty the wave even when the first vote passed.
+            vcc = [e and 64 * wave + lane < threshold for lane, e in enumerate(active)]
+            for _ in range(2):
+                if not any(active):
+                    break
+                active = [e and bit for e, bit in zip(active, vcc)]
+        then_runs = any(active)
+        red = then_red[wave] if then_runs else 64
+        green = [then_red[wave] if e else 0 for e in active]
+        if mutant == 'wrong complement':
+            other = active
+        else:
+            other = [s and not e for s, e in zip(saved, active)]
+        if any(other):
+            green = [else_green[wave] if e else old for e, old in zip(other, green)]
+        # Restoring EXEC makes the wave scalar observable on every exported lane.
+        for tid in {i for tri in triangles for i in tri if i // 64 == wave}:
+            lane, slot = tid & 63, tid & 15
+            result = 64 if mutant == 'per-lane EXEC branch' and not first_vote[lane] else red
+            colours[slot] = (result, green[lane], *colours[slot][2:])
+    return data, rasterise(points, colours, triangles, 128, len(triangles))
+
+
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label in COHERENT_DRAWS:
+        expect(label + ' inner EXEC vote is present', 'mesh_vote == 0u' in source, True)
+        mutants = [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
+        if label == 'S5':
+            complement = 'exec = (s52 & ~exec) & 1;'
+            expect(label + ' complement is unique', source.count(complement), 1)
+            mutants.append(('wrong complement', source.replace(complement, 'exec = exec & 1;')))
+        return mutants
     if label.endswith('mask regions'):
         expect(label + ' has two votes', source.count('mesh_vote == 0u'), 2)
         return [('per-lane EXEC branch', source.replace('mesh_vote == 0u', 'exec == 0u', 1))]
@@ -1346,8 +1828,22 @@ def draw_lane_masks(dxc, renderer, adapter):
                 status = draw_lane_mask_case(tmp, dxc, renderer, adapter, label, program, full)
                 if status:
                     return status
+    for shape in COHERENT_DRAWS:
+        for full in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                status = draw_lane_mask_case(tmp, dxc, renderer, adapter, shape, coherent_mesh(shape, full=full), full)
+                if status:
+                    return status
     with tempfile.TemporaryDirectory() as tmp:
-        return draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+        status = draw_guarded_positions(Path(tmp), dxc, renderer, adapter)
+        if status:
+            return status
+    for vector_bound in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            status = draw_count_guard(Path(tmp), dxc, renderer, adapter, vector_bound=vector_bound)
+            if status:
+                return status
+    return 0
 
 
 def guarded_position_reference():
@@ -1402,6 +1898,79 @@ def draw_guarded_positions(tmp, dxc, renderer, adapter):
     return 0
 
 
+def count_guard_reference(bit, *, vector_bound=False):
+    """Build the two synthetic prefix inputs and model the guest index clamp."""
+    points, colours, _ = geometry()
+    triangles = [(7, 2, 15)]
+    data = bytearray(buffer(points, colours, []))
+    struct.pack_into('<3I', data, 384, *triangles[0])
+    # The set-bit arm obtains byte offset 0 from the indexed R32_FLOAT load.
+    if vector_bound:
+        # s9 = 2. The clear-bit arm selects (2 << 4) + 4 as the offset.
+        # The set-bit arm loads B = 5 at offset 0, then scales it by s9.
+        struct.pack_into('<I', data, 456, 0)
+        struct.pack_into('<2I', data, 464, 4, 0)
+        struct.pack_into('<2I', data, 500, 8, 0)
+        raw_v, raw_p = struct.unpack_from('<2I', data, 464 if bit else 500)
+        verts, prims = ((raw_v & 127) + 1) * (2 if bit else 1), raw_p + 1
+    else:
+        # s9 = 1. The clear-bit arm computes 16, and both fields come from one word.
+        struct.pack_into('<I', data, 452, 0)
+        struct.pack_into('<2I', data, 464, 9, 0)
+        struct.pack_into('<2I', data, 480, 8, 0)
+        packed = struct.unpack_from('<I', data, 464 if bit else 480)[0]
+        verts, prims = (packed & 63) + 1, ((packed >> 8) & 255) + 1
+    guest = [tuple(min(i, verts - 1) for i in tri) for tri in triangles]
+    wrong = [tuple(min(i, verts - 2) for i in tri) for tri in guest]
+    return data, rasterise(points, colours, guest, verts, prims), rasterise(points, colours, wrong, verts, prims)
+
+
+def clamp_with_rewritten_count(source):
+    """m3 substitutes the decremented SGPR for the published vertex count in the exporter."""
+    old, new = 'max(mesh_vertex_count, 1u) - 1u', 'max(s14, 1u) - 1u'
+    assert source.count(old) == 1
+    return source.replace(old, new)
+
+
+def draw_count_guard(tmp, dxc, renderer, adapter, *, vector_bound=False):
+    mesh = vector_count_guard_mesh() if vector_bound else count_guard_mesh()
+    bound = 'VGPR' if vector_bound else 'SGPR'
+    key, result = request(tmp, mesh)
+    expect(f'two wave-load guards with a {bound} position bound compile', result, 'ok')
+    if result != 'ok':
+        return 1
+    base = tmp / ('%016x' % key)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
+    for key, value in ((('rootconst', 0, 1), 2 if vector_bound else 1),
+                       (('stride', 0), 4), (('descword3', 0), (22 << 12) | 4)):
+        struct.pack_into('<I', constants, 4 * uds.index(key), value)
+    source = base.with_suffix('.ms57.hlsl').read_text()
+    mutant = tmp / 'rewritten-clamp.cso'
+    mutant_text = mutant.with_suffix('.hlsl')
+    mutant_text.write_text(clamp_with_rewritten_count(source), encoding='ascii')
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutant_text], check=True)
+    path = tmp / 'count-guard.bin'
+    for bit in (0, 1):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), bit)
+        data, guest, wrong = count_guard_reference(bit, vector_bound=vector_bound)
+        differences = sum(a != b for a, b in zip(guest, wrong))
+        expect('the index clamp affects the image', differences > 0, True)
+        cases = (('guest', base.with_suffix('.ms57.cso'), guest, 0),
+                 ('m3 against guest', mutant, guest, differences), ('m3 against mutant', mutant, wrong, 0))
+        for label, shader, image, mismatches in cases:
+            path.write_bytes(constants + data + b'\xcd' * 80 + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), path],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            expect(f'{bound} bound, prefix arm {bit}, {label}',
+                   (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout),
+                   (int(mismatches != 0), True))
+    return 0
+
+
 def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
     key, result = request(tmp, mesh)
     expect(label + ' compiles', result, 'ok')
@@ -1419,11 +1988,7 @@ def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
         hlsl, shader = Path(tmp, f'mutant{i}.hlsl'), Path(tmp, f'mutant{i}.cso')
         hlsl.write_text(mutated)
         subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', shader, hlsl], check=True)
-        if name == 'wrong mask select':
-            # The scalar model does not reproduce this mutant's exact image; it only has to differ from the guest.
-            cases += [(name, shader, correct, None)]
-        else:
-            cases += [(name, shader, correct, differences), (name + ' reference', shader, wrong, 0)]
+        cases += [(name, shader, correct, differences), (name + ' reference', shader, wrong, 0)]
     constants = bytearray(1024)
     uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
     for slot, count in enumerate((4, 128)):
@@ -1438,9 +2003,6 @@ def draw_lane_mask_case(tmp, dxc, renderer, adapter, label, mesh, full):
         if run.returncode == 77:
             print(run.stdout + run.stderr)
             return 77
-        if differences is None:
-            expect(name, run.returncode, 1)
-            continue
         expect(name, (run.returncode, f'pixels=1024 mismatches={differences}' in run.stdout),
                (int(differences != 0), True))
     return 0
