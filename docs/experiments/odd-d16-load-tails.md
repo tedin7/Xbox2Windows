@@ -32,3 +32,17 @@ On Linux, `python -B tests/startup_image_load_d16_check.py` passed. Compared
 with base `e8015da7a`, fixtures A–D emit identical vertex and pixel HLSL and
 manifests. The base refuses each of the three newly accepted fixtures.
 WARP execution requires the Windows test machine.
+
+A full overwrite clears the restriction within the same basic block and
+EXEC generation, including under a narrowed mask. Every EXEC write advances
+the generation. A later masked load cannot erase an older restriction on
+lanes outside its mask.
+
+The odd-tail WARP check also compares a masked three-component load, low-half
+conversion, full overwrite and float add across the same 8×2 target. A wrong
+overwrite value must produce eight mismatching pixels. The Python controls
+require refusal after narrowing or rewriting EXEC and across a branch.
+On x86-64 Linux with Python 3.14.8, `python3 -B tests/startup_image_load_d16_check.py`
+passed. Base `741f301fa` refused the new reference shader, and all nine existing
+odd-tail HLSL variants matched that base byte for byte. This change's WARP
+readback is pending on Windows.
