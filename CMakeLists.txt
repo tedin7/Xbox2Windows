@@ -1553,7 +1553,9 @@ target_link_libraries(startup_resource_budget PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     foreach(debug IN ITEMS 0 1)
         set(case startup_resource_budget_${backend}_debug${debug})
-        set(budget_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        set(budget_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug};X2W_UPLOAD_PAGE_REUSE=0")
+        # Reuse keeps a finished recording's page in the free pool, still live. This test counts the release at the allocator Reset;
+        # the pool has its own test (startup_upload_arena_guard).
         add_test(NAME ${case} COMMAND startup_resource_budget ${backend})
         add_test(NAME ${case}_inline_control COMMAND startup_resource_budget ${backend} inline-control)
         set_tests_properties(${case} ${case}_inline_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "${budget_env}")
