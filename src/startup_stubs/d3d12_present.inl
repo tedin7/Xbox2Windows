@@ -16,7 +16,7 @@ struct WindowPresenter {
     x2w_startup::PlaneCompositor compositor;  // shaders, pipelines and plane views
     ID3D12Fence* fence = nullptr;
     HANDLE reached = nullptr;
-    UINT64 fence_value = 0;
+    UINT64 submitted = 0;
     UINT width = 0, height = 0;
     bool failed = false;
 };
@@ -174,7 +174,20 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
     const UINT index = p.chain->GetCurrentBackBufferIndex();
     const D3D12_CPU_DESCRIPTOR_HANDLE target{p.targets->GetCPUDescriptorHandleForHeapStart().ptr +
                                              SIZE_T{index} * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
-    if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.compositor.initial_pipeline()))) return false;
+    auto wait = [&] {
+        return x2w_startup::wait_for_fence(p.fence, p.submitted, p.reached, device, [] {
+            static LONG slow_waits;
+            if (first_calls(slow_waits, 4)) log("x2w-present fence wait exceeded 2 seconds");
+        }) == x2w_startup::FenceWait::reached;
+    };
+    if (!wait()) {
+        p.failed = true;
+        return false;
+    }
+    if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.compositor.initial_pipeline()))) {
+        p.failed = true;
+        return false;
+    }
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const UINT drawn = p.compositor.record(device, p.list, target, p.width, p.height, steps, count, plane_surfaces, log);
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -189,10 +202,17 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
     ID3D12CommandList* lists[] = {p.list};
     queue->ExecuteCommandLists(1, lists);
     const HRESULT hr = p.chain->Present(0, 0);
-    // The allocator is reused next frame: wait until this frame's commands are done.
-    if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value)) && p.fence->GetCompletedValue() < p.fence_value &&
-        SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
-        WaitForSingleObject(p.reached, 2000);
+    // A failed signal leaves the submitted list without a completion marker: never reuse it.
+    const UINT64 next = p.submitted + 1;
+    if (FAILED(queue->Signal(p.fence, next))) {
+        p.failed = true;
+        return false;
+    }
+    p.submitted = next;
+    if (!wait()) {
+        p.failed = true;
+        return false;
+    }
     static LONG failures;
     if (FAILED(hr) && first_calls(failures, 4)) log("x2w-present Present failed 0x%08lx", static_cast<unsigned long>(hr));
     check_device("window present", 0);
