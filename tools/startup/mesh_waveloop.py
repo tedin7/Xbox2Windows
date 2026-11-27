@@ -250,6 +250,12 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             entry.update('s%d' % n for n in self.entry_symbols)
             self.defined_entry = entry
 
+        def uniform_source(self, token):
+            reg = G.reg_range(token)
+            if reg and reg[0] == 's' and reg[1] == reg[2]:
+                return True
+            return token in MASK_WORDS | {'exec', 'vcc', 'm0'} or super().uniform_source(token)
+
         def translate(self):
             self.real = self.ins
             self.cfg = ControlFlow(G, self.real)

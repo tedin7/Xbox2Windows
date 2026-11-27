@@ -6,7 +6,7 @@ import tempfile
 from unittest.mock import patch
 
 from startup_mesh57_loop_check import DATA_DEP
-from startup_mesh57_skeleton_check import G, GROUP_MESH, MESH, PIXEL, request, refusal_head
+from startup_mesh57_skeleton_check import G, GROUP_MESH, HEAP_SETUP, MESH, PIXEL, heap_root, request, refusal_head
 
 
 # Separate allocation block for wave 0, followed by a partial-EXEC lane read.
@@ -25,15 +25,17 @@ SERIAL_MESH = (
 ).split()
 
 
-def run(mesh, mode=None, pixel=(), *, artifacts=False):
+def run(mesh, mode=None, pixel=(), *, artifacts=False, root_blob=None, stubs=False):
     with patch.dict(os.environ, {'X2W_FXC': ''}):
         for variable in ('X2W_MESH_WAVELOOP', 'X2W_MESH_WAVELOOP_STUBS', 'X2W_PLACEHOLDER_PS'):
             os.environ.pop(variable, None)
+        if stubs:
+            os.environ['X2W_MESH_WAVELOOP_STUBS'] = '1'
         if mode is not None:
             os.environ['X2W_MESH_WAVELOOP'] = mode
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                key, result = request(tmp, mesh, pixel)
+                key, result = request(tmp, mesh, pixel, root_blob=root_blob)
             except G.Unsupported as reason:
                 return refusal_head(str(reason)), {}
             output = {}
@@ -55,6 +57,14 @@ def check_exec_zero_edges():
     assert 'v0 may be read before it is written' in status, status
     status, _ = run(prefix + ['bf880001', writes[0]] + suffix, 'force')
     assert 's20 may be read before it is written' in status, status
+
+
+def check_scalar_uniformity():
+    # A scalar copied from m0 still has one value per guest wave.
+    program = ['befc0380', 'be98037c', 'f408070d', '30000000']
+    status, _ = run(SERIAL_MESH[:6] + HEAP_SETUP + program + SERIAL_MESH[6:],
+                    'force', root_blob=heap_root())
+    assert status == 'ok', status
 
 
 def main():
@@ -92,6 +102,7 @@ def main():
     reason, _ = run(undefined)
     assert 'wave loop: v0 may be read before it is written' in reason, reason
     check_exec_zero_edges()
+    check_scalar_uniformity()
     print('ok')
 
 
