@@ -317,6 +317,17 @@ MASK_CASES = (
 
 COHERENT_THEN = 'f4200a04 520001e0 bf8cc07f 7e0e0228'  # s40 = buffer[480 + 4*wave], v7 = s40
 COHERENT_ELSE = 'f4200f04 520001e8 bf8cc07f 7e0e023c'  # s60 = buffer[488 + 4*wave], v7 = s60
+COHERENT_OFFSET_SETUP = 'f4200984 520001f0 bf8cc07f 8726c426'
+COHERENT_OFFSET_ADD = '802eff26 000001e0'
+COHERENT_OFFSET_LOAD = 'f4200b84 5c000000 bf8cc07f bea8032e 7e0e0228'
+COHERENT_OFFSET_MASK = 'd4c4002e 000200ff 00000080'  # 128 > tid; true for all active lanes here
+COHERENT_OFFSET_USE = '87fe2e7e'  # exec &= s[46:47]
+COHERENT_DESCRIPTOR_LOAD = 'f4080e09 fa000000 bf8cc07f'  # s_load_dwordx4 s[56:59], s[18:19], 0
+COHERENT_DESCRIPTOR_LOW = 'bee80438'  # s_mov_b64 s[104:105], s[56:57]
+COHERENT_DESCRIPTOR_HIGH = 'beea043a'  # s_mov_b64 vcc, s[58:59]
+COHERENT_DESCRIPTOR_MASK = 'd4c4003a 000200ff 00000080'  # v_cmp_gt_u32_e64 s58, 128, v0
+# Base field 52 names s[104:107]. The upper pair is VCC.
+COHERENT_DESCRIPTOR_READ = 'f4200bb4 5c000000 bf8cc07f bea8032e 7e0e0228'
 
 
 def coherent_words(parts):
@@ -351,6 +362,7 @@ SCC_RED = '7e280c14'  # v_cvt_f32_u32_e32 v20, s20
 def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=False, live_mask=False,
                   numeric_pair=False, vcc_before_compare=False):
     # Wave 0 has six then lanes. Wave 1 has zero or 64. The enclosing prefix covers both waves.
+    full = full or control in ('conditional address', 'mixed VCC source')  # exercise both SCC paths
     threshold = 'bf068006 ' + ('8532ff86 00000080' if full else '8532c086')  # s50 = SCC ? 6 : 128/64
     before = ['beb4047e bf8cc07f', 'head:', '7da80032']  # save EXEC, wait, CMPX s50 > v0
     then = [COHERENT_THEN]
@@ -372,6 +384,27 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
         else:
             # Both edges carry the AND's SCC to the select, including the empty-wave skip.
             before.extend(((0xbf88, 'SCC select'), SCC_VALU, 'SCC select:', SCC_SELECT))
+    if shape == 'S9':
+        then = [COHERENT_OFFSET_MASK, COHERENT_OFFSET_SETUP]
+        if control == 'conditional address':
+            then += ['bf068006', (0xbf84, 'offset join')]
+        then.append(COHERENT_OFFSET_ADD)
+        if control == 'conditional address':
+            then.append('offset join:')
+        if control == 'partial mask':
+            then.append(COHERENT_OFFSET_USE)
+        if control in ('conditional address', 'partial mask'):
+            then.append(COHERENT_OFFSET_LOAD)
+        else:
+            then.append(COHERENT_DESCRIPTOR_LOAD)
+            if control == 'mixed VCC source':
+                then += ['bf068006', (0xbf84, 'descriptor join'), COHERENT_DESCRIPTOR_MASK,
+                         'descriptor join:']
+            elif control == 'compare VCC source':
+                then.append(COHERENT_DESCRIPTOR_MASK)
+            then += ['beea047e' if control == 'EXEC VCC source' else COHERENT_DESCRIPTOR_HIGH,
+                     COHERENT_DESCRIPTOR_LOW, COHERENT_DESCRIPTOR_READ]
+        then += [COHERENT_OFFSET_MASK, COHERENT_OFFSET_USE]
     if control == 'backward':
         then.append((0xbf82, 'head'))
     elif control == 'constant-trip':
@@ -461,6 +494,7 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
 
 COHERENT_DRAWS = {'S5': ('S5', {}), 'S6': ('S6', {}),
                   COHERENT_VCC_DRAW: ('S5', {'vcc_before_compare': True}),
+                  'S9': ('S9', {}),
                   **{name: (name, {}) for name in SCC_AND}}
 COHERENT_CONTROLS = (
     ('S5', 'backward', 'a backward branch inside the block'),
@@ -473,6 +507,11 @@ COHERENT_CONTROLS = (
     ('SCC move', 'SCC overwritten on one path', 'SCC of a mask operation is read'),
     ('SCC move', 'SCC writer skipped', 'SCC of a mask operation is read'),
     ('S5', 'varying address', 'a scalar load address is not wave-uniform'),
+    ('S9', 'conditional address', 'a scalar load address is not wave-uniform'),
+    ('S9', 'partial mask', 'an unsupported vector instruction (v_cmp_gt_u32_e64)'),
+    ('S9', 'compare VCC source', 'a scalar load address is not wave-uniform'),
+    ('S9', 'EXEC VCC source', 'a scalar load address is not wave-uniform'),
+    ('S9', 'mixed VCC source', 'a scalar load address is not wave-uniform'),
     ('S5', 'varying SCC', 'SCC is not proven wave-uniform'),
 )
 
@@ -1378,6 +1417,7 @@ def coherent_controls(tmp):
     for label, shape, options, votes in (
             ('S5', 'S5', {}, (2, 0)), ('S5 full', 'S5', {'full': True}, (2, 0)),
             ('S6', 'S6', {}, (5, 0)), ('S6 full', 'S6', {'full': True}, (5, 0)),
+            ('S9 scalar offset', 'S9', {}, (2, 0)), ('S9 full', 'S9', {'full': True}, (2, 0)),
             ('S7', 'S7', {}, (5, 0)), ('S7 nonzero votes', 'S7', {'nonzero': True}, (3, 2)),
             ('S8', 'S8', {}, (8, 0)), ('S5 position exports', 'S5', {'positions': True}, (2, 0)),
             ('S5 live mask', 'S5', {'live_mask': True}, (2, 0)),
@@ -1401,6 +1441,11 @@ def coherent_controls(tmp):
         if label.startswith('S7'):
             expect(label + ' counts VCC even under zero EXEC',
                    bool(re.search(r'mesh_first_active\(tid, pc == \d+ && \(vcc & 1u\) != 0u', source)), True)
+        if shape == 'S9':
+            expect(label + ' register-offset load reaches the colour export',
+                   bool(re.search(r's46 = r0\.Load\(s46 \+ 0\);\s+s40 = s46;'
+                                  r'.*?v20 = s40;.*?o\.param0 = float4\(F\(v20\),',
+                                  source, re.S)), True)
         draw_label = label.removesuffix(' full')
         if draw_label in COHERENT_DRAWS:
             full = options.get('full', False)
@@ -1461,6 +1506,69 @@ def coherent_controls(tmp):
     expect('m3 control sees impure VCC', 'vcc' in G.lane_mask_webs(ins).get(vote, ()), False)
     expect('m3 accepting the numeric VCC fails the purity control',
            'vcc' in G.lane_mask_webs(mutant).get(vote, ()), True)
+
+    coherent_offset_proofs(tmp)
+    coherent_descriptor_proofs(tmp)
+
+
+def coherent_descriptor_proofs(tmp):
+    for control in (None, 'compare VCC source', 'EXEC VCC source', 'mixed VCC source'):
+        ins = G.decode(code(coherent_mesh('S9', control=control)))
+        load = next(i for i, item in enumerate(ins) if item[3] == 's_buffer_load_dword s46, s[104:107], s46')
+        reads = set()
+        G.lane_mask_webs(ins, numeric_reads=reads)
+        expect(f'{control} descriptor is a numeric mask read', load in reads, control is not None)
+
+    source = inspect.getsource(G.lane_mask_webs)
+    seed = "(pair == 'vcc' and i not in vcc_copies)"
+    expect('VCC seed mutant site is unique', source.count(seed), 1)
+    namespace = dict(vars(G))
+    exec(compile(source.replace(seed, "pair == 'vcc'"), '<VCC seed mutant>', 'exec'), namespace)
+    with patch.object(G, 'lane_mask_webs', namespace['lane_mask_webs']):
+        _, result = request(tmp, coherent_mesh('S9'))
+    expect('unconditional VCC seed breaks the descriptor copy fixture', result,
+           f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: a scalar load address is not wave-uniform)')
+
+
+def coherent_offset_proofs(tmp):
+    """Check the words at the load and the mask use, including the bypass edge."""
+    for control in ('conditional address', 'partial mask'):
+        ins = G.decode(code(coherent_mesh('S9', control=control)))
+        add = next(i for i, item in enumerate(ins) if item[3] == 's_add_u32 s46, s38, 0x1e0')
+        load = next(i for i, item in enumerate(ins) if item[3] == 's_buffer_load_dword s46, s[8:11], s46')
+        _, writes, possible_writes, candidates = G.lane_mask_accesses(ins)
+        first_mask = next(i for i in candidates if i < add and candidates[i] == 's[46:47]')
+        cfg = G.lane_mask_cfg(ins)
+        incoming = G.reaching_mask_words(cfg, writes, possible_writes, {'s46', 's47'})
+        low = {first_mask, add} if control == 'conditional address' else {add}
+        expect(f'{control} offset reaches the load', incoming[load], {'s46': low, 's47': {first_mask}})
+        reads = set()
+        webs = G.lane_mask_webs(ins, numeric_reads=reads)
+        expect(f'{control} offset is a numeric mask read', load in reads, control == 'conditional address')
+        if control == 'partial mask':
+            expect('the partial pair has no mask web', 's[46:47]' in webs.get(add + 1, ()), False)
+
+    # This mutant loses definitions that exist on just one incoming path.
+    source = inspect.getsource(G.reaching_mask_words)
+    merge = 'before[w] | after[w]'
+    expect('reaching definitions mutant site is unique', source.count(merge), 1)
+    namespace = dict(vars(G))
+    exec(compile(source.replace(merge, 'before[w] & after[w]'), '<reaching definitions mutant>', 'exec'),
+         namespace)
+    prove = G.mesh_coherent_block
+    accepted = []
+
+    def record_proof(*args):
+        proof = prove(*args)
+        accepted.append(proof)
+        return proof
+
+    with patch.object(G, 'reaching_mask_words', namespace['reaching_mask_words']), \
+            patch.object(G, 'mesh_coherent_block', record_proof):
+        _, result = request(tmp, coherent_mesh('S9', control='conditional address'))
+    expect('intersection mutant accepts the conditional mask offset in the block proof', bool(accepted), True)
+    expect('emitter still refuses the conditional mask offset', result,
+           f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: a masked arm reads a scalar that is not wave-uniform)')
 
 
 def mesh_root_layout_controls():
@@ -1551,8 +1659,8 @@ def controls():
                "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
         formatted = HEAP_MESH.copy()
         formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
-        expect('formatted heap refused', request(tmp, formatted, root_blob=heap_root())[1],
-               'unsupported: dynamic resource heap views require a raw buffer load')
+        # A formatted buffer load through a heap record translates since the heap format table exists.
+        expect('formatted heap load translates', request(tmp, formatted, root_blob=heap_root())[1], 'ok')
     with tempfile.TemporaryDirectory() as group_tmp:
         key, group_result = request(group_tmp, GROUP_MESH)
         expect('numeric group index translates', group_result, 'ok')
@@ -1758,6 +1866,34 @@ def lane_mask_binary(mc):
     expect('VCC select and EXEC write words',
            assemble(mc, 'v_cndmask_b32_e64 v60, 0, 1, vcc\ns_cmp_eq_u32 s6, 0\ns_cselect_b32 exec_lo, 0, -1'),
            (COHERENT_VCC_READ + ' ' + COHERENT_EXEC_WRITE).split())
+    expect('coherent scalar offset words', assemble(mc, """
+s_buffer_load_dword s38, s[8:11], s41 offset:0x1f0
+s_waitcnt lgkmcnt(0)
+s_and_b32 s38, s38, -4
+s_add_u32 s46, s38, 0x1e0
+s_buffer_load_dword s46, s[8:11], s46
+s_waitcnt lgkmcnt(0)
+s_mov_b32 s40, s46
+v_mov_b32 v7, s40
+v_cmp_gt_u32_e64 s[46:47], 128, v0
+s_and_b64 exec, exec, s[46:47]
+"""), ' '.join((COHERENT_OFFSET_SETUP, COHERENT_OFFSET_ADD, COHERENT_OFFSET_LOAD,
+                 COHERENT_OFFSET_MASK, COHERENT_OFFSET_USE)).split())
+    expect('descriptor copy words', assemble(mc, """
+s_load_dwordx4 s[56:59], s[18:19], 0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 vcc, s[58:59]
+s_mov_b64 s[104:105], s[56:57]
+v_cmp_gt_u32_e64 s[58:59], 128, v0
+s_mov_b64 vcc, exec
+"""), ' '.join((COHERENT_DESCRIPTOR_LOAD, COHERENT_DESCRIPTOR_HIGH, COHERENT_DESCRIPTOR_LOW,
+                 COHERENT_DESCRIPTOR_MASK, 'beea047e')).split())
+    # llvm-mc rejects the VCC alias in the tuple. Verify the other fields
+    # against the adjacent aligned base and check the full operand in Python.
+    load = COHERENT_DESCRIPTOR_READ.split()[:2]
+    load[0] = '%08x' % ((int(load[0], 16) & ~0x3f) | (100 >> 1))
+    expect('descriptor register-offset load words',
+           assemble(mc, 's_buffer_load_dword s46, s[100:103], s46'), load)
     expect('standalone select words', assemble(mc, """
 s_cmp_eq_u32 s6, 0
 s_cselect_b64 vcc, -1, 0
@@ -2033,6 +2169,8 @@ def coherent_reference(shape, full, mutant=None):
     for wave in (0, 1):
         struct.pack_into('<f', data, 480 + 4 * wave, then_red[wave] / 255)
         struct.pack_into('<f', data, 488 + 4 * wave, else_green[wave] / 255)
+        if shape == 'S9':
+            struct.pack_into('<I', data, 496 + 4 * wave, 4 * wave)
         saved = [True] * 64
         threshold = 6 if wave == 0 else 128 if full else 64
         cut = (8 if wave == 0 else 128) if shape == 'S6' else threshold
@@ -2046,12 +2184,13 @@ def coherent_reference(shape, full, mutant=None):
                     break
                 active = [e and bit for e, bit in zip(active, vcc)]
         then_runs = any(active)
-        red = then_red[wave] if then_runs else 64
+        loaded = then_red[1 if mutant == 'wrong scalar offset' else wave]
+        red = loaded if then_runs else 64
         if shape in SCC_AND:
             mask_result = [e and 64 * wave + lane == 1 for lane, e in enumerate(active)]
             vote = mask_result[0] if mutant == 'lane 0 only' else any(mask_result)
             red = 255 * (vote or mutant == 'always true')
-        green = [then_red[wave] if e else 0 for e in active]
+        green = [loaded if e else 0 for e in active]
         if mutant == 'wrong complement':
             other = active
         else:
@@ -2083,6 +2222,10 @@ def lane_mask_mutants(label, source):
             complement = 'exec = (s52 & ~exec) & 1;'
             expect(label + ' complement is unique', source.count(complement), 1)
             mutants.append(('wrong complement', source.replace(complement, 'exec = exec & 1;')))
+        if label == 'S9':
+            address = 's46 = r0.Load(s46 + 0);'
+            expect(label + ' computed scalar load is unique', source.count(address), 1)
+            mutants.append(('wrong scalar offset', source.replace(address, 's46 = r0.Load(484);')))
         return mutants
     if label.endswith('mask regions'):
         expect(label + ' has two votes', source.count('mesh_vote == 0u'), 2)
