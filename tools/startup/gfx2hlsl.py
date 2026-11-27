@@ -12950,14 +12950,35 @@ class Stage:
         empty = frozenset()
         if not successors:
             return {}
-        facts = {0: (empty, empty, empty)}
+        facts = {0: (empty, empty, empty, empty, empty, frozenset({'entry'}))}
         work = [0]
         while work:
             i = work.pop()
             if i in indirect:
                 return {}  # An unknown incoming edge can invalidate facts at any origin.
-            writes, save, restore, exec_write, bounds, _, _ = effects[i]
-            equal, superset, subsets = facts[i]
+            writes, save, restore, exec_write, bounds, wqm, shrink = effects[i]
+            equal, superset, subsets, live, quad_pairs, flags = facts[i]
+            # Only a copy of entry EXEC can start a live-mask proof. Subsequent
+            # in-place AND/ANDN2 updates preserve it, including across WQM.
+            live = self.interp_live_pairs(live, writes) | ({shrink} if shrink in live else empty)
+            quad_pairs = self.interp_live_pairs(quad_pairs, writes)
+            if save is not None:
+                if 'entry' in flags:
+                    live |= {save}
+                if 'quad' in flags:
+                    quad_pairs |= {save}
+            if exec_write:
+                unchanged = restore in equal
+                entry = unchanged and 'entry' in flags
+                quad = (restore in quad_pairs or (unchanged and 'quad' in flags)
+                        or (wqm == 'exec' and bool(flags & {'entry', 'quad'}))
+                        or ('wqm' in flags and wqm in live))
+                flags -= {'entry', 'quad'}
+                if entry:
+                    flags |= {'entry'}
+                if quad:
+                    flags |= {'quad', 'wqm'}
+
             equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in (equal, superset))
             if restore is not None:
                 if restore not in equal:
@@ -12975,7 +12996,7 @@ class Stage:
                 equal |= {save}
                 superset |= {save}
 
-            transferred = equal, superset, self.interp_subset_step(subsets, effects[i])
+            transferred = equal, superset, self.interp_subset_step(subsets, effects[i]), live, quad_pairs, flags
             for j in successors[i]:
                 previous = facts.get(j)
                 merged = (tuple(a & b for a, b in zip(transferred, previous))
@@ -12997,6 +13018,61 @@ class Stage:
         return name.startswith('v_') and not (
             name.endswith('_dpp') or name.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane',
                                                       'v_movrel', 'v_permlane')))
+
+    @staticmethod
+    def interp_helper_observer(name, lane_local, exact=False):
+        if name.startswith('v_cmp') or VOP3B_SDST.match(name):
+            return 'uses it to write a lane mask'
+        if name.startswith(INTERP_STORE_PREFIXES) or '_atomic' in name:
+            return None if exact else 'uses it in a memory write with helper lanes enabled'
+        if '_dpp' in name or name.startswith(('v_quad', 'v_wave', 'v_permlane')):
+            return 'reads it across lanes'
+        if lane_local or name == 'image_sample_d' or name.startswith(('flat_load', 'scratch_load')):
+            return None
+        return 'reads it across lanes'
+
+    def interp_helper_scan(self, work, rows, effects, successors, entry_facts, sample_obligations):
+        """Follow differences confined to lanes outside the live mask."""
+        seen = set()
+        while work:
+            state = work.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > 65536:
+                raise Unsupported('v_interp_p1ll_f16 helper-lane taint state budget exceeded')
+            i, taint, identity = state
+            name, _, written, written_halves, lane_local, helper_reads = rows[i]
+            _, _, subsets, live, _, flags = entry_facts[i]
+            _, _, masked, _, _, at_superset, covered = identity
+            sources = taint & helper_reads
+            if sources:
+                # The exact mask must also exclude the original stale lanes.
+                exact = covered and ('entry' in flags or any(a == 'exec' and b in live for a, b in subsets))
+                observer = self.interp_helper_observer(name, lane_local, exact)
+                if observer:
+                    reason = ('v%d may hold a stale v_interp_p1ll_f16 value in helper lanes: %s %s'
+                              % (min(sources), name, observer))
+                    if name in ('image_sample', 'image_sample_c'):
+                        sample_obligations.setdefault(self.ins[i][0], reason)
+                    else:
+                        raise Unsupported(reason)
+                taint |= written
+            elif written_halves == 3 and (at_superset or (
+                    'quad' in flags and any(b == 'exec' and a in live and a in masked for a, b in subsets))):
+                # Lane-local operations keep differences inside the original
+                # EXEC. Whole-quad EXEC containing the covered live mask also
+                # reaches every observable quad, even after the old alias is lost.
+                taint -= written
+            if not taint:
+                continue
+            if name.startswith(('s_setpc', 's_swappc')):
+                raise Unsupported('unmodelled v_interp_p1ll_f16 helper-lane taint across an indirect jump')
+            identity = self.interp_exec_step(identity, effects[i])
+            for j in successors[i]:
+                if j <= i:
+                    raise Unsupported('unmodelled v_interp_p1ll_f16 helper-lane taint across a backward branch')
+                work.append((j, taint, identity))
 
     def interp_exec_step(self, identity, effects):
         """Advance EXEC identity and coverage for one omitted half."""
@@ -13143,7 +13219,10 @@ class Stage:
             exec_write = writes_exec(name, ops, mods)
             effects = self.interp_exec_effects(name, asm, ops, exec_write)
             exec_effects.append(effects)
-            rows.append((name, read, written, self.interp_write_halves(name, mods), self.interp_lane_local(name)))
+            # VOPCX writes EXEC implicitly, so both printed operands are sources.
+            helper_reads = regs(ops) if name.startswith('v_cmpx') else read.keys()
+            rows.append((name, read, written, self.interp_write_halves(name, mods),
+                         self.interp_lane_local(name), helper_reads))
             if interp:
                 self.interp_f16_pair(name, ops)
             if base is not None and name in ('v_interp_p1_f32', 'v_interp_p2_f32',
@@ -13192,7 +13271,7 @@ class Stage:
                 if i in seen:
                     continue
                 seen.add(i)
-                name, _, written, _, _ = rows[i]
+                name, _, written, _, _, _ = rows[i]
                 if reg in written:
                     raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
                                       'where interpolation reads them' % (name, reg))
@@ -13201,11 +13280,11 @@ class Stage:
         entry_facts = self.interp_exec_entry_facts(successors, exec_effects, indirect)
         covered_pairs = {}
         sample_obligations = {}
-        work = []
+        work, helper_work = [], []
         for i, reg, halves in omitted:
             # EXEC cannot change between p1ll and p2. Using facts at p2 also drops pairs
             # clobbered since p1ll and includes any intervening copies of that same EXEC.
-            equal, superset, _ = entry_facts.get(i, (empty, empty, empty))
+            equal, superset = entry_facts.get(i, (empty, empty))[:2]
             identity = equal, superset | equal, empty, equal, True, True, False
             work.extend((j, reg, half, halves != 3, identity)
                         for half in (1, 2) if halves & half for j in successors[i])
@@ -13218,7 +13297,7 @@ class Stage:
             if len(seen) > 65536:
                 raise Unsupported('v_interp_p1ll_f16 liveness state budget exceeded')
             i, reg, half, alias, identity = state
-            name, read, written, written_halves, lane_local = rows[i]
+            name, read, written, written_halves, lane_local, _ = rows[i]
             if read.get(reg, 0) & half and not (identity[-1] and lane_local):
                 if alias:
                     reason = '%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' % (name, reg)
@@ -13227,6 +13306,12 @@ class Stage:
                               'a v_interp_p2_f16 that wrote another register' % (reg, name))
                 if identity[-1] and name in ('image_sample', 'image_sample_c'):
                     sample_obligations.setdefault(self.ins[i][0], reason)
+                elif (getattr(self, 'kind', None) == 'ps' and i in entry_facts and identity[2] & entry_facts[i][3]
+                      and name.startswith('v_') and not self.interp_helper_observer(name, lane_local)):
+                    # A write covering the live mask leaves differences only
+                    # in helpers, even if the original EXEC alias was lost.
+                    helper_work.append((i, frozenset({reg}), identity))
+                    continue
                 else:
                     raise Unsupported(reason)
             identity = self.interp_exec_step(identity, exec_effects[i])
@@ -13235,7 +13320,7 @@ class Stage:
                 if at_superset:
                     continue
                 if i not in covered_pairs:
-                    _, _, subsets = entry_facts.get(i, (empty, empty, empty))
+                    _, _, subsets = entry_facts.get(i, (empty, empty, empty))[:3]
                     writes, _, _, exec_write, _, _, _ = exec_effects[i]
                     covered_pairs[i] = (empty if exec_write else
                                         self.interp_live_pairs((a for a, b in subsets if b == 'exec'), writes))
@@ -13246,6 +13331,7 @@ class Stage:
                 if j <= i:
                     raise Unsupported('unmodelled v_interp_p2_f16 result across a backward branch')
                 work.append((j, reg, half, alias, identity))
+        self.interp_helper_scan(helper_work, rows, exec_effects, successors, entry_facts, sample_obligations)
         self.interp_sample_obligations = sample_obligations
         self.interp_scanned = True
 

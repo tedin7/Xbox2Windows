@@ -4482,6 +4482,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # control, then a desktop draw of the translated pair with DXC 6_0.
     add_test(NAME startup_gfx2hlsl_interp_f16_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_interp_f16_check.py")
+    add_test(NAME startup_gfx2hlsl_interp_f16_helper_taint_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_interp_f16_check.py" draw_helper_taint "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_interp_f16_helper_taint_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_interp_f16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_interp_f16_check.py" draw "${DXC_EXECUTABLE}"
