@@ -12602,7 +12602,7 @@ class Stage:
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
                         array_ok=False):
         level_zero = name == 'image_gather4_lz'
-        if self.kind == 'vs' and level_zero:
+        if self.kind in ('vs', 'ms') and level_zero:
             if len(ops) != 4:
                 raise Unsupported('%s requires four operands' % name)
         elif self.kind not in ('ps', 'cs') or len(ops) != 4:
@@ -12672,7 +12672,11 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
-        tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d') if key is not None else None
+        kind = 'tex2da' if array else 'tex2d'
+        if self.kind == 'ms':
+            tex = self.image_texture(key, kind)
+        else:
+            tex = self.pipe.resource(key, kind) if key is not None else None
         if array and tex is not None:
             # The compute runtime binds a Texture2DArray input only under the typed-SRV manifest line.
             self.pipe.typed_srvs = True

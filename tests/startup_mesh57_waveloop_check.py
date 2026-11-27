@@ -2,6 +2,8 @@
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
 
@@ -149,6 +151,36 @@ def check_carry_masks_use_partial_exec():
     assert calls and set(calls) == {('vcc_lo', False), ('s30', False)}, calls
 
 
+def check_level_zero_mesh_gather():
+    program = [
+        'f40c0809', 'fa000000',  # s_load_dwordx8 s[32:39], s[18:19], 0
+        'bea80392', 'bea90380', 'beaa03ff', '04500000', 'beab0380',  # static sampler s[40:43]
+        '7e020280',              # v_mov_b32 v1, 0
+        'f11c0108', '01480600',  # image_gather4_lz v[6:9], v[0:1], s[32:39], s[40:43]
+    ]
+    status, output = run(SERIAL_MESH[:8] + program + SERIAL_MESH[9:], 'force', artifacts=True)
+    assert status == 'ok', status
+    manifest = output['ms57.txt'].splitlines()
+    assert b'srv 0 tex2d table 1 0' in manifest and b'smp 0 0x12 0x0 0x4500000 0x0' in manifest
+
+
+def check_export_rewrite(dxc):
+    # Model an export expression using a temporary whose name ends with "o".
+    original = G.MeshPipeline.mesh_output_line
+
+    def with_temporary(pipe, line):
+        return 'float4 foo = 0; ' + original(pipe, line) + ' o.pos.x += foo.x;'
+
+    with patch.object(G.MeshPipeline, 'mesh_output_line', with_temporary):
+        status, output = run(SERIAL_MESH, 'force', artifacts=True)
+    assert status == 'ok', status
+    with tempfile.TemporaryDirectory() as tmp:
+        shader = Path(tmp) / 'export.hlsl'
+        shader.write_bytes(output['ms57.hlsl'])
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', str(shader.with_suffix('.cso')),
+                        str(shader)], check=True)
+
+
 def main():
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
@@ -190,6 +222,11 @@ def main():
     check_mesh_heap_image_record()
     check_stub_cascade()
     check_carry_masks_use_partial_exec()
+    check_level_zero_mesh_gather()
+    if len(sys.argv) == 2:
+        check_export_rewrite(sys.argv[1])
+    elif len(sys.argv) > 2:
+        raise SystemExit('usage: startup_mesh57_waveloop_check.py [dxc]')
     print('ok')
 
 
