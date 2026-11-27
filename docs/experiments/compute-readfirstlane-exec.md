@@ -77,6 +77,33 @@ The four new kernels and their mutations previously reported
 ctest --preset dev --no-tests=error -R '^startup_compute_readfirstlane_wave_(controls|warp)$' -V
 ```
 
+## Constant EXEC across compute waves
+
+After the existing compute retries end in a uniform-source refusal, the
+translator can project a constant EXEC move onto each guest lane. It uses
+the flattened thread ID modulo the guest wave width. A group larger than
+32 threads requires a proven width. The first active lane must exist in
+every wave, including the tail wave.
+
+The fallback recomputes the first lane's value from uniform arithmetic or a
+uniform read-only buffer load. It keeps the original EXEC guard on the VGPR
+assignment. A branch, block boundary or EXEC write ends the proof. A direct
+move can restore a proven saved mask or set every lane's bit with `-1`.
+
+The fixture covers groups of 128 and 16×16 threads in wave64 and 64 threads
+in wave32. It checks the loaded word plus the lane index and a VGPR write
+that only active lanes should see. The WARP test also dispatches a mutant
+that enables all lanes and expects the first differing word predicted by
+the CPU reference.
+
+```bash
+env -u X2W_DXC nice -n 15 python3 -B tests/startup_compute_const_exec_check.py
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_const_exec_(controls|warp)$' -V
+```
+
 ## Wide vector raw loads
 
 The same waterfall proof accepts one to four dwords per raw vector load. With

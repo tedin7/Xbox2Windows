@@ -36,6 +36,7 @@ WAVE_REDUCTION_PARTICIPATION = 'wave reduction: lane participation may change at
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
                            'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
+CONST_EXEC_WAVE_SIZE = 'compute constant EXEC requires a proven wave size for groups larger than 32 threads'
 
 
 class Unsupported(Exception):
@@ -4850,6 +4851,13 @@ class Stage:
                 del self.low16_generation[n]
 
     def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
+        const_values = getattr(self, 'const_exec_values', None)
+        const_definition = (n in getattr(self, 'const_exec_defs', ())
+                            and all(int(v) in const_values for v in re.findall(r'\bv(\d+)\b', expr)))
+        if const_definition:
+            recompute = re.sub(r'\bv(\d+)\b', lambda m: const_values[int(m[1])], expr)
+        if const_values is not None:
+            const_values.pop(n, None)
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
@@ -4875,10 +4883,11 @@ class Stage:
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known or ignore_exec else 'if (exec & 1) v%d = %s;' % (n, expr))
         temps = getattr(self, 'uniform_temps', None)
-        if temps is not None:  # a uniform load past the entry block (one()): every lane keeps the words
+        if const_definition or temps is not None:  # every lane keeps the uniform value in a separate temporary
+            temps = const_values if const_definition else temps
             temps[n] = 'ul%x_%d' % (self.pc, n)
             self.uniform_load_temps.add(temps[n])
-            self.emit('%s = %s;' % (temps[n], expr))
+            self.emit('%s = %s;' % (temps[n], recompute if const_definition else expr))
 
     def f_mods(self, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
@@ -6412,6 +6421,9 @@ class Stage:
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.exec_generation = 0
+            self.const_exec_mask = None
+            self.const_exec_values = {} if getattr(getattr(self, 'pipe', None), 'retry_const_exec', False) else None
+            self.used_const_exec_read = False
             self.low16_generation = {}
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.pixel_rw_loads = {}    # shared pixel image -> [(offset, packed, address registers)] of its loads
@@ -6469,6 +6481,7 @@ class Stage:
                     if falls and getattr(self, 'phi_regs', {}).get(off):
                         self.phi_assign(self.phi_regs[off])
                     self.exec_generation += 1
+                    self.clear_const_exec()
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.align4_v.clear()
                     self.align4_s.clear()
@@ -7393,10 +7406,67 @@ class Stage:
             return ()
         return range(candidate[1], candidate[2] + 1)
 
+    def clear_const_exec(self):
+        self.const_exec_mask = None
+        if getattr(self, 'const_exec_values', None) is not None:
+            self.const_exec_values.clear()
+
+    def const_exec_source(self, tok):
+        reg = reg_range(tok)
+        if reg:
+            kind, lo, hi = reg
+            if kind == 'v':
+                return lo == hi and lo in self.const_exec_values
+            if lo not in self.defined_uniform_s:
+                return False
+        return self.uniform_source(tok)
+
+    def const_exec_descriptor(self, tok):
+        """An intact, fixed read-only buffer descriptor permits an unguarded recomputation."""
+        reg = reg_range(tok)
+        first = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
+        if not first:
+            return False
+        if first[0] == 'desc' and first[1][0] == 'table' and first[2] is not None:
+            if (reg[2] != reg[1] + 3 or not names_one_value(first)
+                    or any(self.sym.get(reg[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
+                return False
+        elif not (first[0] == 'ptr' and first[1][0] == 'root'):
+            return self.null_descriptor(tok)
+        key = self.descriptor(tok)
+        return key not in self.pipe.rw_keys and key not in self.pipe.modified and key not in self.pipe.other_modified
+
+    def const_exec_definitions(self, base, ops, mods):
+        """VGPR writes whose value every thread can recompute under this EXEC write."""
+        if not getattr(self, 'const_exec_mask', None) or not self.uniform_cf or not ops:
+            return (), None
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] > 255:
+            return (), None
+        if base in UNIFORM_VALU and not mods and dst[1] == dst[2] and len(ops) > 1:
+            inputs = ops[1:]
+            if base in VEC_F:
+                inputs = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in inputs]
+            if all(self.const_exec_source(tok) for tok in inputs):
+                return (dst[1],), None
+        if (base in UNIFORM_LOADS and len(ops) == 4 and dst[2] - dst[1] + 1 == UNIFORM_LOAD_WORDS[base]
+                and all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods)
+                and not ('idxen' in mods and 'offen' in mods) and self.const_exec_source(ops[3])
+                and self.const_exec_descriptor(ops[2])):
+            if ops[1] == 'off' and 'idxen' not in mods and 'offen' not in mods:
+                return range(dst[1], dst[2] + 1), None
+            addr = reg_range(ops[1])
+            if addr and addr[0] == 'v' and self.const_exec_source(ops[1]):
+                return range(dst[1], dst[2] + 1), self.const_exec_values[addr[1]]
+        return (), None
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         if writes_exec(name, ops):
             self.exec_generation += 1
+            self.clear_const_exec()
+        if name.startswith(('s_branch', 's_cbranch', 's_setpc')):
+            self.clear_const_exec()
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
             return self.lower_image_instruction(image, name, asm, ops, mods)
@@ -7526,10 +7596,13 @@ class Stage:
                         and self.firstlane_source(ops[3], base)
                         and not self.pipe.rw_keys):
                     extra_regs = range(data[1], data[2] + 1)
+        self.const_exec_defs, const_addr = self.const_exec_definitions(base, ops, mods)
         if recomputed:
             # Read before the load can overwrite its own address register.
             self.uniform_vaddr = '(%s)' % exprs[vaddr[1]] if vaddr and vaddr[1] in exprs else None
             self.uniform_temps = {}
+        if const_addr is not None:
+            self.uniform_vaddr = const_addr
         self.last_v = None
         if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
             # Any write ends a register's mark; the lowering below sets the new one, if any.
@@ -7541,6 +7614,7 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+            self.const_exec_defs = ()
         if extra_proof:
             for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops):
                 reg = reg_range(token)
@@ -7915,7 +7989,8 @@ class Stage:
             restore = None  # the OR would add lanes the copy does not hold
         if writes_exec(name, ops) and not narrows and restore is None:
             self.uniform_expr.clear()
-            copies.clear()
+            if getattr(self, 'const_exec_values', None) is None or name not in ('s_mov_b32', 's_mov_b64'):
+                copies.clear()
             self.exec_mask = len(self.exec_mask_parent)  # a mask nothing is known about: a new root
             self.exec_mask_parent[self.exec_mask] = None
             if getattr(self, 'entry_exec_proof', None) is not None:
@@ -9187,6 +9262,56 @@ class Stage:
                 pending.extend((target, bounds[target][0]) for target in succ[block])
         return True
 
+    def const_exec_move(self, base, ops):
+        if (getattr(self, 'const_exec_values', None) is None or len(ops) != 2 or
+                (base, ops[0]) not in (('s_mov_b64', 'exec'), ('s_mov_b32', 'exec_lo'))):
+            return False
+        src = ops[1]
+        pair = base.endswith('_b64')
+        if pair and (reg := reg_range(src)):
+            if reg[0] != 's' or reg[2] != reg[1] + 1 or reg[2] > 105:
+                raise Unsupported(READFIRSTLANE_UNIFORM)
+            words = [self.const_u32('s%d' % n) for n in range(reg[1], reg[2] + 1)]
+            mask = None if None in words else words[0] | (words[1] << 32)
+        else:
+            mask = self.const_u32(src)
+            if pair and re.fullmatch(r'-\d+', src) and -16 <= int(src) < 0:
+                # SOP1 inline negative integers sign extend. A literal dword zero extends.
+                mask |= 0xffffffff00000000
+        width = self.pipe.wave_size
+        if width is None:
+            width = 32 if wave32_exec_proof(self.ins) else 64 if wave64_exec_proof(self.ins) else None
+        x, y, z = self.pipe.group
+        threads = x * y * z
+        if width not in (32, 64) and threads > 32:
+            raise Unsupported(CONST_EXEC_WAVE_SIZE)
+        width = 64 if width == 64 else 32
+        lane = '((tid.x + %du * (tid.y + %du * tid.z)) & %du)' % (x, y, width - 1)
+        # AMD RDNA 2 ISA §3.3 EXECute mask: each guest lane uses its own bit, and EXEC_LO writes leave EXEC_HI intact.
+        has_high_lanes = width == 64 and threads > 32
+        if mask is None:
+            if self.exec_restore_copy(base, ops) is None:
+                raise Unsupported(READFIRSTLANE_UNIFORM)
+            bit = '(%s & 1u)' % self.S(reg_range(src)[1])
+        else:
+            mask &= (1 << width) - 1
+            word = '0x%08xu' % (mask & 0xffffffff)
+            shift = lane
+            if has_high_lanes:
+                shift = '(%s & 31u)' % lane
+                if pair:
+                    word = '(%s < 32u ? %s : 0x%08xu)' % (lane, word, mask >> 32)
+            bit = '((%s >> %s) & 1u)' % (word, shift)
+            # A tail wave must also contain the first set bit. For EXEC_LO, a set low bit precedes every
+            # bit in the preserved high word. C == 0 gives no proof of a fresh first-lane value.
+            tail = threads % width or width
+            self.const_exec_mask = mask if mask & ((1 << tail) - 1) else 0
+        if has_high_lanes and not pair:
+            bit = '(%s < 32u ? %s : exec)' % (lane, bit)
+        self.emit('exec = %s;' % bit)
+        self.exec_known = self.exec_narrow_only = False
+        return True
+
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -9195,6 +9320,8 @@ class Stage:
             raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
+        if not mods and self.const_exec_move(base, ops):
+            return None
         text, scc = SCA[base]
         dst = reg_range(ops[0])
         if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
@@ -10478,12 +10605,15 @@ class Stage:
             offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
+        const_exec_retry = getattr(self, 'const_exec_values', None) is not None
+        if const_exec_retry:
+            uniform = self.const_exec_source(token) and self.const_exec_descriptor(ops[1])
         for i in range(count):
             address = '%s + %d' % (offset, extra + 4 * i)
             expr = (self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic
                     else '%s.Load(%s)' % (buf, address) if buf else '0u')
             self.set_s(dst[1] + i, expr, uniform=uniform)
-            if is_lit:
+            if is_lit and (not const_exec_retry or uniform):
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
             if hasattr(self, 'heap_index'):
                 self.heap_index[dst[1] + i] = ('bufword',) + (where[:5] + ((where[5] + 4 * i) & 0xffffffff,) if where else ())
@@ -12955,6 +13085,15 @@ class Stage:
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         valid = (not mods and dst and dst[0] == 's' and dst[1] == dst[2]
                  and src and src[0] == 'v' and src[1] == src[2])
+        if getattr(self, 'const_exec_mask', None) is not None:
+            value = self.const_exec_values.get(src[1]) if valid else None
+            if value is None:
+                raise Unsupported(READFIRSTLANE_UNIFORM)
+            # AMD RDNA 2 ISA §12.8 VOP1: read the lowest active lane, or lane zero for empty EXEC. The temporary
+            # reproduces the definition that ran in that lane. Inactive lanes still hold their old VGPR values.
+            self.set_s(dst[1], value, uniform=True)
+            self.used_const_exec_read = True
+            return
         if self.group_vote and valid:
             # AMD RDNA 2 Instruction Set Architecture, §12.8 VOP1: read the first active lane, or lane 0.
             self.uses_group_first = True
@@ -16603,6 +16742,7 @@ class ComputePipeline(Pipeline):
         self.retry_entry_exec = False
         self.retry_firstlane = False
         self.retry_group_vote = False
+        self.retry_const_exec = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -16610,27 +16750,47 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A readfirstlane refusal first retries the existing proofs. A single guest wave can then retry with group votes."""
+        The existing readfirstlane and group-vote lowerings run before the constant-EXEC retry."""
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if not self.retry_group_vote and refusals is not None and len(refusals) > self._refusals_before:
-                    if ((READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]
-                            and self.retry_readfirstlane()):
+                if refusals is not None and len(refusals) > self._refusals_before:
+                    new_refusals = refusals[self._refusals_before:]
+                    if self._retry_stage(new_refusals[0][0], (READFIRSTLANE_UNIFORM, 'cs') in new_refusals):
                         continue
-                    if self.retry_group_vote_for(refusals[self._refusals_before][0]):
-                        continue
+                elif self.retry_const_exec and (not self.cs.used_const_exec_read or self.cs.lane_exec_breaks):
+                    if refusals is None:
+                        raise Unsupported(READFIRSTLANE_UNIFORM)
+                    refusals.append((READFIRSTLANE_UNIFORM, 'cs'))
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if not self.retry_group_vote:
-                    if str(reason) == READFIRSTLANE_UNIFORM and self.retry_readfirstlane():
-                        continue
-                    if self.retry_group_vote_for(str(reason)):
-                        continue
+                if self._retry_stage(str(reason), str(reason) == READFIRSTLANE_UNIFORM):
+                    continue
                 raise
+
+    def _retry_stage(self, reason, firstlane_refused):
+        if self.retry_const_exec:
+            return False
+        if not self.retry_group_vote:
+            if firstlane_refused and self.retry_readfirstlane():
+                return True
+            if self.retry_group_vote_for(reason):
+                return True
+        return reason == READFIRSTLANE_UNIFORM and self.retry_const_exec_for()
+
+    def retry_const_exec_for(self):
+        code, refusals, decoded = self._stage_args
+        ins = decoded if refusals is not None and decoded is not None else decode(
+            strip_header(code), [] if refusals is not None else None)
+        destinations = {'s_mov_b64': 'exec', 's_mov_b32': 'exec_lo'}
+        if not any(name in destinations and parse(asm)[1][:1] == [destinations[name]] for _, _, name, asm in ins):
+            return False
+        self.retry_group_vote = False
+        self.retry_const_exec = True
+        return True
 
     def retry_group_vote_for(self, reason):
         if not (reason == READFIRSTLANE_UNIFORM or reason.startswith('compute readfirstlane waterfall:')
