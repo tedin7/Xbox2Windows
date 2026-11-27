@@ -175,9 +175,8 @@ void check_clear(const char* name, const D3D12_CLEAR_VALUE& clear, DXGI_FORMAT r
     const auto* forwarded = x2w_startup::desktop_clear_value(&clear, requested, created, copy);
     if (!std::strcmp(mutation, "raw-clear") && clear.Format == static_cast<DXGI_FORMAT>(118))
         forwarded = &clear;
-    constexpr auto payload_offset = offsetof(D3D12_CLEAR_VALUE, Color);
     const auto payload = [](const D3D12_CLEAR_VALUE& value) {
-        return reinterpret_cast<const unsigned char*>(&value) + payload_offset;
+        return reinterpret_cast<const unsigned char*>(&value) + offsetof(D3D12_CLEAR_VALUE, Color);
     };
     ++checks;
     if (forwarded != (rewritten ? &copy : &clear) || forwarded->Format != expected_format ||
