@@ -260,6 +260,9 @@ struct DescriptorRange {
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
 
+// Zero selects the desktop increment for heaps created without a replay declaration.
+LONG replay_title_increments[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES]{};
+
 // Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
 // API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
 // the accepted maximum is measured once and cached rather than assumed.
@@ -4231,14 +4234,15 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     InterlockedIncrement(&render_clears);
 }
 // The desktop shader-visible CBV/SRV/UAV heap that owns the GPU handle's descriptor, or null.
-ID3D12DescriptorHeap* owning_view_heap(u64 gpu)
+ID3D12DescriptorHeap* owning_view_heap(u64 gpu, u64& desktop_gpu)
 {
     u64 owner = 0;
     AcquireSRWLockShared(&note_lock);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
         const u64 offset = gpu - heap.desktop_gpu;
-        if (heap.increment && offset < u64{heap.count} * heap.increment && offset % heap.increment == 0) {
+        if (heap.title_increment && offset < u64{heap.count} * heap.title_increment && offset % heap.title_increment == 0) {
+            desktop_gpu = heap.desktop_gpu + (offset / heap.title_increment) * heap.increment;
             owner = heap.wrapper;
             break;
         }
@@ -4270,12 +4274,13 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const ResolvedView view = desktop ? resolve_view(desktop, 19) : ResolvedView{};
     ID3D12Resource* target = view.resource;
     ID3D12DescriptorHeap* view_heap = nullptr;
+    u64 desktop_gpu = 0;
     const char* why = nullptr;
     if (!x2w_local::readable(values, 4 * sizeof(UINT))) why = "no clear values";
     else if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) why = "unreadable rects";
     else if (!target) why = view.wrong_kind ? "view is not an unordered-access view"
                             : view.skipped ? "view was skipped at creation" : "view holds no known resource";
-    else if (!(view_heap = owning_view_heap(gpu_handle))) why = "GPU handle is on no known descriptor heap";
+    else if (!(view_heap = owning_view_heap(gpu_handle, desktop_gpu))) why = "GPU handle is on no known descriptor heap";
     else if (!(target->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) why = "resource lacks unordered access";
     else if (!tracked_from_common(title_resource)) why = "resource does not use COMMON state tracking";
     if (why) {
@@ -4290,7 +4295,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     ID3D12DescriptorHeap* bound[] = {view_heap};
     list->SetDescriptorHeaps(1, bound);
     pass_of(self).heap_set = false;
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{desktop_gpu};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
@@ -5087,7 +5092,10 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     const UINT desktop_stride = device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
     const bool raw_samplers = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
         extra[1] == u64{desc->NumDescriptors} * x2w_startup::title_sampler_stride;
-    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : desktop_stride;
+    const UINT recorded = x2w_startup::is_valid_desktop_descriptor_heap_type(desc->Type)
+        ? static_cast<UINT>(InterlockedCompareExchange(&replay_title_increments[desc->Type], 0, 0)) : 0;
+    const UINT replay_stride = recorded ? recorded : desktop_stride;
+    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : replay_stride;
     const u64 bytes = u64{desc->NumDescriptors} * title_stride;
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
@@ -5097,9 +5105,13 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
     // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
     // of another type gets the same when its desktop start is not an address (title_heap_memory.h).
-    if (!x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, [](u64 size) {
+    const auto allocate_title_memory = [](u64 size) {
         return reinterpret_cast<u64>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    })) {
+    };
+    // A replay with different increments needs a title CPU range even for an aligned desktop handle.
+    if (!title_memory && replay_stride != desktop_stride && bytes) title_memory = allocate_title_memory(bytes);
+    if ((!title_memory && replay_stride != desktop_stride) ||
+        !x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, allocate_title_memory)) {
         heap->Release();
         return E_OUTOFMEMORY;
     }
@@ -5121,7 +5133,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
               title_memory, desktop,
               (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
-              sampler_cpu);
+              sampler_cpu, replay_stride);
     *out = w;
     return S_OK;
 }
@@ -5714,6 +5726,14 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     return S_OK;
 }
 
+D3D12_RESOURCE_DESC existing_heap_buffer_desc(const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_RESOURCE_DESC copy = desc;
+    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return copy;
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -5874,9 +5894,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             }
         }
     }
-    D3D12_RESOURCE_DESC copy = *desc;
-    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
-                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
         hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
@@ -7868,6 +7886,61 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+
+extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment)
+{
+    if (!x2w_startup::is_valid_desktop_descriptor_heap_type(type)) return;
+    const UINT minimum = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 16 : 32;
+    if (increment < minimum || increment > 256 || (increment & (increment - 1))) {
+        log("x2w-d3d12 replay: invalid heap type %u title increment %u: ignored", type, increment);
+        return;
+    }
+    InterlockedExchange(&replay_title_increments[type], static_cast<LONG>(increment));
+    static LONG logged[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
+    if (InterlockedExchange(&logged[type], 1) == 0)
+        log("x2w-d3d12 replay: heap type %u title increment %u (this device %u)", type, increment,
+            removal_device ? removal_device->GetDescriptorHandleIncrementSize(static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type)) : 0);
+}
+
+// The offline player owns these heap references and keys them by recorded creation ID.
+extern "C" __declspec(dllexport) HRESULT x2w_d3d12_replay_place(
+    void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state,
+    ID3D12Heap** heap, void** out)
+{
+    auto* self = static_cast<Wrapper*>(device);
+    if (!out) return E_INVALIDARG;
+    *out = nullptr;
+    if (!device || !base || !heap || !desc || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return E_INVALIDARG;
+    x2w_budget::Ticket* backing_budget = nullptr;
+    if (!*heap) {
+        Microsoft::WRL::ComPtr<ID3D12Device3> device3;
+        HRESULT hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
+        if (FAILED(hr)) return hr;
+        Microsoft::WRL::ComPtr<ID3D12Heap> opened;
+        hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&opened));
+        if (FAILED(hr)) return hr;
+        // Keep the page-alias resolver and resource budgeting on the ordinary slot 133 heap registry.
+        std::lock_guard lock(placed_mutex);
+        backing_budget = x2w_budget::backing_heap(opened.Get(), 0);
+        existing_heaps.emplace_back(base, ExistingHeap{opened.Get(), backing_budget});
+        opened->AddRef();  // registry lifetime, independent of the player's cache
+        *heap = opened.Detach();
+    } else {
+        std::lock_guard lock(placed_mutex);
+        const auto known = std::find_if(existing_heaps.begin(), existing_heaps.end(),
+            [&](const auto& entry) { return entry.second.real == *heap; });
+        if (known != existing_heaps.end()) backing_budget = known->second.budget;
+    }
+    const auto initial_state = state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
+    const HRESULT hr = device_of(self)->CreatePlacedResource(*heap, offset, &copy, initial_state, nullptr,
+                                                             IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return hr;
+    return publish_placed_buffer(self, static_cast<char*>(base) + offset, desc, initial_state, resource, true, backing_budget, out);
+}
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

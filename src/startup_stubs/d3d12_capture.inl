@@ -58,7 +58,7 @@ struct ViewRecord {
 };
 struct HeapInfo {
     u64 wrapper;
-    std::uint32_t type, count, increment, logical_count;
+    std::uint32_t type, count, increment, title_increment, logical_count;
     u64 title_cpu, desktop_cpu, desktop_gpu;
     u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
@@ -406,10 +406,10 @@ const ResourceInfo* resource_info(const Wrapper* w)
     return info;
 }
 void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
-               u64 title_sampler_cpu)
+               u64 title_sampler_cpu, UINT title_increment)
 {
     AcquireSRWLockExclusive(&note_lock);
-    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
+    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, title_increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
