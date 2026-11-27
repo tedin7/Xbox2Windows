@@ -14,6 +14,7 @@ Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, W
 extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
 extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
 extern "C" __declspec(dllimport) void x2w_d3d12_fail_wraps(LONG count);
+extern "C" __declspec(dllimport) void x2w_d3d12_fixture_copy15(BOOL partial_move_mutant);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -590,29 +591,80 @@ int draw_copied_vertex_buffer_srv(void* guest, void* list)
 
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_COPIED_VERTEX_SRV", mode, sizeof(mode));
-    if (std::strcmp(mode, "copy15") == 0) {
-        // Use fresh, deliberately unaligned placements so the draw snapshots
-        // the title destination. Give the untouched destination a different
-        // color so a skipped copy fails the pixel comparison.
+    const bool lazy = std::strcmp(mode, "copy15-lazy") == 0;
+    const bool decommitted_tail = std::strcmp(mode, "copy15-tail") == 0;
+    if (lazy || decommitted_tail || std::strcmp(mode, "copy15") == 0) {
+        // Unaligned placements force a desktop stand-in. The draw snapshots the title destination.
         static constexpr std::size_t page = 4096;
         auto allocate = [] {
             auto* base = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * page,
                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
             return base ? reinterpret_cast<std::uint32_t*>(base + page) : nullptr;
         };
-        auto* source = allocate();
-        records = allocate();
+        std::uint32_t* source = nullptr;
+        if (decommitted_tail) {
+            auto* base = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * page,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            source = base ? reinterpret_cast<std::uint32_t*>(base + page - short_bytes) : nullptr;
+        } else {
+            source = allocate();
+        }
         void* from = nullptr;
-        if (!source || !records ||
-            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(source), ptr(&buffer),
-                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&from)))) ||
-            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer),
-                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+        auto place = [&](void* address, void** result) {
+            return SUCCEEDED(static_cast<HRESULT>(invoke(guest, 133, ptr(address), ptr(&buffer),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(result)))) && *result;
+        };
+        if (!source || !place(source, &from)) return 47;
+        if (lazy) {
+            wchar_t path[32768];
+            const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_COPY15_XMEM", path, ARRAYSIZE(path));
+            if (!length || length >= ARRAYSIZE(path)) return 56;
+            const HMODULE xmem = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!xmem) return 56;
+            using Reserve = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+            using Allocate = BOOL(WINAPI*)(ULONG_PTR, ULONG_PTR*, ULONG_PTR*);
+            using Map = void*(WINAPI*)(void*, ULONG_PTR, const ULONG_PTR*);
+            const auto reserve = reinterpret_cast<Reserve>(GetProcAddress(xmem, "XMemVirtualAlloc"));
+            const auto physical = reinterpret_cast<Allocate>(GetProcAddress(xmem, "XMemAllocatePhysicalPages"));
+            const auto map = reinterpret_cast<Map>(GetProcAddress(xmem, "XMemMapPhysicalPages"));
+            if (!reserve || !physical || !map) return 56;
+            // Reserve the shim's physical mapping arena and use one 64 KiB slot.
+            // Install the lazy mapping after placement because slot 133 commits mapped pages.
+            auto* base = static_cast<unsigned char*>(reserve(nullptr, SIZE_T{16} << 30, 0x20402000, 0x21, PAGE_READWRITE));
+            if (!base) return 56;
+            records = reinterpret_cast<std::uint32_t*>(base + page);
+            ULONG_PTR count = 1, token = 0;
+            if (!place(records, &placed) || !physical(0x20400000, &count, &token) ||
+                count != 1 || map(base, count, &token) != base) return 56;
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(records, &info, sizeof(info)) || info.State != MEM_RESERVE) return 56;
+        } else {
+            records = allocate();
+            if (!records || !place(records, &placed)) return 47;
+            records[224 / sizeof(*records)] = 19;
+            records[288 / sizeof(*records)] = 41;
+        }
         source[224 / sizeof(*source)] = 73;
         source[288 / sizeof(*source)] = 149;
-        for (unsigned i = 0; i < 2000; ++i) {
-            const Word offset = (i % 8) * 64;
-            invoke(list, 15, ptr(placed), offset, ptr(from), offset, 64);
+        x2w_d3d12_fixture_copy15(FALSE);
+        if (lazy) {
+            invoke(list, 15, ptr(placed), 0, ptr(from), 0, full_bytes);
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(records, &info, sizeof(info)) || info.State != MEM_COMMIT) return 57;
+        } else {
+            for (unsigned i = 0; i < 2000; ++i) {
+                const Word offset = (i % 8) * 64;
+                invoke(list, 15, ptr(placed), offset, ptr(from), offset, 64);
+            }
+        }
+        x2w_d3d12_fixture_copy15(FALSE);
+        if (decommitted_tail) {
+            // A partial write would replace the first field, visibly changing the WARP output.
+            source[224 / sizeof(*source)] = 211;
+            auto* tail = reinterpret_cast<unsigned char*>(source) + short_bytes;
+            if (!VirtualFree(tail, page, MEM_DECOMMIT)) return 58;
+            invoke(list, 15, ptr(placed), 0, ptr(from), 0, full_bytes);
+            x2w_d3d12_fixture_copy15(FALSE);
         }
     } else {
         static std::array<std::uint8_t, 65536 + full_bytes> storage{};
