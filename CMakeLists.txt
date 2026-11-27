@@ -1363,6 +1363,7 @@ target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
 add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj> tests/startup_stream_draw.cpp
     tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
+add_dependencies(startup_stream_consumer xmem_shim)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
@@ -1834,6 +1835,15 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_list_copy_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME startup_list_copy15_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_copy_check.py" "$<TARGET_FILE:startup_list_copy>")
+    add_test(NAME startup_list_copy15_probe_control_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_copy_check.py" "$<TARGET_FILE:startup_list_copy>" --mutant)
+    set_tests_properties(startup_list_copy15_warp startup_list_copy15_probe_control_warp
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
+endif()
 
 # Validation of the whole-resource copies (src/startup_stubs/list_copy.h); the mutated runs are negative controls.
 add_executable(startup_list_copy_check tests/startup_list_copy_check.cpp)
@@ -5216,6 +5226,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_copied_vertex_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_copied_vertex_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_list_copy15_draw_warp COMMAND "${CMAKE_COMMAND}" -E env
+                "X2W_FXC=${STARTUP_FXC}" "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_copy_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" --draw "$<TARGET_FILE:xmem_shim>")
+            set_tests_properties(startup_list_copy15_draw_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
+        endif()
         add_test(NAME startup_direct_index_late_write_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

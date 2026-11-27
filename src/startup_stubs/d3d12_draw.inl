@@ -246,6 +246,7 @@ inline void draw_lock_acquire_exclusive()
     QueryPerformanceFrequency(&frequency);
     draw_lock_held_since = end.QuadPart;
     const LONG64 waited = end.QuadPart - start.QuadPart;
+    x2w_phase::LockWaitScope::note(waited);
     InterlockedIncrement64(&draw_lock_stats.wait_calls);
     InterlockedAdd64(&draw_lock_stats.wait_ticks, waited);
     draw_lock_note_max(draw_lock_stats.wait_max, waited);
