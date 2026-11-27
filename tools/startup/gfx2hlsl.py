@@ -1200,6 +1200,10 @@ UNIFORM_IMAGE_LOADS = frozenset(('image_load',))
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
 # Image ops that take implicit derivatives of the pixel quad (see Stage.quad_vote).
 DERIVATIVE_OPS = ('image_sample_b', 'image_get_lod')
+HEAP_IMAGE_TYPES = {'tex1d': ('Texture1D<float4>', 8), 'tex2d': ('Texture2D<float4>', 9),
+                    'tex3d': ('Texture3D<float4>', 10), 'tex2da': ('Texture2DArray<float4>', 13)}
+HEAP_IMAGE_DIMS = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d',
+                   'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
 # "Some lane of the 2x2 quad has bit 0 set": fine derivatives of a 0/1 value read the row neighbour (ddx_fine), then
 # the other row (ddy_fine). Exact for 0/1 and defined only where the quad runs the statement together (SM 5.0 and 6.0).
 # The derivatives are arithmetic operands, not operands of a short-circuit ||: a DXC build for some GPUs moved a derivative
@@ -3556,6 +3560,7 @@ class Stage:
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
         self.loop_uniform = None  # None until a heap load refuses; then loop header -> assumed uniform SGPRs
+        self.retry_heap_dimensions = False
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -3586,12 +3591,13 @@ class Stage:
                 self.translate()
             except Unsupported as reason:
                 if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
-                        or self.retry_loop_uniform(str(reason))):
+                        or self.retry_loop_uniform(str(reason)) or self.retry_heap_image_number(str(reason))):
                     raise
                 continue
             reasons = [reason for reason, stage in refusals[first_refusal:] if stage == kind] if refusals is not None else []
             if (any(self.retry_reduction_exec(reason) or self.retry_join(reason) for reason in reasons)
-                    or any(self.retry_loop_uniform(reason) for reason in reasons)):
+                    or any(self.retry_loop_uniform(reason) for reason in reasons)
+                    or any(self.retry_heap_image_number(reason) for reason in reasons)):
                 del refusals[first_refusal:]
                 continue
             if self.retry_join_phi and self.phi_new != self.phi_regs:
@@ -3612,6 +3618,14 @@ class Stage:
                 del refusals[first_refusal:]
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
+
+    def retry_heap_image_number(self, reason):
+        if (self.retry_heap_dimensions or not re.fullmatch(
+                r"cannot materialize descriptor word \d+ from \('dynamic_heap', 'heap_index_[0-9a-f]+', 'image'\) at 0",
+                reason)):
+            return False
+        self.retry_heap_dimensions = True
+        return True
 
     def retry_loop_uniform(self, reason):
         if (self.loop_uniform is not None or self.kind not in ('vs', 'ps') or not getattr(self, 'loop_headers', ())
@@ -3802,6 +3816,10 @@ class Stage:
             raise Unsupported('descriptor numeric expression exceeds 128 operations and operands')
         kind, *args = node
         if kind == 'alu':
+            if getattr(self, 'retry_heap_dimensions', False) and not fixed_only:
+                dimensions = self.heap_image_number(node, probe)
+                if dimensions is not None:
+                    return dimensions
             template, operands = args
             return '(' + template.format(*(self.descriptor_number(word, budget, fixed_only=fixed_only, probe=probe)
                                            for word in operands)) + ')'
@@ -3833,6 +3851,95 @@ class Stage:
         if symbol and symbol[0] == 'descnum' and len(symbol) == 3:
             return self.descriptor_number(self.descriptor_number_node(symbol), fixed_only=True)
         return self.u(token)
+
+    @staticmethod
+    def heap_image_source(node):
+        pending = [node]
+        for _ in range(128):
+            if not pending:
+                break
+            word = pending.pop()
+            if word[0] == 'desc' and word[1][0] == 'dynamic_heap' and word[1][2:] == ('image',):
+                return word[1]
+            if word[0] == 'alu':
+                pending.extend(reversed(word[2]))
+        return None
+
+    def heap_image_number(self, node, probe):
+        source = self.heap_image_source(node)
+        if source not in self.heap_image_kinds:
+            return None
+        kind = self.heap_image_kinds[source]
+        if kind is None:
+            return None
+
+        def alu(op, a, b):
+            return 'alu', SCA['s_' + op][0], (a, b)
+
+        def literal(value):
+            return 'value', '0x%08xu' % value
+
+        word1, word2, word3 = (('desc', source, 0, word) for word in (1, 2, 3))
+        one = literal(1)
+        base = alu('bfe_u32', word3, literal(0x4000c))
+        last = alu('bfe_u32', word3, literal(0x40010))
+
+        # RDNA 2 ISA §8.2.6, Table 45 stores mip-zero sizes minus one and absolute mip indices.
+        # GetDimensions(0) returns the view's top mip: equivalent to max(mip_zero_size >> base, 1).
+        # The raw size fields agree only at base zero. Match the full calculation before rebasing them.
+        def top_mip(size):
+            return alu('max_u32', alu('lshr_b32', size, base), one)
+
+        width_hi = alu('and_b32', word2, literal(0x3fff))
+        width_shifted = alu('lshl_b32', width_hi, literal(2))
+        for low in (alu('bfe_u32', word1, literal(0x2001e)), alu('lshr_b32', word1, literal(30))):
+            width_lo = alu('add_u32', low, one)
+            if node in (top_mip(alu('lshl2_add_u32', width_hi, width_lo)),
+                        top_mip(alu('add_u32', width_lo, width_shifted)),
+                        top_mip(alu('add_u32', width_shifted, width_lo))):
+                return self.heap_view_dimensions(source, kind, probe)[0]
+        for field in (0xe000e, 0x10000e):
+            height = alu('add_u32', alu('bfe_u32', word2, literal(field)), one)
+            if node == top_mip(height):
+                return self.heap_view_dimensions(source, kind, probe)[1]
+        if node == alu('sub_u32', last, base):
+            return '(%s - 1u)' % self.heap_view_dimensions(source, kind, probe)[2]
+
+        # The resource level, reserved bit and type do not change when the view starts at a later mip.
+        template, (a, b) = node[1:] if len(node[2]) == 2 else ('', (None, None))
+        if template == SCA['s_and_b32'][0] and b in (word2, word3):
+            a, b = b, a
+        if a not in (word2, word3) or b[0] != 'value' or not re.fullmatch(r'0x[0-9a-f]{8}u', b[1]):
+            return None
+        value = int(b[1][2:-1], 16)
+        if template == SCA['s_and_b32'][0]:
+            bits = value
+        elif template == SCA['s_bfe_u32'][0]:
+            shift = value & 31
+            bits = (((1 << min((value >> 16) & 127, 32)) - 1) << shift) & 0xffffffff
+        elif template == SCA['s_lshr_b32'][0]:
+            bits = (0xffffffff << (value & 31)) & 0xffffffff
+        else:
+            return None
+        known, packed = (0xc0000000, 0x80000000) if a == word2 else (0xf0000000, HEAP_IMAGE_TYPES[kind][1] << 28)
+        if not bits & ~known:
+            return '(' + template.format('0x%08xu' % packed, b[1]) + ')'
+        return None
+
+    def heap_view_dimensions(self, source, kind, probe):
+        suffix = '%x_%s' % (self.pc, source[1])
+        w, h, levels, third = ('heap_%s_%s' % (field, suffix) for field in ('w', 'h', 'levels', 'z'))
+        if kind == 'tex1d':
+            h = '1u'
+            outputs = (w, levels)
+        else:
+            outputs = (w, h, third, levels) if kind in ('tex2da', 'tex3d') else (w, h, levels)
+        if not probe and suffix not in self.heap_dimensions_emitted:
+            self.heap_dimensions_emitted.add(suffix)
+            tex = self.image_texture((source, 0), kind, name='heap_dims_' + suffix)
+            self.emit('uint %s;' % ', '.join(outputs))
+            self.emit('%s.GetDimensions(0u, %s);' % (tex, ', '.join(outputs)))
+        return w, h, levels
 
     def mark_descriptor_scc(self):
         if hasattr(self, 'descriptor_scc_writes'):
@@ -5768,6 +5875,7 @@ class Stage:
             self.exec_copies = {}     # SGPR -> (EXEC mask id, offset, may be empty) of the EXEC it copied (until written)
             self.exec_may_be_empty = False  # EXEC was narrowed and no s_cbranch_execz has shown a live lane since
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
+            self.heap_image_kinds, self.heap_dimensions_emitted = {}, set()
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
@@ -8711,6 +8819,12 @@ class Stage:
             if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
                 result = self.descriptor_alu(text, srcs, syms)
+                if getattr(self, 'retry_heap_dimensions', False) and self.heap_image_source(result[2]):
+                    # Keep the partial width symbolic until the base mip has been applied. Its carry cannot be used.
+                    self.scc_effect = 'descriptor'
+                    self.scc_uniform = self.scc_verified = False
+                    self.sym[dst[1]] = result
+                    return None
                 expr = self.descriptor_number(self.descriptor_number_node(result), fixed_only=True)
                 values = [self.descriptor_operand(t) for t in srcs]
                 self.set_scc(shift_add_carry(base, values, expr))
@@ -9470,23 +9584,43 @@ class Stage:
         name = 'heap_index_%x' % self.pc
         self.uniform_load_temps.add(name)
         self.emit('%s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
+        source = ('dynamic_heap', name, 'image')
+        if getattr(self, 'retry_heap_dimensions', False):
+            self.heap_image_kinds[source] = self.heap_image_kind(dst)
         for i in range(8):
-            self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name, 'image'), 0, i)
+            self.sym[dst[1] + i] = ('desc', source, 0, i)
 
-    def image_texture(self, key, kind):
+    def heap_image_kind(self, dst):
+        """The first MIMG using the whole record before any write to one of its SGPRs."""
+        regs = set(range(dst[1], dst[2] + 1))
+        for _, _, name, asm in self.ins[self.descriptor_instruction_index + 1:]:
+            writes = scalar_destinations(name, asm)
+            if writes & regs or 'any' in writes:
+                break
+            if name.startswith('image_'):
+                _, ops, mods = parse(asm)
+                if len(ops) >= 3 and reg_range(ops[2]) == dst:
+                    dim = next((part[4:] for part in mods if part.startswith('dim:')), '')
+                    return HEAP_IMAGE_DIMS.get(dim)
+        return None
+
+    def image_texture(self, key, kind, name=None):
         """The HLSL name of the texture an image instruction reads. A key from the dynamic heap becomes a local view
         of the bound heap slot; any other key is a normal SRV resource."""
         if key is None or key[0][0] != 'dynamic_heap':
             return self.pipe.resource(key, kind) if key is not None else None
-        types = {'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>',
-                 'tex3d': 'Texture3D<float4>'}
-        if self.kind not in ('ps', 'vs') or len(key[0]) != 3 or kind not in types or key[1] != 0 or key in self.pipe.modified:
+        if (self.kind not in ('ps', 'vs') or len(key[0]) != 3 or kind not in HEAP_IMAGE_TYPES
+                or key[1] != 0 or key in self.pipe.modified):
             raise Unsupported('dynamic resource heap views require a raw buffer load')
+        assumed = getattr(self, 'heap_image_kinds', {}).get(key[0])
+        if assumed is not None and kind != assumed:
+            raise Unsupported('dynamic resource heap image dimension disagrees with its descriptor use')
         self.pipe.uses_dynamic_heap = True
-        name = 'heap_tex_%x' % self.pc
+        if name is None:
+            name = 'heap_tex_%x' % self.pc
         # An index past the logical heap reads slot 0 instead of an out-of-range descriptor (a title's index is in range).
         self.emit('%s %s = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];'
-                  % (types[kind], name, key[0][1], key[0][1]))
+                  % (HEAP_IMAGE_TYPES[kind][0], name, key[0][1], key[0][1]))
         return name
 
     def dynamic_heap_load(self, key, address):
@@ -10713,11 +10847,11 @@ class Stage:
             raise Unsupported('image instruction without %s' % ('dim:' if not dims else 'dmask:'))
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = HEAP_IMAGE_DIMS
         # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
         cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
         if cube:
-            kinds[dim] = 'texcube'
+            kinds = {**kinds, dim: 'texcube'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and

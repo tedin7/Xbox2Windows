@@ -128,29 +128,32 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
         }
         D3D12_RESOURCE_DESC image_desc{};
         image_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        image_desc.Width = 1;
-        image_desc.Height = 1;
         image_desc.DepthOrArraySize = 1;
-        image_desc.MipLevels = 1;
+        image_desc.MipLevels = 3;
         image_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         image_desc.SampleDesc.Count = 1;
         image_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         static constexpr float texels[2][4]{{1.25f, 2.5f, 4.0f, 8.0f}, {16.0f, 32.0f, 64.0f, 128.0f}};
+        static constexpr UINT widths[]{37, 43}, heights[]{11, 15};
         const D3D12_DESCRIPTOR_HEAP_DESC image_rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
         check(device->CreateDescriptorHeap(&image_rtv_desc, IID_PPV_ARGS(&image_rtvs)), "Create heap fixture RTV heap");
         auto image_rtv = image_rtvs->GetCPUDescriptorHandleForHeapStart();
         const UINT rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         for (UINT i = 0; i < 2; ++i, cpu.ptr += increment, image_rtv.ptr += rtv_increment) {
+            image_desc.Width = widths[i];
+            image_desc.Height = heights[i];
             D3D12_CLEAR_VALUE value{DXGI_FORMAT_R32G32B32A32_FLOAT, {}};
             std::memcpy(value.Color, texels[i], sizeof(value.Color));
             images[i] = resource(device, image_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &value);
-            device->CreateRenderTargetView(images[i].Get(), nullptr, image_rtv);
+            D3D12_RENDER_TARGET_VIEW_DESC image_target{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RTV_DIMENSION_TEXTURE2D};
+            image_target.Texture2D = {i, 0};
+            device->CreateRenderTargetView(images[i].Get(), &image_target, image_rtv);
             list->ClearRenderTargetView(image_rtv, value.Color, 0, nullptr);
             transition(list, images[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
                                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-            view.Texture2D = {0, 1, 0, 0.0f};
+            view.Texture2D = {i, static_cast<UINT>(image_desc.MipLevels) - i, 0, 0.0f};
             device->CreateShaderResourceView(images[i].Get(), &view, cpu);
             auto alias = cpu;
             alias.ptr += 3 * increment;

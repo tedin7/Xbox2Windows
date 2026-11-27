@@ -168,7 +168,7 @@ def main(offscreen, dxc):
                                    mutate(ps_source, 'index >= heap_count', 'index > heap_count'))
         draw(offscreen, vs, unbounded, 64, 0, count, negative=True)
 
-        # Slots 3 and 4 hold 1x1 float textures: (1.25, 2.5, 4, 8) and (16, 32, 64, 128).
+        # The top view mip in slots 3 and 4 is cleared to (1.25, 2.5, 4, 8) and (16, 32, 64, 128).
         _, image_source = translate_image()
         first, second = [0x3fa00000, 0x40200000, 0x40800000, 0x41000000], [0x41800000, 0x42000000, 0x42800000, 0x43000000]
         image = compile_shader(dxc, directory, 'ps_6_6', image_source)

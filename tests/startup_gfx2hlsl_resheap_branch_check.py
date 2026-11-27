@@ -27,7 +27,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from startup_gfx2hlsl_dynamic_heap_check import G, root_blob, compile_shader
+from startup_gfx2hlsl_dynamic_heap_check import G, IMAGE_HEAD, IMAGE_LOAD, IMAGE_TAIL, root_blob, compile_shader
+from startup_gfx2hlsl_dynamic_heap_check import draw as draw_pixel
 from startup_gfx2hlsl_heap_record_check import root_blob as table_root_blob
 from startup_flat_param_check import PS_WORDS, VS_WORDS
 
@@ -38,6 +39,10 @@ def sop1(op, dst, src):
 
 def sop2(op, dst, a, b):
     return struct.pack('<I', 0x80000000 | (op << 23) | (dst << 16) | (b << 8) | a)
+
+
+def sop2_literal(op, dst, src, literal):
+    return sop2(op, dst, src, 255) + struct.pack('<I', literal)
 
 
 def sopc(op, a, b):
@@ -182,6 +187,38 @@ def descriptor_word_control():
     return pipe, vs, ps, index
 
 
+DIM_BASE = sop2_literal(0x27, 25, 19, 0x4000c)
+DIM_WIDTH = (sop2_literal(0x27, 26, 17, 0x2001e) + sop2(0x00, 26, 26, ONE)
+             + sop2_literal(0x0e, 27, 18, 0x3fff) + sop2(0x2f, 27, 27, 26))
+DIM_HEIGHT = sop2_literal(0x27, 28, 18, 0x10000e) + sop2(0x00, 28, 28, ONE)
+DIM_CLAMP = (sop2(0x20, 27, 27, 25) + sop2(0x09, 27, 27, ONE)
+             + sop2(0x20, 28, 28, 25) + sop2(0x09, 28, 28, ONE))
+DIM_EXPORT = bytes.fromhex('1b0c087e1c0c0a7e') + bytes.fromhex(IMAGE_TAIL)  # convert s27 and s28 to float
+
+
+def image_dimensions_control():
+    head, image = bytes.fromhex(IMAGE_HEAD), bytes.fromhex(IMAGE_LOAD)
+    body = DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_CLAMP
+    pipe, vs, ps = translate(VS_WORDS, head + body + image + DIM_EXPORT)
+    assert pipe.ps.retry_heap_dimensions and ps.count('.GetDimensions(0u,') == 2
+    assert re.search(r'v4 = U\(float\(heap_w_\w+\)\);', ps)
+    assert re.search(r'v5 = U\(float\(heap_h_\w+\)\);', ps)
+    split_width = DIM_WIDTH[:-4] + sop2(0x1e, 27, 27, 130) + sop2(0x00, 27, 26, 27)
+    short_height = sop2_literal(0x27, 28, 18, 0xe000e) + sop2(0x00, 28, 28, ONE)
+    split = translate(VS_WORDS, head + DIM_BASE + split_width + short_height + DIM_CLAMP + image + DIM_EXPORT)[2]
+    assert split.count('.GetDimensions(0u,') == 2
+    for bad in (sop2_literal(0x27, 27, 17, 0x90014) + image,  # format
+                DIM_WIDTH + image,  # raw mip-zero width when the view may start at a later mip
+                body,  # no MIMG to determine the type
+                body + sop1(S_MOV_B32, 16, ZERO) + image):  # a write to the record precedes the first MIMG
+        reason = refusal(VS_WORDS, head + bad + DIM_EXPORT)
+        assert reason and 'descriptor' in reason, reason
+    other_dim = bytes.fromhex('100100f0080e0400')  # image_load with a 3D resource operand
+    reason = refusal(VS_WORDS, head + body + image + DIM_EXPORT[:-12] + other_dim + bytes.fromhex(IMAGE_TAIL))
+    assert reason and 'image dimension disagrees' in reason, reason
+    return pipe, vs, ps
+
+
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
 # picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
 # index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
@@ -229,6 +266,7 @@ def main(dxc=None):
     vertex_image_control()
     vertex_image_loop_control()
     descriptor_word_control()
+    image_dimensions_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
     tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
@@ -404,6 +442,21 @@ def warp_descriptor_word(offscreen, dxc):
         draw(offscreen, wrong, ps, 0, expected, count, negative=True, extra={index: num_records})
 
 
+def warp_image_dimensions(offscreen, dxc):
+    pipe, vs_source, source = image_dimensions_control()
+    count = len(pipe.uds)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', source)
+        for slot, base, full_width, full_height, blue, alpha in ((3, 0, 37, 11, 4, 8), (4, 1, 43, 15, 64, 128)):
+            expected = list(struct.unpack('<4I', struct.pack('<4f', max(full_width >> base, 1),
+                                                             max(full_height >> base, 1), blue, alpha)))
+            draw_pixel(offscreen, vs, ps, 32 * slot, expected, count, heap_count=5)
+        wrong = compile_shader(dxc, directory, 'ps_6_6', source.replace('.GetDimensions(0u,', '.GetDimensions(1u,'))
+        draw_pixel(offscreen, vs, wrong, 32 * slot, expected, count, negative=True, heap_count=5)
+
+
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
@@ -432,5 +485,7 @@ if __name__ == '__main__':
         warp_image_loop(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-descriptor-word']:
         warp_descriptor_word(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-image-dimensions']:
+        warp_image_dimensions(*sys.argv[2:4])
     else:
         main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())
