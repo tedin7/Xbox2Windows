@@ -615,7 +615,7 @@ def native_instructions(code):
     return out
 
 
-def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
+def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, embedded_pixel=False):
     out, off = [], 0
     saw_getpc = False
     while off + 4 <= len(code):
@@ -640,11 +640,14 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
             refusals.append((str(reason), 'decode'))
         else:
             out.append((off, n, name, asm))
-            if embedded_vertex:
+            if embedded_vertex or embedded_pixel:
                 saw_getpc |= name == 's_getpc_b64'
                 # A proven table is data, even if its words resemble instructions.
-                if name == 's_endpgm' and saw_getpc and embedded_buffer_proof(code, out):
-                    return out
+                if name == 's_endpgm' and saw_getpc:
+                    if embedded_vertex and embedded_buffer_proof(code, out):
+                        return out
+                    if embedded_pixel and embedded_pixel_table(code, out):
+                        return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
     # A bounded stream can end in a back edge after the last exit. Keep the tail
@@ -1322,6 +1325,46 @@ def embedded_buffer_proof(code, ins):
     data = code[offset:offset + size]
     words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-size % 4)))
     return setup, loads, size, words
+
+
+def embedded_pixel_table(code, ins):
+    """Resolve a straight-line pixel entry's GETPC-relative scalar color table."""
+    if not ins or ins[-1][2] != 's_endpgm':
+        return None
+    start = int(code.startswith(PREFETCH))
+    if len(ins) < start + 4:
+        return None
+    (pc, n, getpc, asm), (load, size, smem, load_asm), (wait, _, barrier, _) = ins[start:start + 3]
+    if (getpc, smem, barrier) != ('s_getpc_b64', 's_load_dwordx4', 's_waitcnt'):
+        return None
+    _, ops, mods = parse(asm)
+    base = pc_pair(ops[0]) if len(ops) == 1 and not mods else None
+    _, load_ops, mods = parse(load_asm)
+    # Require a full wait immediately after the load before using its SGPR results.
+    if (base is None or pc != 4 * start or n != 4 or load != pc + n or size != 8
+            or wait != load + size or code[wait:wait + 4] != struct.pack('<I', 0xbf8c0000)
+            or len(load_ops) != 3 or mods or pc_pair(load_ops[1]) != base):
+        return None
+    dst = reg_range(load_ops[0])
+    disp = pc_word(load_ops[2])
+    address_regs = {base, base + 1}
+    if (not dst or dst[0] != 's' or dst[1] % 4 or dst[2] != dst[1] + 3 or dst[2] > 105
+            or address_regs.intersection(range(dst[1], dst[2] + 1)) or disp is None or disp < 0):
+        return None
+    # Require the plain immediate encoding, including unprinted reserved bits.
+    if struct.unpack_from('<2I', code, load) != (0xf4080000 | dst[1] << 6 | base // 2, 0xfa000000 | disp):
+        return None
+    end = wait + 4
+    for off, size, name, asm in ins[start + 3:]:
+        if (off != end or address_regs & scalar_registers(asm) or 'movrel' in name
+                or name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call',
+                                    's_rfe', 's_trap', 's_return', 's_endpgm_', 's_set_gpr_idx'))):
+            return None
+        end += size
+    table = load + disp  # GETPC returns the address of the next instruction.
+    if table % 4 or table < end or table + 16 > len(code) or classify_decoded(ins) != 'ps':
+        return None
+    return pc, load, dst[1], struct.unpack_from('<4I', code, table)
 
 
 def calculated_pc_proof(ins, kind):
@@ -3135,10 +3178,12 @@ class Stage:
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
         if self.image_proof is None:
-            self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs')
+            self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs',
+                               embedded_pixel=kind == 'ps')
                         if refusals is None or decoded is None else decoded)
         if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
             self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
+        self.pixel_table = embedded_pixel_table(self.raw_code, self.ins) if kind == 'ps' else None
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
@@ -4862,6 +4907,9 @@ class Stage:
             self.calculated_pc = {}
         if self.embedded_buffer:
             self.calculated_pc.update(self.embedded_buffer[0])
+        pixel_table = getattr(self, 'pixel_table', None)
+        if pixel_table:
+            self.calculated_pc[pixel_table[0]] = None
         targets = set()
         targets.update(target for target in self.calculated_pc.values() if target is not None)
         # (branch, target) of every branch, the proven s_setpc_b64 jumps included
@@ -5907,6 +5955,12 @@ class Stage:
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
             return self.lower_image_instruction(image, name, asm, ops, mods)
+        pixel_table = getattr(self, 'pixel_table', None)
+        if pixel_table and self.pc == pixel_table[1]:
+            _, _, first, words = pixel_table
+            for reg, word in enumerate(words, first):
+                self.set_s(reg, '0x%08xu' % word, ('const', word))
+            return
         if (getattr(self, 'vcc_lost', False) or
                 (getattr(self, 'has_branches', False) and
                  ('vcc' in asm or name.startswith(IMPLICIT_VCC_READ)))):
@@ -6854,7 +6908,7 @@ class Stage:
                 return None
             raise Unsupported(base)
         if base == 's_getpc_b64':
-            # The calculated branch and program-image proofs elide GETPC before
+            # The calculated branch, embedded table and program-image proofs elide GETPC before
             # scalar lowering. Keep the established diagnostic for unproven uses.
             raise Unsupported('%s: the shader load address is only elided for a program that also calculates a branch target' % base)
         raise Unsupported(base)
@@ -14946,7 +15000,7 @@ def classify_decoded(ins):
 
 
 def classify(blob):
-    return classify_decoded(decode(strip_header(blob), embedded_vertex=True))
+    return classify_decoded(decode(strip_header(blob), embedded_vertex=True, embedded_pixel=True))
 
 
 def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
@@ -14966,7 +15020,7 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
                     else:
                         return 'ps'
                 raise
-        ins = decode(strip_header(blob), refusals, embedded_vertex=True)
+        ins = decode(strip_header(blob), refusals, embedded_vertex=True, embedded_pixel=True)
         kind = classify_decoded(ins)
         decoded[kind] = ins
         return kind

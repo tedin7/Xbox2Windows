@@ -30,3 +30,25 @@ against that reference. The test uses DXC and also FXC when configured.
 ```powershell
 ctest --preset dev --no-tests=error -V -R '^startup_gfx2hlsl_getpc_(refusal|table_warp)$'
 ```
+
+## Pixel scalar loads from an embedded table
+
+The pixel path accepts an entry GETPC, an immediate `s_load_dwordx4` through
+that pair and a full wait. The program runs straight through its terminator.
+The four words must be aligned to a dword and fit wholly after the terminator.
+The proof also checks that the address pair has no other use. The HLSL assigns
+the four constant words to the destination SGPRs without a resource binding.
+See [RDNA 2 scalar memory addressing, §7.2.1](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+On Linux, `python3 -B tools/startup/gfx2hlsl.py --refusals out/getpc-scalar-diagnostic`
+examined one synthetic request using the pixel fixture and the existing vertex
+table fixture. Revision `82f5cf5c0` reported the GETPC refusal first, followed
+by a scalar load through an unknown base. The revised translator reported zero
+refusal sites. The Python command above tests the table extraction and the
+refusals for invalid bounds, alignment, control flow, address use and encoding.
+
+The existing WARP test also draws each of two embedded RGBA rows across a 3×2
+floating-point target. All 24 readback words per draw must match the CPU
+reference. Shifting the load to the second row must fail at all six pixels
+against the first row's reference. The Windows command above runs this case
+with DXC and with FXC when available. WARP verification is pending.
