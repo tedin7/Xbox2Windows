@@ -1565,10 +1565,13 @@ def embedded_scalar_buffer_proof(code, ins):
 
 
 def embedded_scalar_address_dead(ins, branches, setup, loads):
-    """Check that erased addresses and carry flags never reach an ordinary read, including around a back edge."""
+    """Check that erased addresses and carry flags never reach an ordinary read, including around a back edge.
+
+    The elided setup instructions assign nothing at run time, so a register they define is 'tainted' until an
+    unconditional write replaces it on that path; a read of a tainted register (or SCC after the elided add) refuses.
+    A possibly predicated write keeps the taint it finds. Forward dataflow over every edge (union at joins)."""
     tracked = set().union(*(scalar_registers(parse(asm)[1][0]) for pc, _, _, asm in ins if pc in setup))
-    entry_defs = dict.fromkeys(tracked, -1)
-    linear_defs, effects, elided_once = entry_defs.copy(), {}, set()
+    effects = {}
     for pc, n, name, asm in ins:
         _, ops, _ = parse(asm)
         if pc in setup:
@@ -1577,7 +1580,8 @@ def embedded_scalar_address_dead(ins, branches, setup, loads):
                 erased.add('scc')
         else:
             erased = set()
-            # Only unconditional SGPR assignments replace the ordinary reaching definition.
+            # Only unconditional SGPR assignments clear the taint; a VOPC/VOP3 SGPR destination, v_writelane or
+            # s_cmov may leave the old value, so it keeps whatever taint it finds.
             writes = scalar_destinations(name, asm) & tracked
             written = writes if name in SCA or name.startswith(('s_load_', 's_buffer_load_', 's_cselect_')) else set()
             read_ops = ops[2:] if pc in loads else ops[1:] if written else ops
@@ -1586,33 +1590,21 @@ def embedded_scalar_address_dead(ins, branches, setup, loads):
                 reads.add('scc')
             if re.fullmatch(r's_cmpk?_(eq|lg|gt|ge|lt|le)_[iu]32|s_bitcmp[01]_b32', name):
                 written = written | {'scc'}
-            # A potentially predicated write cannot clear taint or justify an ordinary definition at a join.
-            erased.update(writes - written)
         successors = [] if name == 's_endpgm' else ([pc + n] if name != 's_branch' else [])
         if pc in branches:
             successors.append(branches[pc])
-        expected = {r: linear_defs.get(r) for r in reads & elided_once}
-        effects[pc] = (reads, erased, written, expected, successors)
-        if pc in setup:
-            elided_once.update(erased & tracked)
-        for reg in erased:
-            linear_defs.pop(reg, None)
-        linear_defs.update((reg, pc) for reg in written & tracked)
+        effects[pc] = (reads, erased, written, successors)
 
-    incoming, pending = {0: (set(), entry_defs)}, [0]
+    incoming, pending = {0: set()}, [0]
     while pending:
         pc = pending.pop()
-        tainted, definitions = incoming[pc]
-        reads, erased, written, expected, successors = effects[pc]
-        if reads & tainted or any(value is None or definitions.get(reg) != value for reg, value in expected.items()):
+        reads, erased, written, successors = effects[pc]
+        if reads & incoming[pc]:
             return False
-        tainted = (tainted - written) | erased
-        definitions = {r: d for r, d in definitions.items() if r not in erased}
-        definitions.update((reg, pc) for reg in written & tracked)
+        tainted = (incoming[pc] - written) | erased
         for target in successors:
             previous = incoming.get(target)
-            merged = (tainted, definitions) if previous is None else (
-                previous[0] | tainted, {r: d for r, d in previous[1].items() if definitions.get(r) == d})
+            merged = tainted if previous is None else previous | tainted
             if merged != previous:
                 incoming[target] = merged
                 pending.append(target)
@@ -4079,6 +4071,23 @@ class Stage:
         if not bits & ~known:
             return '(' + template.format('0x%08xu' % packed, b[1]) + ')'
         return None
+
+    def heap_image_null_compare(self, name, ops, symbols):
+        """s_cmp_eq/lg of word 1 of an intact heap image record with 0: the guest's test for an unbound descriptor.
+
+        RDNA 2 ISA 8.2.6 Table 45: word 1 holds the format field (bits 60:52), which is never 0 for a texture that can be
+        sampled, and an all-zero resource acts as unbound. The bound view's top-mip width is 0 only for a null view, so
+        word1 == 0 is width == 0. Only under retry_heap_dimensions; any other compare keeps the descriptor path."""
+        if (not getattr(self, 'retry_heap_dimensions', False) or name[6:8] not in ('eq', 'lg')
+                or len(ops) != 2 or 0 not in (self.const_u32(ops[0]), self.const_u32(ops[1]))):
+            return False
+        word = next((s for s in symbols if s and s[0] == 'desc'), None)
+        if (word is None or len(word) != 4 or word[1][0] != 'dynamic_heap' or word[1][2:] != ('image',)
+                or word[2:] != (0, 1) or self.heap_image_kinds.get(word[1]) is None):
+            return False
+        width = self.heap_view_dimensions(word[1], self.heap_image_kinds[word[1]], False)[0]
+        self.set_scc('%s %s 0u' % (width, '==' if name[6:8] == 'eq' else '!='))
+        return True
 
     def heap_view_dimensions(self, source, kind, probe):
         suffix = '%x_%s' % (self.pc, source[1])
@@ -14923,7 +14932,9 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 symbols = [self.sym.get(r[1]) if (r := reg_range(t)) and r[0] == 's' else None for t in ops]
                 descriptor = (getattr(self, 'kind', None) in ('ps', 'vs')
                               and any(s and s[0] in ('desc', 'descnum') for s in symbols))
-                if descriptor:
+                if descriptor and not mods and self.heap_image_null_compare(name, ops, symbols):
+                    self.mark_descriptor_scc()
+                elif descriptor:
                     if mods or any(self.is_lane_mask(t) or t == 'src_scc' for t in ops):
                         raise Unsupported('scc from descriptor data in %s with a lane mask, SCC or modifier' % name)
                     self.set_scc((cast % op).format(*(self.descriptor_operand(t) for t in ops)))
