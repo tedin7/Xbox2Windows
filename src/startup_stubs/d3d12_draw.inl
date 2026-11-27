@@ -584,8 +584,18 @@ bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
 
 bool read_text(const wchar_t* path, std::string& out)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    const bool opened = x2w_startup::open_with_lock_retry(
+        [&]() -> unsigned {
+            file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            return file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        },
+        Sleep,
+        [path](int tries, unsigned code, bool succeeded) {
+            log("x2w-draw manifest %ls busy (error %lu), %d tries, %s",
+                path, static_cast<unsigned long>(code), tries, succeeded ? "opened" : "failed");
+        });
+    if (!opened) return false;
     char buffer[8192];
     DWORD got = 0;
     while (ReadFile(file, buffer, sizeof(buffer), &got, nullptr) && got) out.append(buffer, got);

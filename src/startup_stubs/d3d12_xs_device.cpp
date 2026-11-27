@@ -67,6 +67,7 @@
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/locked_open_retry.h"
 #include "startup_stubs/manifest_prefetch.h"
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
