@@ -3695,6 +3695,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py")
     add_test(NAME startup_gfx2hlsl_heap_format COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_format_check.py")
+    add_test(NAME startup_compute_heap_format COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_format_check.py")
     add_test(NAME startup_compute_dynamic_heap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dynamic_heap_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
@@ -5160,7 +5162,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_resheap_branch_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp "$<TARGET_FILE:offscreen_check>"
         "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_heap_format_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_format_check.py" warp "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_compute_heap_format_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_format_check.py" "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")
     set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp startup_gfx2hlsl_resheap_branch_warp
+        startup_gfx2hlsl_heap_format_warp startup_compute_heap_format_warp
         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B

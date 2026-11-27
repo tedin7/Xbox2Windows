@@ -51,5 +51,8 @@ The translation reads FORMAT and DST_SEL from that word; see the AMD RDNA 2
 Instruction Set Architecture, sections 8.1.2, 8.1.5 and 8.1.8.
 
 Run the Python translation controls with
-`python3 -B tests/startup_gfx2hlsl_heap_format_check.py`. These controls do not
-exercise the Windows runtime or a GPU.
+`python3 -B tests/startup_gfx2hlsl_heap_format_check.py` and
+`python3 -B tests/startup_compute_heap_format_check.py`. On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_heap_format|compute_heap_format)_warp$' -V`
+for WARP readback through the offscreen and runtime dispatch fixtures. A capability
+skip is separate from a pass. The Python controls do not exercise the runtime or GPU.
