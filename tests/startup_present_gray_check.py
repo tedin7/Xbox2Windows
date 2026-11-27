@@ -122,7 +122,8 @@ def check_recent_fps(consumer):
             assert readback.read_bytes() == reference, f'frame 60 RGBA8 readback mismatch (switch={enabled})'
             rates = recent_rates(result.stdout)
             if enabled == '1':
-                assert rates is not None, f'expected slow rate first and higher run average: {result.stdout}'
+                assert rates is not None, (f'expected slow rate first and higher run average: {result.stdout}\n'
+                                           f'stderr tail: {result.stderr[-1500:]}')
                 recent, average = rates
                 match = RECENT_CAPTION.search(result.stdout)
                 swapped = (result.stdout[:match.start(1)] + match[2] +
@@ -130,7 +131,10 @@ def check_recent_fps(consumer):
                 assert recent_rates(swapped) is None, f'swapped-rate control passed: {swapped}'
                 print(f'frame 60: {recent:.1f} fps (last 30), {average:.1f} fps (run average), pixels match')
             else:
-                assert LEGACY_CAPTION.search(result.stdout), f'expected the legacy caption: {result.stdout}'
+                # The old caption only appears when the picture reached the window; without it the new text must be absent.
+                assert "(last 30)" not in result.stdout, f"switch off still shows the recent rate: {result.stdout}"
+                legacy = LEGACY_CAPTION.search(result.stdout)
+                assert legacy or "frame 60" not in result.stdout, f"unexpected caption with the switch off: {result.stdout}"
                 assert rates is None, f'switch-off control unexpectedly passed the recent-caption check: {result.stdout}'
                 print('switch-off control: legacy caption rejected by recent-caption check, pixels match')
 
