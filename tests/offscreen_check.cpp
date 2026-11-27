@@ -1591,13 +1591,17 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, colors.data(), ctx.argv[8],
                                false, 3, false, true, 0, 3, false, UINT(width), UINT(height));
         std::memcpy(pixels.data(), colors.data(), pixels.size() * sizeof(std::uint32_t));
-    } else if (operation == "--startup-pixel-buffer-words") {
+    } else if (operation == "--startup-pixel-buffer-words" ||
+               operation == "--startup-instanced-vertex-buffer-words") {
         const auto entry = parse_hex_words(ctx.argv[8]);
         const auto buffer = parse_hex_words(ctx.argv[9]);
         if (entry.empty() || entry.size() > 32 || buffer.empty())
             return {OutcomeKind::fail, "expected 1..32 entry constants and a nonempty buffer"};
+        const bool vertex_buffer = operation == "--startup-instanced-vertex-buffer-words";
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
-                                D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer);
+                                D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer,
+                                vertex_buffer ? UINT(width) : 1, DXGI_FORMAT_R32G32B32A32_FLOAT, false, nullptr,
+                                vertex_buffer);
     } else {
         const UINT instances = operation == "--startup-instanced-pixel-words" ? UINT(width) : 1;
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
@@ -1869,6 +1873,7 @@ const OperationSpec kOperations[] = {
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-image-words", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-instanced-vertex-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-r16-unorm", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},

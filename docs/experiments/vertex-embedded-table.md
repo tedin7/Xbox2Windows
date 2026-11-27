@@ -52,3 +52,35 @@ floating-point target. All 24 readback words per draw must match the CPU
 reference. Shifting the load to the second row must fail at all six pixels
 against the first row's reference. The Windows command above runs this case
 with DXC and with FXC when available. WARP verification is pending.
+
+## Vertex GLOBAL loads from a program-image table
+
+A vertex program can read aligned dwords from a table after its executable
+instructions using a GETPC-relative scalar pair and a per-lane vector address.
+The proof requires a literal low addition, its zero high carry, a bounded index
+shifted by two, matching vector carry instructions and a GLOBAL load with scalar
+address off. It refuses address or carry uses that cannot be elided safely.
+UNORM8 and UNORM16 ranges can establish the index bound; unmodelled joins,
+EXEC changes and arithmetic may discard those facts. The HLSL embeds the table
+once, and the load adds no resource binding. The instruction behavior is
+specified in the AMD RDNA 2 ISA guide, sections 3.9, 6, 8.1 and 9.2.
+
+On Linux, revision `c323c1fec` passed the following controls. They translate
+synthetic stream and plain vertex programs, check three adjacent table reads,
+reject one-past-end and unbounded indices, and compare an unrelated shader's
+HLSL and manifest with its pre-change hashes.
+
+```sh
+nice -n 15 python3 -B tests/startup_vertex_image_getpc_check.py
+nice -n 15 python3 -B tests/startup_vertex_image_ranges_check.py
+nice -n 15 python3 -B tests/startup_vertex_image_address_check.py
+```
+
+The Windows fixture is registered for WARP. It compares all four words of
+eight pixels with a Python table reference; a reference shifted by one word
+must differ for every pixel. WARP execution and the C++ harness build are
+pending on an x64 Windows host with DXC.
+
+```powershell
+ctest --preset dev --no-tests=error -V -R '^startup_vertex_image_address(_warp)?$'
+```

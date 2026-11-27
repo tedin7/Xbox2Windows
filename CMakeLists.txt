@@ -3875,6 +3875,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     # GETPC refusal controls and synthetic embedded vertex table translation.
     add_test(NAME startup_gfx2hlsl_getpc_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py")
+    add_test(NAME startup_vertex_image_ranges COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_ranges_check.py")
+    set_tests_properties(startup_vertex_image_ranges PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_vertex_image_address COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_address_check.py")
+    set_tests_properties(startup_vertex_image_address PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_vertex_image_getpc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vertex_image_getpc_check.py")
+    set_tests_properties(startup_vertex_image_getpc PROPERTIES TIMEOUT 120)
     # Image instructions with fewer than three operands (#2360 follow-up): the handler refused
     # them as an index error before it checked the count.
     add_test(NAME startup_gfx2hlsl_image_arity COMMAND "${INTAKE_PYTHON}" -B
@@ -4637,6 +4646,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py" "${DXC_EXECUTABLE}"
         "$<TARGET_FILE:offscreen_check>" $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
     set_tests_properties(startup_gfx2hlsl_getpc_table_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_vertex_image_address_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_vertex_image_address_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_vertex_image_address_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # gfx2hlsl 16-bit vector ALU (#1723): the translated pairs drawn on WARP and hardware (FXC 5_1 and DXC 6_0),
     # four result words per draw against an exact binary16 reference.
     add_test(NAME startup_gfx2hlsl_f16_alu_draw_controls COMMAND "${INTAKE_PYTHON}" -B

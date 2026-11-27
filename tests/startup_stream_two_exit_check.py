@@ -10,6 +10,7 @@ from unittest.mock import patch
 from startup_buffer_address_check import root_with_one_constant
 import startup_stream_interface_check as S
 from startup_stream_interface_check import gfx2hlsl
+import pixel_aot  # noqa: E402
 from pixel_aot import container_code  # noqa: E402
 from resource_inventory import parts  # noqa: E402
 
@@ -152,6 +153,33 @@ def translator_cases(directory):
     refused("stage 13, 8 decoded exits: missing mesh allocation", mesh, stage=13)
     native_code(S.container(13, [0xbf900009, *eight], S.PS_BASE, [], {}), stage=13)
     translated(directory / "branch_tail", S.vertex(), pixel(branch_tail()), root)
+
+    # GETPC reads the address of the following instruction; 24 reaches byte 28.
+    getpc = [0xbe901f00, 0x8010ff10, 24, 0x82118011]
+    table = [END, END, 7, END]
+    image = getpc + table
+    assert native_code(vertex(image), stage=1) == struct.pack("<8I", *image)
+
+    def unreadable_tail(code):
+        if len(code) > 20:
+            raise ValueError("undecodable table")
+        return decode_native(code)
+
+    assert native_code(vertex(image), unreadable_tail, stage=1) == struct.pack("<8I", *image)
+    with patch.object(pixel_aot, "_vertex_getpc_tail", return_value=False):
+        refused("stage 1, 3 decoded exits: unreachable instruction at +0x14", vertex(image), stage=1)
+    refused("stage 1, 3 decoded exits: unreachable instruction at +0x14",
+            vertex([NOP, NOP, NOP, NOP, *table]), stage=1)
+    for displacement in (4, 28):  # points inside code, or just beyond the image
+        refused("stage 1, 3 decoded exits: unreachable instruction at +0x14",
+                vertex([getpc[0], getpc[1], displacement, getpc[3], *table]), stage=1)
+    refused("stage 1, 3 decoded exits: unreachable instruction at +0x18",
+            vertex([*getpc, 0xbe921f00, *table]), stage=1)
+    refused("stage 1, 2 decoded exits: unreachable instruction at +0x14",
+            vertex([getpc[0], getpc[1], 24, getpc[3], END, 0xbe921f00, 7, END]), stage=1)
+    # A reachable branch entering the supposed table cannot close the prefix graph.
+    refused("stage 1, 2 decoded exits: unreachable instruction at +0x18",
+            vertex([*getpc, branch(4, 2), END, 7, END]), stage=1)
 
     no_position = vertex([compare_zero(0), branch(4, 1), END, *S.vertex_words()])
     status, _ = S.translate(directory / "no_position", no_position, S.pixel())
