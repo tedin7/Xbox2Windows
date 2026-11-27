@@ -266,6 +266,14 @@ MASK_MEMORY = (
                             '7e640280 7e660280 f0000108 000e0732 bf8c0f70')),
 )
 
+# Post-count, scalar-load-free skips use the same proof as the compute phi.
+MASK_GENERIC = (
+    ('generic live', vertex_red('beae0480 7d880086 be94246a bf880002 d4c4002e 00020086 '
+                                'befe04c1 d5010007 00b9e480')),
+    ('generic dead', vertex_red('7e0e0280 7d880086 be94246a bf880003 d4c4002e 00020086 '
+                                '7e0e02f2 befe04c1')),
+)
+
 MASK_CONTROLS = (
     ('c1 numeric read', lane_mask_mesh(setup='beb6102e'), 'a lane mask is also read as a number'),
     ('c2 unproven base', lane_mask_mesh(load=MASK_LOAD.replace('f4080c05', 'f4080c1b')),
@@ -773,10 +781,10 @@ def depth_only_controls():
 
 
 def lane_mask_controls(tmp):
-    for label, mesh in MASK_CASES + MASK_MEMORY:
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC:
         key, result = request(tmp, mesh)
         expect(label + ' translates', result, 'ok')
-        if result == 'ok' and (label.startswith('S') or label in ('tbuffer', 'image')):
+        if result == 'ok':
             source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
             for mutant, mutated in lane_mask_mutants(label, source):
                 expect(label + ' mutant changes HLSL', mutated != source, True)
@@ -785,6 +793,11 @@ def lane_mask_controls(tmp):
                     for full in (False, True)), True)
     for label, mesh, reason in MASK_CONTROLS:
         expect(label, request(tmp, mesh)[1], f'unsupported: {WAVE_LOAD_REFUSAL} (wave-load block: {reason})')
+
+    mesh = MASK_GENERIC[0][1]
+    bad = mutate('d5010007', '7e0e022f', mesh=mesh)  # v_mov_b32 v7, s47
+    bad.remove('00b9e480')
+    expect('generic skip reads the high half as a number', request(tmp, bad)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
 
     # m3 ignores a numeric use before running the purity proof. The classifier's
     # c1 assertion would fail under this mutant, independently of the emitter.
@@ -1137,6 +1150,10 @@ def lane_mask_reference(label, full, mutant=None):
                 lane, slot = tid & 63, tid & 15
                 runs = then[lane] if mutant == 'per-lane EXEC branch' else any(then)
                 red = loaded[first // 64] if runs else 64
+                if label.startswith('generic'):
+                    red = 255 if tid < 6 or mutant == 'wrong generic mask' else 0
+                    colours[slot] = (red, *colours[slot][1:])
+                    continue
                 if memory:
                     green = 255 if then[lane] or (mutant == 'unpredicated memory' and any(outer)) else 0
                 else:
@@ -1150,6 +1167,11 @@ def lane_mask_reference(label, full, mutant=None):
 
 def lane_mask_mutants(label, source):
     """m1 makes the branch lane-local, m2 drops the saved complement."""
+    if label.startswith('generic'):
+        old, new = (('s46 = 0x00000000u;', 's46 = 0xffffffffu;') if label == 'generic live' else
+                    ('if (exec & 1) v7 = 0x00000000u;', 'if (exec & 1) v7 = 0x3f800000u;'))
+        expect(label + ' mutant site is unique', source.count(old), 1)
+        return [('wrong generic mask', source.replace(old, new))]
     if label in ('tbuffer', 'image'):
         start = source.index('if (exec & 1) {', source.index('s40 = r0.Load('))
         end = source.index('pc =', start)
@@ -1177,7 +1199,7 @@ def lane_mask_mutants(label, source):
 def draw_lane_masks(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
-    for label, mesh in MASK_CASES + MASK_MEMORY:
+    for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC:
         # A group has two guest waves. A second S1 draw changes wave 1 from
         # empty to full so the reference exercises all three kinds of wave.
         programs = [(False, mesh)]

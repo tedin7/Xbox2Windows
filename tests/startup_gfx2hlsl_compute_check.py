@@ -916,6 +916,54 @@ WORDS_O_SHIFT = bytes.fromhex(OFF_PROLOGUE_WORDS + '040394be' '050395be' '078416
 CASES['O-dword'] = (SOURCE_O_DWORD, WORDS_O_DWORD, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1))
 CASES['O-shift'] = (SOURCE_O_SHIFT, WORDS_O_SHIFT, USER7 | TGID_X | tidig(1), (32, 1, 1), (4, 1, 1))
 
+# The condition selects 48 lanes, including 16 from the high half. All 64
+# lanes consume the result after the EXEC restore.
+PAIR_PHI_CASES = (
+    ('phi64-vcc', 'vcc', 'v_cmp_gt_u32_e32 vcc, 40, v0', '0', '8004eabe010088bfa800887d', 'aa01'),
+    ('phi64-sgpr', 's[24:25]', 'v_cmp_gt_u32_e64 s[24:25], 40, v0', '0',
+     '800498be020088bf1800c4d4a8000200', '6200'),
+    ('phi64-ones', 's[24:25]', 's_orn2_b64 s[24:25], 0, exec', '-1', 'c10498be010088bf807e988b', '6200'),
+    ('phi64-keep', 's[24:25]', 's_andn2_b64 s[24:25], s[24:25], exec', '-1', 'c10498be010088bf187e988a', '6200'),
+)
+
+
+def pair_phi_case(mask, writer, initial, block, selector):
+    source = OFF_PROLOGUE + f"""v_cmpx_gt_u32_e32 48, v0
+s_mov_b64 {mask}, {initial}
+s_cbranch_execz {len(block) // 8 - 2}
+{writer}
+s_mov_b64 exec, -1
+v_cndmask_b32_e64 v5, 3, v0, {mask}
+v_lshlrev_b32 v4, 2, v0
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+    words = bytes.fromhex(OFF_PROLOGUE_WORDS + 'b000a87d' + block
+                          + 'c104febe050001d58300' + selector + '82000834001070e004050480000081bf')
+    return source, words, USER7, (64, 1, 1), (1, 1, 1)
+
+
+CASES.update({case: pair_phi_case(*args) for case, *args in PAIR_PHI_CASES})
+PAIR_PHI_NAMES = frozenset(case for case, *_ in PAIR_PHI_CASES)
+
+
+def pair_phi_reference(case, wrong_init=False):
+    """Apply the guest's pair update to the entire 64-lane wave."""
+    initial_ones = case in ('phi64-ones', 'phi64-keep')
+    initial = ((1 << 64) - 1) if initial_ones != wrong_init else 0
+    active = (1 << 48) - 1
+    if case == 'phi64-keep':
+        mask = initial & ~active
+    elif case == 'phi64-ones':
+        mask = ((1 << 64) - 1) ^ active
+    else:
+        mask = (1 << 40) - 1
+    if wrong_init:
+        # The mutant's per-lane skip retains the wrong initialization outside EXEC.
+        mask = (mask & active) | (initial & ~active)
+    return [lane if mask & (1 << lane) else 3 for lane in range(64)]
+
+
 # Two groups reach the same load from different branch arms. Each of their lanes must read its group's word.
 SOURCE_JOIN_LOAD = OFF_PROLOGUE + """\
 s_cmp_eq_u32 s7, 0
@@ -1042,6 +1090,8 @@ def expected(name):
     if name in ('I', 'I-raw', 'I-raw-mask'):
         return expected('A')
     out = [SENTINEL] * WORDS
+    if name in PAIR_PHI_NAMES:
+        return pair_phi_reference(name) + out[64:]
     if name == CASE_F16_UNARY:
         for lane, word in enumerate(INPUT_F16_UNARY):
             hi, lo = word >> 16, word & 0xffff
@@ -1192,7 +1242,8 @@ def expected(name):
 
 def translate(name, rsrc2=None, code=None, group=None):
     source, words, default_rsrc2, local, _ = CASES[name]
-    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local)
+    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local,
+                             wave_size=64 if name in PAIR_PHI_NAMES else None)
 
 
 def refused(fragment, build):
@@ -1875,7 +1926,39 @@ def check_execz_mask_exact():
         assert bad == want, (name, sorted(bad))
 
 
+def check_pair_phi_controls():
+    for name, *_ in PAIR_PHI_CASES:
+        text = translate(name).hlsl_cs()
+        control = 'wrong-init-' + name
+        assert mutate(text, control) != text
+        assert sum(a != b for a, b in zip(pair_phi_reference(name), pair_phi_reference(name, True))) == 16
+
+    # A whole-word read (including just the high half) disqualifies both words.
+    for name, edit, refused_word in (
+            ('phi64-vcc', '6b020a7e', 'vcc_hi'),
+            ('phi64-vcc', '000086bf', 'vcc'),
+            ('phi64-sgpr', '19020c7e', 's24')):
+        program = CASES[name][1].replace(bytes.fromhex('c104febe'), bytes.fromhex('c104febe' + edit), 1)
+        if refused_word == 'vcc_hi':
+            program = program.replace(bytes.fromhex('050001d58300aa01'), b'', 1)
+        refused('definition of ' + refused_word, lambda: translate(name, code=program))
+        decoded = G.decode(program)
+        pair = 'vcc' if name == 'phi64-vcc' else 's[24:25]'
+        if edit != '000086bf':  # VCC votes are mask operands but cannot follow a per-lane join.
+            assert pair not in G.pure_lane_mask_pairs(decoded)
+            assert pair in G.pure_lane_mask_pairs(G.decode(CASES[name][1]))
+
+    name = 'phi64-sgpr'
+    high_only = CASES[name][1].replace(bytes.fromhex('050001d583006200'), bytes.fromhex('19020a7e'), 1)
+    refused('reads lane mask s25 as numeric data', lambda: translate(name, code=high_only))
+
+    for name, old, wrong in (('phi64-vcc', '8004eabe', 'c104eabe'), ('phi64-ones', 'c10498be', '800498be')):
+        program = CASES[name][1].replace(bytes.fromhex(old), bytes.fromhex(wrong), 1)
+        refused('live where the block joins', lambda: translate(name, code=program))
+
+
 def check_controls():
+    check_pair_phi_controls()
     f16_unary = translate(CASE_F16_UNARY).hlsl_cs()
     assert 'v6 = f16rn(exp2(f16tof32(v5 & 0xffffu)));' in f16_unary
     assert 'v7 = f16rn(1.0 / f16tof32(v5 & 0xffffu));' in f16_unary
@@ -2532,7 +2615,11 @@ def check_binary(llvm_mc):
     assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     assert assemble(llvm_mc, EXIT_RUN_SOURCE) == EXIT_RUN_WORDS
     for name, (source, words, *_rest) in CASES.items():
-        built = assemble(llvm_mc, source)
+        if name in PAIR_PHI_NAMES:
+            from startup_mesh57_skeleton_check import assemble as assemble_wave64
+            built = b''.join(struct.pack('<I', int(word, 16)) for word in assemble_wave64(llvm_mc, source))
+        else:
+            built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
     for line, words in SPLICE.items():
         built = assemble(llvm_mc, line + '\n').hex()
@@ -2615,6 +2702,13 @@ def mutate(hlsl, control):
     return hlsl.replace(old, new)
 
 
+for case, mask, _, initial, *_ in PAIR_PHI_CASES:
+    target = 'vcc' if mask == 'vcc' else 's24'
+    old, new = ('0x00000000u', '0xffffffffu') if initial == '0' else ('0xffffffffu', '0x00000000u')
+    wrap = ('(%s) & 1' if target == 'vcc' else '%s')
+    CONTROLS['wrong-init-' + case] = (case, f'{target} = {wrap % old};', f'{target} = {wrap % new};')
+
+
 MBCNT_COMPACTION_CONTROLS = (
     ('mbcnt-base-dropped', ')) + 0x00000001u);', ')) + 0x00000000u);', 0),
     ('mbcnt-hi-adds-one', 'v8 = v8;', 'v8 = v8 + 1u;', 1),
@@ -2671,10 +2765,12 @@ def check_dispatch(dxc, runner, adapter, control=None):
         elif control == 'mbcnt-compaction':
             runs = [(name, mutation) for name in ('mbcnt-64', 'mbcnt-256')
                     for mutation in (None, *(label for label, *_ in MBCNT_COMPACTION_CONTROLS))]
+        elif control == 'phi64':
+            runs = [(name, mutation) for name, *_ in PAIR_PHI_CASES for mutation in (None, 'wrong-init-' + name)]
         elif control:
             runs = [(CONTROLS[control][0], control)]
         else:
-            runs = [(name, None) for name in CASES]
+            runs = [(name, None) for name in CASES if name not in PAIR_PHI_NAMES]
             runs.append(('join-load', 'join-load-zero'))
             runs += [(CASE_F16_UNARY, mutation) for mutation in F16_UNARY_CONTROLS]
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]

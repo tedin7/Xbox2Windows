@@ -151,8 +151,7 @@ The slot 57 wave-load block uses shared helpers to classify wave64 mask pairs.
 The proof inspects decoded accesses, including overlapping SGPR words, and
 checks that a mask read has a definition on every incoming path. The existing
 one-lane representation carries the lane's EXEC bit through comparisons,
-Boolean operations, copies, and selects on verified uniform SCC. Compute and
-graphics still use their existing paths.
+Boolean operations, copies, and selects on verified uniform SCC.
 
 The first shape has forward uniform branches, one inner AND-saveexec if/else
 and a complement. An EXEC vote gates its scalar then arm. VALU and read-only
@@ -161,6 +160,18 @@ Numeric reads of masks, SCC produced by mask operations, non-uniform scalar
 inputs, undefined skip values, and scalar else arms without a vote are refused.
 Additional nested if/else regions and uses of the saved mask beyond the region
 remain refused.
+
+#### Shared EXEC-zero join proof
+
+Compute, pixel and mesh use the same full-pair classifier and skipped-lane
+write rules. A compare or an EXEC-masked write requires zero on the skip path.
+A write that produces one for inactive lanes requires all ones. A preserving
+write may retain any proven lane mask. Once the region joins, a live mask can
+feed a lane select, a carry, or an operation that intersects it with EXEC.
+Either half used as numeric data, a whole-wave observation, an SCC read of
+a mask operation, or unexpected control flow keeps the prior refusal.
+The new proof covers straight forward blocks with stable EXEC. Existing
+compute and graphics programs get their original lowering first.
 
 ### Phase 3: `v_readfirstlane` and waterfalls
 

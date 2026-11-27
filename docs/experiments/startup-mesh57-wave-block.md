@@ -135,3 +135,24 @@ existing mesh57 and gfx2hlsl fixture scripts, including the graphics shaders
 from two draw-only scripts. All outputs matched byte for byte. The standalone
 watch, retry and draw-skip checks also passed. The Windows draws remain to be
 run.
+
+
+## Shared EXEC-zero joins
+
+The shared proof also accepts post-count mesh skips with a dead pure mask or
+a zero-initialized compare pair consumed by a lane select after the join. The
+existing mesh lane-mask readback mode covers both forms. Compute has four
+wave64 readback cases for VCC, an SGPR compare pair, all-ones initialization
+and a lane-preserving write. Changing the initialization in each case changes
+16 CPU reference words. The pixel derivative suite tests a compare pair that
+survives a quad-voted EXEC-zero join.
+
+```text
+ctest --preset dev --no-tests=error -R '^startup_(mesh57_skeleton(_lanemask_(warp|hardware))?|gfx2hlsl_compute_(controls|phi64_(warp|hardware))|image_sample_b_flow_(controls|warp|hardware))$'
+```
+
+On Linux with Python 3.14.8 and LLVM 19, the offline controls and assembler
+checks passed in all three suites. The before/after comparison against
+`871025f1c` matched all 484 emitted HLSL and manifest outputs from the seven
+existing fixture scripts exercised in the comparison. Windows readback
+remains pending.
