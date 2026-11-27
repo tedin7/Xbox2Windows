@@ -3544,6 +3544,15 @@ class Stage:
             # as a lane mask.
             pipe = getattr(self, 'pipe', None)
             self.ins = wave32_vcc_hi(self.ins, wave32=getattr(pipe, 'wave_size', None) == 32 or wave32_exec_proof(self.ins))
+        self.vcc_inline_sampler = False
+        if kind == 'ps' and any(name.startswith(('s_mov', 's_brev', 's_bfm')) and 'vcc' in asm
+                                for _, _, name, asm in self.ins):
+            for off, _, name, asm in self.ins:
+                ops = parse(asm)[1]
+                if name.startswith('image_sample') and len(ops) >= 4 and ops[3] == 's[104:107]':
+                    if self.literal_vcc_sampler_words(off) is not None:
+                        self.vcc_inline_sampler = True
+                        break
         if kind == 'ps':
             self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
@@ -4055,6 +4064,17 @@ class Stage:
             value = tuple(self.sym[i] for i in (106, 107))
             self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
 
+    def record_vcc_constant(self, word, value):
+        self.sym[word] = ('const', value & 0xffffffff)
+        getattr(self, 'masks', set()).discard(word)
+        getattr(self, 'mask_high', set()).discard(word)
+        getattr(self, 'uniform_cmp_masks', {}).pop(word, None)
+        getattr(self, 'float_const_s', {}).pop(word, None)
+        self.vcc_lost = False
+        self.vcc_descriptor_extended = False
+        self.vcc_descriptor_overwritten = False
+        self.vcc_constant_pair = True
+
     def emit(self, text):
         if 'vcc' in text:
             assignment = re.match(r'vcc = (.*);$', text)
@@ -4066,7 +4086,7 @@ class Stage:
                     self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
                 if getattr(self, 'vcc_constant_pair', False):
                     self.vcc_constant_pair = False
-                    if not getattr(self, 'has_branches', False):
+                    if not getattr(self, 'has_branches', False) or getattr(self, 'vcc_inline_sampler', False):
                         self.sym.pop(106, None)
                         self.sym.pop(107, None)
                 if getattr(self, 'vcc_lost', False):
@@ -4408,7 +4428,138 @@ class Stage:
         fconst = getattr(self, 'float_const_s', {})
         words = [self.is_const(n) if self.is_const(n) is not None else fconst.get(n)
                  for n in range(r[1], r[2] + 1)]
+        if (getattr(self, 'kind', None) == 'ps' and r == ('s', 104, 107)
+                and words[0] is not None and (any(w is None for w in words)
+                                              or getattr(self, 'vcc_inline_sampler', False))):
+            proven = self.literal_vcc_sampler_words()
+            if proven is not None:
+                return list(proven)
+            if not getattr(self, 'has_branches', False):
+                for off, size, name, asm in reversed(self.ins):
+                    if off >= self.pc:
+                        continue
+                    _, ops, _ = parse(asm)
+                    _, _, writes = scalar_effects(name, asm)
+                    if writes & {'vcc', 'vcc_hi', 's106', 's107'}:
+                        if name == 's_mov_b64' and len(ops) == 2 and ops[0] == 'vcc':
+                            try:
+                                value = (fbits(FLOATS[ops[1]]) if ops[1] in FLOATS else int(ops[1], 0)) & 0xffffffff
+                            except ValueError:
+                                break
+                            if size == 8 and value & 0x80000000:
+                                raise Unsupported('s_mov_b64 vcc literal bit 31 has ambiguous 64-bit extension')
+                        break
+            elif getattr(self, 'vcc_sampler_proof_failure', None):
+                raise Unsupported(self.vcc_sampler_proof_failure)
+            if getattr(self, 'vcc_inline_sampler', False):
+                return None
         return None if any(w is None for w in words) else words
+
+    def literal_vcc_sampler_words(self, at=None):
+        """Prove the complete inline sampler and reject numeric VCC mask uses on every reachable path."""
+        self.vcc_sampler_proof_failure = None
+        ins = self.ins
+        at = self.pc if at is None else at
+        offsets = {off: i for i, (off, _, _, _) in enumerate(ins)}
+        if at not in offsets or not ins:
+            return None
+        keys = {'vcc', 'vcc_hi', 's106', 's107'}
+        todo = [(0, (None, None, None, None), 0)]
+        seen, found = set(), set()
+        while todo:
+            i, words, tainted = todo.pop()
+            state = (i, words, tainted)
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > 10000:
+                return None
+            off, size, name, asm = ins[i]
+            base, ops, mods = parse(asm)
+            reads, _, writes = scalar_effects(name, asm)
+            sampler_read = (name.startswith(('image_sample', 'image_gather')) and len(ops) >= 4
+                            and ops[3] == 's[104:107]')
+            if sampler_read:
+                reads -= {'s106', 's107'}
+                reads |= scalar_tokens(' '.join(ops[:3] + ops[4:])) & keys
+                if tainted and any(word is None for word in words):
+                    self.vcc_sampler_proof_failure = ('descriptor operand overlaps s106/s107 without a matching load '
+                                                      'on every path')
+                    return None
+            if tainted and reads & keys:
+                self.vcc_sampler_proof_failure = 'vcc constant read as a lane mask'
+                return None  # the per-lane VCC representation cannot read a whole constant mask
+            if off == at:
+                found.add(words)
+            new = list(words)
+            changed = set()
+            for k, aliases in enumerate(({'s104'}, {'s105'}, {'s106', 'vcc'}, {'s107', 'vcc_hi'})):
+                if writes & aliases:
+                    changed.add(k)
+                    new[k] = None
+                    if k >= 2:
+                        if name.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+                            tainted &= ~(1 << (k - 2))
+                        else:
+                            # An unproved scalar write can be a whole word, not this invocation's mask bit.
+                            tainted |= 1 << (k - 2)
+            def constant(tok):
+                aliases = {'s104': 0, 's105': 1, 's106': 2, 'vcc_lo': 2, 's107': 3, 'vcc_hi': 3}
+                if tok in aliases:
+                    return words[aliases[tok]]
+                if tok in FLOATS:
+                    return fbits(FLOATS[tok])
+                try:
+                    return int(tok, 0)
+                except ValueError:
+                    return None
+            if not mods and len(ops) >= 2:
+                dst = {'s104': (0,), 's105': (1,), 'vcc_lo': (2,), 'vcc_hi': (3,),
+                       'vcc': (2, 3), 's[104:105]': (0, 1)}.get(ops[0], ())
+                vals = [constant(t) for t in ops[1:]]
+                value = None
+                if base in ('s_mov_b32', 's_movk_i32') and len(vals) == 1 and vals[0] is not None:
+                    value = sopk_imm(ops[1], True) if base == 's_movk_i32' else vals[0]
+                elif base == 's_brev_b32' and len(vals) == 1 and vals[0] is not None:
+                    value = SCALAR_CONST_FOLD[base](vals[0] & 0xffffffff)
+                elif base in ('s_bfm_b32', 's_bfm_b64') and len(vals) == 2 and None not in vals:
+                    bits = 63 if base.endswith('64') else 31
+                    value = ((1 << (vals[0] & bits)) - 1) << (vals[1] & bits)
+                elif base == 's_mov_b64' and len(vals) == 1 and vals[0] is not None:
+                    # RDNA 2 ISA, 6.2.1: literal expansion agrees for an unsigned value with bit 31 clear.
+                    if size == 8:
+                        literal = vals[0] & 0xffffffff
+                        if literal < 0x80000000:
+                            value = literal
+                    elif ops[1] in FLOATS and ops[1] != '0.15915494':
+                        value = struct.unpack('<Q', struct.pack('<d', FLOATS[ops[1]]))[0]
+                    elif ops[1] not in FLOATS and -16 <= vals[0] <= 64:
+                        value = vals[0] & 0xffffffffffffffff
+                if value is not None and dst and set(dst) <= changed:
+                    for n, k in enumerate(dst):
+                        new[k] = (value >> (32 * n)) & 0xffffffff
+                        if k >= 2:
+                            tainted |= 1 << (k - 2)
+            nexts = []
+            if name in ('s_setpc_b64', 's_swappc_b64'):
+                return None
+            if name == 's_branch' or name.startswith('s_cbranch_'):
+                target = int(ops[0].split('_')[1], 16)
+                if target not in offsets:
+                    return None
+                nexts.append(offsets[target])
+            if name != 's_branch' and name != 's_endpgm' and i + 1 < len(ins):
+                nexts.append(i + 1)
+            for target in nexts:
+                todo.append((target, tuple(new), tainted))
+        if len(found) != 1:
+            self.vcc_sampler_proof_failure = 'descriptor operand overlaps s106/s107 without a matching load on every path'
+            return None
+        result = next(iter(found))
+        if any(value is None for value in result):
+            self.vcc_sampler_proof_failure = 'descriptor operand overlaps s106/s107 without a matching load on every path'
+            return None
+        return result
 
     def execz_counted_loop(self, guard, latch, into, effects, live_in):
         """Recognize a finite scalar loop entered at its head or, with EXEC empty, via its latch."""
@@ -7562,6 +7713,58 @@ class Stage:
 
     def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
+        if (getattr(self, 'vcc_inline_sampler', False) and base == 'v_writelane_b32' and not mods
+                and len(ops) == 3 and ops[1] in ('vcc_lo', 'vcc_hi')):
+            dst = reg_range(ops[0])
+            try:
+                lane = int(ops[2], 0)
+            except ValueError:
+                lane = -1
+            if dst and dst[0] == 'v' and dst[1] == dst[2] and 0 <= lane < 64:
+                register = dst[1]
+                dead = True
+                for _, _, other_name, other_asm in self.ins:
+                    _, other_ops, _ = parse(other_asm)
+                    for index, token in enumerate(other_ops):
+                        spans = re.findall(r'\bv(?:\[(\d+):(\d+)\]|(\d+))', token)
+                        if any(int(lo or one) <= register <= int(hi or one) for lo, hi, one in spans):
+                            if not (other_name == 'v_writelane_b32' and index == 0
+                                    and len(other_ops) == 3 and other_ops[1] in ('vcc_lo', 'vcc_hi')):
+                                dead = False
+                if dead:
+                    return None  # Both saved words are dead; no lane needs a materialized wave mask.
+        if (getattr(self, 'vcc_inline_sampler', False) and not mods and len(ops) >= 2
+                and ((ops[0] == 'vcc_hi' and base in ('s_mov_b32', 's_movk_i32', 's_brev_b32', 's_bfm_b32'))
+                     or (ops[0] == 'vcc_lo' and base == 's_bfm_b32')
+                     or (ops[0] == 'vcc' and base == 's_bfm_b64'))):
+            try:
+                sources = []
+                for source in ops[1:]:
+                    reg = reg_range(source)
+                    if reg and reg[0] == 's' and reg[1] == reg[2] and self.is_const(reg[1]) is not None:
+                        sources.append(self.is_const(reg[1]))
+                    else:
+                        sources.append(fbits(FLOATS[source]) if source in FLOATS else int(source, 0))
+            except ValueError:
+                pass
+            else:
+                if base == 's_movk_i32':
+                    value = sopk_imm(ops[1], True)
+                elif base == 's_brev_b32':
+                    value = SCALAR_CONST_FOLD[base](sources[0] & 0xffffffff)
+                elif base in ('s_bfm_b32', 's_bfm_b64'):
+                    bits = 63 if base.endswith('64') else 31
+                    value = ((1 << (sources[0] & bits)) - 1) << (sources[1] & bits)
+                else:
+                    value = sources[0]
+                if ops[0] == 'vcc':
+                    self.record_vcc_constant(106, value)
+                    self.record_vcc_constant(107, value >> 32)
+                else:
+                    self.record_vcc_constant(106 if ops[0] == 'vcc_lo' else 107, value)
+                # The path proof rejects any lane-mask use before a full overwrite. These words only feed
+                # static sampler state, so no per-lane assignment can represent or needs to materialize them.
+                return None
         calculated = getattr(self, 'calculated_pc', {})
         if pc in calculated:
             target = calculated[pc]
@@ -8608,6 +8811,25 @@ class Stage:
         syms = [src_sym(t) for t in srcs]
         mask_dest = dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo', 'exec_hi', 'vcc_hi')
         constant_pair = None
+        inline_vcc = None
+        old_vcc_high = self.sym.get(107)
+        if (getattr(self, 'vcc_inline_sampler', False) and not mods and len(srcs) == 1
+                and ((base == 's_mov_b64' and dname == 'vcc')
+                     or (base in ('s_mov_b32', 's_movk_i32') and dname == 'vcc_lo'))):
+            try:
+                number = fbits(FLOATS[srcs[0]]) if srcs[0] in FLOATS else int(srcs[0], 0)
+            except ValueError:
+                pass
+            else:
+                size = next((size for off, size, _, _ in self.ins if off == self.pc), 0)
+                if base == 's_mov_b64' and size == 4 and srcs[0] in FLOATS and srcs[0] != '0.15915494':
+                    number = struct.unpack('<Q', struct.pack('<d', FLOATS[srcs[0]]))[0]
+                elif base == 's_mov_b64' and size == 8:
+                    number &= 0xffffffff
+                if (base != 's_mov_b64' or size == 4 and srcs[0] != '0.15915494'
+                        or size == 8 and number < 0x80000000):
+                    inline_vcc = (number & 0xffffffff,
+                                  (number >> 32) & 0xffffffff if base == 's_mov_b64' else None)
         if base == 's_mov_b64' and ops[0] == 'vcc' and len(ops) == 2:
             source = reg_range(ops[1])
             if source and source[0] == 's':
@@ -8823,6 +9045,12 @@ class Stage:
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
                     self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             self.emit('%s = (%s) & 1;' % (var, expr))
+            if inline_vcc is not None:
+                self.record_vcc_constant(106, inline_vcc[0])
+                if inline_vcc[1] is not None:
+                    self.record_vcc_constant(107, inline_vcc[1])
+                elif old_vcc_high and old_vcc_high[0] == 'const':
+                    self.record_vcc_constant(107, old_vcc_high[1])
             if constant_pair is not None:
                 # Keep the numeric mask assignment and also make the literal words available to a resource read.
                 self.sym[106], self.sym[107] = constant_pair

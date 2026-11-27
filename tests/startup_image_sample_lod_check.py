@@ -30,7 +30,9 @@ A constant u has no derivatives, so for image_sample the draw replaces only the 
 footprint of two texels on the 4x4 base level, an implicit LOD of exactly 1. The Sample call is not touched.
 """
 import contextlib
+import hashlib
 import io
+import math
 import re
 import struct
 import subprocess
@@ -43,8 +45,9 @@ sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 import startup_sampler_heap_check as H  # noqa: E402
+import startup_image_sample_c_check as C  # noqa: E402
 from startup_compute_gather_l_check import COMPUTE_TAIL, compute_prefix, cs_pipe, gather_insn  # noqa: E402
-from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
+from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, WORDS_2D, assemble, compile_hlsl, root_blob  # noqa: E402
 from startup_image_sample_b_check import texel_cell  # noqa: E402
 
 POINT_MIP = 0x4000000  # word 2 bits 27:26 = 1
@@ -83,6 +86,157 @@ BIAS_SAMPLE = {
     'lz': bytes.fromhex('080f9cf01318a801703f8cbf'),
 }
 BIAS_PS_TAIL = bytes.fromhex('0f1800f818191a1b000081bf')
+
+
+def vcc_sampler_program(shape='a', word0=0x92, word2=0x18500000, coordinate=0x3f000000, extra=b''):
+    def sop1(op, dst, src):
+        return struct.pack('<I', 0xbe800000 | dst << 16 | op << 8 | src)
+
+    def sop2(op, dst, src0, src1):
+        return struct.pack('<I', 0x80000000 | op << 23 | dst << 16 | src1 << 8 | src0)
+
+    if shape == 'a':
+        assert 0 <= word0 < 0x8000
+        setup = struct.pack('<I', 0xb0000000 | 104 << 16 | word0) + sop2(0x24, 105, 130, 150)
+        setup += sop1(4, 48, 106)  # save the incoming VCC mask
+        setup += sop1(4, 106, 255) + struct.pack('<I', word2)
+    else:
+        setup = struct.pack('<IIII', 0xd7610047, 106 | 146 << 9, 0xd7610047, 107 | 147 << 9)
+        setup += sop1(4, 106, 255) + struct.pack('<I', word2) + sop2(0x25, 104, 130, 182)
+    setup += extra
+    program = WORDS_2D[:8] + setup + WORDS_2D[24:]
+    program = program.replace(bytes.fromhex('0000403f'), struct.pack('<I', coordinate))
+    program = program.replace(bytes.fromhex('0000803e'), struct.pack('<I', 0x3f000000))
+    old = bytes.fromhex('080f80f00000c400')
+    sample = bytearray(bytes.fromhex('080f9cf00000c400'))
+    word = struct.unpack_from('<I', sample, 4)[0]
+    struct.pack_into('<I', sample, 4, (word & ~(31 << 21)) | (26 << 21))
+    assert program.count(old) == 1
+    return program.replace(old, sample)
+
+
+def vcc_comparison_program():
+    def sop1(op, dst, src):
+        return struct.pack('<I', 0xbe800000 | dst << 16 | op << 8 | src)
+    setup = sop1(3, 106, 255) + struct.pack('<I', 0x18500000)
+    setup += sop1(11, 107, 129)  # s_brev_b32 vcc_hi, 1
+    setup += struct.pack('<I', 0xb0000000 | 104 << 16 | 0x30b6)
+    setup += struct.pack('<I', 0x80000000 | 0x24 << 23 | 105 << 16 | 150 << 8 | 130)
+    program = C.WORDS['lz'][:8] + setup + C.WORDS['lz'][28:]
+    sample = bytes.fromhex('0801bcf00004c400')
+    word = struct.unpack_from('<I', sample, 4)[0]
+    return program.replace(sample, sample[:4] + struct.pack('<I', (word & ~(31 << 21)) | 26 << 21))
+
+
+def vcc_sampler_controls():
+    unchanged = stage('lz limits')
+    digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
+    assert digest == 'a98b36fe9b4cd302a35025630fc91ebb9088657c6bca923b63b07b75a93f8dbe', digest
+    setup = struct.pack('<III', 0xbeea04ff, 0x18500000, 0x7c000000 | 0xc2 << 17 | 256)
+    compare_after = WORDS_2D[:24] + setup + WORDS_2D[24:]
+    unchanged = G.Pipeline(VS_WORDS, compare_after, root_blob())
+    digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
+    assert digest == '5a866b8f985d63b9b846632e1508c978b9bf8db3c9030936b33cf542a0a6bd2b', digest
+    for shape, first in (('a', 0x92), ('b', 0)):
+        pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(shape), root_blob())
+        assert '.SampleLevel(' in pipe.hlsl_ps()
+        assert sampler_line(pipe) == 'smpl 0 0x%x 0xc00000 0x18500000 0x0' % first
+        assert pipe.ps.sym[106] == ('const', 0x18500000) and pipe.ps.sym[107] == ('const', 0)
+    pipe = G.Pipeline(C.VS_WORDS, vcc_comparison_program(), C.root_blob(flags=0))
+    assert '.SampleCmpLevelZero(' in pipe.hlsl_ps()
+    assert 'smpc 0 0x30b6 0xc00000 0x18500000 0x80000000' in pipe.manifest().splitlines()
+    # RDNA 2 ISA, 8.2.7: X/Y border, LESS_EQUAL, bilinear XY, opaque-white border.
+    w0, w2, w3 = 0x30b6, 0x18500000, 0x80000000
+    assert (w0 & 7, w0 >> 3 & 7, w0 >> 12 & 7, w2 >> 20 & 3,
+            w2 >> 22 & 3, w3 >> 30) == (6, 6, 3, 1, 1, 2)
+    brev = struct.pack('<I', 0xbe800000 | 107 << 16 | 11 << 8 | 129)
+    bfm = struct.pack('<I', 0x80000000 | 0x24 << 23 | 107 << 16 | 159 << 8 | 129)
+    mov = struct.pack('<II', 0xbe800000 | 107 << 16 | 3 << 8 | 255, 0x80000000)
+    for replacement in (bfm, mov):
+        code = vcc_comparison_program().replace(brev, replacement)
+        pipe = G.Pipeline(C.VS_WORDS, code, C.root_blob(flags=0))
+        assert 'smpc 0 0x30b6 0xc00000 0x18500000 0x80000000' in pipe.manifest().splitlines()
+    mov64 = struct.pack('<II', 0xbeea04ff, 0x18500000)
+    inline_float = vcc_sampler_program().replace(mov64, struct.pack('<I', 0xbeea04f2))
+    probe = G.Stage.__new__(G.Stage)
+    probe.ins = G.decode(inline_float)
+    sample_pc = next(off for off, _, name, _ in probe.ins if name == 'image_sample_lz')
+    assert probe.literal_vcc_sampler_words(sample_pc) == (0x92, 0xc00000, 0, 0x3ff00000)
+    assert sampler_line(G.Pipeline(VS_WORDS, inline_float, root_blob())) == 'smp 0 0x92 0xc00000 0x0 0x3ff00000'
+    literal_float = vcc_sampler_program().replace(mov64, struct.pack('<II', 0xbeea04ff, 0x3f800000))
+    assert sampler_line(G.Pipeline(VS_WORDS, literal_float, root_blob())) == 'smpl 0 0x92 0xc00000 0x3f800000 0x0'
+    inline_negative = vcc_sampler_program().replace(mov64, struct.pack('<I', 0xbeea04c1))
+    probe.ins = G.decode(inline_negative)
+    sample_pc = next(off for off, _, name, _ in probe.ins if name == 'image_sample_lz')
+    assert probe.literal_vcc_sampler_words(sample_pc) == (0x92, 0xc00000, 0xffffffff, 0xffffffff)
+    bfm64 = struct.pack('<I', 0x80000000 | 0x25 << 23 | 106 << 16 | 190 << 8 | 129)
+    pipe = G.Pipeline(VS_WORDS, vcc_sampler_program().replace(mov64, bfm64), root_blob())
+    assert sampler_line(pipe) == 'smp 0 0x92 0xc00000 0x0 0x40000000'
+    movk_and_hi = struct.pack('<II', 0xb0000000 | 106 << 16, 0xbe800000 | 107 << 16 | 3 << 8 | 128)
+    pipe = G.Pipeline(VS_WORDS, vcc_sampler_program().replace(mov64, movk_and_hi), root_blob())
+    assert sampler_line(pipe) == 'smp 0 0x92 0xc00000 0x0 0x0'
+    # Both edges reach the same VCC constant; the second fixture bypasses its definition.
+    branch = struct.pack('<III', 0xbf008080, 0xbf840001, 0xbf800000)
+    pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(extra=branch), root_blob())
+    assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18500000 0x0'
+    unjoined = vcc_sampler_program()
+    position = unjoined.index(bytes.fromhex('ff04eabe'))
+    unjoined = (unjoined[:position] + struct.pack('<III', 0x7c000000 | 0xc2 << 17 | 256,
+                                                  0xbf008080, 0xbf840002) + unjoined[position:])
+    code = vcc_sampler_program()
+    end_sample = code.index(bytes.fromhex('080f9cf0')) + 8
+    code = code[:end_sample] + struct.pack('<I', 0x7c000000 | 0xc2 << 17 | 256) + code[end_sample:]
+    pipe = G.Pipeline(VS_WORDS, code, root_blob())
+    assert 106 not in pipe.ps.sym and 107 not in pipe.ps.sym
+    literal_minus_one = vcc_sampler_program().replace(mov64, struct.pack('<II', 0xbeea04ff, 0xffffffff))
+    used_spill = vcc_sampler_program('b')
+    position = used_spill.index(bytes.fromhex('080f9cf0')) + 8
+    used_spill = used_spill[:position] + struct.pack('<I', 0x7e000200 | 327) + used_spill[position:]
+    for code, reason in ((vcc_sampler_program(word2=0x98500000), 's_mov_b64 vcc literal bit 31'),
+                         (literal_minus_one, 's_mov_b64 vcc literal bit 31'),
+                         (vcc_sampler_program(extra=struct.pack('<I', 0x7c000000 | 0xc2 << 17 | 256)),
+                          'descriptor operand s[104:107] holds'),
+                         (unjoined, 'descriptor operand overlaps s106/s107 without a matching load on every path'),
+                         (used_spill, 'v_writelane_b32 source vcc_lo is a lane mask or m0')):
+        try:
+            G.Pipeline(VS_WORDS, code, root_blob())
+        except G.Unsupported as error:
+            assert reason in str(error), str(error)
+        else:
+            raise AssertionError('unproved VCC sampler accepted')
+    original = G.Stage.literal_vcc_sampler_words
+    def wrong_filter(stage, at=None):
+        words = original(stage, at)
+        return words[:2] + (words[2] & ~0x500000, words[3]) if words else None
+    G.Stage.literal_vcc_sampler_words = wrong_filter
+    try:
+        pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(), root_blob())
+        assert sampler_line(pipe) == 'smpl 0 0x92 0xc00000 0x18000000 0x0'
+        assert vcc_sampler_reference(0x92, 0x18500000, 0.5, 0.5) != vcc_sampler_reference(0x92, 0x18000000, 0.5, 0.5)
+    finally:
+        G.Stage.literal_vcc_sampler_words = original
+
+
+def vcc_sampler_reference(word0, word2, u, v):
+    # RDNA 2 ISA, 8.2.7 Image Sampler: clamp modes and XY filter fields.
+    modes = (word0 & 7, (word0 >> 3) & 7)
+    linear = ((word2 >> 20) & 3) == 1 and ((word2 >> 22) & 3) == 1
+    assert all(mode in (0, 2) for mode in modes)
+    def address(index, mode):
+        return index % 2 if mode == 0 else max(0, min(1, index))
+    def weights(coord, mode):
+        if not linear:
+            return [(address(math.floor(coord * 2), mode), 1.0)]
+        position = coord * 2 - 0.5
+        low = math.floor(position)
+        return [(address(low, mode), 1 - (position - low)), (address(low + 1, mode), position - low)]
+    color = [0.0] * 4
+    for x, wx in weights(u, modes[0]):
+        for y, wy in weights(v, modes[1]):
+            texel = ((1 + x + 2 * y) / 8, float(x), float(y), 0.0)
+            for c in range(4):
+                color[c] += texel[c] * wx * wy
+    return ','.join('%08x' % struct.unpack('<I', struct.pack('<f', channel))[0] for channel in color)
 
 
 def bias_code(forms, word2=LINEAR_MIP | 0x3f80, word1=BIAS_LIMITS):
@@ -324,6 +478,9 @@ def controls(only=None):
     assert WORDS, 'no recorded words'
     if only is None:
         bias_controls()
+        vcc_sampler_controls()
+        assert vcc_sampler_reference(0x92, 0x18500000, 0.5, 0.5) != vcc_sampler_reference(0x92, 0x18000000, 0.5, 0.5)
+        assert vcc_sampler_reference(0x92, 0x18500000, 1.25, 0.5) != vcc_sampler_reference(0, 0x18500000, 1.25, 0.5)
     for form, (_, op, w1, mip, plain_mip) in FORMS.items():
         if only and form != only:
             continue
@@ -440,6 +597,23 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen_lod_%s' % kind, vs_profile, directory)
+            for word0, word2, coordinate, bits in ((0x92, 0x18500000, 0.5, 0x3f000000),
+                                                    (0x92, 0x18000000, 0.5, 0x3f000000),
+                                                    (0x92, 0x18500000, 1.25, 0x3fa00000),
+                                                    (0, 0x18500000, 1.25, 0x3fa00000)):
+                pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(word0=word0, word2=word2, coordinate=bits), root_blob())
+                shader = compile_hlsl(compiler, kind, pipe.hlsl_ps(),
+                                      'ps_vcc_%x_%x_%x_%s' % (word0, word2, bits, kind), ps_profile, directory)
+                expected = vcc_sampler_reference(word0, word2, coordinate, 0.5)
+                run = subprocess.run([renderer, adapter, '--startup-image-2d', str(vs), str(shader), '0', expected,
+                                      sampler_line(pipe)], capture_output=True, text=True)
+                sys.stdout.write(run.stdout)
+                if run.returncode == 77:
+                    sys.exit(77)
+                if run.returncode:
+                    raise AssertionError('VCC sampler draw: %s\n%s' % (run.stdout, run.stderr))
+                if 'debug_layer=enabled' in run.stdout:
+                    assert 'debug_errors=0 debug_warnings=0' in run.stdout
             for form, (_, op, w1, mip, plain_mip) in FORMS.items():
                 pipe = stage('%s limits' % form)
                 shader = compile_hlsl(compiler, kind, drawable(form, pipe.hlsl_ps()), 'ps_lod_%s_%s' % (form, kind),
