@@ -95,7 +95,8 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     auto* list = commands.list.Get();
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     ComPtr<ID3D12Resource> source;
-    ComPtr<ID3D12DescriptorHeap> views;
+    ComPtr<ID3D12DescriptorHeap> views, image_rtvs;
+    ComPtr<ID3D12Resource> images[2];
     if (dynamic_heap) {
         constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
         constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
@@ -106,7 +107,8 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
         for (UINT i = 0; i < 3; ++i)
             std::memcpy(static_cast<unsigned char*>(mapped) + i * buffer_stride, values + i, sizeof(values[i]));
         source->Unmap(0, nullptr);
-        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+        // Slots 0..2 are raw buffers; slots 3 and 4 are 1x1 float textures holding one distinct texel each.
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create raw fixture heap");
         auto cpu = views->GetCPUDescriptorHandleForHeapStart();
@@ -116,6 +118,33 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
                                                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
             srv.Buffer = {i * (buffer_stride / 4), 1, 0, D3D12_BUFFER_SRV_FLAG_RAW};
             device->CreateShaderResourceView(source.Get(), &srv, cpu);
+        }
+        D3D12_RESOURCE_DESC image_desc{};
+        image_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        image_desc.Width = 1;
+        image_desc.Height = 1;
+        image_desc.DepthOrArraySize = 1;
+        image_desc.MipLevels = 1;
+        image_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        image_desc.SampleDesc.Count = 1;
+        image_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        static constexpr float texels[2][4]{{1.25f, 2.5f, 4.0f, 8.0f}, {16.0f, 32.0f, 64.0f, 128.0f}};
+        const D3D12_DESCRIPTOR_HEAP_DESC image_rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+        check(device->CreateDescriptorHeap(&image_rtv_desc, IID_PPV_ARGS(&image_rtvs)), "Create heap fixture RTV heap");
+        auto image_rtv = image_rtvs->GetCPUDescriptorHandleForHeapStart();
+        const UINT rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        for (UINT i = 0; i < 2; ++i, cpu.ptr += increment, image_rtv.ptr += rtv_increment) {
+            D3D12_CLEAR_VALUE value{DXGI_FORMAT_R32G32B32A32_FLOAT, {}};
+            std::memcpy(value.Color, texels[i], sizeof(value.Color));
+            images[i] = resource(device, image_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &value);
+            device->CreateRenderTargetView(images[i].Get(), nullptr, image_rtv);
+            list->ClearRenderTargetView(image_rtv, value.Color, 0, nullptr);
+            transition(list, images[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            view.Texture2D = {0, 1, 0, 0.0f};
+            device->CreateShaderResourceView(images[i].Get(), &view, cpu);
         }
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);

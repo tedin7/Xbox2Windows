@@ -1,0 +1,255 @@
+"""A vertex stage loads a resource heap record inside a branch (tools/startup/gfx2hlsl.py, dynamic_heap_record).
+
+  (no arguments)   translation controls, pure Python
+  dxc <dxc.exe>    also compile the translated vertex stage as vs_6_6 with that DXC
+  warp <offscreen_check> <dxc.exe>   draw both vertex fixtures on WARP and compare the target (with a mutant)
+
+The register-offset `s_load_dwordx4 sD, s[ptr:ptr+1], sOFF` was refused in any program that had a branch target, so a
+vertex stage that loads the record in a branch arm could not be translated. The fixture is the flat-parameter vertex
+stage with a record load inside an arm, entered when a root constant is non-zero. A second uniform branch splits the
+arm, so the buffer read that uses the descriptor is in a later block than the load. The index temporary must
+therefore be declared once at the top of the function and assigned in the block of the load.
+
+Controls, each of which must stay refused:
+- a pixel stage with the same load in a branch (only the vertex stage declares the index outside its block);
+- a record index that is a lane mask, not a wave-uniform value;
+- a record loaded in one arm and read after the join, where the other path holds no descriptor.
+
+The words are encoded from the SOP1 / SOP2 / SOPC / SOPP, SMEM and MUBUF field layouts that
+`tools/disasm_rdna2.py` decodes. The first test below checks them against the decoded text.
+"""
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from startup_gfx2hlsl_dynamic_heap_check import G, root_blob, compile_shader
+from startup_flat_param_check import PS_WORDS, VS_WORDS
+
+
+def sop1(op, dst, src):
+    return struct.pack('<I', 0xBE800000 | (dst << 16) | (op << 8) | src)
+
+
+def sopc(op, a, b):
+    return struct.pack('<I', 0xBF000000 | (op << 16) | (b << 8) | a)
+
+
+def sopp(op, imm=0):
+    return struct.pack('<I', 0xBF800000 | (op << 16) | (imm & 0xFFFF))
+
+
+def smem(op, sdata, sbase, soffset):
+    return struct.pack('<II', 0xF4000000 | (op << 18) | (sdata << 6) | (sbase >> 1), soffset << 25)
+
+
+def mubuf(op, vdata, vaddr, srsrc):
+    """MUBUF with offen: the vector address register holds the byte offset."""
+    return struct.pack('<II', 0xE0000000 | (op << 18) | (1 << 12),
+                       0x80000000 | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr)
+
+
+S_MOV_B32, S_ENDPGM, S_WAITCNT, S_CBRANCH_SCC1, S_CMP_EQ_U32 = 0x03, 0x01, 0x0C, 0x05, 0x06
+S_LOAD_DWORDX4, BUFFER_LOAD_DWORD = 0x02, 0x0C
+LGKM0, VM0, VCC_LO, ZERO, ONE = 0xC07F, 0x3F70, 106, 128, 129
+V_MOV_V11_0 = bytes.fromhex('8002167e')
+S_HEAP, S_OFFSET, S_COND, S_RECORD = 10, 8, 9, 16  # heap pointer, byte offset and a root constant, s[16:19]
+
+HEAD, EXPORTS = VS_WORDS[:-20], VS_WORDS[-20:]  # everything before the exports; the two exports and s_endpgm
+
+
+def assemble(items):
+    """items: bytes, or 'join' (a branch to the end of the arm), or ('back', n) (a branch back to item n)."""
+    sizes = [4 if not isinstance(i, bytes) else len(i) for i in items]
+    at = [sum(sizes[:n]) for n in range(len(items) + 1)]
+    out = []
+    for n, item in enumerate(items):
+        if item == 'join':
+            item = sopp(S_CBRANCH_SCC1, (at[-1] - (at[n] + 4)) // 4)
+        elif isinstance(item, tuple):
+            item = sopp(S_CBRANCH_SCC1, (at[item[1]] - (at[n] + 4)) // 4)
+        out.append(item)
+    return b''.join(out)
+
+
+COND = sopc(S_CMP_EQ_U32, S_COND, ZERO)
+COND_ONE = sopc(S_CMP_EQ_U32, S_COND, ONE)
+LOAD = smem(S_LOAD_DWORDX4, S_RECORD, S_HEAP, S_OFFSET)
+READ = mubuf(BUFFER_LOAD_DWORD, 8, 11, S_RECORD)
+SETUP = [sop1(S_MOV_B32, S_HEAP + 1, ZERO), V_MOV_V11_0]
+
+
+def vertex(arm):
+    return HEAD + assemble(SETUP + [COND, 'join'] + arm) + EXPORTS
+
+
+# The load in the arm, a second branch, then the read in the next block.
+ARM = [LOAD, sopp(S_WAITCNT, LGKM0), COND_ONE, 'join', READ, sopp(S_WAITCNT, VM0)]
+# The load in the arm; the read after the join sees one path with a descriptor and one without.
+AFTER_JOIN = [LOAD, sopp(S_WAITCNT, LGKM0)]
+AFTER_JOIN_VS = HEAD + assemble(SETUP + [COND, 'join'] + AFTER_JOIN) + READ + sopp(S_WAITCNT, VM0) + EXPORTS
+# The record index is a lane mask copied into an SGPR.
+MASK_INDEX_VS = HEAD + assemble(SETUP + [sop1(S_MOV_B32, 12, VCC_LO), COND, 'join'] + [
+    smem(S_LOAD_DWORDX4, S_RECORD, S_HEAP, 12), sopp(S_WAITCNT, LGKM0), READ, sopp(S_WAITCNT, VM0)]) + EXPORTS
+# The pixel stage: the same load and read in an arm.
+PS_BRANCHED = assemble([sop1(S_MOV_B32, S_HEAP + 1, ZERO), COND, 'join', LOAD, sopp(S_WAITCNT, LGKM0),
+                        bytes.fromhex('8002087e'), mubuf(BUFFER_LOAD_DWORD, 5, 4, S_RECORD),
+                        sopp(S_WAITCNT, VM0)]) + bytes.fromhex('0f1800f805050505') + sopp(S_ENDPGM)
+
+# The load and the read inside a loop: every pass reloads the record, so the index is assigned again each pass.
+LOOP_VS = HEAD + assemble(SETUP + [LOAD, sopp(S_WAITCNT, LGKM0), READ, sopp(S_WAITCNT, VM0), COND_ONE, ('back', 2)]) + EXPORTS
+
+# Part 2: the loaded record is rewritten into a raw buffer descriptor before the read (the structured-to-raw
+# conversion): stride in bits 16..29 of word 1 becomes the multiplier of NUM_RECORDS, the stride field is cleared and
+# the out-of-range select in word 3 is set. Encoded with llvm-mc (gfx1030, wave32) and checked by the decode test.
+S_BFE_STRIDE = bytes.fromhex('11ff949310000e00')      # s_bfe_u32 s20, s17, 0xe0010
+S_MAX_STRIDE = bytes.fromhex('14819484')              # s_max_u32 s20, s20, 1
+S_MUL_RECORDS = bytes.fromhex('12141293')             # s_mul_i32 s18, s18, s20
+S_CLEAR_STRIDE = bytes.fromhex('11ff1187ffff00c0')    # s_and_b32 s17, s17, 0xc000ffff
+S_CLEAR_OOB = bytes.fromhex('13ff1387ffffffcf')       # s_and_b32 s19, s19, 0xcfffffff
+S_SET_OOB = bytes.fromhex('13ff138800000030')         # s_or_b32 s19, s19, 0x30000000
+REWRITE = [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE, S_CLEAR_OOB, S_SET_OOB]
+# Every word of the same quadruple is needed: each control drops or changes one step.
+REWRITE_CONTROLS = {
+    'no out-of-range select': REWRITE[:5],
+    'stride field kept': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_OOB, S_SET_OOB],
+    'stride mask too wide': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE.replace(b'\xff\xff\x00\xc0', b'\xff\xff\x01\xc0'),
+                             S_CLEAR_OOB, S_SET_OOB],
+    'records not scaled': [S_BFE_STRIDE, S_MAX_STRIDE, S_CLEAR_STRIDE, S_CLEAR_OOB, S_SET_OOB],
+    'select value changed': [S_BFE_STRIDE, S_MAX_STRIDE, S_MUL_RECORDS, S_CLEAR_STRIDE, S_CLEAR_OOB,
+                             S_SET_OOB.replace(b'\x00\x00\x00\x30', b'\x00\x00\x00\x20')],
+}
+# The same read, with the rewritten descriptor.
+REWRITE_ARM = [LOAD, sopp(S_WAITCNT, LGKM0)] + REWRITE + [READ, sopp(S_WAITCNT, VM0)]
+# The result of the read copied into all four parameter words, so the target holds one value four times (a plain
+# copy: no denormal or NaN words to flush).
+COPY_V8 = bytes.fromhex('08030c7e08030e7e0803127e')   # v_mov_b32 v6, v8 / v7, v8 / v9, v8
+
+
+def vertex_copy(arm):
+    return HEAD + assemble(SETUP + [COND, 'join'] + arm) + COPY_V8 + EXPORTS
+
+
+REFUSAL = "s_load with a register offset through ('resheap',)"
+
+
+def translate(vs, ps=PS_WORDS):
+    pipe = G.Pipeline(vs, ps, root_blob())
+    return pipe, pipe.hlsl_vs(), pipe.hlsl_ps()
+
+
+def refusal(vs, ps=PS_WORDS):
+    try:
+        translate(vs, ps)
+    except G.Unsupported as reason:
+        return str(reason)
+    return None
+
+
+def expect(label, condition, detail=''):
+    print('%s: %s' % (label, 'ok' if condition else 'MISMATCH'))
+    if not condition:
+        sys.exit('%s %s' % (label, detail))
+
+
+def main(dxc=None):
+    vs = vertex(ARM)
+    decoded = [asm for _, _, _, asm in G.decode(vs)]
+    tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
+            's_load_dwordx4 s[16:19], s[10:11], s8', 's_waitcnt lgkmcnt(0)', 's_cmp_eq_u32 s9, 1',
+            's_cbranch_scc1 label_0x%x', 'buffer_load_dword v8, v11, s[16:19], 0 offen', 's_waitcnt vmcnt(0)']
+    start = len(G.decode(HEAD))
+    expect('fixture decodes', [re.sub(r'label_0x[0-9a-f]+', 'label_0x%x', asm) for asm in decoded[start:start + 10]] == tail,
+           str(decoded[start:start + 10]))
+    pipe, vs_source, ps_source = translate(vs)
+    expect('manifest names the dynamic heap', 'dynamic_heap\n' in pipe.manifest())
+    lines = vs_source.splitlines()
+    names = sorted(set(re.findall(r'heap_index_[0-9a-f]+', vs_source)))
+    expect('one index temporary', len(names) == 1, str(names))
+    name = names[0]
+    declared = [i for i, line in enumerate(lines) if re.fullmatch(r'\s*uint %s = 0;' % name, line)]
+    assigned = [i for i, line in enumerate(lines) if line.strip().startswith(name + ' = (')]
+    used = [i for i, line in enumerate(lines) if 'x2w_heap_load(' + name in line]
+    blocks = [i for i, line in enumerate(lines) if re.match(r'\s*(\[branch\] )?(else )?if \(pc == \d+\) \{', line)]
+    expect('declared once before the first block', len(declared) == 1 and declared[0] < blocks[0])
+    expect('assigned once, read later', len(assigned) == 1 and used and min(used) > assigned[0])
+    expect('the read is in another block than the load', any(assigned[0] < b < min(used) for b in blocks))
+    if dxc:
+        with tempfile.TemporaryDirectory() as tmp:
+            compile_shader(dxc, Path(tmp), 'vs_6_6', vs_source)
+        print('dxc vs_6_6 compile: ok')
+
+    reason = refusal(VS_WORDS, PS_BRANCHED)
+    expect('pixel stage branch refused', reason == REFUSAL, str(reason))
+    reason = refusal(MASK_INDEX_VS)
+    expect('lane-mask index refused', reason == REFUSAL, str(reason))
+    reason = refusal(AFTER_JOIN_VS)
+    expect('record read after the join refused', reason is not None, str(reason))
+    loop_source = translate(LOOP_VS)[1]
+    loop_lines = loop_source.splitlines()
+    set_at = [i for i, line in enumerate(loop_lines) if re.match(r'\s*heap_index_[0-9a-f]+ = \(', line)]
+    read_at = [i for i, line in enumerate(loop_lines) if 'x2w_heap_load(heap_index_' in line]
+    expect('loop: assigned and read in the same pass', len(set_at) == 1 and len(read_at) == 1 and read_at[0] == set_at[0] + 2
+           and '[loop] for' in loop_source)
+    print('heap record in a branch: controls matched')
+    rewrite_controls()
+
+
+def rewrite_controls():
+    decoded = [asm for _, _, _, asm in G.decode(assemble(REWRITE))]
+    expect('rewrite decodes', decoded == [
+        's_bfe_u32 s20, s17, 0xe0010', 's_max_u32 s20, s20, 1', 's_mul_i32 s18, s18, s20',
+        's_and_b32 s17, s17, 0xc000ffff', 's_and_b32 s19, s19, 0xcfffffff', 's_or_b32 s19, s19, 0x30000000'], str(decoded))
+    pipe, vs_source, _ = translate(vertex_copy(REWRITE_ARM))
+    expect('rewritten record translates', 'dynamic_heap\n' in pipe.manifest() and 'x2w_heap_load(' in vs_source)
+    for label, steps in REWRITE_CONTROLS.items():
+        reason = refusal(vertex_copy([LOAD, sopp(S_WAITCNT, LGKM0)] + steps + [READ, sopp(S_WAITCNT, VM0)]))
+        expect('rewrite refused: ' + label, reason == 'dynamic resource heap descriptor requires four intact words', str(reason))
+    print('heap record rewrite: controls matched')
+
+
+def draw(offscreen, vs, ps, offset, reference, count, negative=False):
+    """One draw of the vertex stage that reads heap record `offset` (ud1) when ud2 is 2."""
+    entry = [0] * count + [2]
+    entry[1], entry[2] = offset, 2
+    as_hex = lambda words: ','.join('%08x' % word for word in words)
+    result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
+                             as_hex([reference] * 4)], capture_output=True, text=True)
+    if result.returncode == 77:
+        print(result.stdout, end='')
+        sys.exit(77)
+    expect('draw offset %d%s' % (offset, ' (mutant)' if negative else ''), result.returncode == int(negative),
+           result.stdout + result.stderr)
+    if negative:
+        expect('mutant reads another record', 'startup_entry_words mismatch' in result.stderr, result.stderr)
+
+
+def mutate(source, old, new):
+    expect('mutation site ' + old, source.count(old) == 1, source)
+    return source.replace(old, new)
+
+
+def warp(offscreen, dxc):
+    """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
+    record chosen by a root constant inside a branch; the target must hold the word the record names."""
+    for label, arm in (('branch', ARM), ('rewrite', REWRITE_ARM)):
+        pipe, vs_source, ps_source = translate(vertex_copy(arm))
+        count = len(pipe.uds)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
+            ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+            draw(offscreen, vs, ps, 0, 0x3fa00000, count)
+            draw(offscreen, vs, ps, 32, 0x40200000, count)
+            wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(vs_source, ') >> 5;', ') >> 6;'))
+            draw(offscreen, wrong, ps, 32, 0x40200000, count, negative=True)
+        print('heap record %s: readback and mutant matched' % label)
+
+
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['warp']:
+        warp(*sys.argv[2:4])
+    else:
+        main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())
