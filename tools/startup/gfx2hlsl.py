@@ -3758,7 +3758,7 @@ class Stage:
                 branches.append((off, target))
         if getattr(self, 'kind', None) == 'cs':
             self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
-        if getattr(self.pipe, 'retry_raw_uav', False):
+        if self.raw_uav_retry():
             self.descriptor_carry_pairs = {
                 low_pc: high_pc
                 for ((low_pc, _, low, _), (high_pc, _, high, _)) in zip(self.ins, self.ins[1:])
@@ -5262,7 +5262,7 @@ class Stage:
             hi = reg_range(ops[1]) if len(ops) == 3 else None
             if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
                 self.scc_uniform = False
-            if self.kind == 'cs' and self.writable_descriptor_carry(ops):
+            if getattr(self, 'kind', None) == 'cs' and self.writable_descriptor_carry(ops):
                 return None
             if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
                 return None
@@ -5971,7 +5971,7 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
-            elif (getattr(self.pipe, 'retry_raw_uav', False) and raw is None
+            elif (self.raw_uav_retry() and raw is None
                   and self.writable_descriptor_alu(base, d, srcs, syms)):
                 pass
             elif (own and own[0] == 'ptr' and base in ('s_add_u32', 's_addc_u32')
@@ -6138,7 +6138,7 @@ class Stage:
             high_source = 's%d' % high if high is not None else srcs[0]
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
-        if (getattr(self.pipe, 'retry_raw_uav', False) and base == 's_mov_b32'
+        if (self.raw_uav_retry() and base == 's_mov_b32'
                 and syms[0] and syms[0][0] == 'ud'):
             # Keep the ordinary scalar assignment and remember its entry-constant provenance
             # for count replacement, subject to the sole-reaching-writer proof at the store.
@@ -7064,6 +7064,10 @@ class Stage:
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
+    def raw_uav_retry(self):
+        """True on the retry pass that models bounded raw UAV writes (a Stage without a pipeline never retries)."""
+        return bool(getattr(getattr(self, 'pipe', None), 'retry_raw_uav', False))
+
     def writable_descriptor_alu(self, op, dst, srcs, syms):
         """Keep the original descriptor identity and the operand of a supported edit."""
         if op not in ('s_add_u32', 's_min_u32', 's_or_b32') or len(syms) != 2:
@@ -7216,7 +7220,7 @@ class Stage:
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
-        extended = getattr(self.pipe, 'retry_raw_uav', False)
+        extended = self.raw_uav_retry()
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
                 offset += int(m[7:], 0)
@@ -7239,12 +7243,20 @@ class Stage:
         bounded = idxen
         try:
             key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
-        except Unsupported:
+        except Unsupported as plain_refusal:
             if not extended:
                 raise
+            first_refusal = plain_refusal
             bounded = True
         if bounded:
-            key, base, stride, limit, raw = self.writable_descriptor(ops[2], kind_label, idxen)
+            try:
+                key, base, stride, limit, raw = self.writable_descriptor(ops[2], kind_label, idxen)
+            except Unsupported as retry_refusal:
+                # A named edited word is the more precise reason; otherwise keep the first one, which names the
+                # descriptor form (the retry's "holding" reason only says it was not a table descriptor).
+                if idxen or ('modified descriptor (word' in str(retry_refusal) and '(word 0)' not in str(retry_refusal)):
+                    raise
+                raise first_refusal from None
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             if not offen and not idxen and not uniform_off:
