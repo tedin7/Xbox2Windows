@@ -285,7 +285,8 @@ def draw_descriptor_number(dxc, renderer, adapter):
 
 
 def descriptor_limits_pipeline(size_word=2, invert=False):
-    from startup_gfx2hlsl_sload_s104_check import TABLE_ROOT, vs_words
+    from startup_gfx2hlsl_sload_s104_check import TABLE_ROOT
+    from startup_image_3d_check import VS_WORDS
     from startup_gfx2hlsl_scalar_null_check import POST_WORDS, smem, sop2, sopc, sopp, vop2
     from startup_image_sample_a16_check import DIM_2D, encode_mimg
 
@@ -317,7 +318,7 @@ def descriptor_limits_pipeline(size_word=2, invert=False):
         body += vop2(0x25, coord, 266, coord)
         body += vop2(0x13, coord, limit, coord)
     body += encode_mimg(0, dim=DIM_2D, vaddr=8, vdata=12, srsrc=64) + sopp(0x0c)
-    return G.Pipeline(vs_words([(0, 0, 0)] * 4), body + POST_WORDS, TABLE_ROOT,
+    return G.Pipeline(VS_WORDS, body + POST_WORDS, TABLE_ROOT,
                       ps_hw_inputs=(0x8000, 0x8000))
 
 
