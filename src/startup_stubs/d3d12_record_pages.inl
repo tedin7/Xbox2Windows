@@ -19,8 +19,12 @@ constexpr std::size_t page_slab_bytes = 1u << 20;
 
 struct PageRange { u64 address, bytes; };
 // Draw capture state (pages_lock).
-std::unordered_map<u64, std::vector<PageRange>> draw_pending;
-std::vector<PageRange> draw_ranges;
+constexpr u64 draw_root_window = 0x10000;   // a root address has no size: the stand-in reads up to 64 KiB from it
+constexpr u64 draw_span_limit = 4ull << 20;  // larger vertex/index spans are left to the page scans
+constexpr std::size_t draw_pending_limit = 64;
+std::unordered_map<u64, std::vector<PageRange>> draw_pending;  // list -> spans bound since its last draw or dispatch
+std::vector<PageRange> draw_ranges;  // the title ranges by address
+bool draw_ranges_missed;             // gathered again this Present for a span outside them
 LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_outside, draw_over_time, draw_pending_dropped;
 double draw_time_used;
@@ -512,18 +516,28 @@ bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
 void draw_capture_span(const PageRange& span, LONG present, u64 stamp, const LARGE_INTEGER& start)
 {
     if (draw_time_exhausted(start, 1)) return;
-    const PageRange* range = draw_find_range(span.address);
-    if (!range && draw_ranges_present != present) {
+    // The title ranges are gathered again at the first capture of each Present (resources come and go), and once more
+    // in that Present when a span falls outside them (a resource made since).
+    const auto gather = [&] {
         u64 unsized = 0, big = 0;
         draw_ranges = page_merge_ranges(true, unsized, big);
+    };
+    if (draw_ranges_present != present) {
+        gather();
         draw_ranges_present = present;
+        draw_ranges_missed = false;
+    }
+    const PageRange* range = draw_find_range(span.address);
+    if (!range && !draw_ranges_missed) {
+        draw_ranges_missed = true;
+        gather();
         range = draw_find_range(span.address);
     }
     if (!range) { ++draw_outside; return; }
     if (page_after_cut(*range)) return;
     constexpr u64 mask = x2w_replay::page_bytes - 1;
     const u64 end = (std::min)(range->address + range->bytes,
-        (span.address + (std::min<u64>)(span.bytes, 4u << 20) + mask) & ~mask);
+        (span.address + (std::min<u64>)(span.bytes, draw_span_limit) + mask) & ~mask);
     bool captured = false;
     for (u64 at = span.address & ~mask; at < end; at += page_slab_bytes) {
         if (page_budget_or_cap_reached() || draw_time_exhausted(start, 1)) break;
@@ -543,7 +557,7 @@ void draw_add_pending(u64 list, u64 address, u64 bytes)
         span.bytes = (std::max)(span.bytes, bytes);
         return;
     }
-    if (spans.size() == 64) { ++draw_pending_dropped; return; }
+    if (spans.size() == draw_pending_limit) { ++draw_pending_dropped; return; }
     spans.push_back({address, bytes});
 }
 
@@ -568,8 +582,8 @@ void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
         draw_consume_pending(list, present, stamp, start);
     } else if (!draw_time_exhausted(start, 1)) {
         if (slot <= 46) {
-            if (r8) draw_capture_span({r8, 0x10000}, present, stamp, start);
-            draw_add_pending(list, r8, 0x10000);
+            if (r8) draw_capture_span({r8, draw_root_window}, present, stamp, start);  // slot 44 copies it now
+            draw_add_pending(list, r8, draw_root_window);  // and a draw reads the root address again
         } else if (slot == 47) {
             D3D12_INDEX_BUFFER_VIEW view{};
             if (rdx && copy_readable(rdx, &view, sizeof(view)))
@@ -623,10 +637,11 @@ u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool
     }
     const bool draw_slot = kind == list_kind &&
         (slot == 12 || slot == 13 || slot == 14 || slot == 61 || (slot >= 41 && slot <= 48));
+    // No flush here: the chunks stay in the thread buffer (page_sink writes it out past 1 MiB, record_call when it is
+    // full), so a draw costs no file write.
     if (draw_slot && draw_pages && window_open && page_writer && !page_budget_reached && !stop_requested && active) {
         page_target = &b;
         draw_pages_at_call(slot, rcx, rdx, r8, r9, seq - 1);
-        page_flush_target();
         page_target = nullptr;
     }
     ReleaseSRWLockExclusive(&pages_lock);

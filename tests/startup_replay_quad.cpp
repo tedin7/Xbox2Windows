@@ -27,6 +27,9 @@ namespace {
 
 constexpr UINT width = 64, height = 32;
 constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
+// X2W_TEST_REPLAY_TITLE_RANGE=ring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
+// recorder's 64 KiB root window, so each binding's capture is needed on its own), and clears both before its Present.
+constexpr UINT ring_slice_bytes = 0x20000, ring_vb_offset = 0x10000;
 enum class TitleRange { none, root, generated, supplied, ring };
 
 struct Scene {
@@ -330,7 +333,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     unsigned char* slice = nullptr;
     if (s.ring) {
         if (frame >= 8) return 47;
-        slice = s.ring + frame * 0x20000;
+        slice = s.ring + frame * ring_slice_bytes;
         constexpr float colours[4][4] = {
             {1.0f, 0.0f, 0.5f, 1.0f}, {0.0f, 1.0f, 0.25f, 1.0f},
             {0.75f, 0.25f, 0.0f, 1.0f}, {0.25f, 0.75f, 1.0f, 1.0f},
@@ -338,7 +341,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         const auto& parts = colours[frame % 4];
         const float vertices[3][4] = {{parts[2], parts[3]}, {}, {}};
         std::memcpy(slice, parts, 2 * sizeof(float));
-        std::memcpy(slice + 0x1000, vertices, sizeof(vertices));
+        std::memcpy(slice + ring_vb_offset, vertices, sizeof(vertices));
     }
     const float t = s.constants ? 0.0f : static_cast<float>(frame) / static_cast<float>(frames);
     if (s.constants) {
@@ -391,7 +394,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
             if (slice) {
                 invoke(s.list, 34, arg(stream_root_signature()));
                 invoke(s.list, 44, 0, arg(slice));
-                const D3D12_VERTEX_BUFFER_VIEW view{arg(slice + 0x1000), 48, 16};
+                const D3D12_VERTEX_BUFFER_VIEW view{arg(slice + ring_vb_offset), 48, 16};
                 invoke(s.list, 48, 0, 1, arg(&view));
             } else if (s.constants) {
                 invoke(s.list, 34, arg(stream_root_signature()));
@@ -409,7 +412,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     invoke(s.queue, 10, 1, arg(&s.list));
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
-        std::memset(slice, 0, 0x2000);
+        std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
     }
     if (!s.signature) {
         // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.

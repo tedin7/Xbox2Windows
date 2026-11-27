@@ -74,9 +74,10 @@ bool stamp_order_case(bool equal_stamp)
         writer.capture(address, b.data(), b.size(), 40);
         writer.capture(address, b.data(), b.size(), 41);
     } else {
+        // A draw reads A (stamp 10), an older-stamped rescan sees B (5), a later draw reads B (30): the replay applies
+        // B@5 before A@10, so B@30 must be written although the last capture was B.
         writer.capture(address, a.data(), a.size(), 10);
         writer.capture(address, b.data(), b.size(), 5);
-        writer.capture(address, a.data(), a.size(), 20);
         writer.capture(address, b.data(), b.size(), 30);
     }
 
