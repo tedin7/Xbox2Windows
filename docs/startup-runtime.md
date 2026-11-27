@@ -2014,6 +2014,14 @@ Submissions and Presents share the change-only page store and its `X2W_REPLAY_PA
 use the same round-robin `X2W_REPLAY_SCAN_MS` limit as Present rescans (default 250 ms). A submit MAP carries the
 submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
 
+The page budget (`X2W_REPLAY_PAGES_MAX_MIB`, default half of `X2W_REPLAY_MAX_MIB`; `tester_run.ps1 -RecordPagesMaxMiB`)
+is part of the window's cap. Resources larger than `X2W_REPLAY_PAGES_MAX_RANGE_MIB` (default 8;
+`tester_run.ps1 -RecordPageRangeMiB`) are left out. The base image written when the window opens may use 3/4 of the
+budget; if it stops there (`x2w-replay pages: the base image stopped at ...`), the range it stopped in and the larger
+ones stay out of the later scans, and the last quarter keeps the window's changed pages (per-frame descriptors,
+constants). `pages: budget of N MiB reached` means the later changes were lost too: the window then replays from stale
+memory, and the pictures are wrong.
+
 `X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
 (up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of
 descriptor heaps, including supplied memory and stand-in allocations whose CPU start the title has queried.

@@ -91,6 +91,21 @@ def main(scene, player, backend):
         compare(replay(player, recording, root / "full", backend, env), live)
         compare(replay(player, mutant, root / "mutant", backend, env), STALE)
         print("Two fenced readback pages match. Removing the second submit MAP leaves stale bytes.")
+
+        # A 2 MiB page budget and a 4 MiB buffer of distinct pages: the base image stops at 3/4 of the budget, so the
+        # second submit's changed page still reaches the file and the replay reads the late write.
+        cut = root / "cut.x2wr"
+        result = run([scene, backend, root / "cut_live.bin"], dict(
+            env, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+            X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(cut), X2W_REPLAY_PAGES="1",
+            X2W_REPLAY_PAGES_AT_SUBMIT="1", X2W_REPLAY_SCAN_MS="250", X2W_REPLAY_MAX_MIB="16",
+            X2W_REPLAY_PAGES_MAX_MIB="2", X2W_TEST_SUBMIT_PAGES_BIG="1"))
+        log = result.stdout + result.stderr
+        assert result.returncode == 0, (result.returncode, log[-3000:])
+        assert "the base image stopped at 1 MiB, 3/4 of the 2 MiB page budget" in log, log[-3000:]
+        assert "budget of 2 MiB reached" not in log, log[-3000:]
+        compare(replay(player, cut, root / "cut", backend, env), EXPECTED)
+        print("With the base image cut at 3/4 of a 2 MiB page budget the late write still replays.")
     return 0
 
 

@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -78,6 +79,22 @@ int scene(IDXGIAdapter* adapter, void* memory, const char* readback_path)
         !check(invoke(device, 73, list_desc, allocator, nullptr, &__uuidof(ID3D12GraphicsCommandList), &list), "compute list") ||
         !check(invoke(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence), &fence), "fence"))
         return 1;
+    // X2W_TEST_SUBMIT_PAGES_BIG=1: a second placed buffer of 4 MiB whose pages all differ, bigger than a small page budget.
+    if (GetEnvironmentVariableA("X2W_TEST_SUBMIT_PAGES_BIG", nullptr, 0)) {
+        constexpr UINT64 big_bytes = UINT64{4} << 20;
+        auto* big = static_cast<std::uint32_t*>(VirtualAlloc(reinterpret_cast<void*>(0x300000100000ull), big_bytes,
+                                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!big) {
+            std::fprintf(stderr, "Could not allocate the big buffer's title memory (error %lu)\n", GetLastError());
+            return 1;
+        }
+        for (std::uint32_t i = 0; i < big_bytes / sizeof(*big); ++i) big[i] = i + 1;
+        const auto big_desc = buffer_desc(big_bytes);
+        void* big_placed = nullptr;
+        if (!check(invoke(device, 133, static_cast<void*>(big), &big_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &resource,
+                          &big_placed), "big placed buffer"))
+            return 1;
+    }
 
     const unsigned char values[] = {0x2a, 0x59};
     for (UINT64 i = 0; i < 2; ++i) {

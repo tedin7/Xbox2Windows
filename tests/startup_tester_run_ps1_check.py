@@ -471,7 +471,11 @@ def check_shell(shell):
         assert auto_env["X2W_REPLAY_RECORD"] == "slow" and auto_env["X2W_REPLAY_MAX_MIB"] == "400" \
                 and auto_env["X2W_REPLAY_SHADERS"] == "0" and auto_env["X2W_REPLAY_PREFIX_MAX_MIB"] == "512", auto_env
         assert "uploaded" not in auto.stdout and "UPLOAD_THESE_FILES" not in auto.stdout, "-NoUpload keeps the recording local"
-        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64", "-RecordPrefixMaxMiB", "96")
+        pages = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64",
+                           "-RecordPagesMaxMiB", "64")
+        assert pages.returncode != 0 and "must be below -RecordMaxMiB" in (pages.stdout + pages.stderr), (pages.stdout[-500:], pages.stderr[-500:])
+        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64", "-RecordPrefixMaxMiB", "96",
+                         "-RecordPagesMaxMiB", "48", "-RecordPageRangeMiB", "32")
         assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])
         assert "recording: 2 files" in rec.stdout and "(cap 64 MiB)" in rec.stdout, rec.stdout[-1500:]
         newest_rec = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
@@ -479,7 +483,8 @@ def check_shell(shell):
             rec_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             rec_names = z.namelist()
         assert rec_manifest["env"]["X2W_REPLAY_RECORD"] == "140,60" and rec_manifest["env"]["X2W_REPLAY_MAX_MIB"] == "64" \
-                and rec_manifest["env"]["X2W_REPLAY_PREFIX_MAX_MIB"] == "96", rec_manifest["env"]
+                and rec_manifest["env"]["X2W_REPLAY_PREFIX_MAX_MIB"] == "96" and rec_manifest["env"]["X2W_REPLAY_PAGES_MAX_MIB"] == "48" \
+                and rec_manifest["env"]["X2W_REPLAY_PAGES_MAX_RANGE_MIB"] == "32", rec_manifest["env"]
         assert rec_manifest["record"]["files"] == 2 and rec_manifest["record"]["bytes"] >= 70000 and rec_manifest["record"]["spec"] == "140,60", rec_manifest["record"]
         assert not [n for n in rec_names if "replay.x2wr" in n], "the recording never travels inside the mail zip"
         uploads = list((tree / "out" / "tester").glob("record_*_upload"))
