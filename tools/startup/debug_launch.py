@@ -34,6 +34,7 @@ SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the perio
 from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes, shape_note  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from log_tail import tail_text  # noqa: E402
+from stall_watchdog import dump_request_filename  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 
@@ -188,8 +189,9 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
     stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at the timeout
-    dump_request = os.path.join(logdir, "dump_request")  # created from outside (stall watchdog): write threads_stall.txt now
-    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file, dump_request):  # a reused run directory starts clean
+    dump_request = os.path.join(logdir, "dump_request")
+    claimed_dump = os.path.join(logdir, "dump_request.claimed")
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file, dump_request, claimed_dump):
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -896,9 +898,13 @@ def main():
                 log(f"{now - start:7.3f} stop file found: ending the run")
                 ending = True
             if os.path.exists(dump_request):
-                os.remove(dump_request)
-                limited(dump_threads, os.path.join(logdir, "threads_stall.txt"))
-                log(f"{now - start:7.3f} threads dump requested from outside: threads_stall.txt")
+                os.replace(dump_request, claimed_dump)
+                with open(claimed_dump, encoding="utf-8", errors="replace") as request:
+                    name = dump_request_filename(request.read())
+                os.remove(claimed_dump)
+                log(f"{now - start:7.3f} threads dump requested from outside: {name}")
+                wait = 2 if name.startswith("threads_present_stall_") else SHUTDOWN_STEP_SECONDS
+                limited(dump_threads, os.path.join(logdir, name), seconds=wait)
             low = headroom.check(time.time())
             warning = headroom.take_warning()
             if warning:

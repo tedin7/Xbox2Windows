@@ -95,7 +95,8 @@ param(
     [int]$CommitWarnMiB = 2048,                 # a warning line in the log when the system commit has less than this free; 0 = off
     [int]$StallSeconds = 90,                    # stall watchdog: the run ends cleanly (zip packed) when frames presented, storage read, translator output and the window picture have all stood still this long; 0 = off
     [int]$StallMinSeconds = 150,                # the watchdog never ends a run before this many seconds
-    [int]$MemoryStopPercent = 95                # the watchdog also ends the run when the committed memory is at or above this percent of the commit limit in 2 samples in a row; 0 = off
+    [int]$MemoryStopPercent = 95,               # the watchdog also ends the run when the committed memory is at or above this percent of the commit limit in 2 samples in a row; 0 = off
+    [int]$PresentDumpSeconds = 15               # diagnostic threads dump when frames stop moving for this long; 0 = off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -460,10 +461,11 @@ try {
 # "tester_run: STALL STOP at N s: ..." and recorded as stop_reason in the manifest.
 $stallFile = Join-Path $logDir "stall_stop.json"
 $stallWatch = $null
-if ($StallSeconds -gt 0 -or $MemoryStopPercent -gt 0) {
+if ($StallSeconds -gt 0 -or $MemoryStopPercent -gt 0 -or $PresentDumpSeconds -gt 0) {
     try {
         $stallArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'stall_watchdog.py')`"", "`"$logDir`"", "--parent", "$PID", "--seconds", "$Seconds",
-            "--stall-seconds", "$StallSeconds", "--min-seconds", "$StallMinSeconds", "--memory-percent", "$MemoryStopPercent")
+            "--stall-seconds", "$StallSeconds", "--min-seconds", "$StallMinSeconds", "--memory-percent", "$MemoryStopPercent",
+            "--present-dump-seconds", "$PresentDumpSeconds")
         $stallWatch = Start-Process -FilePath $python -PassThru -NoNewWindow -ArgumentList $stallArgs
     } catch { Write-Warning "tester_run: the stall watchdog is off: $($_.Exception.Message)" }
 }
