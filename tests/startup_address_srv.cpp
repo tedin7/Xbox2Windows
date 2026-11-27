@@ -1073,8 +1073,8 @@ int draw_formatted_buffer(void* guest, void* list)
             static_cast<std::uint32_t>(address >> 32) | (4u << 16), 4u, (format << 12) | 4u};
         std::memcpy(reinterpret_cast<void*>(cpu), descriptor, sizeof(descriptor));
     };
-    store(red, 2);
-    draw_at(1);  // Unknown FORMAT, readable descriptor and range.
+    store(red, 3);
+    draw_at(1);  // FORMAT 3 has no decode even in the default extended table; readable descriptor and range.
     store(zeros, 22);
     draw_at(2);  // Real zero data with a supported R32_FLOAT descriptor.
     store(nullptr, 22);

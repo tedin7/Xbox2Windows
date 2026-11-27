@@ -374,7 +374,9 @@ def controls():
         assert all(words[v * 4 + 3] for v in range(16)), label  # an xyz translation leaves this register 0
     for op, count in ((0, 1), (1, 2), (2, 3), (3, 4)):
         source = pipeline_mubuf(4, op).hlsl_vs()
-        assert source.count('case ') == len(FORMATS), op
+        # One case per decoded FORMAT: the extended table by default, the FORMATS subset with the switch at 0.
+        cases = len(gfx2hlsl.DESC_FORMAT_CODES) if gfx2hlsl.extended_buffer_formats() else len(FORMATS)
+        assert source.count('case ') == cases, (op, source.count('case '), cases)
         # An unvalidated FORMAT yields the NaN sentinel in every component, never silent zeros.
         assert 'default: c0 = c1 = c2 = c3 = %du;' % gfx2hlsl.DESC_FORMAT_UNKNOWN in source, op
         assert 'default: break' not in source, op

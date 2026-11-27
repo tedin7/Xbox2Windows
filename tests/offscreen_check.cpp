@@ -1705,7 +1705,8 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 // target must hold, compared bit for bit.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
-    const bool dynamic_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    const bool record_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap-records";
+    const bool dynamic_heap = record_heap || std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
     if (dynamic_heap) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
@@ -1718,8 +1719,22 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
     if (expected.size() != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::vector<std::vector<std::uint32_t>> records;
+    if (record_heap) {
+        std::string_view input(ctx.argv[7]);
+        while (!input.empty()) {
+            const auto separator = input.find(';');
+            auto record = parse_hex_words(input.substr(0, separator));
+            if (record.empty() || record.size() > 64) return {OutcomeKind::fail, "invalid heap record"};
+            records.push_back(record);
+            if (separator == std::string_view::npos) break;
+            input.remove_prefix(separator + 1);
+            if (input.empty()) return {OutcomeKind::fail, "empty heap record"};
+        }
+        if (records.empty() || entry.back() >= records.size()) return {OutcomeKind::fail, "missing heap format info"};
+    }
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap, records);
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1861,6 +1876,7 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
+    {"--startup-dynamic-heap-records", 8, 8, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},

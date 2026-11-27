@@ -17,7 +17,7 @@ of its `.fail` text (the translator's own message; a compiler message is cut to 
 run used its first and last use in seconds since the process started (the refused keys used latest are listed first). Never
 shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
 `shader_requests/`: the request files (req_<key>.*) of the 40 worst refused keys, ranked by draws not drawn (graphics) or dispatches
-without a translation (compute) from stderr.txt, at most 4 MB in all, listed in the manifest (`request_files`). Private data: mailed, never posted.
+refused at runtime (compute and mesh57) from stderr.txt, at most 4 MB in all, listed in the manifest (`request_files`). Private data: mailed, never posted.
 
 `null-inputs.txt` includes render-target windows, starved targets, and the most frequent target for each refused
 graphics pipeline when present in the log.
@@ -436,10 +436,11 @@ def key_use(logdir):
     return found
 
 
-def format_results(rows, use=None):
+def format_results(rows, use=None, dispatches=None):
     """Text for the zip: totals, the refusals ranked by normalized reason, the refused keys used latest, then one line per
     key. use is key_use(): a key a draw or Dispatch used carries first=, last= (seconds since the process started) and uses=."""
     use = use or {}
+    dispatches = dispatches or {}
     kinds = {}
     for _, kind, _, _ in rows:
         kinds[kind] = kinds.get(kind, 0) + 1
@@ -460,9 +461,18 @@ def format_results(rows, use=None):
         latest = sorted(((use[key][1], key, kind, reason) for key, kind, status, reason in rows if status == "refused" and key in use), reverse=True)
         lines += ["", "## refused keys used latest: last use, first use, uses, key kind reason"]
         lines += ["%8.1f %8.1f %7d %s %s %s" % (last, use[key][0], use[key][2], key, kind, reason) for last, key, kind, reason in latest[:LATEST_USED_KEYS]]
-    lines += ["", "## keys: key kind status reason [first= last= uses= seconds since the process started]"]
-    lines += ["%s %s %s%s%s" % (key, kind, status, " " + reason if reason else "",
-                              " first=%.1fs last=%.1fs uses=%d" % use[key] if key in use else "") for key, kind, status, reason in rows]
+    lines += ["", "## keys: key kind status reason [first= last= uses=] [skipped_dispatches= mesh_groups= unknown_group_counts= first_runtime_refusal=]"]
+    for key, kind, status, reason in rows:
+        line = f"{key} {kind} {status}" + (" " + reason if reason else "")
+        if key in use:
+            line += " first=%.1fs last=%.1fs uses=%d" % use[key]
+        if (kind, key) in dispatches:
+            count, groups, unknown, first = dispatches[kind, key]
+            line += f" skipped_dispatches={count}"
+            if groups is not None:
+                line += f" mesh_groups={groups} unknown_group_counts={unknown}"
+            line += f" first_runtime_refusal={first}"
+        lines.append(line)
     return "\n".join(lines) + "\n"
 
 
@@ -475,13 +485,31 @@ NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)"
 CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
 
 
-def key_weights(stderr_text):
-    """{key: draws not drawn (graphics) or dispatches without a translation (compute)}: each key's newest cumulative line."""
+REFUSED_DISPATCH_RE = re.compile(
+    r"^x2w-render (compute|mesh57) refused key ([0-9a-f]{16}): (\d+) dispatches"
+    r"(?:, (\d+) groups, (\d+) unknown group counts)?, first refusal: ([^\r\n]+)", re.M)
+
+
+def refused_dispatch_keys(stderr_text):
+    """Latest cumulative snapshot per (kind, key), with mesh group totals and the first refusal."""
+    rows = {}
+    for match in REFUSED_DISPATCH_RE.finditer(stderr_text):
+        kind, key, count, groups, unknown, reason = match.groups()
+        rows[kind, key] = (int(count), int(groups) if groups is not None else None,
+                           int(unknown) if unknown is not None else None, reason)
+    return rows
+
+
+def key_weights(stderr_text, dispatches=None):
+    """{key: draws not drawn (graphics) or refused dispatches (compute and mesh57)}: each key's newest cumulative line."""
     weights = {}
     for m in NOT_DRAWN_KEY_RE.finditer(stderr_text):
         weights[m.group(1)] = int(m.group(2))
     for m in CENSUS_KEY_RE.finditer(stderr_text):
         weights[m.group(1)] = max(0, int(m.group(2)) - int(m.group(3)))
+    if dispatches is None:
+        dispatches = refused_dispatch_keys(stderr_text)
+    weights.update((key, counts[0]) for (_, key), counts in dispatches.items())
     return weights
 
 
@@ -496,8 +524,9 @@ REQUESTS_FAMILY_KEYS = 20  # ... each get their top 20 keys by uses first (on to
 
 def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE,
                     uses=None, families=REQUESTS_FAMILIES, family_keys=REQUESTS_FAMILY_KEYS):
-    """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys: compute keys ranked by dispatches
-    without a translation, the other kinds by draws not drawn, `compute_share` of `top` for compute and the rest for the others
+    """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys.
+    Compute and mesh57 use refused dispatches, graphics uses draws not drawn.
+    `compute_share` of `top` is for compute and the rest is for the other kinds
     (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
     .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
     without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing.
@@ -906,19 +935,21 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
-        add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
+        stderr_path = os.path.join(logdir, "stderr.txt")
+        stderr_text = ""
+        if os.path.isfile(stderr_path):
+            with open(stderr_path, encoding="utf-8", errors="replace") as handle:
+                stderr_text = handle.read()
+        dispatches = refused_dispatch_keys(stderr_text)
+        uses = key_use(logdir)
+        add(RESULTS_NAME, format_results(rows, uses, dispatches).encode("utf-8"))
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             symbol_rows = parse_symbols(handle.read())
         manifest["symbols"] = len(symbol_rows)
         add(SYMBOLS_NAME, format_symbols(symbol_rows).encode("utf-8"))
     if cache_dir:  # the request files of the worst refused keys (select_requests)
-        stderr_path = os.path.join(logdir, "stderr.txt")
-        weights = {}
-        if os.path.isfile(stderr_path):
-            with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
-                weights = key_weights(handle.read())
-        chosen = select_requests(cache_dir, rows, weights, uses=key_use(logdir))
+        chosen = select_requests(cache_dir, rows, key_weights(stderr_text, dispatches), uses=uses)
         for key, kind, weight, files_of_key, _missing in chosen:
             for name, _ in files_of_key:
                 with open(os.path.join(cache_dir, name), "rb") as handle:

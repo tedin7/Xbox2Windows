@@ -176,7 +176,7 @@ check('the revision is x2w-startup-shader-28, after the precise v_fma_mix loweri
 
 def key_from_seed(word):
     """pipeline_key's hash chain with one seed, over the same three blobs, without the layout."""
-    return G.fnv(b'root', G.fnv(b'ps', G.fnv(b'vs', G.fnv(word.encode()))))
+    return G.fnv(b'root', G.fnv(b'ps', G.fnv(b'vs', G.shader_cache_seed(word.encode()))))
 
 
 if seed:

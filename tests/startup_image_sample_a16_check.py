@@ -225,7 +225,7 @@ def check_cache_revision():
     runtime = HERE.parent / 'src' / 'startup_stubs' / 'd3d12_draw.inl'
     revision = re.search(rb'constexpr char revision\[\] = "([^"]+)";', runtime.read_bytes())
     assert revision, 'desktop startup cache revision missing'
-    runtime_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(revision[1]))))
+    runtime_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.shader_cache_seed(revision[1]))))
     assert key == runtime_key, f'offline ({key:#x}) and desktop ({runtime_key:#x}) cache revisions differ'
     print(f'cache revision: {revision[1].decode("ascii")} matches runtime and invalidates x2w-startup-shader-5')
 

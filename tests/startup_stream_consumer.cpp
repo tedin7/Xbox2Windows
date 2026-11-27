@@ -272,6 +272,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     };
     if (!from_file("X2W_TEST_DISPATCH_IN", buffers[0], words * sizeof(UINT)) ||
         !from_file("X2W_TEST_DISPATCH_FIELDS", fields, sizeof(fields))) return 2;
+    if (mode == "dispatch-heap-dynamic-format-view") {
+        buffers[0][0] = 0;
+        buffers[0][1] = 0x40003c00u;  // element 1: half 1.0, 2.0
+    }
     UINT input[words];
     std::memcpy(input, buffers[0], sizeof(input));
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
@@ -546,11 +550,20 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT index_view[4]{static_cast<UINT>(index_address), static_cast<UINT>(index_address >> 32), 16, 0};
         std::memcpy(reinterpret_cast<void*>(cpu), index_view, sizeof(index_view));
         for (UINT slot : {2u, 3u}) {
+            if (slot == 2 && mode == "dispatch-heap-dynamic-format-view") {
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R16G16_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+                view.Buffer = {0, words, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+                invoke(device, 18, word(placed[0]), word(&view), cpu + 64);
+                continue;
+            }
             auto* const data = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
             if (!data) return 81;
             *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
             const UINT64 address = reinterpret_cast<UINT64>(data);
-            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            const bool formatted = slot == 2 && mode == "dispatch-heap-dynamic-format";
+            if (formatted) { data[2] = 0x40003c00u; data[3] = 0x44004200u; }
+            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (formatted ? 8u << 16 : 0u),
+                              formatted ? 2u : 16u, formatted ? (71u << 12) | (7u | (4u << 3) | (6u << 6) | (5u << 9)) : 0u};
             std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
         }
     }
