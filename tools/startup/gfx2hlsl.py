@@ -7746,6 +7746,8 @@ class Stage:
             return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
+        if base in ('v_fma_f16', 'v_ldexp_f16'):
+            return self.half_new(base, ops, mods)
         if base in VEC_H:
             return self.half_alu(base, ops, mods)
         if base == 'v_ldexp_f32':
@@ -8187,6 +8189,91 @@ class Stage:
         if absolute:
             text = 'abs(%s)' % text
         return '(-%s)' % text if neg else text
+
+    def half_new(self, base, ops, mods):
+        # AMD RDNA 2 ISA guide, VOP3 V_FMA_F16 and VOP2 V_LDEXP_F16.
+        fma = base == 'v_fma_f16'
+        if len(ops) != (4 if fma else 3):
+            raise Unsupported('%s operand count' % base)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        sel = [0, 0, 0, 0]
+        seen = set()
+        for m in mods:
+            if m == 'clamp' and m not in seen:
+                seen.add(m)
+                continue
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])(?:,([01]))?\]', m)
+            if fma and match and 'op_sel' not in seen:
+                sel = [int(x or 0) for x in match.groups()]
+                seen.add('op_sel')
+                continue
+            raise Unsupported('%s modifier %s' % (base, m))
+        if fma:
+            args = []
+            for tok, high in zip(ops[1:], sel):
+                neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+                t = tok[1:] if neg else tok
+                absolute = t.startswith('|') and t.endswith('|')
+                t = t[1:-1] if absolute else t
+                r = reg_range(t)
+                if r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255)):
+                    raise Unsupported('%s source register %s' % (base, tok))
+                if high:
+                    if t in FLOATS or re.fullmatch(r'-?\d+', t):
+                        word = '0u'
+                    else:
+                        word = '(%s >> 16)' % self.u(t)
+                elif t in FLOATS:
+                    word = '%du' % struct.unpack('<H', struct.pack('<e', FLOATS[t]))[0]
+                else:
+                    word = self.u(t, low16_only=True)
+                val = 'f16tof32(%s & 0xffffu)' % word
+                if absolute:
+                    val = 'abs(%s)' % val
+                args.append('(-%s)' % val if neg else val)
+            expr = 'fma16o(%s)' % ', '.join(args)
+        else:
+            if (ops[2].startswith(('-', '|')) and ops[2] not in FLOATS
+                    and not re.fullmatch(r'-\d+', ops[2])):
+                raise Unsupported('%s exponent source modifier' % base)
+            r = reg_range(ops[2])
+            if r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255)):
+                raise Unsupported('%s exponent register %s' % (base, ops[2]))
+            pipe = getattr(self, 'pipe', None)
+            if pipe is not None:
+                pipe.uses_ldexp = True
+            exponent = ('%du' % struct.unpack('<H', struct.pack('<e', FLOATS[ops[2]]))[0]
+                        if ops[2] in FLOATS else self.u(ops[2], low16_only=True))
+            exponent = 'clamp(asint((%s & 0xffffu) << 16u) >> 16, -64, 64)' % exponent
+            tok = ops[1]
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            tok = tok[1:] if neg else tok
+            absolute = tok.startswith('|') and tok.endswith('|')
+            tok = tok[1:-1] if absolute else tok
+            r = reg_range(tok)
+            if r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255)):
+                raise Unsupported('%s source register %s' % (base, ops[1]))
+            word = ('%du' % struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+                    if tok in FLOATS else self.u(tok, low16_only=True))
+            source = 'f16tof32(%s & 0xffffu)' % word
+            if absolute:
+                source = 'abs(%s)' % source
+            if neg:
+                source = '(-%s)' % source
+            expr = 'asfloat(x2w_ldexp(asuint(%s), %s))' % (source, exponent)
+        if 'clamp' in mods:
+            expr = 'saturate(%s)' % expr
+        result = 'f16rn(%s)' % expr
+        d = dst[1]
+        if fma:
+            keep_low16 = not sel[3] and d in self.low16_only_v
+            result = ('(v%d & 0xffffu) | ((%s) << 16)' if sel[3]
+                      else '(v%d & 0xffff0000u) | (%s)') % (d, result)
+            self.set_v(d, result, low16_only=keep_low16)
+        else:
+            self.set_v(d, result)
 
     def half_alu(self, base, ops, mods):
         """16-bit VALU: operands are the low 16 bits, the result fills the low 16 bits and zeroes the rest (RDNA 2)."""
@@ -13045,6 +13132,34 @@ class Stage:
 
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
+    def op_v_pk_fmac_f16(self, ops, mods):
+        # AMD RDNA 2 ISA guide, VOP2 V_PK_FMAC_F16; RDNA 3 ISA guide, 7.5.1 packed inline constants.
+        if mods or len(ops) != 3:
+            raise Unsupported('v_pk_fmac_f16 modifiers or operand count %s' % mods)
+        d, s0, s1 = ops
+        dst, src1 = reg_range(d), reg_range(s1)
+        if (not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255 or not src1
+                or src1[0] != 'v' or src1[1] != src1[2] or src1[1] > 255):
+            raise Unsupported('v_pk_fmac_f16 destination or source1')
+        src0 = reg_range(s0)
+        if src0 and src0[0] in ('s', 'v') and src0[1] == src0[2] and (src0[0] != 'v' or src0[1] <= 255):
+            word = self.u(s0)
+        elif s0 in FLOATS:
+            word = '%du' % struct.unpack('<H', struct.pack('<e', FLOATS[s0]))[0]
+        elif re.fullmatch(r'-?\d+', s0):
+            word = '%du' % (int(s0) & 0xffff)
+        elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', s0):
+            word = self.u(s0)
+        else:
+            raise Unsupported('v_pk_fmac_f16 source0 %s' % s0)
+        b = self.u(s1)
+        old = self.u(d)
+        lanes = []
+        for shift in (0, 16):
+            args = ['f16tof32((%s >> %du) & 0xffffu)' % (v, shift) for v in (word, b, old)]
+            lanes.append('f16rn(fma16o(%s))' % ', '.join(args))
+        self.set_v(dst[1], '%s | ((%s) << 16)' % tuple(lanes))
 
     # v_pk_{min,max}_f16: the lane values are exact binary32 images of binary16, so the binary32 helper that orders -0 below +0 and passes a
     # NaN to D3D min/max (the one v_min_f32 and v_max_f32 use) is exact, and f16rn gives the result back its binary16 word.
