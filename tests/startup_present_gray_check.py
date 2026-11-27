@@ -1,6 +1,6 @@
 """The gray-world log lines of the console present (render mode): picture mean and spread, and the per-interval counters.
 
-usage: startup_present_gray_check.py <startup_stream_consumer>
+usage: startup_present_gray_check.py <startup_stream_consumer> [--recent-fps]
 
 The consumer presents a 64x64 RGBA8 render target 600 times through queue slot 32 with X2W_D3D12_RENDER=1 on WARP. The stand-in
 reads the picture back and logs `x2w-render presented surface 64x64 format 28, readback N, mean level M/255, spread S`, and
@@ -36,27 +36,29 @@ ONSET = re.compile(r'x2w-gray onset (\d+) \(frame (\d+)\): flat picture from ([0
                    r'first upload ring refusal at (NONE yet, )?([0-9.]+) s; first draw not drawn at (NONE yet, )?([0-9.]+) s')
 
 
-def present(consumer, directory, mode):
+def run_present(consumer, directory, mode, **overrides):
     cache = directory / 'cache'
     cache.mkdir(exist_ok=True)
     for name, data in (('vertex', S.container(1)), ('pixel', S.container(0))):
         (directory / name).write_bytes(data)
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_RENDER='1', X2W_D3D12_LIST_NOOP='1',
                X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache))
+    env.update(overrides)
     started = time.monotonic()
     result = subprocess.run([consumer, directory / 'vertex', directory / 'pixel', directory / 'root', mode], env=env,
                             capture_output=True, text=True)
-    present.elapsed = time.monotonic() - started
+    elapsed = time.monotonic() - started
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
     assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
-    return result.stderr
+    return result, elapsed
 
 
 def check(consumer, mode, mean, spread):
     with tempfile.TemporaryDirectory() as temporary:
-        log = present(consumer, Path(temporary), mode)
+        result, _ = run_present(consumer, Path(temporary), mode)
+    log = result.stderr
     pictures = [PRESENTED.search(line) for line in log.splitlines()]
     pictures = [m for m in pictures if m]
     assert pictures, f'{mode}: no "x2w-render presented" line\n{log[-3000:]}'
@@ -82,8 +84,8 @@ def check_onset(consumer):
     line at least every 5 s (the run shows a constant picture for 12 s, which the count/40th rules alone would not log
     more than three times)."""
     with tempfile.TemporaryDirectory() as temporary:
-        log = present(consumer, Path(temporary), 'present-onset')
-    elapsed = present.elapsed
+        result, elapsed = run_present(consumer, Path(temporary), 'present-onset')
+    log = result.stderr
     onsets = [m for m in map(ONSET.search, log.splitlines()) if m]
     assert len(onsets) == 1, f'present-onset: {len(onsets)} onset lines\n{log[-3000:]}'
     m = onsets[0]
@@ -95,6 +97,44 @@ def check_onset(consumer):
     print(f'present-onset: one onset line, flat from {at} s of a {elapsed:.1f} s run; {len(pictures)} picture lines')
 
 
+RECENT_CAPTION = re.compile(r'^caption: .* - frame 60, ([0-9]+[.][0-9]) fps [(]last 30[)], '
+                            r'([0-9]+[.][0-9]) fps [(]run average[)],', re.MULTILINE)
+LEGACY_CAPTION = re.compile(r'^caption: .* - frame 60, [0-9]+[.][0-9] fps, [0-9]+ translated draws', re.MULTILINE)
+
+
+def recent_rates(stdout):
+    match = RECENT_CAPTION.search(stdout)
+    if match:
+        recent, average = map(float, match.groups())
+        if 0 < recent <= 4.1 and recent < average:
+            return recent, average
+    return None
+
+
+def check_recent_fps(consumer):
+    reference = bytes((37, 109, 223, 255)) * (64 * 64)
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        for enabled in ('1', '0'):
+            readback = directory / f'frame60-{enabled}.rgba'
+            result, _ = run_present(consumer, directory, 'present-recent-fps',
+                                    X2W_PRESENT_RECENT_FPS=enabled, X2W_TEST_PRESENT_OUT=str(readback))
+            assert readback.read_bytes() == reference, f'frame 60 RGBA8 readback mismatch (switch={enabled})'
+            rates = recent_rates(result.stdout)
+            if enabled == '1':
+                assert rates is not None, f'expected slow rate first and higher run average: {result.stdout}'
+                recent, average = rates
+                match = RECENT_CAPTION.search(result.stdout)
+                swapped = (result.stdout[:match.start(1)] + match[2] +
+                           result.stdout[match.end(1):match.start(2)] + match[1] + result.stdout[match.end(2):])
+                assert recent_rates(swapped) is None, f'swapped-rate control passed: {swapped}'
+                print(f'frame 60: {recent:.1f} fps (last 30), {average:.1f} fps (run average), pixels match')
+            else:
+                assert LEGACY_CAPTION.search(result.stdout), f'expected the legacy caption: {result.stdout}'
+                assert rates is None, f'switch-off control unexpectedly passed the recent-caption check: {result.stdout}'
+                print('switch-off control: legacy caption rejected by recent-caption check, pixels match')
+
+
 def main(consumer):
     check(consumer, 'present-flat', 128.0, 0.0)
     check(consumer, 'present-split', 127.5, 127.5)
@@ -103,6 +143,9 @@ def main(consumer):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
+    if len(sys.argv) == 3 and sys.argv[2] == "--recent-fps":
+        check_recent_fps(sys.argv[1])
+    elif len(sys.argv) == 2:
+        main(sys.argv[1])
+    else:
         raise SystemExit(__doc__)
-    main(sys.argv[1])
