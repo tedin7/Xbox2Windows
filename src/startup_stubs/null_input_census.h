@@ -117,7 +117,7 @@ struct NullInputCensus {
             if (row.cause == NullCause::unknown_token)
                 std::snprintf(detail, sizeof(detail), " words %08x %08x", row.words[0], row.words[1]);
             else if (row.cause == NullCause::buffer_unreadable)
-                std::snprintf(detail, sizeof(detail), " bytes %zu reason %s", row.bytes, row.reason);
+                std::snprintf(detail, sizeof(detail), " bytes %zu reason %s", row.bytes, row.reason ? row.reason : "unspecified");
             else if (row.cause == NullCause::ring_full)
                 std::snprintf(detail, sizeof(detail), " bytes %zu", row.bytes);
             batch.add("x2w-render null input: key %016llx input %u (%s) cause %s calls %llu frames %ld..%ld target format %d depth format %d%s",
