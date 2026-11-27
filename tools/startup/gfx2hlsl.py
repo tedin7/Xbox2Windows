@@ -226,7 +226,8 @@ DESC_ONE_INTEGER = frozenset(fmt for fmt in DESC_FORMAT_CODES if fmt.endswith(('
 
 
 def extended_buffer_formats():
-    return os.environ.get('X2W_EXTENDED_BUFFER_FORMATS') == '1'
+    """Default on, as in the runtime (d3d12_draw.inl extended_buffer_formats); only X2W_EXTENDED_BUFFER_FORMATS=0 opts out."""
+    return os.environ.get('X2W_EXTENDED_BUFFER_FORMATS') != '0'
 
 
 def extended_format_body(fmt, buf):

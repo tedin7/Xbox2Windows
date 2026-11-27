@@ -9,6 +9,9 @@ so the draw has no hardware descriptor word 3: it builds FORMAT and DST_SEL from
 mapping (src/startup_stubs/buffer_format_word3.h). One translation serves every case; each draw is compared as four
 32-bit words. Views the translation cannot decode refuse the draw with one logged reason, and the
 target keeps its clear value. A translation whose W selector reads the Z field must fail.
+
+Without --extended the run opts out with X2W_EXTENDED_BUFFER_FORMATS=0, so R32_UINT is refused. With --extended the
+switch is left unset: the extended FORMAT table (R32_UINT and the other added formats) is the default on both sides.
 """
 import os
 from pathlib import Path
@@ -148,8 +151,10 @@ def check(work, consumer, backend, fxc, extended=False):
     cases = tuple(expanded_cases()) if extended else CASES
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
                X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc,
-               X2W_EXTENDED_BUFFER_FORMATS='1' if extended else '0',
+               X2W_EXTENDED_BUFFER_FORMATS='0',
                X2W_FORMATTED_BUFFER_DIAGNOSTICS='0', X2W_TEST_FORMATTED_VIEW_REPEAT='0')
+    if extended:  # the default: runtime and translator both run without the switch
+        del env['X2W_EXTENDED_BUFFER_FORMATS']
     args = [consumer, vs, ps, root, backend, output, str(3 if extended else TARGET)]
 
     def draw(case, source_env=None):
