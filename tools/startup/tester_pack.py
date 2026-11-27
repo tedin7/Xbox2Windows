@@ -31,6 +31,7 @@ import os
 import sys
 import zipfile
 import zlib
+from decimal import Decimal
 
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
@@ -568,6 +569,35 @@ HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
 
 
+UPLOAD_RING_NAME = "upload_ring.txt"
+UPLOAD_CONSUMERS_RE = re.compile(r"^x2w-render upload ring by consumer( \(window\))?: (.+)$", re.M)
+UPLOAD_REUSE_RE = re.compile(r"^x2w-render upload ring reuse blocked( \(window\))?: ([^;\r\n]+);", re.M)
+UPLOAD_CONSUMER_RE = re.compile(r"([\w-]+) (\d+(?:\.\d+)?)/\d+ refused (\d+)/\d+(?:\.\d+)? max \d+")
+
+
+def upload_ring_report(stderr_text):
+    """Rank the latest cumulative sample, or the latest heartbeat window if it is all we have."""
+    consumers = dict(UPLOAD_CONSUMERS_RE.findall(stderr_text))
+    reuse = dict(UPLOAD_REUSE_RE.findall(stderr_text))
+    if not consumers and not reuse:
+        return ""
+    scope = "" if "" in consumers or "" in reuse else " (window)"
+    lines = ["Upload ring " + ("(latest heartbeat window)" if scope else "(cumulative)")]
+    if scope in consumers:
+        entries = [UPLOAD_CONSUMER_RE.fullmatch(entry) for entry in consumers[scope].strip().split("; ")]
+        rows = [(match[1], Decimal(match[2]), int(match[3])) for match in entries if match]
+        by_bytes = sorted((row for row in rows if row[1]), key=lambda row: (-row[1], row[0]))[:3]
+        by_refusals = sorted((row for row in rows if row[2]), key=lambda row: (-row[2], row[0]))[:2]
+        lines.append("Top by bytes: " + (", ".join(f"{name} {mib.normalize():f} MiB" for name, mib, _ in by_bytes) or "none"))
+        lines.append("Top by refusals: " + (", ".join(f"{name} {count}" for name, _, count in by_refusals) or "none"))
+    if scope in reuse:
+        counts = [(name, int(count)) for name, count in re.findall(r"([\w-]+) (\d+)", reuse[scope])
+                  if name != "reset-unsubmitted" and int(count)]
+        top = min(counts, key=lambda row: (-row[1], row[0]), default=None)
+        lines.append("Top reuse blocker: " + (f"{top[0]} {top[1]}" if top else "none"))
+    return "\n".join(lines) + "\n"
+
+
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
     """One row per `window` seconds: frames presented and fps in that window (from the cumulative 'heartbeat' lines of the
     stand-in) and the mean level of the last window picture inside it, so the phases of a run read in one place instead of
@@ -829,6 +859,9 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                 texts[name] = handle.read()
     if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
         add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
+    upload_report = upload_ring_report(texts.get("stderr.txt", ""))
+    if upload_report:
+        add(UPLOAD_RING_NAME, upload_report.encode("utf-8"))
     files = log_files(logdir)
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:

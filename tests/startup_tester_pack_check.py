@@ -679,6 +679,40 @@ def check_mail_ready_parts():
                     assert "manifest.json" in names
 
 
+def check_upload_ring_report():
+    window = (
+        "x2w-render upload ring by consumer (window): other 9/1 refused 8/1 max 9437184\n"
+        "x2w-render upload ring reuse blocked (window): open-list 0, closed-unsubmitted 0, "
+        "reset-unsubmitted 0, fence 0, frame-hold 0; oldest hold 0 frames (average 0.00)\n"
+    )
+    cumulative = (
+        "x2w-render upload ring by consumer: small-binding 0.03125/2 refused 5/0.5 max 16384; "
+        "large-binding 1.5/3 refused 2/1 max 524288; compute-snapshot 0.75/9 refused 8/0.25 max 131072; "
+        "copy-source 0.125/2 refused 0/0 max 65536\n"
+        "x2w-render upload ring reuse blocked: open-list 4, closed-unsubmitted 5, reset-unsubmitted 99, "
+        "fence 10, frame-hold 1, submitted-list 7; oldest hold 3 frames (average 1.25)\n"
+    )
+    assert not T.upload_ring_report("no upload diagnostics in this log")
+    assert T.upload_ring_report(window.replace("\n", "\r\n")).splitlines() == [
+        "Upload ring (latest heartbeat window)", "Top by bytes: other 9 MiB",
+        "Top by refusals: other 8", "Top reuse blocker: none",
+    ]
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        run = root / "log"
+        run.mkdir()
+        (run / "stderr.txt").write_text(window + cumulative + window, encoding="utf-8")
+        zip_path = root / "report.zip"
+        T.pack(str(run), MANIFEST, str(zip_path))
+        with zipfile.ZipFile(zip_path) as archive:
+            assert archive.read(T.UPLOAD_RING_NAME).decode().splitlines() == [
+                "Upload ring (cumulative)",
+                "Top by bytes: large-binding 1.5 MiB, compute-snapshot 0.75 MiB, copy-source 0.125 MiB",
+                "Top by refusals: compute-snapshot 8, small-binding 5",
+                "Top reuse blocker: fence 10",
+            ]
+
+
 def check_phase_table():
     """phases.txt: presents, fps and picture mean per 30 s window from the stand-in heartbeats and the capture rows."""
     beats = ("x2w-d3d12 heartbeat: 150 frames presented in 5.0 s (30.0 fps overall); x\n"
@@ -914,6 +948,7 @@ if __name__ == "__main__":
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
+    check_upload_ring_report()
     check_request_families()
     check_combine()
     check_part_one_has_the_small_files()

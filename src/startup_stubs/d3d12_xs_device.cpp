@@ -190,6 +190,10 @@ struct alignas(16) WrapperOwn {
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
+    WrapperOwn* upload_prev;
+    WrapperOwn* upload_next;
+    UINT upload_hold_frame[max_upload_chunks];
+    bool upload_submitted;
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
@@ -1584,6 +1588,76 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+// All recording and frame hold metadata is protected by allocator_lock.
+WrapperOwn* upload_recordings;
+UINT upload_frame_hold_since[max_upload_chunks];
+// Recording callers take this hold under draw_lock followed by allocator_lock.
+UploadChunkMask big_binding_chunks;
+volatile LONG upload_present_count;
+bool upload_consumer_mutant;  // Fixture only, protected by allocator_lock.
+
+enum class UploadConsumer : unsigned {
+    large_binding, small_binding, vertex_index, compute_snapshot, entry_constants,
+    copy_source, mirror_block, other, count
+};
+constexpr const char* upload_consumer_names[] = {
+    "large-binding", "small-binding", "vertex-index", "compute-snapshot", "entry-constants",
+    "copy-source", "mirror-block", "other"
+};
+constexpr unsigned upload_consumer_count = static_cast<unsigned>(UploadConsumer::count);
+static_assert(std::size(upload_consumer_names) == upload_consumer_count);
+
+struct UploadConsumerCounters {
+    alignas(8) LONG64 reservations, bytes, refusals, refused_bytes, largest;
+};
+
+struct UploadReuseCounters {
+    u64 open_list, closed_unsubmitted, reset_unsubmitted, submitted_list, fence, frame_hold;
+    u64 age_max, age_sum, age_samples;
+};
+
+struct UploadDiagnostics {
+    UploadConsumerCounters consumers[upload_consumer_count];
+    UploadReuseCounters reuse;
+};
+
+UploadDiagnostics upload_totals{}, upload_window{};
+
+UINT upload_current_frame()
+{
+    return static_cast<UINT>(InterlockedCompareExchange(&upload_present_count, 0, 0));
+}
+
+void hold_upload_recording(WrapperOwn& recording, unsigned index)
+{
+    if (recording.upload_chunks & (UploadChunkMask{1} << index)) return;
+    if (!recording.upload_chunks) {
+        recording.upload_next = upload_recordings;
+        if (upload_recordings) upload_recordings->upload_prev = &recording;
+        upload_recordings = &recording;
+    }
+    recording.upload_hold_frame[index] = upload_current_frame();
+    upload_chunks[index].hold(recording.upload_chunks, index);
+}
+
+void discard_upload_recording(WrapperOwn& recording, bool reset = false)
+{
+    if (recording.upload_chunks) {
+        if (reset && !recording.upload_submitted) {
+            for (auto mask = recording.upload_chunks; mask; mask &= mask - 1) {
+                ++upload_totals.reuse.reset_unsubmitted;
+                ++upload_window.reuse.reset_unsubmitted;
+            }
+        }
+        if (recording.upload_prev) recording.upload_prev->upload_next = recording.upload_next;
+        else upload_recordings = recording.upload_next;
+        if (recording.upload_next) recording.upload_next->upload_prev = recording.upload_prev;
+        recording.upload_prev = recording.upload_next = nullptr;
+        discard_upload_chunks(recording.upload_chunks, upload_chunks.data());
+    }
+    recording.upload_submitted = false;
+}
+
 // Pages of finished list arenas, handed to the next arenas (allocator_lock).
 x2w_upload::FreePages free_upload_pages;
 
@@ -1678,7 +1752,7 @@ void reclaim_finished_arenas(DesktopAllocator& allocator)
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
-    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    discard_upload_recording(list->own());
     retire_list_arena(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
     if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
@@ -1894,7 +1968,15 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         }
     }
     UploadChunkMask chunks = 0;
-    for (auto* list : lists) chunks |= list->own().upload_chunks;
+    for (auto* list : lists) {
+        list->own().upload_submitted = true;
+        chunks |= list->own().upload_chunks;
+    }
+    const UINT frame = upload_current_frame();
+    for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+        if ((chunks & (UploadChunkMask{1} << i)) && submit.completed(i))
+            submit.hold_since[i] = frame;
+    }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
     submit.submitted(chunks, signaled);
@@ -2075,7 +2157,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
-            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            discard_upload_recording(state, true);
             retire_list_arena(self);
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -2117,7 +2199,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
-        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        discard_upload_recording(state);
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2778,25 +2860,141 @@ u64 upload_ring_max_bytes()
     return bytes;
 }
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
+// These updates and the report snapshots share allocator_lock, so each window
+// includes a complete update, including the maximum request size.
+void count_upload_request(UploadConsumer consumer, u64 bytes, u64 rounded, bool success)
+{
+    if (upload_consumer_mutant) consumer = UploadConsumer::other;
+    for (auto* diagnostics : {&upload_totals, &upload_window}) {
+        auto& count = diagnostics->consumers[static_cast<unsigned>(consumer)];
+        if (success) {
+            InterlockedIncrement64(&count.reservations);
+            InterlockedAdd64(&count.bytes, static_cast<LONG64>(rounded));
+        } else {
+            InterlockedIncrement64(&count.refusals);
+            InterlockedAdd64(&count.refused_bytes, static_cast<LONG64>(bytes));
+        }
+        if (bytes > static_cast<u64>(count.largest))
+            InterlockedExchange64(&count.largest, static_cast<LONG64>(bytes));
+    }
+}
+
+// Count each reason once per eligible chunk on a failed reuse search. Reasons can
+// overlap. A submitted recording still holds its bytes until Reset or release,
+// even after its fence completes. Reset without submission drops its hold at once.
+void count_upload_reuse_blockers(u64 rounded)
+{
+    UploadChunkMask open = 0, closed = 0, submitted = 0;
+    UINT ages[max_upload_chunks]{};
+    const UINT frame = upload_current_frame();
+    for (auto* recording = upload_recordings; recording; recording = recording->upload_next) {
+        const auto mask = recording->upload_chunks;
+        if (recording->list_open) open |= mask;
+        else if (recording->upload_submitted) submitted |= mask;
+        else closed |= mask;
+        for (unsigned i = 0; i < upload_chunks.size(); ++i)
+            if (mask & (UploadChunkMask{1} << i))
+                ages[i] = (std::max)(ages[i], frame - recording->upload_hold_frame[i]);
+    }
+    for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+        if (upload_chunks[i].capacity < rounded) continue;
+        const auto bit = UploadChunkMask{1} << i;
+        const bool frame_held = (big_binding_chunks & bit) != 0;
+        if (frame_held) ages[i] = (std::max)(ages[i], frame - upload_frame_hold_since[i]);
+        bool fenced = false;
+        for (const auto& queue : queue_submits) {
+            if (queue.second.completed(i)) continue;
+            fenced = true;
+            ages[i] = (std::max)(ages[i], frame - queue.second.hold_since[i]);
+        }
+        if (!((open | closed | submitted | big_binding_chunks) & bit) && !fenced) continue;
+        for (auto* diagnostics : {&upload_totals, &upload_window}) {
+            auto& reuse = diagnostics->reuse;
+            reuse.open_list += (open & bit) != 0;
+            reuse.closed_unsubmitted += (closed & bit) != 0;
+            reuse.submitted_list += (submitted & bit) != 0;
+            reuse.fence += fenced;
+            reuse.frame_hold += frame_held;
+            reuse.age_max = (std::max)(reuse.age_max, static_cast<u64>(ages[i]));
+            reuse.age_sum += ages[i];
+            ++reuse.age_samples;
+        }
+    }
+}
+
+void format_upload_mib(char (&text)[40], u64 bytes)
+{
+    constexpr u64 mib = 1u << 20;
+    char fraction[24];
+    std::snprintf(fraction, sizeof(fraction), "%.20f", static_cast<double>(bytes % mib) / mib);
+    auto* end = fraction + std::strlen(fraction);
+    while (end[-1] == '0') --end;
+    if (end[-1] == '.') --end;
+    *end = '\0';
+    std::snprintf(text, sizeof(text), "%llu%s", bytes / mib, fraction + 1);
+}
+
+void report_upload_diagnostics(bool window)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    const UploadDiagnostics snapshot = window ? upload_window : upload_totals;
+    if (window) upload_window = {};
+    ReleaseSRWLockExclusive(&allocator_lock);
+
+    const char* scope = window ? " (window)" : "";
+    char consumers[1200]{};
+    std::size_t used = 0;
+    for (unsigned i = 0; i < upload_consumer_count; ++i) {
+        const auto& count = snapshot.consumers[i];
+        if (!count.reservations && !count.refusals) continue;
+        char mib[40], refused_mib[40];
+        format_upload_mib(mib, static_cast<u64>(count.bytes));
+        format_upload_mib(refused_mib, static_cast<u64>(count.refused_bytes));
+        const int n = std::snprintf(consumers + used, sizeof(consumers) - used,
+            "%s%s %s/%lld refused %lld/%s max %llu",
+            used ? "; " : "", upload_consumer_names[i], mib, count.reservations, count.refusals,
+            refused_mib, static_cast<u64>(count.largest));
+        if (n < 0 || static_cast<std::size_t>(n) >= sizeof(consumers) - used) break;
+        used += static_cast<std::size_t>(n);
+    }
+    log("x2w-render upload ring by consumer%s: %s", scope, used ? consumers : "none");
+    const auto& r = snapshot.reuse;
+    log("x2w-render upload ring reuse blocked%s: open-list %llu, closed-unsubmitted %llu, reset-unsubmitted %llu, "
+        "fence %llu, frame-hold %llu, submitted-list %llu; oldest hold %llu frames (average %.2f)",
+        scope, r.open_list, r.closed_unsubmitted, r.reset_unsubmitted, r.fence, r.frame_hold, r.submitted_list,
+        r.age_max, r.age_samples ? static_cast<double>(r.age_sum) / r.age_samples : 0.0);
+}
+
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadConsumer consumer = UploadConsumer::other,
+                                      bool hold_for_frame = false)
 {
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;
-    if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
-    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
+    if (bytes == 0) return reservation;
 
     auto& chunks = upload_chunks;
     static unsigned active = 0;
     static u64 total_bytes = 0;
 
     AcquireSRWLockExclusive(&allocator_lock);
+    if (bytes > max_alloc_bytes) {
+        count_upload_request(consumer, bytes, 0, false);
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return reservation;
+    }
+    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
     const auto finish = [&](unsigned index) {
         active = index;
         InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
         InterlockedIncrement(&upload_ring_reservations);
-        chunks[index].hold(list->own().upload_chunks, index);
-        if (frame_hold) chunks[index].hold(*frame_hold, index);
+        count_upload_request(consumer, bytes, rounded, true);
+        hold_upload_recording(list->own(), index);
+        if (hold_for_frame) {
+            const auto bit = UploadChunkMask{1} << index;
+            if (!(big_binding_chunks & bit)) upload_frame_hold_since[index] = upload_current_frame();
+            chunks[index].hold(big_binding_chunks, index);
+        }
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
@@ -2858,6 +3056,8 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
         }
     }
 
+    count_upload_request(consumer, bytes, rounded, false);
+    count_upload_reuse_blockers(rounded);
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
@@ -2868,30 +3068,38 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource,
+                                   UploadConsumer consumer = UploadConsumer::other)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(list, bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes, consumer);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource, UploadConsumer consumer)
 {
-    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource, consumer);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
+}
+
+UploadConsumer binding_upload_consumer(std::size_t bytes, bool vertex = false)
+{
+    if (vertex) return UploadConsumer::vertex_index;
+    return bytes >= x2w_local::big_copy_bytes ? UploadConsumer::large_binding : UploadConsumer::small_binding;
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(Wrapper* list, u64 title_address, std::size_t bytes)
 {
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
-    return ring_copy(list, title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
+    if (!ring_copy(list, title_address, bytes, &offset, &resource, binding_upload_consumer(bytes)) || !resource) return 0;
+    return resource->GetGPUVirtualAddress() + offset;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -7756,11 +7964,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     Timed timed(time_present);
     X2W_ZONE("Present");
     X2W_FRAME_MARK;
-    static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
-    const LONG frame = InterlockedIncrement(&frames);
+    const LONG frame = InterlockedIncrement(&upload_present_count);
     gpu_time_frame = frame;
     frame_number = frame;
     if (reuse_large_bindings) {
@@ -7895,6 +8102,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        report_upload_diagnostics(false);
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
         log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
         for (int size_class = 0; size_class < 2; ++size_class) {
@@ -8003,6 +8211,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_graphics_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        if (render_mode()) report_upload_diagnostics(true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -8364,4 +8573,13 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     if (!*out) return E_OUTOFMEMORY;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     return S_OK;
+}
+
+// Frame-copy fixture: sample the same cumulative diagnostics as the totals block.
+extern "C" __declspec(dllexport) void x2w_d3d12_upload_diagnostics(BOOL attribute_as_other)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    upload_consumer_mutant = attribute_as_other != FALSE;
+    ReleaseSRWLockExclusive(&allocator_lock);
+    if (!attribute_as_other) report_upload_diagnostics(false);
 }

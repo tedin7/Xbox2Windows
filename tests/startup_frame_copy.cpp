@@ -30,19 +30,23 @@ static void* create_present_queue(void* guest)
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
 //            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
 //            the second view the first view's bytes.
+//   ring-control / ring-full  fill one chunk with one 64 KiB and six 32 KiB copies. The full case asks for
+//            another 32 KiB with the same recording still open and checks that the refusal leaves its column red.
 int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width, UINT height)
 {
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+    const bool ring_full = !std::strcmp(mode, "ring-full");
+    const bool ring_case = ring_full || !std::strcmp(mode, "ring-control");
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool once = keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
-    if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
+    if (!ring_case && !once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
     alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
-    if (big)
+    if (big || ring_case)
         for (int i = 4; i < 16384; ++i) constants[i] = 0.5f;
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = keys ? 2 : (32 + increment - 1) / increment;
@@ -70,7 +74,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     }
     const auto* memory = once ? large : constants;
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory),
-        once ? large_bytes : big ? static_cast<UINT>(sizeof(constants)) : 256u};
+        once ? large_bytes : (big || ring_case) ? static_cast<UINT>(sizeof(constants)) : 256u};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
     if (keys) {
         // The second view: the same address, 64 KiB long.
@@ -82,6 +86,34 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 
     invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));  // SetDescriptorHeaps
     invoke(list, 36, 0, table);                                    // SetGraphicsRootDescriptorTable
+    if (ring_case) {
+        using ReportUpload = void (*)(BOOL);
+        const auto report = reinterpret_cast<ReportUpload>(
+            GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"), "x2w_d3d12_upload_diagnostics"));
+        if (!report) return 46;
+        if (GetEnvironmentVariableW(L"X2W_TEST_UPLOAD_CONSUMER_OTHER", nullptr, 0)) report(TRUE);
+
+        const D3D12_RECT all{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&all));
+        invoke(list, 12, 3, 1);  // 64 KiB of red, including a nonzero tail.
+
+        alignas(256) static float small[8192]{};
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC small_view{reinterpret_cast<std::uintptr_t>(small), sizeof(small)};
+        invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&small_view), cpu);
+        const UINT small_draws = ring_full ? 7 : 6;
+        for (UINT draw = 0; draw < small_draws; ++draw) {
+            small[0] = draw % 2 ? 1.0f : 0.0f;
+            small[2] = draw % 2 ? 0.0f : 1.0f;
+            small[3] = 1.0f;
+            // Six 32 KiB replacements fill the rest. The seventh would overwrite column 0.
+            const LONG x = draw == 6 ? 0 : static_cast<LONG>(draw + 1);
+            const D3D12_RECT column{x, 0, x + 1, static_cast<LONG>(height)};
+            invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&column));
+            invoke(list, 12, 3, 1);
+        }
+        report(FALSE);  // The fixture caller closes, submits and reads back after this sample.
+        return 0;
+    }
     if (keys) {
         const StreamWord large_table = table, small_table = table + increment;
         for (UINT draw = 0; draw < 4; ++draw) {

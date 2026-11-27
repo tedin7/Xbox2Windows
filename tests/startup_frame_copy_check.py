@@ -1,4 +1,5 @@
 """Check title-memory snapshots for writes between draws and across frame boundaries."""
+from decimal import Decimal
 from pathlib import Path
 import re
 import sys
@@ -64,6 +65,53 @@ def check(directory, consumer, backend):
     return 0
 
 
+def ring_attribution(line):
+    counts = {}
+    for entry in line.split(": ", 1)[1].split("; "):
+        name, success, _, refused, _, largest = entry.split()
+        mib, reservations = success.split("/")
+        refusals, refused_mib = refused.split("/")
+        counts[name] = (Decimal(mib) * (1 << 20), int(reservations), int(refusals),
+                        Decimal(refused_mib) * (1 << 20), int(largest))
+    return counts
+
+
+def check_ring(directory, consumer, backend):
+    expected_pixels = b"".join((RED, BLUE, RED, BLUE, RED, BLUE, RED, RED)) * 4
+    for label, mode, mutant in (("control", "ring-control", False), ("full", "ring-full", False),
+                                ("all-other", "ring-full", True)):
+        folder = directory / label
+        folder.mkdir()
+        log = folder / "trap.log"
+        modes = {
+            "X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), "X2W_BIGBIND_ONCE": "0",
+            "X2W_BIG_COPY_REUSE": "0", "X2W_TEST_UPLOAD_RING_MAX_KIB": "256",
+        }
+        if mutant:
+            modes["X2W_TEST_UPLOAD_CONSUMER_OTHER"] = "1"
+        pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        assert pixels == expected_pixels, f"{label}: pixels {pixels.hex()} expected {expected_pixels.hex()}"
+        lines = log.read_text(errors="replace").splitlines()
+        attribution, = [line for line in lines if line.startswith("x2w-render upload ring by consumer: ")]
+        reuse, = [line for line in lines if line.startswith("x2w-render upload ring reuse blocked: ")]
+        refused = int(mode == "ring-full")
+        expected_counts = {"large-binding": (65536, 1, 0, 0, 65536),
+                           "small-binding": (196608, 6, refused, refused * 32768, 32768)}
+        counts = ring_attribution(attribution)
+        if mutant:
+            assert counts != expected_counts, "the all-other mutant passed the attribution comparison"
+            assert counts == {"other": (262144, 7, 1, 32768, 65536)}, counts
+        else:
+            assert counts == expected_counts, (label, counts)
+        assert reuse == (f"x2w-render upload ring reuse blocked: open-list {refused}, closed-unsubmitted 0, "
+                         "reset-unsubmitted 0, fence 0, frame-hold 0, submitted-list 0; "
+                         "oldest hold 0 frames (average 0.00)"), reuse
+        print(f"{backend} {label}: checked 32 pixels, consumer bytes and counts, and reuse blockers")
+    return 0
+
+
 def check_once(directory, consumer, backend):
     shader = HLSL.replace("asfloat(constants.Load4(0))",
                           "0.5 * (asfloat(constants.Load4(0)) + asfloat(constants.Load4(16777200)))")
@@ -121,5 +169,5 @@ def check_once(directory, consumer, backend):
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "ring": check_ring}.get(sys.argv[3] if len(sys.argv) > 3 else "", check)
         sys.exit(check_mode(Path(temporary), consumer, backend))

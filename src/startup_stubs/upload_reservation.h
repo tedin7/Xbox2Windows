@@ -17,6 +17,7 @@ struct UploadQueue {
     Fence* fence = nullptr;
     std::uint64_t value = 0;
     std::array<std::uint64_t, max_upload_chunks> last_use{};
+    std::array<unsigned, max_upload_chunks> hold_since{}; // Runtime diagnostic frame of the oldest pending use.
 
     void submitted(UploadChunkMask chunks, bool signaled)
     {

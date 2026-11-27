@@ -1581,7 +1581,6 @@ struct BigBinding {
 // Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
 // taken by command lists, so the ring cannot recycle a cached slice before Present.
 std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
-UploadChunkMask big_binding_chunks;
 struct BigBindingCounts {
     unsigned trims = 0, copies = 0, hits = 0;
     std::size_t copied_bytes = 0;
@@ -1634,7 +1633,7 @@ bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
     for (unsigned i = 0; i < upload_chunks.size(); ++i) {
         auto& chunk = upload_chunks[i];
         if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
-            chunk.hold(self->own().upload_chunks, i);
+            hold_upload_recording(self->own(), i);
             ReleaseSRWLockExclusive(&allocator_lock);
             return true;
         }
@@ -1644,7 +1643,8 @@ bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
 }
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
-bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource,
+                UploadConsumer consumer)
 {
     if (frame_copies_frame != frame_number) {
         frame_copies_frame = frame_number;
@@ -1664,7 +1664,7 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
             return true;
         }
     }
-    const auto slice = reserve_upload_ring(self, bytes);
+    const auto slice = reserve_upload_ring(self, bytes, consumer);
     if (!slice.mapped) return false;
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
@@ -1906,7 +1906,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 if (owned.cpu) {
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                 } else {
-                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk, UploadConsumer::copy_source);
                     if (!rows || !chunk) {
                         state.done = false;
                         return false;
@@ -1932,7 +1932,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 if (owned.cpu) {
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                 } else {
-                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk, UploadConsumer::copy_source);
                     if (!rows || !chunk) {
                         state.done = false;
                         return false;  // staging failed: not uploaded, so report it and retry at the next bind
@@ -1955,7 +1955,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         if (owned.cpu) {
             owned.cursor += (bytes + placement - 1) & ~(placement - 1);
         } else {
-            rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+            rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk, UploadConsumer::copy_source);
             if (!rows || !chunk) {
                 state.done = false;
                 return false;  // staging failed: not uploaded, so report it and retry at the next bind
@@ -1980,7 +1980,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     return false;  // fixture fault: a level could not be staged
                 }
                 if (is_compact) {
-                    auto* const rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    auto* const rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk, UploadConsumer::copy_source);
                     if (!rows || !chunk) {
                         state.done = false;
                         return false;  // staging failed: not uploaded, so report it and retry at the next bind
@@ -1999,7 +1999,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     std::memcpy(owned.cpu + offset, memory + stride * s + fp.Offset, static_cast<std::size_t>(bytes));
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                     chunk = owned.resource.Get();
-                } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
+                } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk, UploadConsumer::copy_source) || !chunk) {
                     state.done = false;
                     return false;  // staging failed: not uploaded, so report it and retry at the next bind
                 }
@@ -2539,7 +2539,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (!bytes && compute_input && !words[0] && !words[1] && !words[2] && !words[3]) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
-        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring, UploadConsumer::compute_snapshot);
         if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
         std::memset(zero_bytes, 0, 16);
         return {zero_ring, zero_offset, 16, 0, true, 3};
@@ -2587,7 +2587,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 ID3D12Resource* ring = nullptr;
                 if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
                     return refuse("an input range in title memory is not readable");
-                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring, UploadConsumer::compute_snapshot) || !ring)
                     return refuse("an input range could not be copied from title memory");
                 return {ring, ring_offset, bytes, stride, true, 2};
             } else {
@@ -3305,7 +3305,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const auto padded = (bytes + 3) & ~std::size_t{3};
             ID3D12Resource* chunk = nullptr;
             const bool readable_range = readable_window(address, bytes) >= bytes;
-            auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk,
+                binding_upload_consumer(bytes, srv.source == 1)) : nullptr;
             if (readable_range && !target) {
                 // The guest memory is there; only the copy failed. A null binding would read zeros as if the title had bound nothing.
                 static LONG copy_refused;
@@ -3406,7 +3407,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 have = bind_upload_slice(self, slice);
                 if (have) InterlockedIncrement64(&big_copies_reused);
             } else {
-                slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
+                slice = reserve_upload_ring(self, bytes, binding_upload_consumer(full_bytes, srv.source == 1),
+                                            /*hold_for_frame=*/true);
                 if (slice.mapped) {
                     std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
                     ++big_binding_counts.copies;
@@ -3423,7 +3425,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 big_bindings.erase(bigbind_key(address, full_bytes));
             }
         } else if (readable_range) {
-            have = frame_copy(self, address, bytes, &offset, &chunk);
+            have = frame_copy(self, address, bytes, &offset, &chunk, binding_upload_consumer(full_bytes, srv.source == 1));
         }
         if (!cache_hit) {
             const LONG64 step_t2 = step_now_us();
@@ -3464,7 +3466,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
             address = reinterpret_cast<u64>(identity);
             bytes = sizeof(identity);
-            have = frame_copy(self, address, bytes, &offset, &chunk);
+            have = frame_copy(self, address, bytes, &offset, &chunk, UploadConsumer::entry_constants);
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
@@ -3604,7 +3606,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         auto view = live_indices;
         if (live_index_resource) {
             require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
-        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
+        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk, UploadConsumer::vertex_index) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         }

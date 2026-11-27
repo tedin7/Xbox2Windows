@@ -517,6 +517,28 @@ one address between two draws of a frame, such as a dynamic constant buffer, gav
 data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
 `startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
 
+The upload ring logs per-consumer totals every 300 render presents and a fresh
+window at each heartbeat. Successful MiB includes the ring's 512-byte alignment.
+Refused MiB and maximum request size use the requested size. The tester archive's
+`upload_ring.txt` ranks consumers by successful bytes and refusals and identifies
+the most frequent reuse blocker from the latest cumulative sample, or from the
+latest heartbeat window if the run has no totals.
+
+A failed reuse search counts each active reason once per chunk large enough for
+the request. A chunk can contribute to several reasons in one search. The age
+maximum and average use the oldest active hold on each blocked chunk in each
+search. A submitted list retains its recording until Reset or release, separately
+from the queue fence. `reset-unsubmitted` counts chunk holds released by Reset
+before submission and is excluded from the blocker ranking. The current runtime
+has no mirror-block caller of the shared ring.
+
+`startup_frame_copy_ring_warp` compares 32 pixels to a CPU reference while
+checking consumer attribution on a 256 KiB synthetic ring. Its full case expects
+one 64 KiB binding, six 32 KiB bindings, a 32 KiB refusal, and one open-list
+blocker. Its control ends before the extra attempt. Its attribution mutant
+charges every request to `other` and must fail the same attribution comparison.
+`startup_tester_pack` checks the archive summary with a synthetic log.
+
 ## Root signature changes and dropped root constants
 
 Command-list slot 34 (`SetGraphicsRootSignature`) clears the translated draw's cached descriptor tables, root
