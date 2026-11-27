@@ -13259,7 +13259,7 @@ class Stage:
             key = self.descriptor(ops[2])
         paired = (self.kind == 'ps' and getattr(self.pipe, 'pixel_rw_images', None) is not None
                   and self.is_fixed_table_image(ops[2], key))
-        sparse = (self.kind == 'ps' and not paired and dims[0] == 'SQ_RSRC_IMG_2D' and not d16
+        sparse = (self.kind == 'ps' and not (paired and key in self.pipe.pixel_rw_images) and dims[0] == 'SQ_RSRC_IMG_2D' and not d16
                   and 0 < mask < 0xf)
         if self.kind == 'ps' and mask != 0xf and not paired and not sparse:
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
