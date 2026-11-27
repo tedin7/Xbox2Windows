@@ -183,7 +183,8 @@ set_tests_properties(placed_build_causes PROPERTIES TIMEOUT 30)
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp
+    src/startup_stubs/read_cache.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -1363,6 +1364,7 @@ target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
 add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj> tests/startup_stream_draw.cpp
     tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
+target_include_directories(startup_stream_consumer PRIVATE src)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
@@ -2335,6 +2337,17 @@ target_compile_features(startup_committed_extent_check PRIVATE cxx_std_17)
 add_test(NAME startup_committed_extent COMMAND startup_committed_extent_check)
 add_test(NAME startup_committed_extent_prefix_control COMMAND startup_committed_extent_check --mutate prefix)
 set_tests_properties(startup_committed_extent_prefix_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_read_cache_check tests/startup_read_cache_check.cpp)
+target_include_directories(startup_read_cache_check PRIVATE src)
+target_compile_features(startup_read_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_read_cache_cpu_on COMMAND startup_read_cache_check "$<TARGET_FILE:xmem_shim>" on)
+add_test(NAME startup_read_cache_cpu_off COMMAND startup_read_cache_check "$<TARGET_FILE:xmem_shim>" off)
+add_test(NAME startup_read_cache_decommit_control COMMAND startup_read_cache_check "$<TARGET_FILE:xmem_shim_test_controls>" on)
+set_tests_properties(startup_read_cache_cpu_on PROPERTIES ENVIRONMENT "X2W_READ_CACHE=1")
+set_tests_properties(startup_read_cache_cpu_off PROPERTIES ENVIRONMENT "X2W_READ_CACHE=0")
+set_tests_properties(startup_read_cache_decommit_control PROPERTIES
+    ENVIRONMENT "X2W_READ_CACHE=1;X2W_READ_CACHE_TEST_SKIP_DECOMMIT=1"
+    PASS_REGULAR_EXPRESSION "FAIL: decommitted page was still a cache hit")
 add_executable(startup_copy_cache_check tests/startup_copy_cache_check.cpp)
 target_include_directories(startup_copy_cache_check PRIVATE src)
 target_compile_features(startup_copy_cache_check PRIVATE cxx_std_17)
@@ -5216,6 +5229,17 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_copied_vertex_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_copied_vertex_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_read_cache_indexed_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp read-cache "$<TARGET_FILE:xmem_shim>")
+            add_test(NAME startup_read_cache_indexed_warp_control COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp read-cache-clipped "$<TARGET_FILE:xmem_shim>")
+            set_tests_properties(startup_read_cache_indexed_warp startup_read_cache_indexed_warp_control PROPERTIES TIMEOUT 90)
+            set_tests_properties(startup_read_cache_indexed_warp_control PROPERTIES
+                PASS_REGULAR_EXPRESSION "FAIL: clipped index control differs from the full-screen CPU reference")
+        endif()
         add_test(NAME startup_direct_index_late_write_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

@@ -4930,14 +4930,16 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
     // of another type gets the same when its desktop start is not an address (title_heap_memory.h).
     if (!x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, [](u64 size) {
-        return reinterpret_cast<u64>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        void* allocation = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (allocation) x2w_local::record_read_span(allocation, size);
+        return reinterpret_cast<u64>(allocation);
     })) {
         heap->Release();
         return E_OUTOFMEMORY;
     }
     Wrapper* w = wrap(heap, descriptor_heap_kind);
     if (!w) {
-        if (title_memory != supplied_memory) VirtualFree(reinterpret_cast<void*>(title_memory), 0, MEM_RELEASE);
+        if (title_memory != supplied_memory) x2w_local::release_read_span(reinterpret_cast<void*>(title_memory));
         heap->Release();
         return E_OUTOFMEMORY;
     }
@@ -7875,6 +7877,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        if (const auto* cache = x2w_local::read_cache()) {
+            const auto stats = cache->stats();
+            log("x2w-render totals read-cache: lookups %llu, hits %llu, system queries %llu, spans %llu, erases %llu",
+                stats.lookups, stats.hits, stats.queries, stats.spans, stats.erases);
+        }
+    }
     if (render_mode() && frame % 300 == 0) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
