@@ -3303,16 +3303,33 @@ class Stage:
         reads_before_write = set()
         defined = {key}
         keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
+        raw_load_widths = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2,
+                           'buffer_load_dwordx3': 3, 'buffer_load_dwordx4': 4}
         for j in range(head + 2, close - 1):
             base, ops, mods = parse(ins[j][3])
             base = re.sub(r'_e(32|64)$', '', base)
-            if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
-                            's_bfe_u32', 's_max_u32', 's_mul_i32', 'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32',
-                            's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2', 'buffer_load_dword'):
+            width = raw_load_widths.get(base)
+            # RDNA 2 SOP2 field extracts and integer min/max have the same scalar/SCC footprint
+            # across signedness. VOP bitwise operations write only the executing lane's VGPR.
+            if not width and base not in (
+                    's_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
+                    's_bfe_u32', 's_bfe_i32', 's_max_u32', 's_max_i32', 's_min_u32', 's_min_i32', 's_mul_i32',
+                    'v_mov_b32', 'v_xor_b32', 'v_and_b32', 'v_or_b32', 'v_not_b32', 'v_xnor_b32', 'v_add_nc_u32',
+                    's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2'):
                 return 'body instruction %s is not proven lane-local' % base
-            if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
+            if mods and not (width and 'offen' in mods and all(
+                    m == 'offen' or re.fullmatch(r'offset:(?:0x[0-9a-f]+|\d+)', m) for m in mods)):
                 return 'body instruction %s has unproved modifiers' % base
             reads, writes, may_write = effects[j]
+            if width:
+                dst = reg_range(ops[0]) if ops else None
+                if not dst or dst[0] != 'v' or dst[2] != dst[1] + width - 1 or dst[2] > 255:
+                    return 'buffer load has an invalid vector destination'
+                # Every destination belongs to this lane, including those read after EXEC is restored.
+                # Keep them in the body write set but out of the escaping scalar dependency set.
+                body_writes.update('v%d' % n for n in range(dst[1], dst[1] + width))
+            if base == 's_bfe_i32':
+                writes = writes | {'scc'}
             if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
                 return 'body reads or changes a lane mask or special register'
             if base in ('s_load_dwordx8', 's_buffer_load_dwordx2'):
@@ -3324,7 +3341,7 @@ class Stage:
                 descriptor_inputs.update(reads)
             else:
                 numeric_writes.update(may_write)
-            if base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
+            if width or base == 's_buffer_load_dwordx2':
                 descriptor_index = 1 if base.startswith('s_buffer') else 2
                 if len(ops) <= descriptor_index:
                     return 'buffer load has no descriptor'
@@ -3332,7 +3349,7 @@ class Stage:
             reads_before_write.update(reads - defined)
             defined.update(writes)
             body_writes.update(may_write)
-            if (reads & keyed) or base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
+            if (reads & keyed) or width or base == 's_buffer_load_dwordx2':
                 keyed.update(may_write)
             else:
                 keyed -= writes
