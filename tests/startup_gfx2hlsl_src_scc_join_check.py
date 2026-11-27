@@ -586,7 +586,7 @@ def vertex_reference():
 # Hand-encoded scalar sequence: save two SCC values, traverse nested SCC
 # diamonds, compare the joined copy, then read SCC after a second diamond.
 # An earlier EXEC branch exercises restoration of a common reaching definition.
-def nested_words(mutation=None):
+def nested_words(mutation=None, stale_bad=False):
     branch_to = lambda op, at, target: branch(op, at * 4, target * 4)
     words = [
         bytes.fromhex('8000847d'), branch_to(SOPP_CBRANCH_EXECZ, 1, 3), sopp(SOPP_NOP),
@@ -604,6 +604,9 @@ def nested_words(mutation=None):
         return struct.pack('<II', 0xf4000000 | (2 << 18) | (20 << 6) | 4,
                            (125 << 25) | offset)
     insertions = {13: load(0x10), 15: load(0x30), 20: load(0x10), 22: load(0x30)}
+    if stale_bad:
+        # A nonuniform write is killed by the later SCC save on every path.
+        insertions[3] = sop2(SOP2_AND_B32, 15, 9, VCC_LO)
     offsets, cursor = {}, 0
     for i, word in enumerate(words):
         offsets[i] = cursor
@@ -616,7 +619,9 @@ def nested_words(mutation=None):
     if mutation:
         i, word = mutation
         words[i] = branch(SOPP_BRANCH, offsets[i], offsets[11]) if word == 'back' else word
-    return b''.join(insertions.get(i, b'') + word for i, word in enumerate(words))
+    result = b''.join(insertions.get(i, b'') + word for i, word in enumerate(words))
+    # This later write forces another analysis pass; it cannot reach the SCC read.
+    return result + (sop2(SOP2_AND_B32, 15, 9, VCC_LO) + sop1(3, 15, 128) if stale_bad else b'')
 
 
 NESTED_TAIL = bytes.fromhex(
@@ -660,6 +665,12 @@ def nested_controls():
         return None
     check('nested SCC edge', True)
     check('nested root binding', ('rootconst', 1, 0) in shaders[3], shaders[2])
+    try:
+        nested_translate(nested_words(stale_bad=True))
+    except G.Unsupported as error:
+        check('overwritten nonuniform write', False, str(error))
+    else:
+        check('overwritten nonuniform write', True)
     for index, word, diagnostic in (
             (3, sop2(SOP2_AND_B32, 6, 9, VCC_LO), 'non-uniform'),
             (22, sop2(SOP2_AND_B32, 6, 9, VCC_LO), 'non-uniform'),
