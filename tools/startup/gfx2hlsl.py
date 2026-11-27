@@ -8064,7 +8064,8 @@ class Stage:
                         pending.extend(succ[block])
         self.compute_dpp_entry = {}
         if (getattr(self, 'kind', None) == 'cs' and
-                any(name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT
+                any((name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT) or
+                    name in ('v_permlane16_b32', 'v_permlanex16_b32')
                     for name in names.values())):
             self.compute_dpp_entry = self.compute_dpp_sites(branches, names)
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
@@ -15760,9 +15761,15 @@ class Stage:
         """v_permlane16_b32 vdst, vsrc0, ssrc1, ssrc2 (RDNA 2 ISA, VOP3 lane permutes; LLVM 15 gfx10): inside each row of
         16 lanes, lane i reads vsrc0 of lane sel[i] of the same row, where sel[i] is the 4-bit field i of ssrc1 (lanes
         0..7) or of ssrc2 (lanes 8..15). The op_sel flags (fetch-inactive, bound_ctrl) only decide what a disabled lane
-        reads, so the form is taken only where every lane is enabled: a straight-line compute program with entry EXEC
+        reads, so the form is taken only where every lane is enabled: a compute program with proven entry EXEC
         in a group of whole rows. Exchanged through groupshared memory like the DPP swaps (compute_quad_gate)."""
-        name = 'v_permlane16_b32'
+        self.permlane16(ops, mods, cross_row=False)
+
+    def op_v_permlanex16_b32(self, ops, mods):
+        self.permlane16(ops, mods, cross_row=True)
+
+    def permlane16(self, ops, mods, *, cross_row):
+        name = 'v_permlanex16_b32' if cross_row else 'v_permlane16_b32'
         dst, src = (reg_range(ops[0]), reg_range(ops[1])) if len(ops) == 4 else (None, None)
         if not dst or not src or dst[0] != 'v' or src[0] != 'v' or dst[1] != dst[2] or src[1] != src[2]:
             raise Unsupported('%s requires VGPR destination and source and two lane selects' % name)
@@ -15770,7 +15777,9 @@ class Stage:
             raise Unsupported('%s with %s' % (name, ' '.join(m for m in mods if not re.fullmatch(r'op_sel:\[[01],[01]\]', m))))
         if getattr(self, 'kind', None) != 'cs':
             raise Unsupported('%s outside a compute program' % name)
-        self.compute_quad_gate(name, row_ror8=True)
+        if cross_row and math.prod(self.pipe.group) % 32:
+            raise Unsupported('v_permlanex16_b32 in a compute program requires a group of whole 32-lane row pairs')
+        self.compute_quad_gate(name, row_ror8=True, allow_flow=True)
         x, y, _z = self.pipe.group
         flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
         lane = '(%s & 15u)' % flat
@@ -15778,7 +15787,8 @@ class Stage:
         self.uses_quad_shared = True
         self.emit('x2w_quad[%s] = %s;' % (flat, self.u(ops[1])))
         self.emit('GroupMemoryBarrierWithGroupSync();')
-        self.set_v(dst[1], 'x2w_quad[(%s & ~15u) | %s]' % (flat, select))
+        row = '(%s ^ 16u)' % flat if cross_row else flat
+        self.set_v(dst[1], 'x2w_quad[(%s & ~15u) | %s]' % (row, select))
         self.emit('GroupMemoryBarrierWithGroupSync();')
 
     def op_v_mov_b32(self, ops, mods):
