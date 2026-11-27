@@ -1295,16 +1295,26 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
     bool variant = std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
-    if (!variant && base->state != 1 &&
+    if (!variant && base->state == 2 &&
         std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_snorm_export_variant)) {
         if (base->snorm_refusal == Translation::SnormRefusal::unchecked) {
             constexpr char signed_export[] = "signed normalized compressed export";
             wchar_t path[MAX_PATH];
-            std::string failure;
-            const bool matches = cache_path(path, L"", base->key, L".fail") && read_text(path, failure) &&
-                                 failure.compare(0, sizeof(signed_export) - 1, signed_export) == 0;
-            base->snorm_refusal = matches ? Translation::SnormRefusal::signed_export
-                                           : Translation::SnormRefusal::other;
+            if (cache_path(path, L"", base->key, L".fail")) {
+                HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    char prefix[sizeof(signed_export) - 1];
+                    DWORD bytes = 0;
+                    const bool read = ReadFile(file, prefix, sizeof(prefix), &bytes, nullptr) != 0;
+                    CloseHandle(file);
+                    if (read) {
+                        const bool matches = bytes == sizeof(prefix) &&
+                                             std::memcmp(prefix, signed_export, sizeof(prefix)) == 0;
+                        base->snorm_refusal = matches ? Translation::SnormRefusal::signed_export
+                                                       : Translation::SnormRefusal::other;
+                    }
+                }
+            }
         }
         variant = base->snorm_refusal == Translation::SnormRefusal::signed_export;
     }
