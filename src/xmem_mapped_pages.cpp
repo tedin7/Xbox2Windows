@@ -150,13 +150,25 @@ BOOL physical_result(era_physical::Status status) noexcept
 // and stays committed after it is freed so that reuse cannot fail for lack of commit. A freed slot is
 // zeroed when it is reused, as a fresh section was. Fails with the system error (for instance
 // ERROR_COMMITMENT_LIMIT) when the slot cannot be committed, leaving no state changed.
+#ifdef X2W_XMEM_TEST_CONTROLS
+thread_local bool test_fault_commit = false;  // set by lazy_commit_fault around the commit it makes
+#endif
+
 bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
 {
 #ifdef X2W_XMEM_TEST_CONTROLS
-    // Refuse the first commit in a dedicated test process without consuming system commit.
-    static bool refuse_commit = x2w_local::env_on("X2W_XMEM_TEST_COMMIT_FAILURE");
-    if (refuse_commit) {
-        refuse_commit = false;
+    // Refuse one commit in a dedicated test process without consuming system commit: X2W_XMEM_TEST_COMMIT_FAILURE=1
+    // refuses the first commit of the process, =touch the first one the lazy-commit fault handler makes (mapping and
+    // other commits before it go through).
+    static const int refuse_mode = [] {
+        char value[8]{};
+        const DWORD length = GetEnvironmentVariableA("X2W_XMEM_TEST_COMMIT_FAILURE", value, sizeof(value));
+        if (!length || length >= sizeof(value)) return 0;
+        return !std::strcmp(value, "touch") ? 2 : value[0] == '1' ? 1 : 0;
+    }();
+    static bool refused = false;
+    if (refuse_mode && !refused && (refuse_mode == 1 || test_fault_commit)) {
+        refused = true;
         SetLastError(ERROR_COMMITMENT_LIMIT);
         return false;
     }
@@ -363,11 +375,18 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
             retried = page;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if (commit_backing(*backing)) {
+#ifdef X2W_XMEM_TEST_CONTROLS
+        test_fault_commit = true;
+#endif
+        const bool committed = commit_backing(*backing);
+        error = committed ? ERROR_SUCCESS : GetLastError();
+#ifdef X2W_XMEM_TEST_CONTROLS
+        test_fault_commit = false;
+#endif
+        if (committed) {
             retried = 0;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        error = GetLastError();
     }
     return stop_after_lazy_commit_failure(*record, page, page_bytes, error);
 }
