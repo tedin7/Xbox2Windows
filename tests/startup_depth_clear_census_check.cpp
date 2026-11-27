@@ -70,10 +70,29 @@ void check_greater_draws()
 
 }  // namespace
 
+// The draw path keeps the desktop depth state for a GREATER test on a view last cleared to 1.0; it asks last_clear.
+void check_last_clear()
+{
+    lines.clear();
+    x2w_depth_census::DepthClearCensus census(sink);
+    const int a = 0, b = 0, c = 0;
+    expect(census.last_clear(&a) == x2w_depth_census::LastClear::never, "a view with no clear is never cleared");
+    expect(census.last_clear(nullptr) == x2w_depth_census::LastClear::never, "no view is never cleared");
+    census.executed(&a, 1.0f, x2w_depth_census::clear_depth_flag);
+    census.executed(&b, 0.0f, x2w_depth_census::clear_depth_flag);
+    census.executed(&c, 0.5f, x2w_depth_census::clear_depth_flag);
+    expect(census.last_clear(&a) == x2w_depth_census::LastClear::far_one, "cleared to 1.0");
+    expect(census.last_clear(&b) == x2w_depth_census::LastClear::near_zero, "cleared to 0.0");
+    expect(census.last_clear(&c) == x2w_depth_census::LastClear::other, "cleared to another value");
+    census.executed(&a, 0.0f, x2w_depth_census::clear_depth_flag);
+    expect(census.last_clear(&a) == x2w_depth_census::LastClear::near_zero, "a later clear replaces the value");
+}
+
 int main()
 {
     check_values();
     check_greater_draws();
+    check_last_clear();
     if (failures) {
         for (const auto& line : lines) std::fprintf(stderr, "  %s\n", line.c_str());
         return 1;

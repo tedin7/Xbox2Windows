@@ -1344,7 +1344,12 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
     // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
-    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    // A decoded GREATER or GREATER_EQUAL test is the reversed-Z form: it needs a view cleared to the far value 0.0. On a view
+    // last cleared to 1.0 (the desktop far value) nothing but depth 1.0 passes, so that draw keeps the desktop default.
+    const bool far_one_greater = bound.depth_from_registers && bound.depth_stencil.DepthEnable && pass.bound_depth &&
+        (bound.depth_stencil.DepthFunc == D3D12_COMPARISON_FUNC_GREATER || bound.depth_stencil.DepthFunc == D3D12_COMPARISON_FUNC_GREATER_EQUAL) &&
+        depth_clear_census().last_clear(pass.bound_depth) == x2w_depth_census::LastClear::far_one;
+    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN) && !far_one_greater;
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);

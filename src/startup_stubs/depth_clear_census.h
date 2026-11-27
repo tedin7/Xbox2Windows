@@ -92,6 +92,17 @@ public:
         ReleaseSRWLockExclusive(&lock_);
     }
 
+    // What a depth view was last cleared to; never when no clear reached it.
+    LastClear last_clear(const void* target)
+    {
+        if (!target) return LastClear::never;
+        AcquireSRWLockShared(&lock_);
+        const auto found = last_.find(target);
+        const LastClear value = found == last_.end() ? LastClear::never : found->second;
+        ReleaseSRWLockShared(&lock_);
+        return value;
+    }
+
     // A draw with a decoded depth test on `target` (the bound depth resource); only GREATER and GREATER_EQUAL count.
     void depth_draw(const void* target, int func)
     {
