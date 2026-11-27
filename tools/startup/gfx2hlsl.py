@@ -33,6 +33,7 @@ from shader_minmax import FLOAT_MINMAX  # noqa: E402
 WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
                            'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
+TABLE_COUNT_REFUSAL = r'^numeric use of s\d+ holding desc$'
 
 
 class Unsupported(Exception):
@@ -3284,6 +3285,14 @@ class Stage:
                 return 's%d' % n
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
+            if (s[0] == 'desc' and s[1][0] == 'table' and getattr(self, 'kind', None) == 'ps'
+                    and getattr(self.pipe, 'lower_table_counts', False)
+                    and 0 <= s[1][1] < 16 and s[3] % 4 == 2 and s[2] is not None):
+                offset = s[2] + 4 * (s[3] - 2)
+                if 0 <= offset <= 0x7fffffff and offset % 4 == 0 and self.spill_word_proven(n, s):
+                    # Keep the descriptor symbol for later resource operands. The draw binder
+                    # snapshots NUM_RECORDS from the hardware record into an entry constant.
+                    return 'ud%d' % self.pipe.ud(('tablenumrecords', s[1][1], offset))
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
@@ -13029,29 +13038,44 @@ class Pipeline:
         self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
 
     def _build_pixel_stage(self, code, refusals=None, decoded=None):
-        # Translation can allocate bindings before refusing. Restore the state left
-        # by the vertex stage so the retry allocates only the bindings it uses.
-        state = deepcopy(self.__dict__, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+        # Keep successful legacy translations unchanged. Retry only a refused
+        # stage and discard the bindings allocated during the preceding attempt.
+        memo = {id(self.vs): self.vs} if hasattr(self, 'vs') else {}
+        state = deepcopy(self.__dict__, memo.copy())
         before = len(refusals) if refusals is not None else 0
-        try:
-            stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
-        except Unsupported as reason:
-            if str(reason) != READFIRSTLANE_UNIFORM:
-                raise
-        else:
-            if refusals is None or (READFIRSTLANE_UNIFORM, 'ps') not in refusals[before:]:
+        retry_firstlane = lower_table_counts = False
+        while True:
+            failure = None
+            try:
+                stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+            except Unsupported as reason:
+                failure = reason
+                reasons = (str(reason),)
+            else:
+                reasons = tuple(text for text, scope in refusals[before:] if scope == 'ps') if refusals else ()
+
+            if not retry_firstlane and READFIRSTLANE_UNIFORM in reasons:
+                retry_firstlane = True
+            elif (getattr(self, 'allow_table_counts', False) and not lower_table_counts
+                  and any(re.fullmatch(TABLE_COUNT_REFUSAL, reason) for reason in reasons)):
+                lower_table_counts = True
+            elif failure is not None:
+                raise failure
+            else:
                 return stage
-        self.__dict__.clear()
-        self.__dict__.update(state)
-        self.retry_firstlane = True
-        if refusals is not None:
-            del refusals[before:]
-        return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+
+            self.__dict__.clear()
+            self.__dict__.update(deepcopy(state, memo.copy()))
+            self.retry_firstlane = retry_firstlane
+            self.lower_table_counts = lower_table_counts
+            if refusals is not None:
+                del refusals[before:]
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
+        self.allow_table_counts = self.vertex_kind == 'vs'  # the graphics draw manifest supplies these constants
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
@@ -13709,8 +13733,10 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def manifest(self):
-        # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
-        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
+        # Version 2 adds writable views. Version 3 adds table record counts.
+        version = (3 if any(source[0] == 'tablenumrecords' for source in self.uds)
+                   else 2 if self.stored_images() else 1)
+        lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
         for i, source in enumerate(self.uds):
@@ -14970,6 +14996,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('table-record-count', TABLE_COUNT_REFUSAL),
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),

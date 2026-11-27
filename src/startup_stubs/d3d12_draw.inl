@@ -154,7 +154,7 @@ std::uint64_t process_ms()
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, table_num_records };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     KeyUse use;                              // when a draw first and last used this pipeline key
@@ -602,14 +602,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
-        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
-            // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
-            // so a translation whose stores would be silently skipped is never drawn (#1723).
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" &&
+                   line != "x2w-manifest 2" && line != "x2w-manifest 3") {
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
-        } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
+        } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y);
+                   fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
             else if (!std::strcmp(source, "basevertex")) ud.kind = Translation::base_vertex;
@@ -618,7 +618,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
             else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
             else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
-            else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
+            else if (!std::strcmp(source, "tablenumrecords")) {
+                if (fields != 4 || x < 0 || x >= 16 || y < 0 || y % 4 ||
+                    static_cast<std::size_t>(i) != tr.uds.size()) return;
+                ud.kind = Translation::table_num_records;
+            } else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
@@ -3215,11 +3219,13 @@ static const char* const not_drawn_names[] = {
     "buffer_copy_failed",
     "index_data_unavailable",
     "dynamic_resource_heap_unavailable",
+    "table_count_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 3;
-constexpr int index_data_unavailable_site = not_drawn_sites - 2;
-constexpr int dynamic_resource_heap_unavailable_site = not_drawn_sites - 1;
+constexpr int buffer_copy_failed_site = not_drawn_sites - 4;
+constexpr int index_data_unavailable_site = not_drawn_sites - 3;
+constexpr int dynamic_resource_heap_unavailable_site = not_drawn_sites - 2;
+constexpr int table_count_unavailable_site = not_drawn_sites - 1;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -3459,6 +3465,23 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(pass, list, not_drawn_key, 8);
     }
+    std::uint32_t values[32] = {};
+    for (std::size_t i = 0; i < tr->uds.size(); ++i) {
+        const auto& ud = tr->uds[i];
+        if (ud.kind != Translation::table_num_records) continue;
+        std::uint32_t words[4]{};
+        const auto* entry = reinterpret_cast<const void*>(pass.view_tables[ud.a].record(ud.b, sizeof(words)));
+        if (entry && x2w_local::readable(entry, sizeof(words))) {
+            std::memcpy(words, entry, sizeof(words));
+            // Hardware buffer descriptors have TYPE == 0. View tokens carry a slot index.
+            if (words[0] != view_token_magic && (words[3] >> 30) == 0) {
+                values[i] = words[2];
+                continue;
+            }
+        }
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, table_count_unavailable_site);
+    }
     const bool trace_inputs = red_producers().onset();
     ID3D12Resource* sampled_textures[32]{};
     unsigned sampled_count = 0;
@@ -3553,7 +3576,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT indexed_vertices = UINT_MAX;
     bool has_null_input = false;
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
-    std::uint32_t values[32] = {};
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -4068,6 +4090,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
+        if (ud.kind == Translation::table_num_records) continue;
         values[i] = ud.kind == Translation::rect ? (rect && !indexed_rect ? 1u : 0u)
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance
