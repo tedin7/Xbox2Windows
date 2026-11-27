@@ -175,6 +175,8 @@ class ControlFlow:
                 empty, active = active, empty
             if empty == active:
                 continue
+            # The skipped region's definitions stand in for undef on the
+            # empty edge. The emitter leaves the skipped registers untouched.
             seen, todo, writes = {empty, start}, [active], set()
             while todo:
                 block = todo.pop()
@@ -186,7 +188,6 @@ class ControlFlow:
                                   if re.fullmatch(r'[sv]\d+', reg))
                 todo.extend(self.successors[block])
             self.exec_zero_edges[start, empty] = writes
-
 
     def definedness(self, entry, elided_scc=()):
         def transfer(state, index):
@@ -448,11 +449,12 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
         def u(self, tok, *, low16_only=False):
             if tok.startswith('serial_word_'):
                 token = tok.removeprefix('serial_word_')
-                if token.startswith('s'):
-                    value = super().S(int(token[1:]))
-                    return 'serial_value_' + value if value == token else value
-                value = self.word(token)
-                return 'serial_value_' + value if value in VCC_REGISTERS.values() else value
+                token = VCC_REGISTERS.get(token, token)
+                if re.fullmatch(r's\d+', token):
+                    n = int(token[1:])
+                    value = super().S(n)
+                    return 'serial_value_' + value if value == token and n in self.masks else value
+                return self.word(token)
             return super().u(tok, low16_only=low16_only)
 
         def S(self, n):
@@ -466,8 +468,8 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 return self.S(int(VCC_REGISTERS[token][1:]))
             if token in MASK_WORDS:
                 return token
-            if token in ('exec', 'vcc'):
-                return token + '_lo'
+            if token == 'exec':
+                return 'exec_lo'
             return self.u(token)
 
         def pair(self, token, destination=False):

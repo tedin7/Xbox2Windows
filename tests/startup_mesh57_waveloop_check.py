@@ -174,9 +174,20 @@ def check_export_rewrite(dxc):
     with patch.object(G.MeshPipeline, 'mesh_output_line', with_temporary):
         status, output = run(SERIAL_MESH, 'force', artifacts=True)
     assert status == 'ok', status
+    compile_mesh(dxc, output['ms57.hlsl'])
+
+
+def check_vcc_numeric_alias_compiles(dxc):
+    program = ['7d840080', 'bf00806a']  # v_cmp_eq_u32 into VCC, then s_cmp_eq_i32 reading its low word
+    status, output = run(SERIAL_MESH[:8] + program + SERIAL_MESH[9:], 'force', artifacts=True)
+    assert status == 'ok', status
+    compile_mesh(dxc, output['ms57.hlsl'])
+
+
+def compile_mesh(dxc, hlsl):
     with tempfile.TemporaryDirectory() as tmp:
-        shader = Path(tmp) / 'export.hlsl'
-        shader.write_bytes(output['ms57.hlsl'])
+        shader = Path(tmp) / 'mesh.hlsl'
+        shader.write_bytes(hlsl)
         subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', str(shader.with_suffix('.cso')),
                         str(shader)], check=True)
 
@@ -225,6 +236,7 @@ def main():
     check_level_zero_mesh_gather()
     if len(sys.argv) == 2:
         check_export_rewrite(sys.argv[1])
+        check_vcc_numeric_alias_compiles(sys.argv[1])
     elif len(sys.argv) > 2:
         raise SystemExit('usage: startup_mesh57_waveloop_check.py [dxc]')
     print('ok')
