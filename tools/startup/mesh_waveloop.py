@@ -383,8 +383,10 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 for reg in sorted(reads):
                     if re.fullmatch(r's\d+', reg) and self.sym.get(int(reg[1:])) == STUB_RESULT:
                         raise G.Unsupported('wave loop: %s holds %s' % (reg, STUB_RESULT[0]))
-                if (real_name != 's_mov_b64' and any(op in VCC_REGISTERS for op in ops)
-                        or real_name.startswith('s_cbranch_vcc')):
+                vcc_copy = (real_name == 's_mov_b64' and ops[1] == 'vcc'
+                            and (ops[0] == 'vcc' or G.reg_range(ops[0]) is not None))
+                if not vcc_copy and (any(op in VCC_REGISTERS for op in ops)
+                                     or real_name.startswith('s_cbranch_vcc')):
                     for reg in ('s106', 's107'):
                         symbol = self.sym.get(int(reg[1:]))
                         if reg in reads and symbol and not G.run_time_symbol(symbol):
@@ -625,7 +627,13 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             symbols = [self.sym.get(n) for n in range(src[1], src[2] + 1)]
             if JOINED in symbols:
                 raise G.Unsupported('wave loop: symbolic pair is joined across blocks')
-            if any(sym and not G.run_time_symbol(sym) for sym in symbols):
+            symbolic = [sym for sym in symbols if sym and not G.run_time_symbol(sym)]
+            if symbolic:
+                if 'vcc' not in ops:
+                    super().one('s_mov_b64', 's_mov_b64 ' + ', '.join(ops))
+                    return True
+                if any(sym[0] != 'desc' for sym in symbolic):
+                    raise G.Unsupported('wave loop: VCC pair copy needs descriptor or runtime words')
                 # A descriptor word is represented by provenance only. Copy
                 # that provenance through VCC as through any other SGPR pair.
                 values = [self.S(n) if sym is None or G.run_time_symbol(sym) else None
