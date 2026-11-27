@@ -55,6 +55,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/null_input_census.h"
+#include "startup_stubs/target_draw_census.h"
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
 #include "startup_stubs/dsv_planes.h"
@@ -3239,8 +3240,8 @@ struct Pass {
     bool depth_view_writable = false;
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
-    UINT64 target0_width = 0;
-    UINT target0_height = 0;
+    x2w_startup::TargetDrawCensus::Surface target_surfaces[8]{};
+    x2w_startup::TargetDrawCensus::Surface depth_surface;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
@@ -3401,6 +3402,9 @@ void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self
 
 #include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
+
+void note_target_draw(const Pass& pass, LONG frame, bool poisoned = false,
+                      const x2w_red::Input* inputs = nullptr, unsigned input_count = 0);
 
 void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
 void forget_red_producer(ID3D12Resource* resource) { red_producers().forget(resource); }
@@ -4174,6 +4178,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (graphics) note_target_draw(pass, InterlockedCompareExchange(&frame_number, 0, 0));
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
@@ -4604,16 +4609,16 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     std::copy_n(targets, 8, pass.bound_targets);
     pass.bound_depth = dsv_target;
     pass.dsv_format = dsv_format;
-    const auto single_sample = [&pass](ID3D12Resource* resource) {
+    const auto inspect = [](ID3D12Resource* resource, DXGI_FORMAT format, auto& surface) {
         const auto desc = resource->GetDesc();
-        if (resource == pass.target0) {
-            pass.target0_width = desc.Width;
-            pass.target0_height = desc.Height;
-        }
+        surface = {reinterpret_cast<std::uintptr_t>(resource), desc.Width, desc.Height, static_cast<int>(format)};
         return desc.SampleDesc.Count == 1 && !desc.SampleDesc.Quality;
     };
-    pass.targets_single_sample = std::all_of(targets, targets + count, single_sample) &&
-        (!dsv_target || single_sample(dsv_target));
+    pass.targets_single_sample = true;
+    for (UINT i = 0; i < count; ++i)
+        pass.targets_single_sample &= inspect(targets[i], formats[i], pass.target_surfaces[i]);
+    pass.depth_surface = {};
+    if (dsv_target) pass.targets_single_sample &= inspect(dsv_target, dsv_format, pass.depth_surface);
     pass.depth_view_writable = dsv_target && dsv_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
@@ -4754,7 +4759,7 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     }
     list->Dispatch(x, y, z);
 }
-extern LONG translated_draws, untranslated_draws, frame_number;
+extern LONG translated_draws, untranslated_draws;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
@@ -4790,6 +4795,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         red_producer_draw_after(self, red_samples);
+        note_target_draw(pass, InterlockedCompareExchange(&frame_number, 0, 0));
         const LONG n = InterlockedIncrement(&render_draws);
         if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
@@ -8225,6 +8231,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     }
     null_report.emit([](const char* line) { log("%s", line); });
+    if (totals_due || null_report_due)
+        target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, 30, totals_due);
     if (render_mode() && frame % 300 == 0) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
@@ -8390,11 +8398,27 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     null_report.add("x2w-render fixture %s", null_totals);
     draw_lock_release_exclusive();
     null_report.emit(emit);
+    target_draw_snapshot(false).report(emit, InterlockedCompareExchange(&frame_number, 0, 0), 30, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;
+}
+
+// The WARP fixture supplies recording frames and drives the production report at explicit window boundaries.
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_target_frame(LONG frame, bool omit_target)
+{
+    InterlockedExchange(&frame_number, frame);
+    AcquireSRWLockExclusive(&target_draw_census_lock);
+    fixture_omit_refused_target = omit_target;
+    ReleaseSRWLockExclusive(&target_draw_census_lock);
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_target_report(LONG threshold)
+{
+    const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
+    target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, threshold, true);
 }
 
 template <int K, int N>

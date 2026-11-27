@@ -34,15 +34,6 @@ struct NullInputCensus {
         }
     };
 
-    struct Target {
-        std::uintptr_t resource;
-        std::uint64_t width;
-        unsigned height;
-        int format;
-        long first, last;
-        std::uint64_t draws = 0, poisoned = 0;
-    };
-
     // omit_index is used only by the negative control.
     void note(Input sample, bool omit_index = false)
     {
@@ -59,25 +50,10 @@ struct NullInputCensus {
         ++input_overflow;
     }
 
-    void note_target(Target sample, bool poisoned)
-    {
-        const auto hash = (sample.resource >> 4) ^ (sample.resource >> 10);
-        for (std::size_t probe = 0; probe < targets.size(); ++probe) {
-            auto& row = targets[(hash + probe) % targets.size()];
-            if (!row.draws) row = sample;
-            else if (row.resource != sample.resource) continue;
-            ++row.draws;
-            if (poisoned) ++row.poisoned;
-            row.last = sample.last;
-            return;
-        }
-        ++target_overflow;
-    }
-
     // With the caller's draw lock held, format the changed rows into a bounded
     // batch. The caller can write the batch to the log after releasing the lock.
     struct Batch {
-        std::array<std::array<char, 384>, 90> lines;
+        std::array<std::array<char, 384>, 26> lines;
         std::size_t count = 0;
 
         template <typename... Args>
@@ -126,27 +102,15 @@ struct NullInputCensus {
                       static_cast<unsigned long long>(row.calls), row.first, row.last, row.rtv, row.dsv, detail);
             if (changed) row.reported = row.calls;
         }
-        for (const auto& row : targets) {
-            if (!row.draws) continue;
-            batch.add("x2w-render target %llx (%llux%u format %d): draws %llu, with a null input %llu frames %ld..%ld",
-                      static_cast<unsigned long long>(row.resource), static_cast<unsigned long long>(row.width),
-                      row.height, row.format, static_cast<unsigned long long>(row.draws),
-                      static_cast<unsigned long long>(row.poisoned), row.first, row.last);
-        }
-        if ((!changed && input_overflow) || input_overflow != reported_overflow || target_overflow)
-            batch.add("x2w-render null census overflow: inputs %llu, target draws %llu",
-                      static_cast<unsigned long long>(input_overflow), static_cast<unsigned long long>(target_overflow));
-        if (changed) {
-            reported_overflow = input_overflow;
-            targets = {};
-            target_overflow = 0;
-        }
+        if ((!changed && input_overflow) || input_overflow != reported_overflow)
+            batch.add("x2w-render null census overflow: inputs %llu, target draws 0",
+                      static_cast<unsigned long long>(input_overflow));
+        if (changed) reported_overflow = input_overflow;
     }
 
 private:
     std::array<Input, 512> inputs{};
-    std::array<Target, 64> targets{};
-    std::uint64_t input_overflow = 0, reported_overflow = 0, target_overflow = 0;
+    std::uint64_t input_overflow = 0, reported_overflow = 0;
 };
 
 }  // namespace x2w_startup
