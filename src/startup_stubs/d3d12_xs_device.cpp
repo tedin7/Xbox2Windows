@@ -109,7 +109,6 @@
 #include <memory>
 #include <new>
 #include <map>
-#include <tuple>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -283,8 +282,7 @@ void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
-u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root, int& pixel_stage,
-                        bool census_only = false);
+void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -3265,8 +3263,6 @@ struct Pass {
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
-    u64 requested_mesh_key = 0;
-    int requested_mesh_pixel_stage = -1;
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
@@ -3855,61 +3851,6 @@ bool split_indirect_dispatch_enabled()
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
 }
 
-enum class MeshSurfaceRole { color, depth, none };
-using MeshRefusalSurface = std::tuple<u64, int, MeshSurfaceRole, UINT, u64, unsigned, int>;
-SRWLOCK mesh_refusal_lock = SRWLOCK_INIT;
-std::map<MeshRefusalSurface, u64> mesh_refusals;
-
-void note_mesh_refusal(const Pass& pass)
-{
-    const bool same_request = pass.pipeline == pass.requested_mesh_pipeline && pass.root == pass.requested_mesh_root;
-    u64 key = same_request ? pass.requested_mesh_key : 0;
-    int pixel = same_request ? pass.requested_mesh_pixel_stage : -1;
-    if (!key && pass.pipeline && !pass.pipeline->own().real)
-        key = request_slot57_mesh(pass.pipeline, pass.root, pixel, true);
-    const auto note = [&](MeshSurfaceRole role, UINT slot, const x2w_startup::TargetDrawCensus::Surface& surface) {
-        ++mesh_refusals[{key, pixel, role, slot, surface.width, surface.height, surface.format}];
-    };
-    x2w_startup::ExclusiveNoteLock guard(mesh_refusal_lock);
-    for (UINT i = 0; i < pass.target_count; ++i) note(MeshSurfaceRole::color, i, pass.target_surfaces[i]);
-    if (pass.bound_depth) note(MeshSurfaceRole::depth, 0, pass.depth_surface);
-    if (!pass.target_count && !pass.bound_depth) note(MeshSurfaceRole::none, 0, {});
-}
-
-template <typename Emit>
-void report_mesh_refusals(Emit emit, bool advance)
-{
-    std::map<MeshRefusalSurface, u64> rows;
-    {
-        x2w_startup::ExclusiveNoteLock guard(mesh_refusal_lock);
-        if (advance) rows.swap(mesh_refusals);
-        else rows = mesh_refusals;
-    }
-    if (rows.empty()) return;
-    std::string line = "x2w-render indirect mesh refusals";
-    for (const auto& [surface, count] : rows) {
-        const auto& [key, pixel, role, slot, width, height, format] = surface;
-        const std::string attachment = role == MeshSurfaceRole::color ? "color" + std::to_string(slot) :
-            role == MeshSurfaceRole::depth ? "depth" : "none";
-        char row[180];
-        std::snprintf(row, sizeof(row), " key=%016llx ps=%s %s=%llux%u/%d calls=%llu",
-                      key, pixel < 0 ? "unknown" : pixel ? "yes" : "none", attachment.c_str(), width, height, format, count);
-        line += row;
-    }
-    emit(line.c_str());
-}
-
-void log_mesh_refusal_window()
-{
-    report_mesh_refusals([](const char* text) {
-        // A window can contain more formats and keys than fit in log's fixed buffer.
-        std::string line = text;
-        line += "\r\n";
-        x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line.data(), static_cast<DWORD>(line.size()));
-        x2w_trap::append_log(line.data(), static_cast<DWORD>(line.size()), false);
-    }, true);
-}
-
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -3919,11 +3860,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
     Wrapper* refusal_pipeline = nullptr;
     u64 trace_call = 0;
-    const Pass* refusal_pass = nullptr;
-    const bool mesh_census = kind == IndirectCommand::dispatch_mesh && x2w_local::env_on("X2W_MESH57_CENSUS");
-    const auto refuse = [&kind, &refusal_pipeline, &trace_call, &refusal_pass, mesh_census](const char* reason, int outcome = indirect_other,
+    const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
                                                                const char* code = nullptr) {
-        if (mesh_census && refusal_pass) note_mesh_refusal(*refusal_pass);
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         if (trace_call)
             log("x2w-mesh86-trace call=%llu stage=record outcome=refused reason=%s", trace_call, reason);
@@ -3940,7 +3878,6 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
-    if (mesh_census) refusal_pass = &pass_of(self);
     if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
         const auto& pass = pass_of(self);
         if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
@@ -3996,8 +3933,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
                 pass.requested_mesh_pipeline = pass.pipeline;
                 pass.requested_mesh_root = pass.root;
-                pass.requested_mesh_pixel_stage = -1;
-                pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root, pass.requested_mesh_pixel_stage);
+                request_slot57_mesh(pass.pipeline, pass.root);
             } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
@@ -8354,10 +8290,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     }
     null_report.emit([](const char* line) { log("%s", line); });
-    if (totals_due || null_report_due) {
+    if (totals_due || null_report_due)
         target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, 30, totals_due);
-        log_mesh_refusal_window();
-    }
     if (render_mode() && frame % 300 == 0) {
         // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
         // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
@@ -8527,7 +8461,6 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     null_report.add("x2w-render fixture %s", null_totals);
     draw_lock_release_exclusive();
     null_report.emit(emit);
-    report_mesh_refusals(emit, false);
     target_draw_snapshot(false).report(emit, InterlockedCompareExchange(&frame_number, 0, 0), 30, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
@@ -8549,7 +8482,6 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fixture_target_report(LONG thres
 {
     const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
     target_draw_snapshot(true).report([](const char* line) { log("%s", line); }, frame, threshold, true);
-    log_mesh_refusal_window();
 }
 
 template <int K, int N>
