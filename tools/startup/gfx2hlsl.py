@@ -6169,7 +6169,9 @@ class Stage:
                     self.descriptor_block_first = instruction_index + 1
 
             new_bad = self.bad_sgprs - force_unproven
-            if getattr(self, 'kind', None) == 'ps' and not back_targets and getattr(self, 'flow', None) is not None:
+            if (not back_targets and getattr(self, 'flow', None) is not None and
+                    (getattr(self, 'kind', None) == 'ps' or
+                     (getattr(self, 'kind', None) == 'vs' and getattr(self, 'retry_scc_edges', False)))):
                 # No loop can bring a later write back to an earlier join: block a register only at the joins its
                 # unproven write can still reach, so a proven rewrite further down lets it be trusted again.
                 for reg in [r for r in new_bad if isinstance(r, int) and r in self.__dict__.get('bad_write_pcs', {})]:
