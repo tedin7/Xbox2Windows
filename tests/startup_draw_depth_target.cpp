@@ -209,7 +209,7 @@ int readonly_scene(ID3D12Device* desktop, void* guest, StreamTarget& state, void
     std::array<ComPtr<ID3D12Resource>, 2> depths, native_depths;
     for (unsigned i = 0; i < depths.size(); ++i) {
         if (FAILED(static_cast<HRESULT>(invoke(guest, 76, ptr_arg(&default_heap), 0, ptr_arg(&depth_desc), 0, 0,
-                                              ptr_arg(&__uuidof(ID3D12Resource)), ptr_arg(depths[i].GetAddressOf()))))
+                                              ptr_arg(&__uuidof(ID3D12Resource)), ptr_arg(depths[i].GetAddressOf())))))
             return 60;
         native_depths[i] = desktop_resource(desktop, guest, depths[i].Get());
         if (!native_depths[i]) return 61;
