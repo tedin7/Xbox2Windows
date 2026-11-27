@@ -4855,8 +4855,6 @@ class Stage:
                 return 's%d' % n
             if s[0] == 'descnum' and len(s) == 3:
                 return self.descriptor_number(self.descriptor_number_node(s))
-            if s[0] == 'mesh_group_value':
-                return 'gid.x'
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
@@ -7651,7 +7649,7 @@ class Stage:
                 return False  # written before the last join: program-order tracking is not exact there
             sym = self.sym.get(lo)
             if sym:
-                return sym[0] in ('const', 'ud', 'fixed_buffer_word', 'mesh_group_value')
+                return sym[0] in ('const', 'ud', 'fixed_buffer_word')
             return lo not in self.varying_s
         if tok == 'null' or tok in FLOATS:
             return True
@@ -12929,7 +12927,7 @@ class Stage:
 
     def op_x2w_mesh_group(self, ops, mods):
         # The recognized exchange broadcasts wave 0 lane 0 entry v5 >> 7, the linear group index.
-        self.sym[reg_range(ops[0])[1]] = ('mesh_group_value',)
+        self.set_s(reg_range(ops[0])[1], 'gid.x', uniform=True)
 
     def op_x2w_mesh_firstlane(self, ops, mods):
         self.mesh_collect_reads[self.pc] = self.u(ops[1])
@@ -17003,6 +17001,14 @@ class MeshPipeline(Pipeline):
                         re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
                                lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
                  for line in s.body()]
+        # Omit an unused group exchange, including its otherwise unused declaration.
+        unused_group_regs = set()
+        for index in range(len(lines) - 1, -1, -1):
+            match = re.fullmatch(r'\s*(s\d+) = gid\.x;', lines[index])
+            if match and not any(re.search(r'\b%s\b' % match[1], other)
+                                 for other in lines[:index] + lines[index + 1:] + s.entry):
+                del lines[index]
+                unused_group_regs.add(int(match[1][1:]))
         if self.ps is None:
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
@@ -17045,13 +17051,19 @@ class MeshPipeline(Pipeline):
             ]
         counts = ['    uint mesh_%s_count = 0u;' % kind for kind, key in (('vertex', 'verts'), ('primitive', 'prims'))
                   if key in s.mesh_count_rewrites]
+        used_s = s.used_s
+        try:
+            s.used_s = used_s - unused_group_regs
+            declarations = s.declarations()
+        finally:
+            s.used_s = used_s
         return '\n'.join(
             self.common() + collectives + mask_collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, %sout vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
-                % ('uint3 gid : SV_GroupID, ' if any('gid.x' in line for line in lines) else '',
+                % ('uint3 gid : SV_GroupID, ' if any('gid.x' in line for line in lines + declarations + s.entry) else '',
                    MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
-            + s.declarations() + counts + ['    ' + line for line in s.entry] + lines
+            + declarations + counts + ['    ' + line for line in s.entry] + lines
             + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
 
 

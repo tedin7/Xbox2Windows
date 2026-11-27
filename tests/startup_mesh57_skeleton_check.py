@@ -64,6 +64,15 @@ GROUP_MESH = MESH[:_group_at] + [
     '8f1e8314',  # s_lshl_b32 s30, s20, 3
     'd70f6a04', '0002081e',  # v_add_co_u32 v4, vcc, s30, v4
 ] + MESH[_group_at:]
+# Keep the draw's primitive count fixed while s16 supplies the independent bound.
+GROUP_JOIN_BASE = [word if word != 'be950310' else 'be950382' for word in GROUP_MESH]
+_group_join_at = GROUP_JOIN_BASE.index('8f1e8314')
+GROUP_JOIN = GROUP_JOIN_BASE[:_group_join_at] + [
+    'bf0a1014',  # s_cmp_lt_u32 s20, s16
+    'bf840001',  # s_cbranch_scc0 over the multiply
+    '9314fd14',  # s_mul_i32 s20, s20, src_scc
+] + GROUP_JOIN_BASE[_group_join_at:]
+GROUP_CLAMP = [word if word != 'bf840001' else 'bf850001' for word in GROUP_JOIN]
 GROUP_CONTROL = [word if word != '7e280505' else '7e280507' for word in GROUP_MESH]
 
 # A root-selected heap record is loaded and used inside a uniform branch arm.
@@ -1473,8 +1482,23 @@ def controls():
         if group_result == 'ok':
             group_source = (Path(group_tmp) / ('%016x.ms57.hlsl' % key)).read_text()
             expect('group index uses SV_GroupID', 'uint3 gid : SV_GroupID' in group_source and 'gid.x' in group_source, True)
+        for label, variant in (('join', GROUP_JOIN), ('clamp', GROUP_CLAMP)):
+            key, status = request(group_tmp, variant)
+            expect('group %s translates' % label, status, 'ok')
+            if status == 'ok':
+                source = (Path(group_tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+                expect('group %s reads gid once into an SGPR' % label,
+                       bool(re.search(r'\bs20 = gid\.x;', source)) and source.count('gid.x') == 1
+                       and 'uint3 gid : SV_GroupID' in source, True)
         expect('non-exchanged first lane refused', request(group_tmp, GROUP_CONTROL)[1],
                'unsupported: slot 57 mesh: v7 is read where it is not defined for every lane (an entry value, or left different per wave by an exchange)')
+    pipe = G.MeshPipeline(code(MESH), code(PIXEL), root())
+    pipe.vs.entry.append('uint entry_group = gid.x;')
+    expect('entry group read adds SV_GroupID', 'uint3 gid : SV_GroupID' in pipe.hlsl_ms(), True)
+    pipe.vs.entry.pop()
+    declarations = pipe.vs.declarations
+    with patch.object(pipe.vs, 'declarations', side_effect=lambda: declarations() + ['    uint decl_group = gid.x;']):
+        expect('declaration group read adds SV_GroupID', 'uint3 gid : SV_GroupID' in pipe.hlsl_ms(), True)
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
@@ -1736,6 +1760,13 @@ buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
     expect('group words match llvm-mc', assemble(mc, mesh.replace(
         'buffer_load_dword v24, v4', 's_lshl_b32 s30, s20, 3\nv_add_co_u32 v4, vcc, s30, v4\nbuffer_load_dword v24, v4')),
         GROUP_MESH)
+    group_asm = mesh.replace('s_mov_b32 s21, s16', 's_mov_b32 s21, 2').replace(
+        'buffer_load_dword v24, v4',
+        's_cmp_lt_u32 s20, s16\ns_cbranch_scc0 1\ns_mul_i32 s20, s20, src_scc\n'
+        's_lshl_b32 s30, s20, 3\nv_add_co_u32 v4, vcc, s30, v4\nbuffer_load_dword v24, v4')
+    expect('group join words match llvm-mc', assemble(mc, group_asm), GROUP_JOIN)
+    expect('group clamp words match llvm-mc', assemble(mc, group_asm.replace('s_cbranch_scc0 1', 's_cbranch_scc1 1')),
+           GROUP_CLAMP)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
            FORMATTED_MESH)
     expect('rewritten descriptor words match llvm-mc',
@@ -2809,6 +2840,25 @@ def draw_group(dxc, renderer, adapter):
                     not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatch}\b', run.stdout)):
                 raise AssertionError(run.stdout + run.stderr)
             print(f'{shader.name}: {mismatch} pixels differ from the reference')
+        clamp_key, status = request(tmp, GROUP_CLAMP)
+        if status != 'ok':
+            raise AssertionError(status)
+        clamp = Path(tmp) / ('%016x.ms57.cso' % clamp_key)
+        clamp_pipe = G.MeshPipeline(code(GROUP_CLAMP), code(PIXEL), root())
+        for bound, image in ((1, zero), (2, correct)):
+            clamp_constants = bytearray(1024)
+            for slot, value in enumerate((bound, len(points))):
+                struct.pack_into('<I', clamp_constants, 4 * clamp_pipe.uds.index(('rootconst', 0, slot)), value)
+            case.write_bytes(bytes(clamp_constants) + buffer(points, colours, words) + b'\xcd' * 80
+                             + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed-groups', clamp,
+                                  base.with_suffix('.ps57.cso'), case, '2'], capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if run.returncode or not re.search(rf'\bpixels={SIDE * SIDE} mismatches=0\b', run.stdout):
+                raise AssertionError(run.stdout + run.stderr)
+            print(f'group clamp bound {bound}: matches reference')
     return 0
 
 
