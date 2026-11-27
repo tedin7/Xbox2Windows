@@ -29,6 +29,14 @@ struct Tracker {
     std::vector<Entry> entries;  // distinct targets bound since the last take
     Entry kept;                  // the last choice, shown again when no pass bound a target since
     unsigned counter = 0;
+    // What happened to each depth buffer since the last take: the depth-writing draws and the depth clears, in order.
+    struct Life {
+        ID3D12Resource* resource = nullptr;  // compared only, no reference
+        unsigned long long writes = 0, clears = 0, last_write = 0, last_clear = 0, partial_clears = 0;
+        float clear_depth = 0;
+    };
+    Life life[16];
+    unsigned long long life_clock = 0;
     unsigned long long total_draws = 0;  // every translated draw seen while enabled (X2W_DEBUG_PRESENT_FROM_DRAWS)
 
     explicit Tracker(const x2w_debug_present::Spec& s = {}) : spec(s) {}
@@ -77,12 +85,55 @@ struct Tracker {
         ReleaseSRWLockExclusive(&lock);
     }
 
+    Life& life_of(ID3D12Resource* resource)  // call with the lock held
+    {
+        Life* free_slot = nullptr;
+        for (Life& l : life) {
+            if (l.resource == resource) return l;
+            if (!l.resource && !free_slot) free_slot = &l;
+        }
+        if (!free_slot) free_slot = &life[0], *free_slot = Life{};
+        free_slot->resource = resource;
+        return *free_slot;
+    }
+
+    // A depth clear of `resource` (the whole view when `rects` is 0).
+    void note_clear(ID3D12Resource* resource, float depth, UINT rects)
+    {
+        if (!enabled() || !resource) return;
+        AcquireSRWLockExclusive(&lock);
+        Life& l = life_of(resource);
+        ++l.clears;
+        l.partial_clears += rects != 0;
+        l.last_clear = ++life_clock;
+        l.clear_depth = depth;
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    // "writes 12, clears 2 (last value 1, 0 partial), the last clear came after the last write: yes"; the counts restart.
+    std::string life_text(ID3D12Resource* resource)
+    {
+        AcquireSRWLockExclusive(&lock);
+        Life l = life_of(resource);
+        for (Life& each : life) if (each.resource == resource) each = Life{};
+        ReleaseSRWLockExclusive(&lock);
+        char text[200];
+        std::snprintf(text, sizeof(text), "depth writes %llu, clears %llu (last value %g, %llu partial), the last clear came after the last write: %s",
+                      l.writes, l.clears, l.clear_depth, l.partial_clears, !l.clears ? "no clear" : l.last_clear > l.last_write ? "YES" : "no");
+        return text;
+    }
+
     // A translated draw wrote these targets: count it for each one that is a candidate.
     void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth, unsigned depth_class = 0)
     {
         if (!enabled()) return;
         AcquireSRWLockExclusive(&lock);
         ++total_draws;
+        if (depth && depth_class == 0) {
+            Life& l = life_of(depth);
+            ++l.writes;
+            l.last_write = ++life_clock;
+        }
         for (Entry& e : entries) {
             if (!e.resource) continue;
             bool hit = e.resource == depth;
@@ -360,6 +411,13 @@ void note_draw(ID3D12Resource* const* targets, UINT count, ID3D12Resource* depth
     if (tracker.enabled()) tracker.note_draw(targets, count, depth, depth_class);
 }
 
+// A depth clear.
+void note_clear(ID3D12Resource* resource, float depth, UINT rects)
+{
+    Tracker& tracker = global_tracker();
+    if (tracker.enabled()) tracker.note_clear(resource, depth, rects);
+}
+
 // How a translated draw treats the depth buffer it was drawn with: the classes the log counts.
 enum DepthClass : unsigned { depth_writes = 0, depth_test_only = 1, depth_test_off = 2, no_depth_state = 3, depth_view_read_only = 4 };
 
@@ -378,6 +436,14 @@ std::string stats_text(const x2w_debug_present::DepthStats& stats)
     char text[96];
     std::snprintf(text, sizeof(text), "spread %.4g..%.4g covered %.1f%%", stats.low, stats.high, stats.covered_percent());
     return text;
+}
+
+// Whether the read resource is a committed or a placed one (a placed one can share memory with another resource).
+const char* placement_text(ID3D12Resource* resource)
+{
+    D3D12_HEAP_PROPERTIES props{};
+    D3D12_HEAP_FLAGS flags{};
+    return resource && SUCCEEDED(resource->GetHeapProperties(&props, &flags)) ? "committed" : "placed or reserved";
 }
 
 // At a title Present, before the picture is read: replace plane 0's surface content by the chosen target. `picture_due`:
@@ -419,6 +485,7 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
     const D3D12_RESOURCE_DESC surface_desc = real_surface ? real_surface->GetDesc() : D3D12_RESOURCE_DESC{};
     unsigned long long interval_draws = 0, classes[5] = {};
     ID3D12Resource* source = tracker.take(surface_desc.Width, surface_desc.Height, info, &interval_draws, classes);
+    const std::string life = source && info.depth ? tracker.life_text(source) : std::string();
     const char* reason = !source ? "no pass has bound a matching target yet" : "no presented surface";
     bool ok = false;
     if (source && real_surface) {
@@ -436,8 +503,10 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
         if (ok && painter.stats.valid && now_tick - last_stats_tick >= 10000) {
             last_stats_tick = now_tick;
             log("x2w-render debug present: depth %s (%s, %llu draws in the interval, %zu of %zu sampled pixels are geometry%s); "
-                "the draws by depth state: %s", stats_text(painter.stats).c_str(), describe(info).c_str(), interval_draws,
-                painter.stats.geometry, painter.stats.sampled, painter.stats.reversed ? ", reversed Z" : "", classes_text(classes).c_str());
+                "the draws by depth state: %s; resource %p, %s; sampled pixels exactly 0: %zu, exactly 1: %zu; %s",
+                stats_text(painter.stats).c_str(), describe(info).c_str(), interval_draws,
+                painter.stats.geometry, painter.stats.sampled, painter.stats.reversed ? ", reversed Z" : "", classes_text(classes).c_str(),
+                static_cast<void*>(source), placement_text(source), painter.stats.zeros, painter.stats.ones, life.c_str());
         }
         ReleaseSRWLockExclusive(&lock);
     }
@@ -452,6 +521,17 @@ void present(Wrapper* queue, Wrapper* surface, LONG frame, bool picture_due)
 // is the setting's text; the colour target and the two depth buffers are "bound" in that order, and `draws` / `draws2` translated
 // draws are counted for the depth buffers. Returns 0 and the log text in `what` (and the depth statistics text in `stats`) when a
 // picture was written, 1 when nothing matched, 2 when the picture could not be made (`what` has the reason).
+// Fixture: the write/clear order text for `depth` after `writes` depth-writing draws and a clear before or after them.
+extern "C" __declspec(dllexport) int x2w_d3d12_fixture_debug_present_life(ID3D12Resource* depth, unsigned writes, int clear_after, char* text, std::size_t capacity)
+{
+    debug_present::Tracker tracker(x2w_debug_present::parse_spec("depth"));
+    if (!clear_after) tracker.note_clear(depth, 1.0f, 0);
+    for (unsigned i = 0; i < writes; ++i) tracker.note_draw(nullptr, 0, depth, debug_present::depth_writes);
+    if (clear_after) tracker.note_clear(depth, 1.0f, 0);
+    std::snprintf(text, capacity, "%s", tracker.life_text(depth).c_str());
+    return 0;
+}
+
 extern "C" __declspec(dllexport) int x2w_d3d12_fixture_debug_present(ID3D12Device* device, ID3D12CommandQueue* queue, const char* spec,
         ID3D12Resource* color, int color_format, ID3D12Resource* depth, int depth_format, ID3D12Resource* depth2,
         unsigned draws, unsigned draws2, ID3D12Resource* surface, char* what, std::size_t capacity, char* stats, std::size_t stats_capacity)
