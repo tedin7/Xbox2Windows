@@ -33,7 +33,7 @@ def prepare(folder, scene, mode):
         return None
     assert code == 0, text[-3000:]
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    manifest, = (p for p in cache.glob("*.txt") if p.name != "revision.txt")
+    manifest, = (p for p in cache.glob("*.txt") if p.name not in ("revision.txt", "x2w_key_seed.txt"))
     binding = "root 0" if mode == "root" else "table 0 0"
     with manifest.open("a", encoding="ascii") as file:
         file.write(f"\nsrv 0 buf {binding}\n")
