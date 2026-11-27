@@ -163,7 +163,7 @@ check('the bits form is narrower than the float form above 1.0, which frac canno
 
 # 4. The shader cache revision: both literals are the same word, and the old seed cannot produce the new key.
 gfx_source = Path(G.__file__).read_text(encoding='utf-8')
-seed = re.search(r"(?:fnv|shader_cache_seed)\(b'(x2w-startup-shader-\d+)'\)", gfx_source)
+seed = re.search(r"(?:(?:fnv|shader_cache_seed)\(b'|PIPELINE_KEY_REVISION = b')(x2w-startup-shader-\d+)'", gfx_source)
 stub_source = (root / 'src' / 'startup_stubs' / 'd3d12_draw.inl').read_text(encoding='utf-8')
 literal = re.search(r'constexpr char revision\[\] = "(x2w-startup-shader-\d+)";', stub_source)
 check('both files spell a x2w-startup-shader revision', seed is not None and literal is not None,

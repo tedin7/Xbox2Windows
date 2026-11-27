@@ -72,7 +72,7 @@ def check(directory, consumer, backend):
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
 
-    manifest, = (path for path in cache.glob('*.txt') if path.name != 'revision.txt')
+    manifest, = (path for path in cache.glob('*.txt') if path.name not in ('revision.txt', 'x2w_key_seed.txt'))
     manifest_text = manifest.read_text(encoding='ascii')
     manifest_lines = manifest_text.splitlines()
     assert 'udsrc 3 d16unorm16 0' in manifest_lines, manifest_text

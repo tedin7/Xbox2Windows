@@ -15,7 +15,7 @@ from startup_mesh57_skeleton_check import (
 # Reuse the count exchanges and export plumbing. The inserted program makes
 # red depend on a sparse VCC, green on a numeric EXEC word, and blue on saved EXEC.
 PROGRAM = [
-    'bf068408',  # s_cmp_eq_u32 s8, 4
+    'bf068410',  # s_cmp_eq_u32 s16, 4
     '7d880086',  # v_cmp_gt_u32 vcc, 6, v0
     '856a6a7e',  # s_cselect_b32 vcc_lo, exec_lo, vcc_lo
     '7e3a02f2',  # v_mov_b32 v29, 1.0
@@ -32,7 +32,7 @@ PROGRAM = [
     '7d880086',  # v_cmp_gt_u32 vcc, 6, v0
     'beaa246a',  # s_and_saveexec_b64 s[42:43], vcc
     'befe04c1',  # s_mov_b64 exec, -1
-    'bf068408',  # s_cmp_eq_u32 s8, 4
+    'bf068410',  # s_cmp_eq_u32 s16, 4
     '856a802b',  # s_cselect_b32 vcc_lo, s43, 0
     '02383a80',  # v_cndmask_b32 v28, 0, v29, vcc
 ]
@@ -41,7 +41,7 @@ EXPORT_COLOUR = ['7e280307', '7e2a031b', '7e2c031c']  # v20..22 = v7, v27, v28
 
 
 def mesh(program):
-    start = MESH.index('7d28000e')
+    start = MESH.index('7d280016')
     after_wait = AFTER_COLOUR_LOAD + 1
     return MESH[:start] + program + MESH[start:after_wait] + EXPORT_COLOUR + MESH[after_wait:]
 

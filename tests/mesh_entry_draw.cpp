@@ -106,7 +106,7 @@ ComPtr<ID3D12RootSignature> create_draw_root(ID3D12Device* device, const D3D12_R
 
 bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
                      bool vertices, MeshConstantBinding binding, const char* fallback_vertex, MeshDrawMode mode,
-                     const MeshTextureProducers* producers, const char* amplification)
+                     const MeshTextureProducers* producers, const char* amplification, unsigned groups)
 {
     const bool fallback = fallback_vertex != nullptr;
     if (!fallback) {
@@ -131,6 +131,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
             throw std::runtime_error("Invalid multi-primitive draw fixture");
         trace_stride = static_cast<UINT>(input.size() - draw_bytes - image_bytes);
     }
+    const bool indexed_heap = mode == MeshDrawMode::heap;
     const bool mesh_texture = mode == MeshDrawMode::mesh_texture_load;
     const bool textured = mode == MeshDrawMode::textured || mesh_texture;
     const bool depth_pair = mode == MeshDrawMode::depth_pair;
@@ -166,6 +167,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     const UINT texture_slot = separate_roots ? vertex_slot : vertex_slot + 1;
     layout.NumParameters = input_slots + fallback;
     layout.pParameters = params;
+    if (indexed_heap) layout.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     ComPtr<ID3D12RootSignature> export_root;
     if (separate_roots) {
         // Compute reads a buffer at t0. Graphics keeps the CBVs and uses t1 for
@@ -295,6 +297,18 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     upload->Unmap(0, nullptr);
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
+    // A root signature with HEAP_DIRECTLY_INDEXED needs its descriptor heap bound before it is set, and the heap
+    // cannot change afterwards: create the two-entry heap now, fill it below.
+    ComPtr<ID3D12DescriptorHeap> indexed_heap_descriptors;
+    if (indexed_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 2;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&indexed_heap_descriptors)), "Create indexed mesh heap");
+        ID3D12DescriptorHeap* bind[]{indexed_heap_descriptors.Get()};
+        list->SetDescriptorHeaps(1, bind);
+    }
     list->SetGraphicsRootSignature(root.Get());
     const auto base = upload->GetGPUVirtualAddress();
     std::array<ComPtr<ID3D12Resource>, 2> constants;
@@ -335,6 +349,29 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     }
     if (vertices && !fallback) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
+    ComPtr<ID3D12Resource> alternate_buffer;
+    if (indexed_heap) {
+        const auto desc = indexed_heap_descriptors->GetDesc();
+        alternate_buffer = make_buffer(device, 512, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(alternate_buffer->Map(0, &empty, &mapped), "Map alternate mesh buffer");
+        std::memcpy(mapped, input.data() + 2 * cb_bytes, 512);
+        auto* bytes = static_cast<char*>(mapped);
+        for (UINT i = 0; i < 12; ++i)
+            for (UINT j = 0; j < 4; ++j) std::swap(bytes[192 + 16 * i + j], bytes[200 + 16 * i + j]);
+        alternate_buffer->Unmap(0, nullptr);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = 128;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        const auto first = indexed_heap_descriptors->GetCPUDescriptorHandleForHeapStart();
+        device->CreateShaderResourceView(alternate_buffer.Get(), &view, first);
+        view.Buffer.FirstElement = 2 * cb_bytes / 4;
+        auto second = first;
+        second.ptr += device->GetDescriptorHandleIncrementSize(desc.Type);
+        device->CreateShaderResourceView(upload.Get(), &view, second);
+    }
     ComPtr<ID3D12Resource> sampled, texture_upload;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> compute_root;
@@ -469,7 +506,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     } else {
         ComPtr<ID3D12GraphicsCommandList6> mesh_list;
         check(commands.list.As(&mesh_list), "Query mesh dispatch list");
-        mesh_list->DispatchMesh(1, 1, 1);
+        mesh_list->DispatchMesh(groups, 1, 1);
         if (depth_pair) {
             const auto second_base = base + draw_bytes;
             list->SetGraphicsRootConstantBufferView(0, second_base);
@@ -536,10 +573,10 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
 
 bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* pixel, const char* fixture,
                            bool vertices, MeshConstantBinding binding, MeshDrawMode mode,
-                           const MeshTextureProducers* producers, const char* amplification)
+                           const MeshTextureProducers* producers, const char* amplification, unsigned groups)
 {
     return check_mesh_draw(device, mesh, pixel, fixture, vertices, binding, nullptr, mode, producers,
-                           amplification);
+                           amplification, groups);
 }
 
 bool check_mesh_amplified_draw(ID3D12Device* device, const char* amplification, const char* mesh,
@@ -554,5 +591,5 @@ void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const c
                               const MeshTextureProducers* producers)
 {
     check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers,
-                    nullptr);
+                    nullptr, 1);
 }

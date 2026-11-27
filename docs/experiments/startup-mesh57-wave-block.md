@@ -194,8 +194,10 @@ outputs across seven scripts. Windows readback remains pending.
 
 Forward value numbering tracks reaching SGPR words, SCC, VGPRs and known
 full EXEC between the exchanges. The GS ES+GS entry layout places per-draw
-user data in s8–s39. The proof uses these values only before any program
-write to their word. Uniform SALU operands yield uniform results. Uniform
+user data in s8–s39. Eight platform words precede the root, which starts at s16.
+See "RDNA 2" Instruction Set Architecture, §3.12.2, pp. 23–24, and "RDNA3"
+Instruction Set Architecture (2023-02), §3.5.3.2, Table 9, pp. 28–29. The
+proof uses these values only before any program write to their word. Uniform SALU operands yield uniform results. Uniform
 addresses, descriptors and offsets preserve uniformity through read-only
 scalar loads. A full-EXEC buffer load with an all-lane uniform address can
 establish an all-lane uniform VGPR, which a first-lane read can turn into a
