@@ -2085,10 +2085,9 @@ recording, 3 a title range could not be reserved at its address, 4 no device, 5 
 accepted and ignored in this version.
 
 The prefix is every call before the recording's first `PRES` chunk (the recorder writes `PRES` only inside the window).
-The log line `x2w-replay: prefix ...` gives the lists submitted in it and its wall time, and `replay_summary.json` has
-the same under `prefix`. `--prefix-fast draws` leaves out the prefix's draws (list slots 12 and 13) to reach the window
-sooner; creations, copies, dispatches, clears, `Map`, fences and descriptor writes still run. A target the title drew
-only in the prefix and shows in the window is then missing from the window's pictures.
+The log line `x2w-replay: prefix: P of N calls played, wall X s` and `prefix` in `replay_summary.json` give its size
+and time. A recording with a window records in its prefix only the calls the window may depend on (device calls,
+`Map`, heap starts, GPU addresses, reference counts, fence and queue signals): no command lists.
 
 Set `X2W_REPLAY_TIMING=1` in the player environment to benchmark replay steps. At each elapsed wall-second boundary,
 the player prints `x2w-replay timing` with calls played, presents, and up to five `kind:slot=us` entries ranked by
