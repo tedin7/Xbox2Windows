@@ -17,8 +17,11 @@ shaders.
 
 ## Texture records
 
-Graphics draws mirror texture SRV tokens from 32-byte image records at their
-original heap indices. The snapshot retains the sampled resources until the
+Graphics draws whose manifest carries `dynamic_heap_images` (the translator
+writes it when a stage reads an image record from the heap) mirror texture SRV
+tokens from 32-byte image records at their original heap indices; other heap
+draws and compute dispatches keep the buffer-only snapshot, so a bindless heap's
+textures are uploaded only for draws that can sample them. The snapshot retains the sampled resources until the
 recording retires. A texture that cannot be bound, including a render target
 or writable depth attachment of the same draw, gets a null SRV of the token's
 dimension. The shader and the indexed view must agree on the resource type.

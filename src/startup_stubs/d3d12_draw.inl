@@ -168,6 +168,7 @@ struct Translation {
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     bool dynamic_heap = false;
+    bool dynamic_heap_images = false;  // manifest 'dynamic_heap_images': the shaders read image records from the heap
     std::string placeholder_ps;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
@@ -648,6 +649,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             tr.placeholder_ps = line.substr(15);
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
+        } else if (line == "dynamic_heap_images") {
+            tr.dynamic_heap_images = true;
         } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -3935,7 +3938,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
-                }, first, true);
+                }, first, tr->dynamic_heap_images);
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();
