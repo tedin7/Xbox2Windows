@@ -59,6 +59,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
     void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
+extern "C" __declspec(dllimport) long long x2w_d3d12_magenta_draws();
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
@@ -870,8 +871,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             long long drawn = 0, not_drawn = 0;
             char reasons[2048];
             const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
-            std::fprintf(f, ", \"draws\": {\"drawn\": %lld, \"not_drawn\": %lld, \"not_drawn_by_reason\": %s, \"per_present\": [",
-                         drawn, not_drawn, length ? reasons : "{}");
+            std::fprintf(f, ", \"draws\": {\"drawn\": %lld, \"not_drawn\": %lld, \"magenta_draws\": %lld, \"not_drawn_by_reason\": %s, \"per_present\": [",
+                         drawn, not_drawn, x2w_d3d12_magenta_draws(), length ? reasons : "{}");
             long long previous_drawn = 0, previous_refused = 0;
             for (std::size_t i = 0; i < p.draw_series.size(); ++i) {
                 std::fprintf(f, "%s{\"drawn\": %lld, \"not_drawn\": %lld}", i ? ", " : "",
@@ -895,7 +896,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         long long drawn = 0, not_drawn = 0;
         char reasons[2048];
         const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
-        std::printf("x2w-replay draws drawn %lld not_drawn %lld by_reason %s\n", drawn, not_drawn, length ? reasons : "{}");
+        std::printf("x2w-replay draws drawn %lld not_drawn %lld by_reason %s magenta draws %lld\n", drawn, not_drawn,
+                    length ? reasons : "{}", x2w_d3d12_magenta_draws());
     }
     std::fflush(stdout);
 }

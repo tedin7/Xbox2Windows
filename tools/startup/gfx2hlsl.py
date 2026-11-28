@@ -20881,7 +20881,9 @@ PLACEHOLDER_ATTEMPT = 'x2w-placeholder-attempt'
 
 
 def placeholder_ps_enabled():
-    return os.environ.get('X2W_PLACEHOLDER_PS') == '1'
+    # X2W_MAGENTA_REFUSED=1 is the short switch: the same placeholder (magenta unless X2W_PLACEHOLDER_RGB says otherwise).
+    return os.environ.get('X2W_PLACEHOLDER_PS') == '1' or (
+        os.environ.get('X2W_PLACEHOLDER_PS') != '0' and os.environ.get('X2W_MAGENTA_REFUSED') == '1')
 
 
 def placeholder_rgb():

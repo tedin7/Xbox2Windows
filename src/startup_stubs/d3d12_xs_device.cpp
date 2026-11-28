@@ -10159,6 +10159,12 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_draw_totals(long long* drawn
     return static_cast<unsigned>(used);
 }
 
+// Draws that ran with a placeholder (magenta) pixel shader because the real one was refused (X2W_MAGENTA_REFUSED=1).
+extern "C" __declspec(dllexport) long long x2w_d3d12_magenta_draws()
+{
+    return static_cast<long long>(placeholder_draw_total());
+}
+
 extern "C" void x2w_d3d12_exit_report()
 {
     char line[1024];

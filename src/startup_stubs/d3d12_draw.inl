@@ -990,8 +990,12 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (line.compare(0, 15, "placeholder ps ") == 0) {
-            char enabled[2]{};
-            if (GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) != 1 || enabled[0] != '1')
+            // X2W_MAGENTA_REFUSED=1 is the short switch for the same placeholder; an explicit X2W_PLACEHOLDER_PS=0 wins.
+            char enabled[2]{}, magenta[2]{};
+            const bool placeholder_on = GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) == 1 && enabled[0] == '1';
+            const bool placeholder_off = GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) == 1 && enabled[0] == '0';
+            const bool magenta_on = GetEnvironmentVariableA("X2W_MAGENTA_REFUSED", magenta, sizeof(magenta)) == 1 && magenta[0] == '1';
+            if (!placeholder_on && !(magenta_on && !placeholder_off))
                 return;
             tr.placeholder_ps = line.substr(15);
         } else if (line.compare(0, 3, "ud ") == 0) {
@@ -4705,6 +4709,16 @@ void note_placeholder_draw(u64 key, const Pass& pass)
         else row.targets.push_back(target);
     }
     ReleaseSRWLockExclusive(&placeholder_draw_lock);
+}
+
+// Every placeholder (magenta) draw so far, for the replay player's summary.
+u64 placeholder_draw_total()
+{
+    u64 total = 0;
+    AcquireSRWLockExclusive(&placeholder_draw_lock);
+    for (const auto& item : placeholder_draws()) total += item.second.draws;
+    ReleaseSRWLockExclusive(&placeholder_draw_lock);
+    return total;
 }
 
 inline std::string placeholder_target_text(const PlaceholderTarget& target)
