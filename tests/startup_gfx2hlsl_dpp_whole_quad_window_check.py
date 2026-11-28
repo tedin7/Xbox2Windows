@@ -1,4 +1,4 @@
-﻿"""Pixel DPP quad reads after an EXEC window (tools/startup/gfx2hlsl.py, Stage.whole_quad_exec_sites).
+"""Pixel DPP quad reads after an EXEC window (tools/startup/gfx2hlsl.py, Stage.whole_quad_exec_sites).
 
   (no arguments)                          translation controls and refusals, pure Python
   draw <dxc> <offscreen_check> <warp|hardware>
@@ -91,6 +91,124 @@ def select_reference():
             value = float(16 * y + x) if x % 2 == 0 else 16 * (y & ~1) + (x | 1) + 0.5
             out.extend(struct.unpack('<I', struct.pack('<f', value)) * 4)
     return out
+
+
+# v_cmpx writes only EXEC; its operands are sources, never destinations. A compare of a dirty register (written before
+# s_wqm, where the guest's helper lanes skip it) is therefore not a lane-exact narrowing, and the register it names is
+# not made clean by it.
+MOV_V5_HALF = 'f0020a7e'                      # v_mov_b32_e32 v5, 0.5
+CMPX_V3_V5 = '030b227c'                       # v_cmpx_lt_f32_e32 v3, v5
+CMPX_V3_V5_E64 = '000011d4' '030b0200'        # v_cmpx_lt_f32_e64 v3, v5
+MOV_V2_ONE = 'f202047e'                       # v_mov_b32_e32 v2, 1.0
+AND_MINUS_ONE = '7ec1fe87'                    # s_and_b64 exec, exec, -1
+
+
+def dirty_compare(narrow, write='', read=READ_V3):
+    # v3 is written before s_wqm (dirty); the narrowing, an optional write and the restore follow; then the quad read.
+    return program(SAVE_EXACT, WINDOW_WRITE, WQM, SAVE_WHOLE, POSITION, MOV_V5_HALF, narrow, write, RESTORE, read,
+                   EXPORT)
+
+
+# A scalar mask narrows lane-exactly only when it holds one bit per lane: a VALU compare or a copy of EXEC. A literal
+# does not (the host tests its bit 0 on every thread, the guest the bit of its own lane).
+MOV_S10_LITERAL = 'ff048abe' '55555555'       # s_mov_b64 s[10:11], 0x55555555
+MOV_S10_EXEC = '7e048abe'                     # s_mov_b64 s[10:11], exec
+CMP_INTO_S10 = '0a00c4d4' '88020200'          # v_cmp_gt_u32_e64 s[10:11], 8, v1
+AND_EXEC_S10 = '7e0afe87'                     # s_and_b64 exec, exec, s[10:11]
+
+
+MOV64_S12_ZERO = '80048cbe'                   # s_mov_b64 s[12:13], 0
+MOV64_S11_ONES = 'c1048bbe'                   # s_mov_b64 s[11:12], -1 (the decoder prints s11)
+MOV32_S13_ONES = 'c1038dbe'                   # s_mov_b32 s13, -1
+MOV64_S11_ZERO = '80048bbe'                   # s_mov_b64 s[11:12], 0
+MOV32_S11_LITERAL = 'ff038bbe' '55550000'     # s_mov_b32 s11, 0x5555
+MOV32_VCC_LITERAL = 'ff03eabe' '55550000'     # s_mov_b32 vcc_lo, 0x5555
+CMP_INTO_S12 = '0c00c4d4' '88020200'          # v_cmp_gt_u32_e64 s[12:13], 8, v1
+CMP_INTO_S13 = '0d00c4d4' '88020200'          # v_cmp_gt_u32_e64 s13, 8, v1
+CMP_INTO_VCC = 'a802887d'                     # v_cmp_gt_u32_e32 vcc_lo, 40, v1
+AND_EXEC_S12 = '7e0cfe87'                     # s_and_b64 exec, exec, s[12:13]
+ANDN2_EXEC_S12 = '7e0cfe8a'                   # s_andn2_b64 exec, exec, s[12:13]
+AND_EXEC_VCC = '7e6afe87'                     # s_and_b64 exec, exec, vcc
+SAVEEXEC_S10_VCC = '6a248abe'                 # s_and_saveexec_b64 s[10:11], vcc
+XOR_EXEC_S10 = '7e0afe89'                     # s_xor_b64 exec, exec, s[10:11]
+
+
+# Input modifiers read the register all the same: -v3 and |v3| are reads of the dirty v3.
+CMPX_NEG_V3 = '000014d4' '03010120'            # v_cmpx_gt_f32_e64 s0, -v3, 0
+CMP_NEG_V3_INTO_S10 = '0a0004d4' '03010120'    # v_cmp_gt_f32_e64 s10, -v3, 0
+CMP_ABS_V3_INTO_S10 = '0a0104d4' '03010100'    # v_cmp_gt_f32_e64 s10, |v3|, 0
+ADD_NEG_V3 = '020003d5' '03010120'             # v_add_f32_e64 v2, -v3, 0
+# In wave64 a compare's SDST printed as s10 writes s11 too.
+CMP_V3_INTO_S10 = '0a00c4d4' '88060200'        # v_cmp_gt_u32_e64 s[10:11], 8, v3
+MOV32_S10_ONES = 'c1038abe'                    # s_mov_b32 s10, -1
+SELECT_BY_S10 = '020001d5' '01052a00'          # v_cndmask_b32_e64 v2, v1, v2, s[10:11]
+# A mask operation of a marked and an unmarked source is not per lane.
+AND_S10_S12_S14 = '0c0e8a87'                   # s_and_b64 s[10:11], s[12:13], s[14:15] (never written)
+AND_S10_S12_LITERAL = '0cff8a87' '55550000'    # s_and_b64 s[10:11], s[12:13], 0x5555
+AND_S10_S12_VCC = '0c6a8a87'                   # s_and_b64 s[10:11], s[12:13], vcc (not a compare)
+SAVEEXEC_S10_EXEC = '7e248abe'                 # s_and_saveexec_b64 s[10:11], exec
+AND_VCC_EXEC_VCC = '7e6aea87'                  # s_and_b64 vcc, exec, vcc
+
+
+# A 64-bit instruction with a 32-bit result writes one SGPR: the next register of a marked or dirty pair is not touched.
+CMP_V3_INTO_S12 = '0c00c4d4' '88060200'         # v_cmp_gt_u32_e64 s[12:13], 8, v3
+MOV32_S13_ZERO = '80038dbe'                    # s_mov_b32 s13, 0
+BCNT1_S11 = '0e108bbe'                         # s_bcnt1_i32_b64 s11, s[14:15]
+BCNT0_S11 = '0e0e8bbe'                         # s_bcnt0_i32_b64 s11, s[14:15]
+SELECT_BY_S12 = '020001d5' '01053200'          # v_cndmask_b32_e64 v2, v1, v2, s12
+# A per-lane selection by a mask no compare wrote reads bit 0 of it on every host thread.
+MOV64_S12_LITERAL = 'ff048cbe' '55550000'      # s_mov_b64 s[12:13], 0x5555
+SELECT_BY_VCC = '01050402'                     # v_cndmask_b32_e32 v2, v1, v2, vcc_lo
+ADDC_BY_S10 = '020c28d5' '01052a00'            # v_add_co_ci_u32_e64 v2, s12, v1, v2, s10
+ADD_CO_V3_INTO_S10 = '040a0fd7' '03030200'     # v_add_co_u32_e64 v4, s10, v3, v1 (v3 dirty)
+
+
+# The carry chain of a 64-bit add: the carry-out is a per-lane mask like a compare's.
+ADD_CO_S10 = '070a0fd7' '01050202'              # v_add_co_u32 v7, s10, v1, v2
+ADD_CO_VCC = '076a0fd7' '01050202'              # v_add_co_u32 v7, vcc_lo, v1, v2
+ADD_CO_S10_DIRTY = '070a0fd7' '03050202'        # v_add_co_u32 v7, s10, v3, v2 (v3 dirty)
+ADDCI_S12_BY_S10 = '080c28d5' '01052a00'        # v_add_co_ci_u32_e64 v8, s12, v1, v2, s10
+ADDCI_E32_VCC = '01051050'                      # v_add_co_ci_u32_e32 v8, vcc_lo, v1, v2, vcc_lo
+MOV_V2_V8 = '0803047e'                          # v_mov_b32_e32 v2, v8
+# Two compares whose destinations overlap, and an input modifier of an SDWA operand.
+CMP_V1_INTO_S11 = '0b00c4d4' '88020200'         # v_cmp_gt_u32_e64 s11, 8, v1 (writes s11 and s12)
+SDWA_SEXT_V3 = 'f902044a' '03060e06'            # v_add_nc_u32_sdwa v2, sext(v3), v1
+# Wave32: s_mov_b64 s11 writes s11 and s12.
+EXACT32 = '0603febe'                            # s_mov_b32 exec_lo, s6
+MOV32_S14_LITERAL = 'ff038ebe' '55550000'       # s_mov_b32 s14, 0x5555
+MOV32_S15_LITERAL = 'ff038fbe' '55550000'       # s_mov_b32 s15, 0x5555
+MOV64_S11_S14 = '0e048bbe'                      # s_mov_b64 s11, s[14:15]
+
+
+def dirty_program32(*parts):
+    window = EXACT32 + WINDOW_WRITE + RESTORE32
+    return program(SAVE_EXACT32, WQM32, SAVE_WHOLE32, POSITION, UNIFORM_TEST, skip(window), window, *parts, EXPORT)
+
+
+def dirty_program(*parts):
+    # v3 is written in an exact-entry window (dirty); then the parts, which end with the read.
+    window = EXACT + WINDOW_WRITE + RESTORE
+    return program(SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(window), window, *parts, EXPORT)
+
+
+# Wave32: the same shapes with exec_lo, s_*_b32 and vcc_lo.
+SAVE_EXACT32 = '7e0386be'                      # s_mov_b32 s6, exec_lo
+WQM32 = '7e09febe'                             # s_wqm_b32 exec_lo, exec_lo
+SAVE_WHOLE32 = '7e0384be'                      # s_mov_b32 s4, exec_lo
+RESTORE32 = '0403febe'                         # s_mov_b32 exec_lo, s4
+AND32_VCC = '7e6a7e87'                         # s_and_b32 exec_lo, exec_lo, vcc_lo
+AND32_S10 = '7e0a7e87'                         # s_and_b32 exec_lo, exec_lo, s10
+MOV32_S10_LITERAL = 'ff038abe' '55550000'      # s_mov_b32 s10, 0x5555
+
+
+def narrowed32(make_mask, and_op):
+    body = COPY_V2_TO_V3_WHOLE + make_mask + and_op + NARROWED_WRITE + RESTORE32
+    return program(SAVE_EXACT32, WQM32, SAVE_WHOLE32, POSITION, UNIFORM_TEST, skip(body), body, READ_V3, EXPORT)
+
+
+def mask_narrowed(make_mask, and_op=AND_EXEC_S10):
+    body = COPY_V2_TO_V3_WHOLE + make_mask + and_op + NARROWED_WRITE + RESTORE
+    return program(SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(body), body, READ_V3, EXPORT)
 
 
 def skip(words):
@@ -232,9 +350,14 @@ def check_draw(dxc, renderer, adapter):
         run = draw(renderer, adapter, partial, probe, probe_ref)
         if run.returncode != 0:
             lines = [ln for ln in run.stderr.splitlines() if 'pixel' in ln]
-            print('%s: SKIP the exact-entry-mask draw: the adapter\'s IsHelperLane disagrees with coverage (%s)'
-                  % (adapter, ' / '.join(lines)))
-            skips.append(adapter)
+            if adapter == 'warp':
+                print('%s: SKIP the exact-entry-mask draw: the adapter\'s IsHelperLane disagrees with coverage (%s)'
+                      % (adapter, ' / '.join(lines)))
+                skips.append(adapter)
+            else:
+                # On hardware a wrong probe is a failure, not a capability skip.
+                check('%s: the adapter\'s IsHelperLane agrees with coverage' % adapter, False,
+                      ' / '.join(lines) + run.stdout + run.stderr)
             helper_pipe = False
         if helper_pipe is False:
             pass
@@ -377,6 +500,103 @@ def controls():
         ('the restore takes the exact entry mask', base(restore=EXACT)),
         ('a VALU compare overwrites the saved whole-quad mask', base(before_restore=COMPARE_INTO_SAVED)),
     )
+    refused += (
+        ('v_cmpx on a dirty register, read of that register', dirty_compare(CMPX_V3_V5)),
+        ('v_cmpx e64 on a dirty register, read of that register', dirty_compare(CMPX_V3_V5_E64)),
+        ('v_cmpx on a dirty register, then a clean write read after the restore',
+         dirty_compare(CMPX_V3_V5, MOV_V2_ONE, READ_V2)),
+        ('v_cmpx e64 on a dirty register, then a clean write read after the restore',
+         dirty_compare(CMPX_V3_V5_E64, MOV_V2_ONE, READ_V2)),
+        ('control: s_and exec with -1 in place of the v_cmpx, read of the dirty register',
+         dirty_compare(AND_MINUS_ONE)),
+        ('the narrowing mask is a literal (0x55555555)', mask_narrowed(MOV_S10_LITERAL)),
+        # A marker names the whole mask: a write of one register of the pair drops it.
+        ('s13 rewritten by a 64-bit write at s11, s12 left zero', mask_narrowed(
+            MOV64_S12_ZERO + MOV64_S11_ONES, AND_EXEC_S12)),
+        ('s13 rewritten by a 32-bit write', mask_narrowed(MOV64_S12_ZERO + MOV32_S13_ONES, AND_EXEC_S12)),
+        ('s_andn2 with a pair overwritten at s11', mask_narrowed(MOV64_S12_ZERO + MOV64_S11_ZERO, ANDN2_EXEC_S12)),
+        ('a compare into s12, then a 64-bit write at s11', mask_narrowed(CMP_INTO_S12 + MOV64_S11_ONES, AND_EXEC_S12)),
+        ('two compares into s12 and s13 (two writes, one pair)', mask_narrowed(CMP_INTO_S12 + CMP_INTO_S13,
+                                                                              AND_EXEC_S12)),
+        ('a compare into s10, then a literal into s11', mask_narrowed(CMP_INTO_S10 + MOV32_S11_LITERAL)),
+        ('a VCC compare, then a literal into vcc_lo', mask_narrowed(CMP_INTO_VCC + MOV32_VCC_LITERAL, AND_EXEC_VCC)),
+        # An input modifier (-v3, |v3|) reads the dirty register all the same.
+        ('v_cmpx of -v3 (dirty), then a clean write read after the restore',
+         dirty_compare(CMPX_NEG_V3, MOV_V2_ONE, READ_V2)),
+        ('a mask operation of a marked and a never-written source', mask_narrowed(CMP_INTO_S12 + AND_S10_S12_S14)),
+        ('a mask operation of a marked source and a literal', mask_narrowed(CMP_INTO_S12 + AND_S10_S12_LITERAL)),
+        ('a mask operation of a marked source and an unmarked VCC', mask_narrowed(CMP_INTO_S12 + AND_S10_S12_VCC)),
+        ('wave32: the narrowing mask is a literal', narrowed32(MOV32_S10_LITERAL, AND32_S10)),
+    )
+    # Reads of a register the exact-entry window wrote: the helper retry gives those the guest's value, so these are
+    # refused without it only.
+    window_refused = (
+        ('a compare of -v3 (dirty) into s10 narrows', dirty_program(
+            CMP_NEG_V3_INTO_S10, AND_EXEC_S10, MOV_V2_ONE, RESTORE, READ_V2)),
+        ('a compare of |v3| (dirty) into s10 narrows', dirty_program(
+            CMP_ABS_V3_INTO_S10, AND_EXEC_S10, MOV_V2_ONE, RESTORE, READ_V2)),
+        ('v_add_f32 of -v3 (dirty) into v2, read of v2', dirty_program(ADD_NEG_V3, READ_V2)),
+        ('a compare of dirty v3 into s10 (and s11), s10 rewritten, selected by s[10:11]', dirty_program(
+            CMP_V3_INTO_S10, MOV32_S10_ONES, SELECT_BY_S10, READ_V2)),
+    )
+    window_refused += (
+        ('an SDWA sext of a dirty register', dirty_program(SDWA_SEXT_V3, READ_V2)),
+        ('a carry-out of dirty v3 feeds a carry-in, read of the result', dirty_program(
+            ADD_CO_S10_DIRTY, ADDCI_S12_BY_S10, MOV_V2_V8, READ_V2)),
+        ('a 32-bit result of a 64-bit op (s_bcnt1_i32_b64) is not the high half of a dirty pair', dirty_program(
+            CMP_V3_INTO_S12, MOV32_S13_ZERO, BCNT1_S11, SELECT_BY_S12, READ_V2)),
+        ('the same with s_bcnt0_i32_b64', dirty_program(
+            CMP_V3_INTO_S12, MOV32_S13_ZERO, BCNT0_S11, SELECT_BY_S12, READ_V2)),
+        ('a carry-out of dirty v3 into s10, s10 rewritten, selected by s[10:11]', dirty_program(
+            ADD_CO_V3_INTO_S10, MOV32_S10_ONES, SELECT_BY_S10, READ_V2)),
+    )
+    refused += (
+        ('two compares with overlapping destinations (s11 writes s12), selected by s12', dirty_program(
+            CMP_INTO_S12, CMP_V1_INTO_S11, SELECT_BY_S12, READ_V2)),
+        ('wave32: s_mov_b64 s11 writes s12, the mask of a compare, selected by s12', dirty_program32(
+            CMP_INTO_S12, MOV32_S14_LITERAL, MOV32_S15_LITERAL, MOV64_S11_S14, SELECT_BY_S12, READ_V2)),
+        ('v_cndmask_e32 by VCC overwritten with a literal', dirty_program(
+            CMP_INTO_VCC, MOV32_VCC_LITERAL, SELECT_BY_VCC, READ_V2)),
+        ('v_cndmask_e64 by a pair whose s11 got a literal', dirty_program(
+            CMP_INTO_S10, MOV32_S11_LITERAL, SELECT_BY_S10, READ_V2)),
+        ('v_cndmask_e64 by a pair overwritten with a 64-bit literal', dirty_program(
+            CMP_INTO_S12, MOV64_S12_LITERAL, SELECT_BY_S12, READ_V2)),
+        ('a carry-in read through a pair whose s11 got a literal', dirty_program(
+            CMP_INTO_S10, MOV32_S11_LITERAL, ADDC_BY_S10, READ_V2)),
+    )
+    accepted = (
+        ('carry chain: v_add_co_u32 into s10, v_add_co_ci_u32_e64 by s10', dirty_program(
+            ADD_CO_S10, ADDCI_S12_BY_S10, MOV_V2_V8, READ_V2)),
+        ('carry chain with VCC: v_add_co_u32 into vcc, v_add_co_ci_u32_e32', dirty_program(
+            ADD_CO_VCC, ADDCI_E32_VCC, MOV_V2_V8, READ_V2)),
+        ('v_cndmask_e32 by VCC from a clean compare', dirty_program(CMP_INTO_VCC, SELECT_BY_VCC, READ_V2)),
+        ('v_cndmask_e64 by a pair from a clean compare', dirty_program(CMP_INTO_S10, SELECT_BY_S10, READ_V2)),
+        ('wave32: s_and_b32 of a VCC compare narrows lane-exactly', narrowed32(CMP_INTO_VCC, AND32_VCC)),
+        ('s_and_saveexec from EXEC, then s_xor of the saved mask', program(
+            SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(
+                COPY_V2_TO_V3_WHOLE + SAVEEXEC_S10_EXEC + NARROWED_WRITE + XOR_EXEC_S10 + NARROWED_WRITE + RESTORE),
+            COPY_V2_TO_V3_WHOLE + SAVEEXEC_S10_EXEC + NARROWED_WRITE + XOR_EXEC_S10 + NARROWED_WRITE + RESTORE,
+            READ_V3, EXPORT)),
+        ('s_and into VCC of a VCC compare, then s_and of VCC', mask_narrowed(CMP_INTO_VCC + AND_VCC_EXEC_VCC,
+                                                                            AND_EXEC_VCC)),
+        ('s_and with a mask from a VALU compare narrows lane-exactly', mask_narrowed(CMP_INTO_S10)),
+        ('s_and with a copy of EXEC narrows lane-exactly', mask_narrowed(MOV_S10_EXEC)),
+        ('s_and with a mask from a VCC compare narrows lane-exactly', mask_narrowed(CMP_INTO_VCC, AND_EXEC_VCC)),
+        ('s_and with a pair from a 64-bit compare narrows lane-exactly', mask_narrowed(CMP_INTO_S12, AND_EXEC_S12)),
+        ('if/else: s_and_saveexec of a VCC compare, then s_xor of the saved mask', program(
+            SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(
+                COPY_V2_TO_V3_WHOLE + CMP_INTO_VCC + SAVEEXEC_S10_VCC + NARROWED_WRITE + XOR_EXEC_S10
+                + NARROWED_WRITE + RESTORE),
+            COPY_V2_TO_V3_WHOLE + CMP_INTO_VCC + SAVEEXEC_S10_VCC + NARROWED_WRITE + XOR_EXEC_S10 + NARROWED_WRITE
+            + RESTORE, READ_V3, EXPORT)),
+    )
+    for label, code in window_refused:
+        text, reason = translate(code, helper=False)
+        check('refused without the helper retry: %s' % label,
+              text is None and reason is not None and 'v_add_f32_dpp' in reason, str(reason))
+    for label, code in accepted:
+        text, reason = translate(code, helper=False)
+        check('accepted without the helper retry: %s' % label, text is not None, str(reason))
     for label, code in helper_reads + refused:
         text, reason = translate(code, helper=False)
         check('refused without the helper retry: %s' % label,

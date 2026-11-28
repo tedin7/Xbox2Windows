@@ -1300,6 +1300,50 @@ PARTIAL_LANE_WRITE_MODS = ('dst_sel', 'dst_unused', 'op_sel', 'd16', 'tfe', 'lwe
 PARTIAL_LANE_WRITE_NAMES = ('_d16', 'mix', '_pk_', 'v_mac', 'v_fmac', 'v_pk_', 'v_cvt_pk', 'v_writelane')
 
 
+def bare_operand(token):
+    """The register token without its input modifiers: -v3, |v3|, abs(v3), neg(v3), sext(v3) read v3 all the same."""
+    token, previous = token.strip(), None
+    while token != previous:
+        previous = token
+        if token[:1] in ('-', '~') and token[1:]:
+            token = token[1:].strip()
+        elif len(token) > 2 and token[0] == token[-1] == '|':
+            token = token[1:-1].strip()
+        else:
+            inner = re.fullmatch(r'(?:abs|neg|sext)\((.*)\)', token)
+            token = inner.group(1).strip() if inner else token
+    return token
+
+
+def high_half_destination(name, ops, wave32):
+    """In wave64 a 64-bit scalar write printed as one register (a compare's or carry-out's SDST, an odd-start
+    s_*_b64 destination) also writes the next one: its name, else None."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('v_cmpx'):
+        return None
+    for dest in destinations(base, ops) if ops else ():
+        single = re.fullmatch(r's(\d+)', dest)
+        # A destination of 64 bits: a 64-bit scalar op (not one with a 32-bit result such as s_bcnt1_i32_b64), a
+        # compare's SDST or a carry-out.
+        wide_scalar = base.startswith('s_') and base.endswith(('_b64', '_u64', '_i64')) and not re.search(
+            r'_[iu]32_[bui]64$', base)
+        # A compare's or carry-out's SDST prints as one register only in wave64; a 64-bit scalar op in both sizes.
+        if single and (wide_scalar or not wave32 and (
+                base.startswith('v_cmp') or '_co' in base or VOP3B_SDST.match(base))):
+            return 's%d' % (int(single.group(1)) + 1)
+    return None
+
+
+def high_half_source(name, ops, wave32):
+    """In wave64 a lane-mask source printed as one register (the last operand of v_cndmask or a carry-in) also reads
+    the next one: its name, else None."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    single = ops and not wave32 and re.fullmatch(r's(\d+)', ops[-1])
+    if single and (base.startswith('v_cndmask') or '_co_ci' in base or base.startswith('v_div_fmas')):
+        return 's%d' % (int(single.group(1)) + 1)
+    return None
+
+
 def whole_quad_lane_registers(name, asm, scalar_reads, scalar_writes):
     """(reads, writes, vector) for the whole-quad EXEC proof: the registers an instruction reads and writes as 'vN' and
     scalar tokens, EXEC left out (the proof tracks it separately), and whether it is a per-lane (non-scalar) form.
@@ -1310,8 +1354,8 @@ def whole_quad_lane_registers(name, asm, scalar_reads, scalar_writes):
     _, ops, mods = parse(asm)
     base = re.sub(r'_e(32|64)$', '', name)
     vector = not base.startswith('s_')
-    lanes = lambda tokens: {'v%d' % n for token in tokens for r in (reg_range(token),) if r and r[0] == 'v'
-                            for n in range(r[1], r[2] + 1)}
+    lanes = lambda tokens: {'v%d' % n for token in tokens for r in (reg_range(bare_operand(token)),)
+                            if r and r[0] == 'v' for n in range(r[1], r[2] + 1)}
     keys = {m.split(':')[0] for m in mods}
     atomic = base.startswith(('buffer_atomic', 'global_atomic', 'image_atomic', 'flat_atomic'))
     stores = '_store' in base or base.startswith(('exp', 'ds_write')) or (atomic and 'glc' not in keys)
@@ -1319,6 +1363,9 @@ def whole_quad_lane_registers(name, asm, scalar_reads, scalar_writes):
         dests, sources = [], ops
     elif base == 'v_swap_b32':
         dests, sources = ops[:2], ops[:2]
+    elif base.startswith('v_cmpx'):
+        # A VOPC with EXEC write: it writes only EXEC; every printed operand (an e64 SDST too) is a source.
+        dests, sources = [], ops
     else:
         dests = destinations(base, ops)
         sources = ops[len(dests):] if len(dests) > 1 else ops[1:]
@@ -5569,17 +5616,72 @@ class Stage:
         constants = {'0', '-1'}
         move, narrow, save = ('s_%s_%s' % (op, width) for op in ('mov', 'and', 'and_saveexec'))
         mask_width = 0 if wave32 else 1
+        lane_mask_ops = {'s_%s_%s' % (op, width) for op in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor',
+                                                             'xnor', 'not')}
+        # Bitwise per-lane operations (and their saveexec forms): between a lane-exact EXEC and per-lane masks the
+        # result holds one bit per lane again.
+        narrowers = {'s_%s_%s' % (op, width) for op in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor',
+                                                        'xnor', 'and_saveexec', 'or_saveexec', 'xor_saveexec',
+                                                        'andn2_saveexec', 'orn2_saveexec', 'nand_saveexec',
+                                                        'nor_saveexec', 'xnor_saveexec')}
         operations = []
         for off, _, name, asm in self.ins:
             _, ops, mods = parse(asm)
             reads, _, writes = scalar_effects(name, asm)
+            lane_info = whole_quad_lane_registers(name, asm, reads, writes)
+            high = high_half_destination(name, ops, wave32)
+            if high and lane_info[1]:
+                # A true 64-bit destination: its upper half is written like the printed register.
+                lane_info = (lane_info[0], lane_info[1] | {high}) + lane_info[2:]
+            high_read = high_half_source(name, ops, wave32)
+            if high_read:
+                lane_info = (lane_info[0] | {high_read},) + lane_info[1:]
             operations.append((off, name, ops, mods, reads, writes,
                                writes_exec(name, ops) or bool(writes & EXEC_KEYS),
-                               name.startswith('exp') and 'vm' in asm.split()) + whole_quad_lane_registers(name, asm, reads, writes))
+                               name.startswith('exp') and 'vm' in asm.split()) + lane_info)
 
         def mask_register(token):
             reg = reg_range(token)
             return bool(reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] == mask_width)
+
+        def mask_dest(token):
+            """A register that can hold a lane mask: a mask pair (a register in wave32), or VCC."""
+            vcc = {'vcc'} if wave32 else {'vcc', 'vcc_hi'}
+            return mask_register(token) or token in ('vcc', 'vcc_lo') and scalar_tokens(token) == vcc
+
+        def selector_mask(name, ops, facts):
+            """False when the instruction selects per lane by a scalar mask that is not one bit per lane: v_cndmask, a
+            carry-in or v_div_fmas reading VCC or an SGPR pair that no VALU compare or mask operation wrote (the host
+            tests bit 0 of it on every thread)."""
+            base = re.sub(r'_e(32|64)$', '', name)
+            if not (base.startswith(('v_cndmask', 'v_div_fmas')) or '_co_ci' in base) or not ops:
+                return True
+            token = ops[-1]
+            if base.startswith('v_div_fmas') or not (token in constants or scalar_tokens(token)):
+                token = 'vcc'
+            if token in constants:
+                return True
+            if token in full_exec:
+                return 'lexact' in facts
+            if token in ('vcc', 'vcc_lo'):
+                key = {'vcc'} if wave32 else {'vcc', 'vcc_hi'}
+            else:
+                key = set(scalar_tokens(token))
+                single = re.fullmatch(r's(\d+)', token)
+                if single and not wave32:
+                    key.add('s%d' % (int(single.group(1)) + 1))
+            return ('lane', frozenset(key)) in facts
+
+        def lane_mask(token, facts):
+            """Whether the operand holds one mask bit per lane: a constant, a lane-exact EXEC, or registers that a
+            VALU compare or a mask operation of such values wrote. A literal or any other scalar does not: the host
+            tests its bit 0 on every thread, the guest the bit of its own lane."""
+            if token in constants:
+                return True
+            if token in full_exec:
+                return 'lexact' in facts
+            # The marker names the whole mask (the pair in wave64) as written by one instruction.
+            return ('lane', frozenset(scalar_tokens(token))) in facts
 
         # EXEC is tracked as three nested levels, each fact set holding the weaker ones too, so an intersection at a
         # join keeps the weakest incoming level:
@@ -5609,7 +5711,9 @@ class Stage:
             lo, hi = bounds[block]
             for (off, name, ops, mods, reads, writes, exec_write, discard,
                  lane_reads, lane_writes, vector, cross) in operations[lo:hi]:
-                if 'exec' in facts and dirty.isdisjoint(lane_reads):
+                # A per-lane selection (v_cndmask, a carry-in, v_div_fmas) by a mask that is not one bit per lane.
+                bad_select = vector and not selector_mask(name, ops, facts)
+                if 'exec' in facts and dirty.isdisjoint(lane_reads) and not bad_select:
                     known.add(off)
                 else:
                     known.discard(off)
@@ -5629,7 +5733,7 @@ class Stage:
                     # swizzle) take another lane and are never proven. EXEC read as data where it is not lane-exact
                     # (the exact entry mask, a count of it) differs on helper lanes.
                     if ((vector and 'lexact' not in facts) or not facts & {'entry', 'lexact'}
-                            or not sources_clean or cross
+                            or not sources_clean or cross or bad_select
                             or ('lexact' not in facts and not (helper_copy and 'entry' in facts)
                                 and not reads.isdisjoint(EXEC_KEYS))):
                         dirty |= lane_writes
@@ -5638,6 +5742,31 @@ class Stage:
                         dirty -= lane_writes
                 previous = facts
                 facts = {fact for fact in previous if not isinstance(fact, frozenset) or writes.isdisjoint(fact)}
+                # Any write that touches one register of a marked mask drops the marker. In wave64 a 64-bit write
+                # through a single printed register (an odd start, a compare's SDST) also covers the next one.
+                touched = set(writes) | lane_writes
+                facts = {fact for fact in facts if not (isinstance(fact, tuple) and not touched.isdisjoint(fact[1]))}
+                if not exec_write:
+                    # A register holding one mask bit per lane: a VALU compare's result, or a scalar mask operation
+                    # (and a copy) of such registers, constants and a lane-exact EXEC.
+                    # The mask destination of a compare (ops[0]) or of a carry-out (ops[1]: v_add_co, v_sub_co,
+                    # v_subrev_co, their carry-in forms, v_div_scale, v_mad_u64_u32).
+                    carry = VOP3B_SDST.match(re.sub(r'_e(32|64)$', '', name)) and len(ops) > 1
+                    if name.startswith('v_cmp') or carry:
+                        mask_op = ops[1] if carry and not name.startswith('v_cmp') else ops[0]
+                        tokens = set(scalar_tokens(mask_op)) if ops else set()
+                        single = re.fullmatch(r's(\d+)', mask_op)
+                        if single and not wave32:
+                            tokens.add('s%d' % (int(single.group(1)) + 1))
+                        if 'vcc' in tokens:
+                            tokens.discard('vcc_hi')
+                            tokens |= set() if wave32 else {'vcc_hi'}
+                        if tokens:
+                            facts.add(('lane', frozenset(tokens)))
+                    elif (not mods and name in lane_mask_ops and ops[1:] and mask_dest(ops[0])
+                          and (all(lane_mask(src, previous) for src in ops[1:])
+                               or helper_copy and 'entry' in previous and name == move)):
+                        facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
                 if (not exec_write and 'exec' in previous and name == move and not mods and ops[1:2]
                         and ops[1] in full_exec and mask_register(ops[0])):
                     # s_mov sN, exec: sN now holds the whole-quad mask.
@@ -5665,6 +5794,7 @@ class Stage:
                     if name == save and ops[1] in full_exec | constants:
                         if mask_register(ops[0]):
                             facts |= whole | {frozenset(scalar_tokens(ops[0]))}
+                            facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
                             continue
                 if (not mods and 'window' in previous and name == move and ops[0] in full_exec and
                         (ops[1] in full_exec and 'exec' in previous or frozenset(scalar_tokens(ops[1])) in previous)):
@@ -5679,7 +5809,13 @@ class Stage:
                     # whole-quad EXEC records its destination as the whole-quad mask.
                     if 'saveexec' in name and 'exec' in previous and mask_register(ops[0]):
                         facts.add(frozenset(scalar_tokens(ops[0])))
-                    facts |= exact if 'lexact' in previous and sources_clean else window
+                    # Lane-exact only for a v_cmpx, or an s_and / s_andn2 (saveexec too) whose mask holds one bit per
+                    # lane (a VALU compare, a copy of EXEC); a literal or another scalar is a window.
+                    per_lane = name.startswith('v_cmpx') or (name in narrowers and ops[1:] and all(
+                        lane_mask(src, previous) for src in ops[1:]))
+                    if 'saveexec' in name and 'lexact' in previous and not mods and mask_register(ops[0]):
+                        facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
+                    facts |= exact if 'lexact' in previous and sources_clean and per_lane else window
                     continue
                 # A later restore cannot repair values produced by an inexact EXEC write.
                 facts.clear()
