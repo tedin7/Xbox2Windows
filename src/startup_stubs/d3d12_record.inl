@@ -447,6 +447,22 @@ void record_generic(ArgumentCapture& capture)
     InterlockedAdd64(&generic_spent[slot], static_cast<LONG64>(before - capture.remaining));
 }
 
+// A queue call with the ExecuteCommandLists shape, (count, array of command-list wrappers): slot 10, and the
+// slots the stand-in executes by that shape (queue_dynamic, such as slot 35 that titles submit with).
+bool list_array_call(const u64* a)
+{
+    constexpr u64 max_lists = 64;
+    const u64 count = a[0];
+    if (!count || count > max_lists || a[1] < 0x10000 || !x2w_local::readable(reinterpret_cast<const void*>(a[1]), count * 8))
+        return false;
+    const auto* lists = reinterpret_cast<void* const*>(a[1]);
+    for (u64 i = 0; i < count; ++i) {
+        const Wrapper* w = as_wrapper(lists[i]);
+        if (!w || w->own().kind != list_kind) return false;
+    }
+    return true;
+}
+
 void record_arguments(ArgumentCapture& capture)
 {
     const Call& call = capture.call;
@@ -561,7 +577,7 @@ void record_arguments(ArgumentCapture& capture)
         }
         break;
     case queue_kind:
-        if (call.slot == 10) capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
+        if (call.slot == 10 || list_array_call(a)) capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
         if (call.slot == 32) {
             const auto stride = x2w_startup::present_plane_stride;
             const auto planes = capture.memory(1, a[1], static_cast<u64>(static_cast<UINT>(a[0])) * stride, 1);

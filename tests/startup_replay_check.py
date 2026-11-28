@@ -444,6 +444,27 @@ def check_base_slices(scene, player, backend, env, directory, vs, ps, root):
     print("replay: base image before window f6,6 in slices over %d presents, 6 presents recorded and equal" % shift)
 
 
+def check_submit_slot35(scene, player, backend, env, directory, vs, ps, root):
+    """A scene that submits through queue slot 35 (count, list array, value) replays to the recorded pictures: the
+    recording holds the list array, so the replay executes the lists."""
+    recorded_dir, recording = directory / "slot35_recorded", directory / "slot35.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_SUBMIT_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    def lit(picture):  # a colour byte above zero in the RGBA rows (each row starts with its PNG filter byte)
+        (width, _height), raw = picture
+        stride = 1 + 4 * width
+        return any(raw[row + 1 + i] for row in range(0, len(raw), stride) for i in range(4 * width) if i % 4 != 3)
+    assert len(recorded) == PRESENTS and all(map(lit, recorded.values())), "the recorded scene is black"
+    _score, rendered = replay(player, recording, directory / "slot35_replayed", backend, env)
+    assert rendered == recorded, "the slot 35 replay differs from the recorded scene"
+    print("submit slot 35: %d pictures replayed equal to the recorded scene" % PRESENTS)
+    return 0
+
+
 def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -469,6 +490,8 @@ def main(scene, player, backend, mode=None):
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "submit-slot35":
+            return check_submit_slot35(scene, player, backend, env, directory, vs, ps, root)
         if mode == "paced":
             return check_paced(scene, player, backend, env, directory, vs, ps, root)
 

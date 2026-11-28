@@ -477,7 +477,14 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
-    invoke(s.queue, 10, 1, arg(&s.list));
+    // X2W_TEST_REPLAY_SUBMIT_SLOT=35: submit through queue slot 35 (count, lists, value), as titles do.
+    static const bool slot35 = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_TEST_REPLAY_SUBMIT_SLOT", value, sizeof(value)) == 2 && value[0] == '3' &&
+               value[1] == '5';
+    }();
+    if (slot35) invoke(s.queue, 35, 1, arg(&s.list), frame + 1);
+    else invoke(s.queue, 10, 1, arg(&s.list));
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
