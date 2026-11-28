@@ -511,7 +511,12 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
-    invoke(s.queue, 10, 1, arg(&s.list));
+    // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
+    static const UINT execute_slot = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("X2W_TEST_REPLAY_EXEC_SLOT", value, sizeof(value)) ? static_cast<UINT>(std::atoi(value)) : 10u;
+    }();
+    invoke(s.queue, execute_slot, 1, arg(&s.list));
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring

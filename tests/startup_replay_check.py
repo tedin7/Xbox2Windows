@@ -142,11 +142,12 @@ def check_timing(summary, recording, progress):
     assert calls <= summary["played"] and presents <= summary["presents"], progress
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=()):
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=(), player_env=None):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     if timing:
         env["X2W_REPLAY_TIMING"] = "1"
+    env.update(player_env or {})
     code, text = run([player, recording, out, "--adapter", backend, *extra], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
@@ -320,6 +321,82 @@ def check_paced(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_execute_slot35(scene, player, backend, env, directory, vs, ps, root):
+    """A title that submits its lists on queue slot 35 (not 10): the recording holds the list array, and the replay
+    submits the lists and draws the recorded pictures."""
+    recorded_dir, recording = directory / "slot35_recorded", directory / "slot35.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == PRESENTS and len(set(recorded.values())) > 1
+    out = directory / "slot35_replayed"
+    _score, rendered = replay(player, recording, out, backend, env)
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "CommandQueue::slot35(count=1, lists) -> ExecuteCommandLists" in log and "x2w-noop CommandQueue::slot35" not in log, \
+        "the replay submitted no list from queue slot 35:\n" + log[-2000:]
+    assert rendered == recorded, "the slot-35 replay differs from the recorded scene"
+    print("execute_slot35: %d presents equal, lists submitted from queue slot 35" % PRESENTS)
+    return 0
+
+
+def without_list_array(source, target):
+    """Copies a slot-35 recording without the list array of its queue submissions (as recorded before the recorder
+    captured it): drops the ARGM and OUTP chunks of argument 1 of every queue slot-35 call."""
+    data = source.read_bytes()
+    submits, out, dropped = set(), bytearray(), 0
+    for tag, header, _hb, _payload, _size in chunks(data):
+        if tag == b"CALL":
+            seq, _t, kind, slot = struct.unpack_from("<QIHH", data, header)
+            if kind == 1 and slot == 35:
+                submits.add(seq)
+    at = 0
+    for tag, header, header_bytes, _payload, size in chunks(data):
+        end = header + header_bytes + size
+        if tag in (b"ARGM", b"OUTP"):
+            seq, arg = struct.unpack_from("<QI", data, header)
+            if seq in submits and arg & 0xFF == 1:
+                out += data[at:header - 16]
+                at = end
+                dropped += 1
+    out += data[at:]
+    target.write_bytes(out)
+    assert dropped, "the recording holds no list array of queue slot 35"
+
+
+def check_infer_execute(scene, player, backend, env, directory, vs, ps, root):
+    """X2W_REPLAY_INFER_EXECUTE=1 on a recording without the slot-35 list array submits the closed lists in Close order
+    (pictures equal to the recorded run); without the setting those calls submit nothing."""
+    recorded_dir, recording = directory / "infer_recorded", directory / "infer.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == PRESENTS and len(set(recorded.values())) > 1
+    old = directory / "infer_old.x2wr"
+    without_list_array(recording, old)
+    out = directory / "infer_off"
+    _score, rendered = replay(player, old, out, backend, env)
+    assert rendered != recorded, "a recording without the list array replayed its pictures with the inference off"
+    out = directory / "infer_on"
+    _score, rendered = replay(player, old, out, backend, env, player_env={"X2W_REPLAY_INFER_EXECUTE": "1"})
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "X2W_REPLAY_INFER_EXECUTE=1: queue slot 35" in log, log[-2000:]
+    assert log.count("X2W_REPLAY_INFER_EXECUTE=1: queue slot") == 1, "the inference is logged once"
+    assert rendered == recorded, "the inferred submissions differ from the recorded scene"
+    out = directory / "infer_recorded_array"
+    _score, rendered = replay(player, recording, out, backend, env, player_env={"X2W_REPLAY_INFER_EXECUTE": "1"})
+    assert "X2W_REPLAY_INFER_EXECUTE=1: queue slot" not in (out / "stderr.txt").read_text(errors="replace"), \
+        "a recorded list array was replaced by the inference"
+    assert rendered == recorded
+    print("infer_execute: %d presents equal with the inference on, not without it; a recorded array wins" % PRESENTS)
+    return 0
+
+
 def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     """The target placed by device slot 133 at a title address (no desktop heap) in frame 0, a window opened mid-run
     (f6,6): the file carries the placement's description, IID and output, and presents 7-12 replay equal. The same
@@ -468,6 +545,10 @@ def main(scene, player, backend, mode=None):
 
         if mode == "slot-layouts":
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "execute-slot35":
+            return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "infer-execute":
+            return check_infer_execute(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
         if mode == "paced":
