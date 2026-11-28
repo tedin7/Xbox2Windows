@@ -676,9 +676,8 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
-        # Hold other threads while stepping over the original instruction.
+        # (the window opened above holds the other threads while the original instruction is stepped over)
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
-        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])

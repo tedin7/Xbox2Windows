@@ -300,6 +300,24 @@ def older_caches(cache_root, new_cache):
     return [path for _, path in sorted(found, reverse=True)]
 
 
+def write_revision_file(cache, here):
+    """<cache>/revision.txt as the stand-in writes it (one "<kind> <revision>" line each), from the revisions of the
+    translator next to this script, so a seeded cache is not reported as one of unknown revision. x2w_key_seed.txt
+    (written by shader_cache_rekey.py) stays as it is."""
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import shader_cache_revision as revision
+    found = revision.translator_revisions(os.path.join(here, "gfx2hlsl.py"))
+    text = "".join("%s %s\n" % (kind, found[kind]) for kind in revision.KINDS if kind in found)
+    if not text:
+        return
+    path = os.path.join(cache, revision.REVISION_FILE)
+    temporary = path + ".%d.tmp" % os.getpid()
+    with open(temporary, "w", newline="\n") as handle:
+        handle.write(text)
+    os.replace(temporary, path)
+
+
 def seed_cache(cache_root, new_cache, jobs=0, rekey=None):
     """Pre-translation of an old cache after a shader revision bump. When the new cache folder holds no request yet, the
     request files of every older shader_cache_* folder are copied into it under the keys of the current revision
@@ -339,6 +357,8 @@ def seed_cache(cache_root, new_cache, jobs=0, rekey=None):
             result["seeded"] = request_count(new_cache)
             if not result["sources"]:
                 result["skipped"] = "every older cache was refused"
+            else:
+                write_revision_file(new_cache, here)
     except Exception as error:  # noqa: BLE001 - seeding must never stop a tester run
         result["skipped"] = "%s: %s" % (type(error).__name__, str(error)[:120])
     result["seconds"] = round(time.monotonic() - started, 1)
