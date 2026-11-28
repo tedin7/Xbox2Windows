@@ -37,6 +37,25 @@ PS = bytes.fromhex(
     '000081bf')
 
 
+def sop2(op, dst, src0, src1, literal=None):
+    word = struct.pack('<I', 0x80000000 | op << 23 | dst << 16 | src1 << 8 | src0)
+    return (word + (b'' if literal is None else struct.pack('<I', literal))).hex()
+
+
+# The structured-to-raw conversion of s[16:19] in place (stride DW1[29:16] cleared, NUM_RECORDS scaled by
+# max(stride, 1), OOB_SELECT 3 in DW3[29:28]), run between the record load and the raw load; s20 holds the stride.
+def convert(stride_mask=0xc000ffff):
+    return (sop2(0x27, 20, 17, 255, 0xe0010)           # s_bfe_u32 s20, s17, 0xe0010
+           + sop2(0x09, 20, 20, 129)                  # s_max_u32 s20, s20, 1
+           + sop2(0x26, 18, 18, 20)                   # s_mul_i32 s18, s18, s20
+           + sop2(0x0e, 17, 17, 255, stride_mask)     # s_and_b32 s17, s17, 0xc000ffff
+           + sop2(0x0e, 19, 19, 255, 0xcfffffff)      # s_and_b32 s19, s19, 0xcfffffff
+           + sop2(0x10, 19, 19, 255, 0x30000000))     # s_or_b32 s19, s19, 0x30000000
+V4_ZERO = bytes.fromhex('8002087e')                   # v_mov_b32 v4, 0
+CONVERT_PS = PS.replace(V4_ZERO, bytes.fromhex(convert()) + V4_ZERO, 1)
+CONVERT_BAD_MASK_PS = PS.replace(V4_ZERO, bytes.fromhex(convert(0xc000fffe)) + V4_ZERO, 1)
+
+
 # s_load_dwordx8 of the 32-byte heap record at byte offset s8, then image_load of texel (0, 0) from that view.
 # (The words are assembled from the listing in the comments; the vertex stage and the root fixture are shared.)
 IMAGE_HEAD = ('80038bbe'          # s_mov_b32 s11, 0
@@ -141,6 +160,20 @@ def translate():
     return pipe, vs, ps
 
 
+def translate_convert():
+    """A pixel shader converts its heap record in place and raw-loads; a changed stride mask stays refused."""
+    pipe = G.Pipeline(VS_WORDS, CONVERT_PS, root_blob())
+    ps = pipe.hlsl_ps()
+    assert pipe.ps_profile() == 'ps_6_6' and 'ResourceDescriptorHeap[' in ps and '.Load(' in ps, ps
+    try:
+        G.Pipeline(VS_WORDS, CONVERT_BAD_MASK_PS, root_blob())
+    except G.Unsupported as reason:
+        assert 'four intact words' in str(reason), str(reason)
+    else:
+        raise AssertionError('accepted a changed stride mask')
+    return pipe, ps
+
+
 def compile_shader(dxc, directory, profile, source):
     hlsl = directory / (profile + '.hlsl')
     cso = hlsl.with_suffix('.cso')
@@ -190,6 +223,14 @@ def main(offscreen, dxc):
                                    mutate(ps_source, 'index >= heap_count', 'index > heap_count'))
         draw(offscreen, vs, unbounded, 64, 0, count, negative=True)
 
+        # The converted record reads the same buffers; a wrong slot reads another one.
+        convert_pipe, convert_source = translate_convert()
+        convert = compile_shader(dxc, directory, 'ps_6_6', convert_source)
+        draw(offscreen, vs, convert, 0, 0x3fa00000, len(convert_pipe.uds))
+        draw(offscreen, vs, convert, 32, 0x40200000, len(convert_pipe.uds))
+        wrong_convert = compile_shader(dxc, directory, 'ps_6_6', mutate(convert_source, '>> 5;', '>> 6;'))
+        draw(offscreen, vs, wrong_convert, 32, 0x40200000, len(convert_pipe.uds), negative=True)
+
         # The top view mip in slots 3 and 4 is cleared to (1.25, 2.5, 4, 8) and (16, 32, 64, 128).
         _, image_source = translate_image()
         first, second = [0x3fa00000, 0x40200000, 0x40800000, 0x41000000], [0x41800000, 0x42000000, 0x42800000, 0x43000000]
@@ -221,6 +262,7 @@ if __name__ == '__main__':
     if len(sys.argv) == 1:
         translate()
         translate_image()
+        translate_convert()
         translate_rewrite()
         translate_mask_branch()
     else:

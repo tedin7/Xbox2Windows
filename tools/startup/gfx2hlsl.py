@@ -13374,7 +13374,7 @@ class Stage:
             d = dst[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
-                   if getattr(self, 'kind', None) in ('cs', 'vs', 'ms') and len(syms) == 2 else None)
+                   if getattr(self, 'kind', None) in ('cs', 'vs', 'ms', 'ps') and len(syms) == 2 else None)
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
                 if pair:
