@@ -185,7 +185,7 @@ struct Submission {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12DescriptorHeap> heap;
-    ComPtr<ID3D12Resource> result, readback, zeros;  // zeros: the upload copy that clears result
+    ComPtr<ID3D12Resource> result, readback;
     std::vector<Report> reports;
     std::vector<Job> jobs;
     u64 words = 0;

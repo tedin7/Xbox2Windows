@@ -63,7 +63,7 @@ void Tracker::build(ID3D12CommandQueue* queue, Submission& s)
             if (!writes[w].snapshot) continue;
             const unsigned groups = m::groups_for(writes[w].texels);
             s.jobs.push_back({r, w, groups, s.words});
-            s.words += u64{groups} * m::group_words;
+            s.words += u64{groups} * m::group_threads * m::record_words;
         }
     }
     if (s.jobs.empty()) return;
@@ -100,14 +100,6 @@ bool Tracker::record_reductions(Submission& s, ID3D12Device* device, D3D12_COMMA
                                                IID_PPV_ARGS(&s.result))))
         return false;
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
-    const D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
-    void* zeros = nullptr;
-    if (FAILED(device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                               nullptr, IID_PPV_ARGS(&s.zeros))) ||
-        FAILED(s.zeros->Map(0, nullptr, &zeros)) || !zeros)
-        return false;
-    std::memset(zeros, 0, static_cast<std::size_t>(bytes));  // the groups fold into zeroed records with atomics
-    s.zeros->Unmap(0, nullptr);
     if (FAILED(device->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                                nullptr, IID_PPV_ARGS(&s.readback))))
         return false;
@@ -117,9 +109,6 @@ bool Tracker::record_reductions(Submission& s, ID3D12Device* device, D3D12_COMMA
     list->SetComputeRootSignature(pipelines_.root.Get());
     list->SetComputeRootUnorderedAccessView(1, s.result->GetGPUVirtualAddress());
     barrier(list, s.result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(s.result.Get(), 0, s.zeros.Get(), 0, bytes);
-    barrier(list, s.result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (std::size_t j = 0; j < s.jobs.size(); ++j) {
@@ -227,11 +216,12 @@ std::string Tracker::line(LONG frame, int index, const Report& report, const Sub
             return &s.reports[j.report] == &report && j.write == w;
         });
         const char* reason = write.reason ? write.reason : s.failure ? s.failure : job == s.jobs.end() ? "not reduced" : nullptr;
-        if (reason || job->word + u64{job->groups} * m::group_words > words.size()) {
+        const unsigned records = job == s.jobs.end() ? 0 : job->groups * m::group_threads;
+        if (reason || job->word + u64{records} * m::record_words > words.size()) {
             out += std::string(",\"stats\":null,\"reason\":\"") + (reason ? reason : "readback") + "\"}";
             continue;
         }
-        const m::Stats stats = m::combine(words.data() + job->word, job->groups, write.texels, write.info.channels);
+        const m::Stats stats = m::combine(words.data() + job->word, records, write.texels, write.info.channels);
         reduced = true;
         signal |= m::has_signal(stats);
         out += ",\"stats\":" + m::stats_json(stats) + '}';

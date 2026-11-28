@@ -1,10 +1,9 @@
 // Pass thermometer reduction (docs/startup-runtime.md#pass-thermometer). One dispatch reads one snapshot: `count`
-// texels (a texture's subresource 0, row-major over `width`) or 32-bit words (a buffer range, KIND 3). Each thread
-// strides over the texels and keeps, per channel, min, max and sum of the finite values and the counts of exact zeros,
-// NaN and Inf; then it folds them with buffer atomics into its group's record: 24 dwords at dword `out_word` +
-// group * 24 of the result buffer, which starts zeroed. Min and max are stored as order-preserving words (0: no
-// finite value; min as the complement of its word), the sum by compare-exchange. No group-shared memory: every D3D12
-// shader compiler the stand-in meets accepts this. The CPU folds the groups (pass_stats_math.h combine).
+// texels (a texture's subresource 0, row-major over `width`) or 32-bit words (a buffer range, KIND 3). Each of the
+// groups * 64 threads strides over the texels and writes its own record: per channel, min, max and sum of the finite
+// values (+Inf, -Inf and 0 when it saw none) and the counts of exact zeros, NaN and Inf, 24 words at word `out_word` +
+// thread * 24 of the result buffer. The CPU folds the records (pass_stats_math.h combine). Plain shader model 5: no
+// group-shared memory, atomics, attributes or structured buffers, so Wine's builtin compiler accepts it too.
 // KIND: 0 float4, 1 uint4, 2 sint4, 3 raw words read as floats.
 #pragma once
 
@@ -32,60 +31,47 @@ float4 texel(uint i)
 #endif
 }
 
-// A word whose unsigned order is the float order; never 0 for a finite value.
-uint ordered(float value)
-{
-    const uint bits = asuint(value);
-    return (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;
-}
+#define ACCUMULATE(c) { \
+    uint magnitude = asuint(v.c) & 0x7fffffff; \
+    if (magnitude > 0x7f800000) { nans.c = nans.c + 1; } \
+    else if (magnitude == 0x7f800000) { infs.c = infs.c + 1; } \
+    else { \
+        if (magnitude == 0) { zeros.c = zeros.c + 1; } \
+        lo.c = min(lo.c, v.c); \
+        hi.c = max(hi.c, v.c); \
+        total.c = total.c + v.c; \
+    } }
 
-void add_float(uint at, float value)
-{
-    if (value == 0) return;
-    uint expected = partials.Load(at);
-    [allow_uav_condition] for (uint tries = 0; tries < 65536; ++tries) {
-        uint original;
-        partials.InterlockedCompareExchange(at, expected, asuint(asfloat(expected) + value), original);
-        if (original == expected) break;
-        expected = original;
-    }
-}
+#define STORE(c, at) { \
+    partials.Store((at) * 4, asuint(lo.c)); \
+    partials.Store((at + 1) * 4, asuint(hi.c)); \
+    partials.Store((at + 2) * 4, asuint(total.c)); \
+    partials.Store((at + 3) * 4, zeros.c); \
+    partials.Store((at + 4) * 4, nans.c); \
+    partials.Store((at + 5) * 4, infs.c); }
 
-void fold(uint at, bool finite, float lo, float hi, float total, uint zeros, uint nans, uint infs)
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
 {
-    if (finite) {
-        partials.InterlockedMax(at, ~ordered(lo));
-        partials.InterlockedMax(at + 4, ordered(hi));
-        add_float(at + 8, total);
+    float4 lo = asfloat(0x7f800000);
+    float4 hi = asfloat(0xff800000);
+    float4 total = float4(0, 0, 0, 0);
+    uint4 zeros = uint4(0, 0, 0, 0);
+    uint4 nans = uint4(0, 0, 0, 0);
+    uint4 infs = uint4(0, 0, 0, 0);
+    uint record = group.x * 64 + thread.x;
+    for (uint i = record; i < count; i += groups * 64) {
+        float4 v = texel(i);
+        ACCUMULATE(x)
+        ACCUMULATE(y)
+        ACCUMULATE(z)
+        ACCUMULATE(w)
     }
-    if (zeros) partials.InterlockedAdd(at + 12, zeros);
-    if (nans) partials.InterlockedAdd(at + 16, nans);
-    if (infs) partials.InterlockedAdd(at + 20, infs);
-}
-
-[numthreads(256, 1, 1)]
-void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
-{
-    float4 lo = asfloat(0x7f800000u), hi = asfloat(0xff800000u), total = 0;
-    uint4 zeros = 0, nans = 0, infs = 0;
-    for (uint i = group.x * 256 + lane; i < count; i += groups * 256) {
-        const float4 v = texel(i);
-        const uint4 magnitude = asuint(v) & 0x7fffffffu;
-        const bool4 is_nan = magnitude > 0x7f800000u, is_inf = magnitude == 0x7f800000u;
-        const bool4 finite = !is_nan && !is_inf;
-        nans += is_nan ? 1 : 0;
-        infs += is_inf ? 1 : 0;
-        zeros += finite && magnitude == 0 ? 1 : 0;
-        lo = finite ? min(lo, v) : lo;
-        hi = finite ? max(hi, v) : hi;
-        total += finite ? v : 0;
-    }
-    const uint at = (out_word + group.x * 24) * 4;
-    const bool4 seen = lo <= hi;
-    fold(at, seen.x, lo.x, hi.x, total.x, zeros.x, nans.x, infs.x);
-    fold(at + 24, seen.y, lo.y, hi.y, total.y, zeros.y, nans.y, infs.y);
-    fold(at + 48, seen.z, lo.z, hi.z, total.z, zeros.z, nans.z, infs.z);
-    fold(at + 72, seen.w, lo.w, hi.w, total.w, zeros.w, nans.w, infs.w);
+    uint at = out_word + record * 24;
+    STORE(x, at)
+    STORE(y, at + 6)
+    STORE(z, at + 12)
+    STORE(w, at + 18)
 }
 )hlsl";
 

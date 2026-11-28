@@ -130,12 +130,12 @@ inline FormatInfo format_info(DXGI_FORMAT format, DXGI_FORMAT written, bool dept
     }
 }
 
-// The partial record of one reduction group per channel, in dwords: min (complement of its ordered word), max
-// (ordered word), sum (float bits), zeros, NaN, Inf. Ordered words keep the float order; 0 means no finite value.
+// The record of one reduction thread per channel, in words: min, max, sum (float bits; +Inf, -Inf and 0 when the
+// thread saw no finite value), zeros, NaN, Inf. A dispatch runs groups_for(texels) groups of group_threads threads.
 constexpr unsigned partial_words = 6;
-constexpr unsigned group_words = 4 * partial_words;
-constexpr unsigned max_groups = 64;
-constexpr unsigned group_threads = 256;
+constexpr unsigned record_words = 4 * partial_words;
+constexpr unsigned max_groups = 16;
+constexpr unsigned group_threads = 64;
 
 inline unsigned groups_for(std::uint64_t texels)
 {
@@ -152,8 +152,6 @@ struct Stats {
     std::uint64_t zero[4]{}, nan[4]{}, inf[4]{};
 };
 
-inline float ordered_float(std::uint32_t word);
-
 inline float word_float(std::uint32_t word)
 {
     float value;
@@ -162,22 +160,21 @@ inline float word_float(std::uint32_t word)
     return value;
 }
 
-// Folds `groups` partial records (group_words dwords each) into the stats of `texels` texels.
-inline Stats combine(const std::uint32_t* words, unsigned groups, std::uint64_t texels, unsigned channels)
+// Folds `records` thread records (record_words words each) into the stats of `texels` texels.
+inline Stats combine(const std::uint32_t* words, unsigned records, std::uint64_t texels, unsigned channels)
 {
     Stats stats;
     stats.texels = texels;
     stats.channels = std::min(channels, 4u);
     for (unsigned c = 0; c < stats.channels; ++c) {
         double sum = 0;
-        for (unsigned g = 0; g < groups; ++g) {
-            const std::uint32_t* p = words + g * group_words + c * partial_words;
-            const bool seen = p[0] != 0 && p[1] != 0;  // a group that saw no finite value left both words 0
-            const float lo = seen ? ordered_float(~p[0]) : 0.0f, hi = seen ? ordered_float(p[1]) : 0.0f;
+        for (unsigned r = 0; r < records; ++r) {
+            const std::uint32_t* p = words + r * record_words + c * partial_words;
+            const float lo = word_float(p[0]), hi = word_float(p[1]);
             stats.zero[c] += p[3];
             stats.nan[c] += p[4];
             stats.inf[c] += p[5];
-            if (!seen) continue;
+            if (!(lo <= hi)) continue;  // a thread that saw no finite value keeps +Inf / -Inf
             stats.min[c] = stats.finite[c] ? std::min(stats.min[c], lo) : lo;
             stats.max[c] = stats.finite[c] ? std::max(stats.max[c], hi) : hi;
             stats.finite[c] = true;
@@ -187,12 +184,6 @@ inline Stats combine(const std::uint32_t* words, unsigned groups, std::uint64_t 
         if (stats.finite[c] && texels > counted) stats.mean[c] = sum / static_cast<double>(texels - counted);
     }
     return stats;
-}
-
-// The float of an order-preserving word (pass_stats_shader.h ordered).
-inline float ordered_float(std::uint32_t word)
-{
-    return word_float((word & 0x80000000u) != 0 ? word & 0x7fffffffu : ~word);
 }
 
 // Signal: a colour channel (the first three; alpha alone is not a picture) holds a finite nonzero value somewhere.

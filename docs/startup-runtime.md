@@ -2406,7 +2406,7 @@ work, and at Close. Draws (refused and not-drawn ones too) belong to the pass of
 dispatches with the same outputs, consecutive copies to resources with render-target or unordered-access flags,
 and clears are passes of their own (a clear followed by draws or a dispatch on the same resources joins them).
 At the close, the list copies the written subresource of each resource into a snapshot. After the list is executed, a
-compute reduction on the same queue reads each snapshot (64 groups at most, 24 words each) and the next present
+compute reduction on the same queue reads each snapshot (16 groups of 64 threads at most, one 24-word record per thread) and the next present
 folds the results. No target is read back whole.
 
 `passes.jsonl` (next to `replay_summary.json` in a replay; `X2W_PASS_STATS_DIR`, else `X2W_PRESENT_PICTURES`, else
