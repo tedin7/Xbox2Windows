@@ -2753,9 +2753,9 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool desktop_array = tiled_address && original && slot70_desktop_arrays_enabled() &&
                                x2w_startup::desktop_address_array(original->console);
     const bool console = tiled_address && original && console_layout_srv(original->console);
-    if (console && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
         static LONG called;
-        if (first_calls(called, 4)) log("x2w-draw upload_texture 1D console: memory %p list %p", static_cast<const void*>(memory), static_cast<void*>(list));
+        if (first_calls(called, 4)) log("x2w-draw upload_texture 1D: tiled_address_srv %d original %d console %d placed_1d %d memory %p list %p", int(resource->own().tiled_address_srv), int(original != nullptr), int(console), int(placed_1d), static_cast<const void*>(memory), static_cast<void*>(list));
     }
     const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
@@ -4933,6 +4933,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 draw_lock_release_exclusive();
                 return not_drawn(pass, list, not_drawn_key, 9);
             }
+            if (srv.kind == 4) { static LONG k4; if (first_calls(k4, 6)) log("x2w-draw 1D srv: texture %p resource %p", static_cast<void*>(texture), static_cast<void*>(resource)); }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             auto* const sampled = texture;
             const bool had_texture = sampled != nullptr;
