@@ -7006,7 +7006,7 @@ class Stage:
             self.clear_low16(n)
         self.used_v.add(n)
 
-    def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False, upper_effect=None):
+    def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False, upper_effect=None, prelude=''):
         events = getattr(self, 'odd_d16_events', None)
         if events is not None:
             if upper_effect is None:
@@ -7037,7 +7037,10 @@ class Stage:
             literal = re.fullmatch(r'0x([0-9a-fA-F]{8})u', expr)
             if literal:
                 vconst[n] = int(literal.group(1), 16)
-        self.emit('v%d = %s;' % (n, expr) if self.exec_known or ignore_exec else 'if (exec & 1) v%d = %s;' % (n, expr))
+        write = 'v%d = %s;' % (n, expr)
+        if prelude:
+            write = '{ %s %s }' % (prelude, write)
+        self.emit(write if self.exec_known or ignore_exec else 'if (exec & 1) ' + write)
         temps = getattr(self, 'uniform_temps', None)
         if recompute is not None or temps is not None:  # every lane keeps a copy of the uniform value
             temp = 'ul%x_%d' % (self.pc, n)
@@ -18619,7 +18622,8 @@ class Stage:
         # v_fma_mix* is fused, but HLSL may round `a * b` before the add, so binary32 sources with long
         # mantissas can differ from the hardware by 1 ULP (same as v_fma_f32 in VEC_F). mix32 is a precise
         # mad: without it an RDNA 1 and an RDNA 4 driver drop the sign of a -0 product (#2729, #2746).
-        expr = 'mix32(%s, %s, %s)' % tuple(operand(*a) for a in zip(ops[1:4], half, hi))
+        args = ', '.join(operand(*a) for a in zip(ops[1:4], half, hi))
+        expr = 'mix32(%s)' % args
         if clamp:
             expr = 'saturate(%s)' % expr
         d = reg_range(ops[0])[1]
@@ -18627,14 +18631,27 @@ class Stage:
             self.set_v(d, 'U(%s)' % expr)
             return
         self.used_v.add(d)
-        convert = 'f16rz' if (self.round_modes or {}).get(getattr(self, 'pc', None)) == 2 else 'f16rn'  # default MODE.FP_ROUND is nearest even
-        if convert == 'f16rz' and getattr(self, 'pipe', None) is not None:
-            self.pipe.uses_f16rz = True
+        prelude = ''
+        if (self.round_modes or {}).get(getattr(self, 'pc', None)) == 2:
+            if getattr(self, 'pipe', None) is not None:
+                self.pipe.uses_f16rz = True
+            rounded = 'f16rz(%s)' % expr
+        else:
+            # FXC can fail to inline the nested mix32 and f16rn calls in a pixel dispatcher.
+            suffix = '%x' % (getattr(self, 'pc', None) or 0)
+            mf, mu, ma = ('mf' + suffix, 'mu' + suffix, 'ma' + suffix)
+            value = 'saturate(%s)' % mf if clamp else mf
+            prelude = (f'precise float {mf} = mad({args}); uint {mu} = asuint({value}); '
+                       f'uint {ma} = {mu} & 0x7fffffffu;')
+            rounded = (f'((({mu} >> 16) & 0x8000u) | ({ma} > 0x7f800000u ? 0x7e00u : '
+                       f'({ma} >= 0x47800000u ? 0x7c00u : ({ma} < 0x38800000u ? '
+                       f'uint(round(asfloat({ma}) * 16777216.0)) : '
+                       f'min(({ma} + 0xfffu + (({ma} >> 13) & 1u) - 0x38000000u) >> 13, 0x7c00u)))))')
         if dest == 'hi':
-            self.set_v(d, '(v%d & 0xffffu) | (%s(%s) << 16)' % (d, convert, expr))
+            self.set_v(d, '(v%d & 0xffffu) | (%s << 16)' % (d, rounded), prelude=prelude)
         else:
             keep_low16 = d in self.low16_only_v
-            self.set_v(d, '(v%d & 0xffff0000u) | %s(%s)' % (d, convert, expr), low16_only=keep_low16)
+            self.set_v(d, '(v%d & 0xffff0000u) | %s' % (d, rounded), low16_only=keep_low16, prelude=prelude)
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
