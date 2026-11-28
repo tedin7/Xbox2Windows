@@ -66,7 +66,7 @@ def main(header=ROOT / 'src' / 'startup_stubs' / 'buffer_format_word3.h'):
     legacy_support, extended_support = supported.split('if (!extended)')
     codes = gfx2hlsl.DESC_FORMAT_CODES
     expected_legacy = {codes[name] for name in gfx2hlsl.DESC_LEGACY_FORMATS}
-    ext_codes = {code for _, code in ADDED.values()}
+    ext_codes = {code for _, code in ADDED.values()} | {codes[n] for n in gfx2hlsl.DESCRIPTOR_ONLY_FORMATS}
     pattern = r'case (\d+):'
     assert {int(c) for c in re.findall(pattern, legacy_support)} == expected_legacy
     assert {int(c) for c in re.findall(pattern, extended_support)} == ext_codes
