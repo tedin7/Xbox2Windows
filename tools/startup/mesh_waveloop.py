@@ -58,6 +58,13 @@ def registers(G, operands, kind):
     return result
 
 
+def vcc_word_alu(name):
+    """A 32-bit scalar ALU op: vcc_lo and vcc_hi are then the plain SGPRs s106 and s107 ("RDNA 2" Instruction Set
+    Architecture, section 3.1: VCC is held in a pair of SGPRs, read by SALU ops like any other), data and never one
+    bit per lane. A descriptor word kept there (s_mov_b64 vcc, s[42:43]) is patched by s_and_b32 and friends."""
+    return re.fullmatch(r's_(?:and|or|xor|andn2|orn2|nand|nor|xnor|mul|add|sub|lshl|lshr|ashr|bfe|min|max|mov|cselect)_[biu]32', name) is not None
+
+
 def mask_operands(G, name, ops):
     """Operands that represent one bit per lane in the shared VALU lowering."""
     base = re.sub(r'_e(?:32|64)$', '', name)
@@ -389,7 +396,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                         raise G.Unsupported('wave loop: %s holds %s' % (reg, STUB_RESULT[0]))
                 vcc_copy = (real_name == 's_mov_b64' and ops[1] == 'vcc'
                             and (ops[0] == 'vcc' or G.reg_range(ops[0]) is not None))
-                if not vcc_copy and (any(op in VCC_REGISTERS for op in ops)
+                if not vcc_copy and (any(op in VCC_REGISTERS for op in ops) and not vcc_word_alu(real_name)
                                      or real_name.startswith('s_cbranch_vcc')):
                     for reg in ('s106', 's107'):
                         symbol = self.sym.get(int(reg[1:]))
@@ -414,7 +421,13 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                         symbol = self.sym.get(word)
                         if 's%d' % word in reads and symbol and not G.run_time_symbol(symbol):
                             raise G.Unsupported('wave loop: mask word s%d holds %s' % (word, symbol[0]))
-                if name == 'x2w_serial':
+                if name == 'x2w_serial' and vcc_word_alu(real_name) and any(
+                        (self.sym.get(int(VCC_REGISTERS[op][1:])) or ('',))[0] == 'desc' for op in ops if op in VCC_REGISTERS):
+                    # A descriptor word held in vcc_lo or vcc_hi: the stage tracks its provenance through the ALU op
+                    # (stride cleared, byte count, OOB select) exactly as for any other SGPR; the serial lowering
+                    # would only have its run-time value.
+                    super().one(real_name, re.sub(r'\bvcc_(lo|hi)\b', lambda m: 's106' if m[1] == 'lo' else 's107', real_asm))
+                elif name == 'x2w_serial':
                     self.op_x2w_serial([str(index)], [])
                 else:
                     if name == 'exp':
