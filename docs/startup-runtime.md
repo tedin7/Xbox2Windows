@@ -2233,6 +2233,16 @@ The log counts resources skipped for budget, multisampling, depth-stencil, or un
 state, including reserved resources and resources outside the shim's COMMON state tracking. The recorder
 skips depth-stencil resources in full. Resources created during the window get their contents from replayed calls.
 
+The snapshot never allocates a copy of a resource: it reads each one through a single reusable READBACK (system
+memory) staging buffer, in pieces (copy, wait for the fence, write to the file), so the extra memory is at most
+`X2W_REPLAY_GPU_STATE_STAGING_MIB` (default 64, a decimal number). The buffer is also kept within 90% of the adapter's
+local video memory budget minus its current usage (`IDXGIAdapter3::QueryVideoMemoryInfo`), re-read before each
+resource. A resource that cannot be cut into pieces that small is skipped and counted as `skipped (vram budget)`.
+`X2W_REPLAY_GPU_STATE_MAX_MS` (default off) stops starting new resources after that many milliseconds; they are
+counted as `skipped (time limit)`. The snapshot is not spread across presents: the title is held at the window's
+first present so every captured resource matches the call stream that follows, and a spread snapshot would not.
+`X2W_TEST_VRAM_BUDGET_MIB` replaces the queried budget (tests only).
+
 Each captured subresource becomes a global `GPUR` chunk. The player uploads its bytes after the prefix
 and before the first window call, so the window can read results produced by earlier GPU work.
 The `startup_replay_gpu_state_warp` fixture reads a DEFAULT texture populated by a prefix copy and uses a new
