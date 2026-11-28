@@ -966,8 +966,6 @@ def oracle_sibling_status(G, name, request, proof_manifest, marker, out_dir, com
         sources, manifest = G.mesh57_sources(pipe, ps)
     except G.Unsupported as reason:
         return 'unavailable serial: ' + ' '.join(str(reason).split())[:300]
-    if isinstance(pipe.ps, G.PlaceholderPixelStage):
-        return 'unavailable placeholder pixel stage'
     # The published proof manifest carries the key line the runtime checks; compare without it.
     published = [line for line in proof_manifest.splitlines() if not line.startswith(('key ', '# '))]
     if manifest.splitlines() != published:

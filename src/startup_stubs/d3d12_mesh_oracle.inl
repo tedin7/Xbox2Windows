@@ -501,6 +501,10 @@ bool mesh_oracle_draw(Wrapper* self, ID3D12GraphicsCommandList* list, const Tran
         return false;
     }
 
+    static LONG ready;
+    if (first_calls(ready, 32))
+        log("x2w-oracle mesh %016llx draw %u: %zu targets, %llu bytes of copies", tr.key, key_draw, prepared.size(),
+            static_cast<unsigned long long>(bytes));
     for (auto& p : prepared) p.saved = mesh_oracle::save_state(pass, p.resource);
     const auto restore_all = [&] {
         for (const auto& p : prepared) mesh_oracle::restore_state(self, list, p.saved);
@@ -613,4 +617,19 @@ void mesh_oracle_discard(ID3D12CommandList* list)
     s.pending.erase(std::remove_if(s.pending.begin(), s.pending.end(),
                                    [list](const mesh_oracle::Sample& sample) { return sample.list == list; }),
                     s.pending.end());
+}
+
+// At exit: one line per selected key with its mesh draw count and how many draws were compared, so the verdicts
+// can be ranked by use.
+void mesh_oracle_exit_report()
+{
+    if (!mesh_oracle_enabled()) return;
+    auto& s = mesh_oracle::state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    for (const auto& entry : s.keys) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "{\"key\":\"%016llx\",\"mesh_draws\":%u,\"sampled\":%u}", entry.first,
+                      entry.second.draws, entry.second.sampled);
+        mesh_oracle::write_line(s, text);
+    }
 }

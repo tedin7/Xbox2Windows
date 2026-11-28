@@ -65,6 +65,7 @@ def run(dxc, renderer, adapter, publisher):
                     X2W_TEST_MESH57_PIXELS=str(pixels), X2W_TRAP_LOG=str(log), X2W_REPLAY_ORACLE_FILE=str(oracle))
         for variable in ('X2W_REPLAY_ORACLE', 'X2W_TEST_MESH57_NO_CONSTANTS', 'X2W_TEST_MESH57_HEAP'):
             base.pop(variable, None)
+        last_output = ['']
 
         def draw(selection=None):
             for path in (pixels, log, oracle):
@@ -77,11 +78,12 @@ def run(dxc, renderer, adapter, publisher):
                 raise SystemExit(77)
             if result.returncode:
                 raise AssertionError(result.stdout + result.stderr)
+            last_output[0] = (result.stdout + result.stderr)[-3000:]
             return pixels.read_bytes(), verdicts(oracle)
 
         def explain(lines):
             text = log.read_text(errors='replace').splitlines() if log.exists() else []
-            return '%s\nlog:\n%s' % (lines, '\n'.join(line[:240] for line in text if any(word in line for word in ('oracle', 'slot57', 'mesh', 'ExecuteIndirect'))))
+            return '%s\nlog tail:\n%s\noutput tail:\n%s' % (lines, '\n'.join(line[:240] for line in text[-60:]), last_output[0])
 
         # 1. both translations right
         image, lines = draw('mesh')

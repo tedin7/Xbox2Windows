@@ -10192,6 +10192,7 @@ extern "C" void x2w_d3d12_exit_report()
     char line[1024];
     if (indirect_totals_line(line, sizeof(line)))
         log("x2w-render indirect at exit:%s", line + sizeof("x2w-render indirect:") - 1);
+    mesh_oracle_exit_report();  // X2W_REPLAY_ORACLE=mesh: per-key draw counts
 }
 
 // The offline player owns these heap references and keys them by recorded creation ID.
