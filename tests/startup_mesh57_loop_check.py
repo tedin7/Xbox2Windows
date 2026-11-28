@@ -275,6 +275,7 @@ def draw(dxc, renderer, adapter):
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     argv = sys.argv
     if len(argv) == 3 and argv[1] == 'binary':
         binary(argv[2])

@@ -240,4 +240,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     sys.exit(main(sys.argv))

@@ -2007,8 +2007,8 @@ buffer_load_dwordx4 v[20:23], v4, s[28:31], 0 offen offset:192
         's_cmp_lt_u32 s20, s16\ns_cbranch_scc0 1\ns_mul_i32 s20, s20, src_scc\n'
         's_lshl_b32 s30, s20, 3\nv_add_co_u32 v4, vcc, s30, v4\nbuffer_load_dword v24, v4')
     expect('group join words match llvm-mc', assemble(mc, group_asm), GROUP_JOIN)
-    expect('group clamp words match llvm-mc', assemble(mc, group_asm.replace('s_cbranch_scc0 1', 's_cbranch_scc1 1')),
-           GROUP_CLAMP)
+    clamp_asm = group_asm.replace('s_cbranch_scc0 1\n', 's_cbranch_scc1 1\n')
+    expect('group clamp words match llvm-mc', assemble(mc, clamp_asm), GROUP_CLAMP)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
            FORMATTED_MESH)
     expect('rewritten descriptor words match llvm-mc',
@@ -3364,4 +3364,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     sys.exit(main(sys.argv))
