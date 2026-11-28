@@ -401,7 +401,7 @@ def check_static_release(scene, player, backend, env, directory, vs, ps, root):
                      dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1",
                           X2W_TEST_REPLAY_STATIC_RELEASE="1", X2W_REPLAY_RECORD="f6,6",
                           X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
-    assert code == 0, "the scene ended with %d (33: the address was never reused)\n%s" % (code, text[-3000:])
+    assert code == 0, "the scene ended with %d (34: the address was never reused)\n%s" % (code, text[-3000:])
     whole = pictures(recorded_dir)
     before = whole["present_0006.png"][1][1:5]
     after = whole["present_0007.png"][1][1:5]

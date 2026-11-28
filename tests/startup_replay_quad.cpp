@@ -536,17 +536,20 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         // address (the others are Released at once). That list is closed empty and takes the old one's place in every submit.
         const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
         void* const old_address = s.static_list;
-        invoke(s.static_list, 2);
+        const Word remaining = invoke(s.static_list, 2);
+        std::fprintf(stderr, "replay quad: static list %p released, %llu references left\n", old_address,
+                     static_cast<unsigned long long>(remaining));
         s.static_list = nullptr;
         for (int attempt = 0; attempt < 512 && !s.static_list; ++attempt) {
             void* candidate = nullptr;
             if (FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(s.static_allocator), 0,
                                                    arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&candidate)))))
                 return 23;
+            if (attempt < 6) std::fprintf(stderr, "replay quad: candidate list %p\n", candidate);
             if (candidate == old_address) s.static_list = candidate;
             else invoke(candidate, 2);
         }
-        if (!s.static_list) return 33;  // the stand-in never gave the address back
+        if (!s.static_list) return 34;  // the stand-in never gave the address back
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
     }
     // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
