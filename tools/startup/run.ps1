@@ -29,7 +29,6 @@ param(
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
     [switch]$FreshShaderCache,                 # with -Render: move a shader cache that is not empty aside first
     [string]$NativeShaders = "",               # with -Render: the directory of dxcompiler.dll and dxil.dll; compute requests are translated in the stand-in (X2W_NATIVE_SHADERS)
-    [switch]$FreshShaderCache,                 # with -Render: move a shader cache that is not empty aside first
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
     [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
     [switch]$NoNullIdentity,                   # with -Render: do not set X2W_DRAW_NULL_IDENTITY (an empty buffer slot then keeps its real address in the log)
