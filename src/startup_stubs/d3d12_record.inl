@@ -1422,3 +1422,9 @@ extern "C" __declspec(dllexport) u64 x2w_d3d12_replay_record_calls()
 {
     return static_cast<u64>(InterlockedCompareExchange64(&replay_record::calls_written, 0, 0));
 }
+
+// Bytes of list calls from before the window that are still held for a later submit (the replay quad test reads it).
+extern "C" __declspec(dllexport) u64 x2w_d3d12_replay_record_carried_bytes()
+{
+    return static_cast<u64>(InterlockedCompareExchange64(&replay_record::carry_total_bytes, 0, 0));
+}

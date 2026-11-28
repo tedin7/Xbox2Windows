@@ -392,16 +392,22 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
 
 
 def check_static_release(scene, player, backend, env, directory, vs, ps, root):
-    """A list carried from before the window (f6,6) is Released inside it without a submit, and an empty list takes its
-    address and is submitted in every frame: the recording must not hand the old list's calls to the new one, so
-    presents 7-12 replay equal (no corner) instead of drawing the old list's magenta corner."""
+    """A list carried from before the window (f6,6) is Released inside it without a submit. The recorder must forget
+    its calls at that last Release (a new list at the same address would otherwise be submitted with them); the
+    address itself cannot be forced on a real runtime, so the test reads the bytes still held. The window then
+    replays equal, without the released list's magenta corner."""
     recorded_dir, recording = directory / "release_recorded", directory / "release.x2wr"
     recorded_dir.mkdir()
     code, text = run([scene, vs, ps, root, backend, PRESENTS],
                      dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1",
                           X2W_TEST_REPLAY_STATIC_RELEASE="1", X2W_REPLAY_RECORD="f6,6",
                           X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
-    assert code == 0, "the scene ended with %d (34: the address was never reused)\n%s" % (code, text[-3000:])
+    assert code == 0, text[-3000:]
+    held = re.search(r"carried bytes (\d+) before the release, (\d+) after", text)
+    assert held, "the scene did not report the carried bytes\n" + text[-2000:]
+    before_bytes, after_bytes = int(held.group(1)), int(held.group(2))
+    assert before_bytes > after_bytes, "the released list's calls are still held (%d before, %d after the release)" % (
+        before_bytes, after_bytes)
     whole = pictures(recorded_dir)
     before = whole["present_0006.png"][1][1:5]
     after = whole["present_0007.png"][1][1:5]
@@ -413,7 +419,7 @@ def check_static_release(scene, player, backend, env, directory, vs, ps, root):
     assert not differ, "the replay differs from live at %s: first pixel replayed %r, live %r" % (
         differ, played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"........"))[1][1:5],
         whole[differ[0]][1][1:5])
-    print("static_release: presents 7-12 replay equal after the carried list was released and its address reused")
+    print("static_release: carried bytes %d -> %d at the release; presents 7-12 replay equal" % (before_bytes, after_bytes))
     return 0
 
 
