@@ -62,6 +62,31 @@ def check_timed_window(folder, scene, vs, ps, root, env):
     return 0
 
 
+TINY_BUDGET_MIB = "0.006"  # 6144 bytes: 5529 usable, so a 4096-byte staging buffer
+STARVED_BUDGET_MIB = "0.001"
+STAGING_LIMIT_KIB = 4
+
+
+def assert_bounded_staging(log, limit_kib, skipped):
+    found = re.search(r"x2w-replay gpu state: (\d+) skipped \(vram budget\), \d+ skipped \(time limit\), "
+                      r"peak staging (\d+) KiB", log)
+    assert found, log[-3000:]
+    assert int(found[1]) == skipped, (found[0], log[-3000:])
+    assert int(found[2]) <= limit_kib, f"staging {found[2]} KiB is over the {limit_kib} KiB the budget allows: {found[0]}"
+
+
+def check_starved(folder, scene, vs, ps, root, env):
+    """With no video memory left to stage in, the snapshot is skipped and the title is not touched."""
+    recording = folder / "gpu-starved.x2wr"
+    code, log = run([scene, vs, ps, root, "warp", PREFIX_PRESENTS + WINDOW_PRESENTS], dict(
+        env, X2W_REPLAY_RECORD="f2,2", X2W_REPLAY_RECORD_FILE=str(recording),
+        X2W_TEST_VRAM_BUDGET_MIB=STARVED_BUDGET_MIB))
+    assert code == 0, log[-3000:]
+    assert_bounded_staging(log, 0, skipped=3)
+    assert not [c for c in chunks(recording.read_bytes()) if c[0] == b"GPUR"], "a starved snapshot wrote resources"
+    print("GPU state: with no budget the snapshot skips all 3 resources and logs them")
+
+
 def assert_colour(picture, colour):
     (width, height), scanlines = picture
     assert scanlines == (b"\0" + colour * width) * height, (colour, scanlines[:17])
@@ -77,15 +102,15 @@ def check(folder, scene, player):
     env.update(X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_TEST_REPLAY_GPU_STATE="1", X2W_REPLAY_PAGES="0", X2W_SHADER_CACHE=str(cache))
     live_reference = None
-    for enabled in (True, False):
-        label = "default" if enabled else "off"
+    for label, extra in (("default", {}), ("off", {"X2W_REPLAY_GPU_STATE": "0"}),
+                         ("tiny-budget", {"X2W_TEST_VRAM_BUDGET_MIB": TINY_BUDGET_MIB})):
+        enabled = label != "off"
         recording = folder / f"gpu-{label}.x2wr"
         original = folder / f"original-{label}"
         original.mkdir()
         record_env = dict(env, X2W_REPLAY_RECORD="f2,2", X2W_REPLAY_RECORD_FILE=str(recording),
                           X2W_PRESENT_PICTURES=str(original))
-        if not enabled:
-            record_env["X2W_REPLAY_GPU_STATE"] = "0"
+        record_env.update(extra)
         code, log = run([scene, vs, ps, root, "warp", PREFIX_PRESENTS + WINDOW_PRESENTS],
                         record_env)
         if code == 77:
@@ -93,6 +118,9 @@ def check(folder, scene, player):
         assert code == 0, log[-3000:]
         live = pictures(original)
         assert len(live) == PREFIX_PRESENTS + WINDOW_PRESENTS, live.keys()
+        if label == "tiny-budget":
+            # 90% of the simulated budget is smaller than a texture: the copies go through a 4 KiB staging buffer in pieces.
+            assert_bounded_staging(log, STAGING_LIMIT_KIB, skipped=0)
         expected = {
             f"present_{index:04d}.png": live[f"present_{index + PREFIX_PRESENTS:04d}.png"]
             for index in range(1, WINDOW_PRESENTS + 1)
@@ -127,6 +155,7 @@ def check(folder, scene, player):
             assert not slices, slices
             assert live == live_reference, "the switch changed the live pictures"
 
+        blobs = [data[payload:payload + size] for _, _, payload, size in slices]
         out = folder / f"played-{label}"
         _, played = replay(player, recording, out, "warp", env, presents=WINDOW_PRESENTS)
         assert played.keys() == expected.keys(), played.keys()
@@ -137,6 +166,11 @@ def check(folder, scene, player):
                 assert_colour(picture, ZERO)
         summary = json.loads((out / "replay_summary.json").read_text())
         assert summary["gpu_state"] == {"restored": len(slices), "failed": 0, "untranslated": 0}, summary
+        if label == "tiny-budget":
+            assert sorted(blobs) == sorted(reference_blobs), "piecewise staging changed the captured bytes"
+        elif enabled:
+            reference_blobs = blobs
+    check_starved(folder, scene, vs, ps, root, env)
     print("GPU state: two replayed presents match live with capture, and are zero without capture")
     return check_timed_window(folder, scene, vs, ps, root, env)
 
