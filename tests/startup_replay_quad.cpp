@@ -35,6 +35,7 @@ enum class TitleRange { none, root, generated, supplied, ring, table };
 
 struct Scene {
     void* target = nullptr;
+    void* offscreen = nullptr;
     void* title_buffer = nullptr;
     void* rtv_heap = nullptr;
     void* queue = nullptr;
@@ -236,6 +237,15 @@ int create_scene(void* device, Scene& s)
         }
         invoke(device, 20, arg(s.target), arg(&view), s.rtv);
     }
+    // The GPU state fixture uses the RTV for an offscreen target written only before the window.
+    char gpu_state[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_GPU_STATE", gpu_state, sizeof(gpu_state)) == 1 && gpu_state[0] == '1') {
+        if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+                                               D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                                               arg(&s.offscreen)))) || !s.offscreen)
+            return 28;
+        invoke(device, 20, arg(s.offscreen), arg(&view), s.rtv);
+    }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&s.queue)))) ||
@@ -410,8 +420,12 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         const float fallback[] = {1.0f, 1.0f, 0.0f, 1.0f};
         invoke(s.list, 52, s.fallback_rtv, arg(fallback));
     }
-    if (!s.signature || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
-    if (!s.signature || frame == 1) {
+    if (s.offscreen) {
+        constexpr float history[]{1.0f, 0.0f, 1.0f, 1.0f};
+        if (frame < 2) invoke(s.list, 52, s.rtv, arg(history));
+        else invoke(s.list, 17, arg(s.target), arg(s.offscreen));
+    } else if (!s.signature || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
+    if (!s.offscreen && (!s.signature || frame == 1)) {
         invoke(s.list, 50, 1, arg(&s.rtv));
         invoke(s.list, 21, 1, arg(&viewport));
         invoke(s.list, 22, 1, arg(&scissor));

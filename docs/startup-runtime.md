@@ -2151,6 +2151,20 @@ its seconds or presents from there (`the base image took X s and N presents befo
 rescans the ranges from the smallest (descriptor rings, constants) within `X2W_REPLAY_SCAN_MS`, and later presents catch
 the rest. The base image counts toward the window's cap, not the prefix's.
 
+In render mode, set `X2W_REPLAY_GPU_STATE=1` to capture desktop resource contents when the recording window opens,
+after the base image. The recorder waits for the stand-in queues to finish, then reads back live
+render-target and unordered-access buffers and single-sample textures in increasing footprint size.
+`X2W_REPLAY_GPU_STATE_MAX_MIB` limits the readback footprints to 1024 MiB by default.
+The log counts resources skipped for budget, multisampling, depth-stencil, or unsupported backing or
+state, including reserved resources and resources outside the shim's COMMON state tracking. The recorder
+skips depth-stencil resources in full. Capture is off by default.
+
+Each captured subresource becomes a global `GPUR` chunk. The player uploads its bytes after the prefix
+and before the first window call, so the window can read results produced by earlier GPU work.
+Older players ignore the chunks. The queue waits, synchronous readback and file writes add a pause
+at the window boundary. The chunks increase the recording size, and the player waits for the uploads
+before it continues. The `gpu_state` summary counts restored, failed and untranslated subresources.
+
 `X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
 (up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of
 descriptor heaps, including supplied memory and stand-in allocations whose CPU start the title has queried.

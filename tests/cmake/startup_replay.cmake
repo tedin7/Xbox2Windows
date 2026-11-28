@@ -31,6 +31,11 @@ if(TARGET startup_replay_quad AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}
         "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_draw_pages_check.py"
         "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>")
     set_tests_properties(startup_replay_draw_pages_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+
+    add_test(NAME startup_replay_gpu_state_warp
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_gpu_state_check.py"
+        "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>")
+    set_tests_properties(startup_replay_gpu_state_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     add_test(NAME startup_replay_draw_tables_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_draw_tables_check.py"
         "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>")
