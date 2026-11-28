@@ -195,6 +195,7 @@ DIM_WIDTH = (sop2_literal(0x27, 26, 17, 0x2001e) + sop2(0x00, 26, 26, ONE)
 DIM_HEIGHT = sop2_literal(0x27, 28, 18, 0x10000e) + sop2(0x00, 28, 28, ONE)
 DIM_CLAMP = (sop2(0x20, 27, 27, 25) + sop2(0x09, 27, 27, ONE)
              + sop2(0x20, 28, 28, 25) + sop2(0x09, 28, 28, ONE))
+DIM_SHIFT = sop2(0x20, 27, 27, 25) + sop2(0x20, 28, 28, 25)  # the guest clamps later, or never: bare size >> base
 DIM_EXPORT = bytes.fromhex('1b0c087e1c0c0a7e') + bytes.fromhex(IMAGE_TAIL)  # convert s27 and s28 to float
 
 
@@ -243,6 +244,17 @@ def image_dimensions_control():
     other_dim = bytes.fromhex('100100f0080e0400')  # image_load with a 3D resource operand
     reason = refusal(VS_WORDS, head + body + image + DIM_EXPORT[:-12] + other_dim + bytes.fromhex(IMAGE_TAIL))
     assert reason and 'image dimension disagrees' in reason, reason
+    return pipe, vs, ps
+
+
+def image_dimensions_bare_control():
+    head, image = bytes.fromhex(IMAGE_HEAD), bytes.fromhex(IMAGE_LOAD)
+    pipe, vs, ps = translate(VS_WORDS, head + DIM_BASE + DIM_WIDTH + DIM_HEIGHT + DIM_SHIFT + image + DIM_EXPORT)
+    assert pipe.ps.retry_heap_dimensions and ps.count('.GetDimensions(0u,') == 2
+    assert re.search(r'v4 = U\(float\(heap_w_\w+\)\);', ps)
+    # the raw mip-zero size without the shift by the base mip is still refused
+    reason = refusal(VS_WORDS, head + DIM_BASE + DIM_WIDTH + DIM_HEIGHT + image + DIM_EXPORT)
+    assert reason and 'descriptor' in reason, reason
     return pipe, vs, ps
 
 
@@ -363,6 +375,7 @@ def main(dxc=None):
     descriptor_word_control()
     image_dimensions_control()
     image_dimensions_null_control()
+    image_dimensions_bare_control()
     embedded_scalar_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
@@ -554,6 +567,14 @@ def warp_image_dimensions(offscreen, dxc):
             draw_pixel(offscreen, vs, ps, 32 * slot, expected, count, heap_count=5)
         wrong = compile_shader(dxc, directory, 'ps_6_6', source.replace('.GetDimensions(0u,', '.GetDimensions(1u,'))
         draw_pixel(offscreen, vs, wrong, 32 * slot, expected, count, negative=True, heap_count=5)
+        bare_pipe, bare_vs, bare_source = image_dimensions_bare_control()
+        vs = compile_shader(dxc, directory, 'vs_6_6', bare_vs)
+        ps = compile_shader(dxc, directory, 'ps_6_6', bare_source)
+        for slot, base, full_width, full_height, blue, alpha in ((3, 0, 37, 11, 4, 8), (4, 1, 43, 15, 64, 128)):
+            expected = list(struct.unpack('<4I', struct.pack('<4f', full_width >> base, full_height >> base, blue, alpha)))
+            draw_pixel(offscreen, vs, ps, 32 * slot, expected, len(bare_pipe.uds), heap_count=5)
+        wrong = compile_shader(dxc, directory, 'ps_6_6', bare_source.replace('.GetDimensions(0u,', '.GetDimensions(1u,'))
+        draw_pixel(offscreen, vs, wrong, 32 * slot, expected, len(bare_pipe.uds), negative=True, heap_count=5)
         null_pipe, null_vs, null_source = image_dimensions_null_control()
         vs = compile_shader(dxc, directory, 'vs_6_6', null_vs)
         ps = compile_shader(dxc, directory, 'ps_6_6', null_source)
