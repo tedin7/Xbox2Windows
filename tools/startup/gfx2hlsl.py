@@ -6440,6 +6440,85 @@ class Stage:
         """Whether the program copies EXEC into a scalar register before its first s_wqm exec, exec."""
         return bool(self.helper_exec_copies())
 
+    WIDENED_EFFECT_PREFIXES = ('exp', 'buffer_store', 'tbuffer_store', 'global_store', 'flat_store', 'scratch_store',
+                               'image_store', 'ds_write', 'ds_store', 'ds_add', 'ds_sub', 'ds_inc', 'ds_dec', 'ds_min',
+                               'ds_max', 'ds_and', 'ds_or', 'ds_xor', 'ds_cmpst', 's_dcache_wb', 's_store')
+
+    def wqm_widen_site(self, off):
+        """Whether the s_wqm_b64 exec, sN at `off` can be lowered as a per-quad widening of a lane mask (RDNA 2 ISA,
+        S_WQM_B64: a destination bit is set when any bit of its quad in the source is set).
+
+        Only in the exact-entry-EXEC retry of a pixel stage, where the entry copy sN derives from is the guest's
+        bit on every host thread: then exec = QuadAny(source bit) is the guest's EXEC on every thread, helper lanes
+        included. Needed to stay exact: the instruction sits before every branch and branch target (all four lanes of a
+        quad run it together), after nothing but the entry s_wqm exec, exec as an EXEC write, and the widened EXEC
+        reaches no store, atomic or export before the next EXEC write on any path (a widened lane must not write)."""
+        if self.kind != 'ps' or not getattr(self, 'retry_helper_exec', False):
+            return False
+        cached = getattr(self, '_wqm_widen_sites', None)
+        if cached is None or cached[0] is not self.ins:
+            cached = (self.ins, {})
+            self._wqm_widen_sites = cached
+        if off in cached[1]:
+            return cached[1][off]
+        ok = cached[1][off] = self.wqm_widen_site_proof(off)
+        return ok
+
+    def wqm_widen_site_proof(self, off):
+        index = next((i for i, ins in enumerate(self.ins) if ins[0] == off), None)
+        if index is None:
+            return False
+        targets = set()
+        for _off, _n, name, asm in self.ins:
+            if name == 's_branch' or name.startswith('s_cbranch'):
+                label = (parse(asm)[1] or [''])[0]
+                if not label.startswith('label_0x'):
+                    return False
+                targets.add(int(label[8:], 16))
+        first_wqm = False
+        for i, (o, _n, name, asm) in enumerate(self.ins[:index]):
+            ops = parse(asm)[1]
+            if name == 's_branch' or name.startswith('s_cbranch') or o in targets:
+                return False
+            if name == 's_wqm_b64' and ops == ['exec', 'exec'] and not first_wqm:
+                first_wqm = True
+            elif writes_exec(name, ops):
+                return False
+        if not first_wqm or off in targets:
+            return False
+        name, ops = self.ins[index][2], parse(self.ins[index][3])[1]
+        reg = reg_range(ops[1]) if len(ops) == 2 else None
+        if (name != 's_wqm_b64' or ops[0] != 'exec' or not reg or reg[0] != 's' or reg[2] != reg[1] + 1
+                or reg[2] > 105):
+            return False
+        bounds, _, succ, _ = self.spill_cfg
+        block = next((b for b, (lo, hi) in enumerate(bounds) if lo <= index < hi), None)
+        if block is None:
+            return False
+        pending, seen = [(block, index + 1)], {block}
+        while pending:
+            block, start = pending.pop()
+            lo, hi = bounds[block]
+            stopped = False
+            for i in range(max(lo, start), hi):
+                _o, _n, iname, iasm = self.ins[i]
+                if writes_exec(iname, parse(iasm)[1]):
+                    stopped = True
+                    break
+                if iname.startswith(self.WIDENED_EFFECT_PREFIXES) or 'atomic' in iname or iname.startswith('s_swappc'):
+                    return False
+            if not stopped:
+                last_name, last_ops = self.ins[hi - 1][2], parse(self.ins[hi - 1][3])[1]
+                # Taken, s_cbranch_execz means the widened EXEC is empty: nothing runs on that edge.
+                skipped = int(last_ops[0][8:], 16) if last_name == 's_cbranch_execz' and last_ops else None
+                for target in succ[block]:
+                    if skipped is not None and target != block + 1 and self.ins[bounds[target][0]][0] == skipped:
+                        continue
+                    if target not in seen:
+                        seen.add(target)
+                        pending.append((target, 0))
+        return True
+
     def helper_exec_copies(self):
         """Offsets of the plain copies of EXEC (s_mov sN, exec) that run once, at the entry mask: before the first
         s_wqm and before any branch or branch target, so no path reaches them a second time (a loop head) or after
@@ -9191,6 +9270,10 @@ class Stage:
                             tokens |= set() if wave32 else {'vcc_hi'}
                         if tokens:
                             facts.add(('lane', frozenset(tokens)))
+                    elif (not mods and name == 's_cselect_' + width and len(ops) == 3 and mask_dest(ops[0])
+                          and set(ops[1:]) <= constants):
+                        # An all-ones or all-zero select by SCC: every lane's bit is the same, so bit 0 is exact.
+                        facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
                     elif (not mods and name in lane_mask_ops and ops[1:] and mask_dest(ops[0])
                           and (all(lane_mask(src, previous) for src in ops[1:])
                                or helper_copy and 'entry' in previous and name == move)):
@@ -9205,6 +9288,12 @@ class Stage:
                 if name.startswith('s_wqm'):
                     if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1] and (
                             previous & {'entry', 'exec'}):
+                        facts |= whole
+                        continue
+                    if (not mods and name == 's_wqm_' + width and not wave32 and ops[0] in full_exec and len(ops) == 2
+                            and 'exec' in previous and sources_clean and lane_mask(ops[1], previous)
+                            and self.wqm_widen_site(off)):
+                        # Lowered as exec = QuadAny(mask bit): the guest's widened EXEC on every thread, whole quads.
                         facts |= whole
                         continue
                     # Any other s_wqm is a no-op on the host while the guest turns on the lanes of every touched
@@ -12146,6 +12235,15 @@ class Stage:
                 self.wqm_count = getattr(self, 'wqm_count', 0) + 1
                 if getattr(self, 'wqm_set_at', False) is None:
                     self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
+            elif (getattr(self, 'exec_known', False) and ops[0] == 'exec' and len(ops) == 2 and
+                    (reg_range(ops[1]) or ('',))[0] == 's' and reg_range(ops[1])[1] in getattr(self, 'masks', ())
+                    and self.wqm_widen_site(self.pc)):
+                # exec = the lanes of every quad that has a live lane in the mask (S_WQM_B64): the quad-wide OR of the
+                # lane's own mask bit, so a helper lane or a killed lane of a live quad runs, as on the hardware.
+                self.uses_quad_vote = True
+                self.emit('exec = x2w_quad_any(%s) ? 1u : 0u;' % self.S(reg_range(ops[1])[1]))
+                self.exec_known = self.exec_narrow_only = False
+                self.wqm_exec = False
             elif hasattr(self, 'lane_exec_breaks'):
                 # Any other s_wqm is a no-op here, while the guest turns on the inactive lanes of every touched quad
                 # (or writes a whole-quad mask somewhere): a lane's EXEC bit may be 0 where the guest's is 1.
