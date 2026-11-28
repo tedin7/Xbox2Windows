@@ -5007,6 +5007,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    if (replay_skip_this(tr ? tr->key : bound && bound->translation ? bound->translation->key : 0, false)) {
+        draw_lock_release_exclusive();
+        if (indirect) indirect->set_refusal("skipped by the replay bisect switch", nullptr);
+        return false;
+    }
     if (used_fallback && tr && tr->manifest_retry.pending() &&
         draw_missing_translation(device_of(self->own().list_device), list, pass, count, instances, start, start_instance)) {
         *used_fallback = true;

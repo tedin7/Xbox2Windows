@@ -664,6 +664,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const auto& pipeline = pass.pipeline->own();
     const u64 key = pipeline.compute_request_key;
     const auto [x, y, z] = dispatch.groups;
+    if (replay_skip_this(key, true)) return "skipped by the replay bisect switch";
     const auto type = list->GetType();
     ComputeManifest* const manifest = pipeline.compute_manifest;
     const bool valid_type = type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;

@@ -4424,6 +4424,7 @@ void replay_dump_draw(Wrapper* list)
 #include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
 #include "startup_stubs/pass_stats.inl"
+#include "startup_stubs/replay_skip.inl"
 
 void note_target_draw(const Pass& pass, LONG frame, bool poisoned = false,
                       ID3D12Resource* const* inputs = nullptr, unsigned input_count = 0);
