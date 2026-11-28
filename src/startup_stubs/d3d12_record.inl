@@ -569,7 +569,9 @@ void record_arguments(ArgumentCapture& capture)
         }
         break;
     case queue_kind:
-        if (call.slot == 10) capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
+        // ExecuteCommandLists: slot 10, and any other queue slot called with its shape (the title submits on slot 35).
+        if (call.slot == 10 || execute_shaped(a[0], a[1]))
+            capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
         if (call.slot == 32) {
             const auto stride = x2w_startup::present_plane_stride;
             const auto planes = capture.memory(1, a[1], static_cast<u64>(static_cast<UINT>(a[0])) * stride, 1);
@@ -591,6 +593,22 @@ void record_arguments(ArgumentCapture& capture)
         if (call.slot == 8) capture.arg(2, sizeof(void*));  // Map's output CPU address
         break;
     }
+}
+
+// (count, array of command-list wrappers) with count 1 to 64 and a readable array of list wrappers: the shape the stand-in's
+// queue_dynamic treats as an ExecuteCommandLists on a slot whose meaning is not fixed.
+bool execute_shaped(u64 count, u64 array)
+{
+    if (count < 1 || count > 64 || array < 0x10000 || array >= 0x7fffffffffffull ||
+        !readable_range(array, static_cast<std::size_t>(count) * sizeof(u64)))
+        return false;
+    for (u64 i = 0; i < count; ++i) {
+        u64 list;
+        if (!copy_readable(array + i * sizeof(u64), &list, sizeof(list))) return false;
+        const auto* w = as_wrapper(reinterpret_cast<const void*>(list));
+        if (!w || w->own().kind != list_kind) return false;
+    }
+    return true;
 }
 
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result

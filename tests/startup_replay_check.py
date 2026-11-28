@@ -319,6 +319,27 @@ def check_paced(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_execute_slot35(scene, player, backend, env, directory, vs, ps, root):
+    """A title that submits its lists on queue slot 35 (not 10): the recording holds the list array, and the replay
+    submits the lists and draws the recorded pictures."""
+    recorded_dir, recording = directory / "slot35_recorded", directory / "slot35.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == PRESENTS and len(set(recorded.values())) > 1
+    out = directory / "slot35_replayed"
+    _score, rendered = replay(player, recording, out, backend, env)
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "CommandQueue::slot35(count=1, lists) -> ExecuteCommandLists" in log and "x2w-noop CommandQueue::slot35" not in log, \
+        "the replay submitted no list from queue slot 35:\n" + log[-2000:]
+    assert rendered == recorded, "the slot-35 replay differs from the recorded scene"
+    print("execute_slot35: %d presents equal, lists submitted from queue slot 35" % PRESENTS)
+    return 0
+
+
 def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     """The target placed by device slot 133 at a title address (no desktop heap) in frame 0, a window opened mid-run
     (f6,6): the file carries the placement's description, IID and output, and presents 7-12 replay equal. The same
@@ -467,6 +488,8 @@ def main(scene, player, backend, mode=None):
 
         if mode == "slot-layouts":
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "execute-slot35":
+            return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
         if mode == "paced":
