@@ -359,6 +359,8 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
                and struct.unpack_from("<Q", data, header)[0] < first_present]
     assert carried, "the recording holds no list call from before its window"
     whole = pictures(recorded_dir)
+    corner = whole["present_0007.png"][1][1:5]  # the first pixel of the first scanline
+    assert corner[1] > 200 and corner[0] < 50 and corner[2] < 50, "the live picture has no green corner: %r" % (corner,)
     pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
     _score, played = replay(player, recording, directory / "static_replayed", backend, env, presents=6)
     differ = [b for a, b in pairs if played.get(a) != whole[b]]
@@ -375,7 +377,9 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     assert code == 0, text[-3000:]
     assert pictures(bare_dir)["present_0007.png"] == whole["present_0007.png"], "the live pictures changed with the carry off"
     _score, lacking = replay(player, bare, directory / "static_bare_replayed", backend, env, presents=6)
-    assert all(lacking.get(a) != whole[b] for a, b in pairs), "without the carry the replay still drew the list's corner"
+    equal = [a for a, b in pairs if lacking.get(a) == whole[b]]
+    assert not equal, "without the carry the replay still drew the list's corner in %s: replayed first pixel %r" % (
+        equal, lacking[equal[0]][1][1:5] if equal else None)
     print("static_list: presents 7-12 replay equal with the carried list, all differ without it")
     return 0
 
