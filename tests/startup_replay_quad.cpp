@@ -48,6 +48,7 @@ struct Scene {
     void* list = nullptr;
     void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
     void* static_allocator = nullptr;
+    void* released_address = nullptr;
     bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: released in the window, its address reused by an empty list
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
@@ -532,25 +533,26 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     if (s.release_static && frame == 6) {
-        // Inside the window: the carried list is Released without a submit, then lists are created until one gets its
-        // address (the others are Released at once). That list is closed empty and takes the old one's place in every submit.
-        const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
-        void* const old_address = s.static_list;
-        const Word remaining = invoke(s.static_list, 2);
-        std::fprintf(stderr, "replay quad: static list %p released, %llu references left\n", old_address,
-                     static_cast<unsigned long long>(remaining));
+        // Inside the window: the carried list is Released without a submit. Its memory is given back only after the
+        // runtime retires it, so from the next frame on lists are created until one gets its address (the others are
+        // Released at once); that list is closed empty and takes the old one's place in every later submit.
+        s.released_address = s.static_list;
+        invoke(s.static_list, 2);
         s.static_list = nullptr;
-        for (int attempt = 0; attempt < 512 && !s.static_list; ++attempt) {
+    }
+    if (s.release_static && frame > 6 && !s.static_list) {
+        const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+        for (int attempt = 0; attempt < 64 && !s.static_list; ++attempt) {
             void* candidate = nullptr;
             if (FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(s.static_allocator), 0,
                                                    arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&candidate)))))
                 return 23;
-            if (attempt < 6) std::fprintf(stderr, "replay quad: candidate list %p\n", candidate);
-            if (candidate == old_address) s.static_list = candidate;
+            if (attempt < 3) std::fprintf(stderr, "replay quad: frame %u list %p (wanted %p)\n", frame, candidate, s.released_address);
+            if (candidate == s.released_address) s.static_list = candidate;
             else invoke(candidate, 2);
         }
-        if (!s.static_list) return 34;  // the stand-in never gave the address back
-        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+        if (s.static_list && FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+        if (!s.static_list && frame + 1 == frames) return 34;  // the stand-in never gave the address back
     }
     // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
     static const UINT execute_slot = [] {
