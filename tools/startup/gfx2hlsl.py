@@ -16549,9 +16549,9 @@ class Stage:
         if dynamic_view and self.kind == 'vs' and how not in ('load', 'load_mip', 'l', 'lz'):
             raise Unsupported('dynamic resource heap views require a raw buffer load')
         # A dynamic heap load reads a UINT or SINT view through the class word the runtime records per heap
-        # texture (x2w_heap_info), so only d16 access and integer sampling stay refused.
+        # texture (x2w_heap_info). A sample keeps its float view, and d16 access stays refused.
         heap_integer = dynamic_view and integer_srvs and how in ('load', 'load_mip')
-        if dynamic_view and ((integer_srvs and not heap_integer) or sample_d16 or 'd16' in mods):
+        if dynamic_view and (sample_d16 or 'd16' in mods):
             raise Unsupported('dynamic resource heap image with integer or d16 access')
         shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
                        and how == 'load'
