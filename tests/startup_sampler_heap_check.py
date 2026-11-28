@@ -103,15 +103,19 @@ def controls():
     print('run-time offset: qh[x2w_sampler_entry(%s)] with %s = ud1 (root constant 1); unaligned or >= 32752 reads '
           'entry 2047; manifest smpheap 2048 1 fallback 2047' % (m.group(2), m.group(2)))
 
-    # A constant heap offset is still refused, with or without the table.
-    for heap in (True, False):
-        try:
-            translate(CONST_WORDS, heap)
-        except G.Unsupported as error:
-            assert 'sampler from a descriptor' in str(error), error
-        else:
-            raise AssertionError('constant sampler heap offset accepted (table %s)' % heap)
-    print('constant offset 0x10: still refused in both modes')
+    # A constant heap offset: refused without the table, a table lookup with it.
+    try:
+        translate(CONST_WORDS, False)
+    except G.Unsupported as error:
+        assert 'sampler from a descriptor' in str(error), error
+    else:
+        raise AssertionError('constant sampler heap offset accepted without the table')
+    pipe = translate(CONST_WORDS, True)
+    ps, manifest = pipe.hlsl_ps(), pipe.manifest()
+    m = re.search(r'(\w+)\.Sample\(qh\[x2w_sampler_entry\((s\d+)\)\], ', ps)
+    assert m and re.search(r'\b%s = 16u;' % m.group(2), ps), ps
+    assert 'smpheap 2048 1 fallback 2047' in manifest and not pipe.notes, (manifest, pipe.notes)
+    print('constant offset 0x10: %s = 16u, qh[x2w_sampler_entry(%s)]; refused without the table' % (m.group(2), m.group(2)))
 
     # Default (X2W_SAMPLER_HEAP unset): today's shortcut, a static all-zero sampler and a note.
     pipe = translate(PS_WORDS, False)
@@ -217,6 +221,24 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     raise AssertionError('%s %s offset %d\n%s\n%s' % (kind, label, offset, run.stdout, run.stderr))
                 assert 'null_sampler_unreadable=1 null_sampler_out_of_range=2044' in run.stdout, run.stdout
                 print('%s %s offset %d: %08x' % (kind, label, offset, expected), flush=True)
+
+            # A constant byte offset 0x10 names entry 1 whatever the root constant says; dropping the index reads entry 0.
+            constant = translate(CONST_WORDS, True).hlsl_ps()
+            constant_shader = compile_hlsl(compiler, kind, constant, 'ps_const_%s' % kind, ps_profile, directory)
+            lost = re.sub(r'qh\[x2w_sampler_entry\(s\d+\)\]', 'qh[0]', constant)
+            assert lost != constant
+            constant_mutant = compile_hlsl(compiler, kind, lost, 'ps_const_lost_%s' % kind, ps_profile, directory)
+            for root_offset in (0, 32):
+                run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_shader),
+                                      str(root_offset), '3f400000', str(manifest)], capture_output=True, text=True)
+                sys.stdout.write(run.stdout)
+                assert run.returncode == 0, f'{kind} constant offset (root {root_offset})\n{run.stdout}\n{run.stderr}'
+                print(f'{kind} constant offset 0x10 (root constant {root_offset}): 3f400000', flush=True)
+            run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_mutant),
+                                  '0', '3f400000', str(manifest)], capture_output=True, text=True)
+            assert run.returncode != 0 and 'mismatch offset=0 expected=3f400000 actual=3e800000' in run.stderr, \
+                f'{kind} constant index dropped\n{run.stdout}\n{run.stderr}'
+            print(f'{kind} constant offset with the index dropped: fails at entry 1 as expected', flush=True)
 
             for label, pixel, bindings, extra, failure in (
                 ('static only', static_shader, static_manifest, [], None),

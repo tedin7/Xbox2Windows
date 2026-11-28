@@ -57,6 +57,22 @@ def binary(mc):
     words = assemble(mc, source)
     assert words == UPPER_EXEC_MESH, words
     print('upper EXEC fixture matches llvm-mc')
+    patched = assemble(mc, """s_load_dwordx4 s[40:43], s[18:19], 0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 s[104:105], s[40:41]
+s_mov_b64 vcc, s[42:43]
+s_bfe_u32 s10, s105, 0xe0010
+s_max_u32 s10, s10, 1
+s_and_b32 s63, vcc_hi, 0xcfffffff
+s_mul_i32 s62, vcc_lo, s10
+s_or_b32 s63, s63, 0x30000000
+s_and_b32 s61, s105, 0xc000ffff
+s_mov_b32 s60, s104
+buffer_load_dword v6, v0, s[60:63], 0 offen
+s_waitcnt vmcnt(0)
+""")
+    assert patched == PATCHED_VCC, patched
+    print('patched vcc descriptor fixture matches llvm-mc')
 
 
 def run(mesh, mode=None, pixel=(), *, artifacts=False, root_blob=None, stubs=False):
@@ -113,6 +129,28 @@ def check_scalar_uniformity():
     status, _ = run(SERIAL_MESH[:6] + HEAP_SETUP + program + SERIAL_MESH[6:],
                     'force', root_blob=heap_root())
     assert status == 'ok', status
+
+
+# A structured buffer descriptor loaded into s[40:43] and patched into a raw one in s[60:63]; its words 2 and 3 pass
+# through vcc_lo and vcc_hi (s_mov_b64 vcc, s[42:43]), which a SALU op reads as the plain SGPRs s106 and s107.
+# llvm-mc 19 (gfx1013, wave64): s_load_dwordx4 s[40:43], s[18:19], 0; s_waitcnt lgkmcnt(0); s_mov_b64 s[104:105], s[40:41];
+# s_mov_b64 vcc, s[42:43]; s_bfe_u32 s10, s105, 0xe0010; s_max_u32 s10, s10, 1; s_and_b32 s63, vcc_hi, 0xcfffffff;
+# s_mul_i32 s62, vcc_lo, s10; s_or_b32 s63, s63, 0x30000000; s_and_b32 s61, s105, 0xc000ffff; s_mov_b32 s60, s104;
+# buffer_load_dword v6, v0, s[60:63], 0 offen; s_waitcnt vmcnt(0)
+PATCHED_VCC = ('f4080a09 fa000000 bf8cc07f bee80428 beea042a 938aff69 000e0010 848a810a 873fff6b cfffffff '
+               '933e0a6a 883fff3f 30000000 873dff69 c000ffff bebc0368 e0301000 800f0600 bf8c3f70').split()
+
+
+def check_vcc_patched_descriptor():
+    program = SERIAL_MESH[:8] + PATCHED_VCC + SERIAL_MESH[9:]
+    for mode in ('force', 'fallback'):
+        status, _ = run(program, mode)
+        assert status == 'ok', (mode, status)
+    # Without the plain-SGPR reading of vcc_lo and vcc_hi the patch is refused as a mask use of descriptor data.
+    import mesh_waveloop
+    with patch.object(mesh_waveloop, 'vcc_word_alu', lambda name: False):
+        status, _ = run(program, 'force')
+    assert 'mask word s107 holds desc' in status, status
 
 
 def check_vcc_descriptor_alias():
@@ -475,6 +513,7 @@ def offline(dxc=None):
     check_exec_zero_symbols()
     check_scalar_uniformity()
     check_vcc_descriptor_alias()
+    check_vcc_patched_descriptor()
     check_mesh_heap_image_record()
     check_stub_cascade()
     check_carry_masks_use_partial_exec()
