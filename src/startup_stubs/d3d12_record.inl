@@ -150,9 +150,9 @@ bool in_window()
     const double t = seconds_now();
     return t >= start_s && t < end_s;
 }
-void update_window()
+void update_window(bool open)
 {
-    window_open = in_window();
+    window_open = open;
     if (window_open) {
         if (!window_base_set) {
             window_base_bytes = prefix_open ? bytes_written - base_prefix_bytes : 0;
@@ -977,6 +977,17 @@ void stop(bool at_exit, bool from_present)
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
 #include "startup_stubs/d3d12_record_pages.inl"
 
+u64 gpu_state_at_window_open(ThreadBuffer& b);
+
+bool gpu_state_enabled()
+{
+    const DWORD saved = GetLastError();
+    char value[2]{};
+    const bool enabled = GetEnvironmentVariableA("X2W_REPLAY_GPU_STATE", value, sizeof(value)) != 1 || value[0] != '0';
+    SetLastError(saved);
+    return enabled;
+}
+
 void present()
 {
     if (!active.load(std::memory_order_relaxed)) return;
@@ -1015,15 +1026,23 @@ void present()
             draws_most = 0;
         }
     }
-    if (!base_image_holds_window(b, present)) update_window();
+    const bool base_pending = base_image_holds_window(b, present);
+    const bool open = base_pending ? was_open : in_window();
+    const bool gpu_lock = !was_open && open && render_mode() && gpu_state_enabled();
+    // Serialize the boundary and the readback with the render submission path.
+    if (gpu_lock) draw_lock_acquire_exclusive();
+    const bool gpu_snapshot = gpu_lock && !window_open;
+    const u64 gpu_seq = gpu_snapshot ? gpu_state_at_window_open(b) : 0;
+    if (!base_pending && !gpu_snapshot) update_window(open);
     if (window_open || (present == first_present && !base_warming)) {
-        const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+        const u64 seq = gpu_seq ? gpu_seq : static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (!extra_title_pages && window_open && !was_open) pages_at_window_open(b, seq, present);
+        if (window_open && !was_open && !extra_title_pages) pages_at_window_open(b, seq, present);
         if (window_open && (draw_pages || (!extra_title_pages && was_open)))
             pages_at_present(b, seq, present, !extra_title_pages && was_open);
     }
+    if (gpu_lock) draw_lock_release_exclusive();
     if (!base_warming && (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)))
         InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&b.lock);
@@ -1155,7 +1174,7 @@ void install()
         if (ms > 0) draw_pages_ms = ms;
     }
     prefix_open = std::strcmp(value, "all") != 0;
-    update_window();
+    update_window(in_window());
     armed = true;
     active.store(true);
     wrap_all(std::make_index_sequence<kind_count>{});

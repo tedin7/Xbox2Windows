@@ -48,7 +48,32 @@ struct Readback {
     ComPtr<ID3D12Resource> resolved;
 };
 
-bool record(ID3D12Device* device, ID3D12GraphicsCommandList* list, Readback& readback)
+UINT subresource_count(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_FEATURE_DATA_FORMAT_INFO format{desc.Format, 0};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format, sizeof(format)))) return 0;
+    return UINT(desc.MipLevels) * format.PlaneCount *
+        (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+}
+
+bool layout(ID3D12Device* device, const D3D12_RESOURCE_DESC& copy_desc, std::vector<Slice>& slices, UINT64& bytes)
+{
+    const bool buffer = copy_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    bytes = copy_desc.Width;
+    if (!buffer) {
+        const UINT count = subresource_count(device, copy_desc);
+        if (!count) return false;
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(count);
+        std::vector<UINT> rows(count);
+        std::vector<UINT64> row_bytes(count);
+        device->GetCopyableFootprints(&copy_desc, 0, count, 0, footprints.data(), rows.data(), row_bytes.data(), &bytes);
+        if (bytes == UINT64_MAX) return false;
+        for (UINT i = 0; i < count; ++i) slices.push_back({footprints[i], rows[i], row_bytes[i]});
+    }
+    return bytes && bytes != UINT64_MAX;
+}
+
+bool record(ID3D12Device* device, ID3D12GraphicsCommandList* list, Readback& readback, UINT64 prepared_bytes = 0)
 {
     auto* source = readback.target.resource.Get();
     const auto& desc = readback.desc;
@@ -69,20 +94,8 @@ bool record(ID3D12Device* device, ID3D12GraphicsCommandList* list, Readback& rea
     }
 
     const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
-    UINT64 bytes = desc.Width;
-    if (!buffer) {
-        D3D12_FEATURE_DATA_FORMAT_INFO format{copy_desc.Format, 0};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format, sizeof(format))) ||
-            !format.PlaneCount) return false;
-        const UINT count = UINT(desc.MipLevels) * format.PlaneCount *
-            (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
-        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(count);
-        std::vector<UINT> rows(count);
-        std::vector<UINT64> row_bytes(count);
-        device->GetCopyableFootprints(&copy_desc, 0, count, 0, footprints.data(), rows.data(), row_bytes.data(), &bytes);
-        for (UINT i = 0; i < count; ++i) readback.slices.push_back({footprints[i], rows[i], row_bytes[i]});
-    }
-    if (!bytes || bytes == UINT64_MAX) return false;
+    UINT64 bytes = prepared_bytes;
+    if (!bytes && !layout(device, copy_desc, readback.slices, bytes)) return false;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
     const D3D12_RESOURCE_DESC staging{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
         DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};

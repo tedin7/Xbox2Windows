@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../startup_stubs/replay_pages.h"
+#include "../startup_stubs/replay_gpu_state.h"
 #include "../startup_stubs/d3d12_replay_slots.h"
 
 namespace x2w_replay {
@@ -210,7 +211,13 @@ struct PageMap {
     u64 data_bytes;
 };
 
+struct GpuSlice {
+    x2w_gpu_state::Header header;
+    const unsigned char* data;
+};
+
 struct Recording {
+    std::vector<GpuSlice> gpu_state;
     HANDLE file = INVALID_HANDLE_VALUE, mapping = nullptr;
     const unsigned char* base = nullptr;
     u64 size = 0;
@@ -326,6 +333,14 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             }
         } else if (name == "SHDR" && header_bytes) {
             out.shader_files.push_back({std::string(reinterpret_cast<const char*>(h), header_bytes), Blob{out.base + data_at, data_bytes}});
+        } else if (name == "GPUR") {
+            GpuSlice slice{};
+            if (header_bytes != sizeof(slice.header)) return "invalid GPUR header at " + std::to_string(at);
+            std::memcpy(&slice.header, h, sizeof(slice.header));
+            if (!data_bytes || slice.header.bytes != data_bytes || slice.header.offset)
+                return "invalid GPUR footprint at " + std::to_string(at);
+            slice.data = out.base + data_at;
+            out.gpu_state.push_back(slice);
         } else if (name == "PAGE" && header_bytes == sizeof(PageKey)) {
             if (data_bytes != page_bytes) return "PAGE of " + std::to_string(data_bytes) + " bytes at " + std::to_string(at);
             PageKey key;

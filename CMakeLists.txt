@@ -791,6 +791,11 @@ foreach(mode IN ITEMS enabled off stale recover cache_first)
     set_tests_properties(startup_slot70_memory_buffer_${mode}_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=${slot70_switch};X2W_TEST_SLOT70_MEMORY_BUFFER_STALE=${slot70_mutant};X2W_TEST_SLOT70_CACHE_FIRST=${slot70_cache_first}")
 endforeach()
+# A typed 16-element view of the same bytes is snapshotted and read back (the snapshot used to take only one structured element).
+add_test(NAME startup_slot70_memory_buffer_typed_warp COMMAND startup_view_dimension_device warp memory-buffer-typed)
+set_tests_properties(startup_slot70_memory_buffer_typed_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=1"
+    FAIL_REGULAR_EXPRESSION "reason=buffer_unavailable")
 add_test(NAME startup_slot70_snapshot_diagnostics_warp
     COMMAND startup_view_dimension_device warp memory-buffer-diagnostics)
 add_test(NAME startup_slot70_snapshot_diagnostics_off_warp

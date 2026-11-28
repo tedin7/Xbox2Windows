@@ -873,7 +873,12 @@ def check_seed_cache():
         # with the key seed it wrote the requests under (x2w_key_seed.txt).
         import gfx2hlsl
         assert (new / gfx2hlsl.KEY_SEED_NAME).read_text() == gfx2hlsl.key_seed_line() + "\n"
-        names = [n for n in names if n != gfx2hlsl.KEY_SEED_NAME]
+        # revision.txt: the same file the stand-in writes, naming the translator's revisions (shader_cache_revision.py
+        # then finds no warning to give for this cache).
+        import shader_cache_revision as R
+        assert R.cache_revisions(str(new)) == R.translator_revisions(str(Path(T.__file__).with_name("gfx2hlsl.py"))), (new / R.REVISION_FILE).read_text()
+        assert R.cache_revisions(str(new)).get("graphics") and R.warning(str(new), str(Path(T.__file__).with_name("gfx2hlsl.py"))) is None
+        names = [n for n in names if n not in (gfx2hlsl.KEY_SEED_NAME, R.REVISION_FILE)]
         assert not [n for n in names if n.endswith((".txt", ".fail", ".cso", ".hlsl", ".tmp"))], names
         assert not [n for n in names if n.startswith(("req_00000000000000a", "req_00000000000000c0", "req_00000000000000e0"))], names
         assert T.request_count(str(new)) == 5, names
