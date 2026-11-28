@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "d3d12x_device_slots.h"
+#include "startup_stubs/d3d12_dred.h"
 #include "startup_stubs/d3d12_teardown.h"
 
 namespace {
@@ -245,6 +246,7 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
         std::fprintf(stderr, "D3D12XboxCreateDevice: unsupported IID %s\n", text.data());
         return E_NOINTERFACE;
     }
+    x2w_dred::configure_before_device();
     AcquireSRWLockExclusive(&vm_state.lock);
     const HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
     if (SUCCEEDED(hr)) vm_state.device_created = true;

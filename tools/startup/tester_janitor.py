@@ -10,7 +10,7 @@ process PID (tester_run) to end. Then:
      20 s to write finished.txt, else its process tree and the title are ended (stall_watchdog.hard_end);
   2. the translator (gfx2hlsl.py --watch on this cache) and its workers are ended, whether or not the run was packed
      (a normal finish has already ended it; what is left is a leftover of an interrupted script);
-  3. if the run was cut short: the report is packed from FILE ({"manifest", "zip", "limit_mb", "cache", "map"}, written by
+  3. if the run was cut short: the report is packed from FILE ({"manifest", "zip", "limit_mb", "cache", "map", "map_xcrdapi"}, written by
      tester_run.ps1 before the run) with end_cause and interrupted=true added, the same zip a normal end would write.
 Everything it does is written to <logdir>/janitor.txt. tester_run.ps1 writes pack_done after its own pack and stops the janitor
 when it ends normally, so a normal run never meets it.
@@ -79,7 +79,8 @@ def main(argv):
         manifest["end_cause"] = "interrupted by the tester (Ctrl-C or the window was closed); " + T.end_cause(args.logdir)
         manifest["exit_code"] = -1
         parts = T.pack(args.logdir, manifest, job["zip"], int(float(job.get("limit_mb", T.DEFAULT_LIMIT_MB)) * 1024 * 1024),
-                       cache_dir=job.get("cache") or None, map_file=job.get("map") or None)
+                       cache_dir=job.get("cache") or None, map_file=job.get("map") or None,
+                       map_xcrdapi=job.get("map_xcrdapi") or None)
         for path, size in parts:
             note("packed %s (%d bytes)" % (path, size))
         with open(os.path.join(args.logdir, "pack_done"), "w", encoding="utf-8") as out:

@@ -18,6 +18,7 @@
 #include "xmem_page_batch.h"
 #include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/d3d12_dred.h"
 #include "startup_stubs/committed_range.h"
 #include "startup_stubs/zero_tail.h"
 #include "startup_stubs/copy_cache_trim.h"
@@ -557,11 +558,14 @@ void drain_debug_messages(const char* context, int slot);
 
 void check_device(const char* context, int slot)
 {
-    if (removal_device && !removal_reported) {
-        const HRESULT reason = removal_device->GetDeviceRemovedReason();
-        if (reason != S_OK && InterlockedExchange(&removal_reported, 1) == 0)
+    auto* const device = removal_device;
+    if (device && !removal_reported) {
+        const HRESULT reason = device->GetDeviceRemovedReason();
+        if (reason != S_OK && InterlockedExchange(&removal_reported, 1) == 0) {
             log("x2w-d3d12 DEVICE REMOVED, reason 0x%08lx, first noticed after %s %d", static_cast<unsigned long>(reason),
                 context, slot);
+            x2w_dred::report_removal(device, reason);
+        }
     }
     if (!info_queue) return;
     AcquireSRWLockExclusive(&debug_lock);
@@ -10357,8 +10361,10 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     } else if (debug) {
         enable_debug_layer(false);
     }
+    const bool accepts_iid = kind_for(iid) == device_kind || iid == __uuidof(IUnknown);
+    if (accepts_iid) x2w_dred::configure_before_device();
     ID3D12Device* device = nullptr;
-    const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)
+    const HRESULT hr = accepts_iid
         ? D3D12CreateDevice(adapter ? reinterpret_cast<IUnknown*>(unwrap(reinterpret_cast<u64>(adapter))) : nullptr,
                             D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))
         : E_NOINTERFACE;

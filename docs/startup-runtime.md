@@ -8,6 +8,21 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Crash diagnostics
+
+When a C++ exception escapes an XCRDAPI queue or heartbeat worker, its first occurrence for
+that role emits `x2w-xcrdapi worker exception: role=… type=… what="…"` before the worker rethrows
+it. The message includes up to 400 characters from `what()` for standard exceptions. Tester
+packs can include `XCRDAPI.symbols.txt` with function RVAs from the matching linker map.
+
+Set `X2W_DRED=1` before starting the process to request D3D12 Device Removed Extended Data
+before the stand-in creates its desktop device. The replay player uses the same device creation
+path. On the first removal detected by the stand-in, it logs the reason, the last completed
+operation for up to 16 command lists, and the page-fault address when available. The page-fault
+report includes up to eight existing and eight recently freed matching allocations. Object
+pointers require DRED 1.1 or later. If the settings interface is unavailable, the stand-in logs
+that result and proceeds with device creation.
+
 ## Derived pipeline blend state
 
 Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics
