@@ -27,7 +27,7 @@ static_assert(sizeof(GamepadState) == 28, "GamepadState layout");
 struct IGameInputDevice;
 
 struct IGameInputReading {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     std::uint32_t Release()
     {
@@ -42,7 +42,7 @@ struct IGameInputReading {
 };
 
 struct IGameInput {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     std::uint32_t Release()
     {

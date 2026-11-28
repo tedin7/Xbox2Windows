@@ -29,8 +29,8 @@ from startup_stream_check import gfx2hlsl as G
 
 
 def state_a(group, rsrc2):
-    # The observed offsets: dword 3 = X | Y << 16, dword 4 = Z, dword 6 = COMPUTE_PGM_RSRC2.
-    return struct.pack('<7I', 0, 0, 0, group[0] | group[1] << 16, group[2], 0, rsrc2)
+    # Dword 3 holds X and Y, dword 4 holds Z and the wave32 bit, and dword 6 holds COMPUTE_PGM_RSRC2.
+    return struct.pack('<7I', 0, 0, 0, group[0] | group[1] << 16, group[2] | (1 << 20), 0, rsrc2)
 
 
 def write_request(cache, code, state, data=DATA, root=None, desc_sizes=None):

@@ -47,7 +47,7 @@ def compute_program(instructions, dst):
 
 def controls(cli, sdk, work, root):
     for words, error in (([scalar(CSELECT, 126, NEG_ONE, ZERO), 0xBF810000], "invalid s_cselect_b64 destination"),
-                         ([sop1(NOT, 24, 106), 0xBF810000], "invalid s_not_b64 source")):
+                         ([sop1(NOT, 24, 127), 0xBF810000], "invalid s_not_b64 source")):
         marker = request(work, root, words)
         output = marker.with_suffix(".cso")
         result = subprocess.run([cli, sdk, work / "cache", "gfx1013-direct-cs@0", marker, output],

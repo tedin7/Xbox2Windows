@@ -65,7 +65,7 @@ def reference(op, selection, active, fi, bound_zero):
 
 
 def request(work, root, program, threads=32):
-    sa = struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1, 0, 0x8A)
+    sa = struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1 | (1 << 20), 0, 0x8A)
     return write_request(work, program, root, sa)
 
 

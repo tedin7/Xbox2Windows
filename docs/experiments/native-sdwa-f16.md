@@ -1,18 +1,21 @@
 # SDWA binary16 arithmetic in direct compute
 
 Issue #2963 adds SDWA to `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and `v_mul_f16`.
-Each source must be a VGPR. WORD_0 and DWORD read the low half, and WORD_1 reads the
-high half. Source abs clears the binary16 sign bit before neg toggles it. The compiler
+Each source can be a VGPR, SGPR, or inline constant. WORD_0 and DWORD read the low
+half, and WORD_1 reads the high half. Inline floats use a low-half binary16 encoding
+with a zero high half. Source abs clears the binary16 sign bit before neg toggles it. The compiler
 widens the halves to binary32, performs the operation, and rounds once to binary16
 using the integer nearest-even path from the [plain forms](f16-alu-direct.md).
 The binary16 rounding and denormal mode requirements apply to both forms.
 
 WORD_0 and WORD_1 destinations accept UNUSED_PAD, which zeroes the other half,
 and UNUSED_PRESERVE, which copies it from the old destination. DWORD and byte
-destinations, UNUSED_SEXT, byte sources, source sext, scalar and constant sources,
+destinations, UNUSED_SEXT, byte sources, source sext, literals,
 clamp, and output modifiers are refused. SDWA min and max remain refused.
 
 Direct wave32 compute SDWA VOPC compares can write a 32-bit mask to `vcc_hi` and read it as a scalar source.
+
+Direct compute `v_cvt_f32_f16_sdwa` supports clamp with WORD_0 or WORD_1 and DWORD/UNUSED_PAD (NaN and -0 become +0), and still refuses omod.
 
 ## Fixture
 
@@ -35,8 +38,9 @@ The product of `7bff` and `4000` overflows to `7c000000` with high-half pad.
 The add of `7e01` and `3c00` expects a NaN in the low half and exactly `a55a`
 in the preserved high half. The NaN payload and sign may vary.
 
-Compile-only controls cover DWORD destination, BYTE_1 source, SGPR source,
-inline constant source, source sext, UNUSED_SEXT, clamp, omod, min and max.
+Compile-only controls cover DWORD destination, BYTE_1 source, source sext,
+UNUSED_SEXT, clamp, omod, min and max. The scalar-source fixture separately
+covers SGPR and inline source selection, literal refusal, and scalar source sext.
 Swapping WORD_0 and WORD_1 on either source and forcing UNUSED_PRESERVE to pad
 are manual lowering mutations that must fail the readback comparison.
 

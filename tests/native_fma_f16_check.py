@@ -206,7 +206,7 @@ def refusal_programs():
         (F.vop2(OP_FMAC, 3, 249, 2) + [0x06060601, 0xBF810000], 'unimplemented direct SDWA operand profile'),
         (vop3_tern(OP_FMA_VOP3, 3, 257, 258, 260, omod=1) + [0xBF810000], 'unsupported v_fma_f16 omod'),
         (vop3_tern(OP_FMAC_VOP3, 3, 257, 258, 0, omod=1) + [0xBF810000], 'unsupported v_fmac_f16 omod'),
-        (vop3_tern(OP_FMA_VOP3, 3, 257, 258, 260, op_sel=1) + [0xBF810000], 'unsupported v_fma_f16 high-half op_sel'),
+        (vop3_tern(OP_FMA_VOP3, 3, 244, 258, 260, op_sel=1) + [0xBF810000], 'unsupported v_fma_f16 high-half op_sel on non-VGPR source'),
         (vop3_tern(OP_FMAC_VOP3, 3, 257, 258, 0, op_sel=8) + [0xBF810000], 'unsupported v_fmac_f16 high-half op_sel'),
         (vop3_tern(OP_FMAC_VOP3, 3, 257, 258, 0, neg=4) + [0xBF810000], 'unsupported v_fmac_f16 third-source modifier'),
         (vop3_tern(OP_FMAC_VOP3, 3, 257, 258, 260) + [0xBF810000], 'unsupported v_fmac_f16 third-source modifier'),

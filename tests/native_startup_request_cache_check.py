@@ -179,6 +179,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
         cs_manifest = cache / f"{cs_key:016x}.txt"
         assert cs_cso.read_bytes().startswith(b"DXBC")
         assert cs_manifest.stat().st_mtime_ns >= cs_cso.stat().st_mtime_ns
+        assert not (cache / f"{cs_key:016x}.cs.hlsl").exists()
         assert not (cache / f"req_{cs_key:016x}.cso").exists()
         assert cs_manifest.read_text(encoding="ascii") == (
             "x2w-manifest 2\n"
@@ -189,6 +190,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
             "udsrc 1 rootconst 0 1\n"
             "srv 0 buf table 1 64\n"
             "uav 0 table 1 32\n"
+            "native 1\n"
         )
         assert G.pending_keys(str(cache), skip_failed=False) == [], "published entries not recognised as complete"
 

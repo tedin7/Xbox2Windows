@@ -26,6 +26,9 @@ constexpr UINT uavs = 13, srvs = 21;
 // The image case header packs the dispatch count and a format/capability selector. The payload
 // carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
 constexpr UINT texture_rgba8_flag = 1u << 24;
+// Read-only image case selectors. The dispatch dimensions each fit in three bits.
+constexpr UINT texture_mip_zero_sampler_flag = 1u << 22;
+constexpr UINT texture_comparison_flag = 1u << 23;
 constexpr UINT texture_atomic_uint_flag = 1u << 25;
 constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
 constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
@@ -491,8 +494,13 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
     const bool rgba32_float = (store.groups & texture_rgba32_float_flag) != 0;
     const bool view_mip1 = (store.groups & texture_view_mip1_flag) != 0;
-    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag);
-    const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
+    const bool mip_zero = (store.groups & texture_mip_zero_sampler_flag) != 0;
+    const bool comparison = (store.groups & texture_comparison_flag) != 0;
+    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag |
+                      texture_mip_zero_sampler_flag | texture_comparison_flag);
+    const auto format = comparison ? DXGI_FORMAT_R32_FLOAT : rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
+        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+    const UINT base_words = texture_width * texture_height * texture_words_per_texel(format);
     std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
     // Older cases stop after the base image. A mip case appends levels one and two; an array case appends
@@ -511,15 +519,35 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
         store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5 || (rgba8 && rgba32_float) ||
+        (comparison && (rgba8 || rgba32_float || mip_zero)) ||
         (view_mip1 && texels.size() <= base_words * 2 && texels.size() % base_words == 0))
         throw std::runtime_error("Invalid compute image load reference");
-    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
-        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
-    auto root = D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)};
-    ComPtr<ID3DBlob> custom_root;
+    D3D12_SHADER_BYTECODE root{compute_tables, sizeof(compute_tables)};
+    ComPtr<ID3DBlob> case_root;
     if (sampler_manifest) {
-        custom_root = compute_texture_sampler_root(sampler_manifest);
-        root = {custom_root->GetBufferPointer(), custom_root->GetBufferSize()};
+        case_root = compute_texture_sampler_root(sampler_manifest);
+        root = {case_root->GetBufferPointer(), case_root->GetBufferSize()};
+    } else if (comparison || mip_zero) {
+        ComPtr<ID3D12VersionedRootSignatureDeserializer> embedded;
+        check(D3D12CreateVersionedRootSignatureDeserializer(root.pShaderBytecode, root.BytecodeLength,
+              IID_PPV_ARGS(&embedded)), "Read embedded compute table signature");
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* original = nullptr;
+        check(embedded->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &original),
+              "Get v1.1 compute table signature");
+        auto desc = *original;
+        if (desc.Desc_1_1.NumStaticSamplers != 1)
+            throw std::runtime_error("Expected one static sampler in the compute table signature");
+        auto sampler = desc.Desc_1_1.pStaticSamplers[0];
+        if (comparison) {
+            sampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+            sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+        } else {
+            sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+            sampler.MaxLOD = 0;
+        }
+        desc.Desc_1_1.pStaticSamplers = &sampler;
+        check(D3D12SerializeVersionedRootSignature(&desc, &case_root, nullptr), "Serialize compute case signature");
+        root = {case_root->GetBufferPointer(), case_root->GetBufferSize()};
     }
     const auto program = create_compute_program(device, shader, root);
     run_compute(device, true, program, false, &store, &texels, format,

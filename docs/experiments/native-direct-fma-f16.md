@@ -6,15 +6,17 @@
 - **Exact single-rounded FMA (`fused_half_rne()`):** Reuses the shared 32-bit integer `fused_half_rne(a, b, c)` helper
   (introduced in #3151 for `v_pk_fma_f16`) so `a * b + c` computes an exact product, aligns the addend with a sticky
   bit, and rounds once to nearest-even binary16 rather than double-rounding through binary32.
-- **High-half preservation:** Every operation reads `16`-bit sources (preserving `S0..S2[15:0]` / `K[15:0]` / `D[15:0]`),
+- **High-half preservation by default:** The default forms read `S0..S2[15:0]` / `K[15:0]` / `D[15:0]`,
   writes the result into `D[15:0]`, and keeps `D[31:16]` unchanged.
 - **Modifiers & MODE contract:** Supports VOP3 `abs`, `neg`, and `clamp` (`[0.0, 1.0]` saturation); refuses DPP, SDWA,
-  `omod`, high-half `op_sel`, third-source modifiers/`src2` on `v_fmac_f16_e64`, and non-default FP16 MODE writes
+  `omod`, high-half `op_sel` and third-source modifiers/`src2` on `v_fmac_f16_e64`, and non-default FP16 MODE writes
   (`half_binary` in `DirectCompute::lower()`).
 - **Test adjustment:** Updated the unlowered-instruction refusal placeholder in
   [`tests/native_f16_alu_check.py`](../../tests/native_f16_alu_check.py) from `v_fmac_f16` to `v_pk_fmac_f16`, and added
   `@dx.op.unaryBits.i32(i32 33, ...)` (`FirstbitHi`) evaluation to its IR interpreter so `native_fma_f16_ir` evaluates
   `fused_half_rne()` directly.
+
+Direct compute also accepts VOP3 `v_fma_f16` with `op_sel`. Bits 0 to 2 select the high half of the respective VGPR source before abs and neg. Bit 3 selects the high destination half and preserves its low half. A clear destination selector writes the low half and preserves the high half. Selected non-VGPR sources and clamp combined with `op_sel` are refused. The [half-selection fixture](../../tests/native_fma_f16_opsel_check.py) checks six captured forms in IR and direct GPU replay.
 
 ## Fixture
 

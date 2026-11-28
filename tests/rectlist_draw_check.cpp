@@ -121,7 +121,7 @@ void execute_draw(
 
     const D3D12_VERTEX_BUFFER_VIEW vbv{
         upload_vb->GetGPUVirtualAddress(),
-        sizeof(Vertex) * vertex_count,
+        static_cast<UINT>(sizeof(Vertex) * vertex_count),
         sizeof(Vertex)
     };
     list->IASetVertexBuffers(0, 1, &vbv);

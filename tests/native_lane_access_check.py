@@ -26,7 +26,7 @@ def readfirstlane(dst, vgpr):
 
 
 def launch(threads):
-    return struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1, 0, 0x8a)
+    return struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1 | (1 << 20), 0, 0x8a)
 
 
 def program():

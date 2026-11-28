@@ -13,6 +13,7 @@ struct NativeComputePipeline {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
     std::vector<ComputeViewBinding> bindings;
     std::vector<ComputeConstants> constants;
+    std::vector<unsigned> stride_srvs;
     unsigned srv_count = 0;
     unsigned uav_count = 0;
     unsigned constant_words = 0, atomic_views = 0;
@@ -28,7 +29,8 @@ struct NativeComputePipeline {
 
     void bind(ID3D12GraphicsCommandList *list, ID3D12DescriptorHeap *heap, D3D12_GPU_DESCRIPTOR_HANDLE first,
               UINT increment, const unsigned *words = nullptr,
-              const std::vector<IndexedAtomicView> &atomic = {}, ID3D12DescriptorHeap *sampler_heap = nullptr) const;
+              const std::vector<IndexedAtomicView> &atomic = {}, ID3D12DescriptorHeap *sampler_heap = nullptr,
+              const std::vector<unsigned> &strides = {}) const;
 };
 
 NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, ShaderDxilCompiler &compiler,

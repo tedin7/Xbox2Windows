@@ -14,6 +14,7 @@ the negated second source, subrev swaps the sources). NaN payloads are compared 
   native_f16_alu_check.py gpu STORE_REPLAY SDK
       compute readback of the same words and the DPP16 cases (exit 77 without wave32)
 """
+import math
 import re
 import struct
 import subprocess
@@ -306,7 +307,7 @@ def check_model(items):
 def refusal_programs():
     add = vop2(0x32, 3, 257, 2)
     programs = []
-    programs.append((vop2(0x32, 3, 233, 2) + [0xfac68801, 0xbf810000], 'SDWA or DPP vector operands'))
+    programs.append((vop2(0x32, 3, 233, 2) + [0xfac68801, 0xbf810000], 'unsupported v_add_f16 DPP form'))  # DPP8 stays refused on binary16
     # Clamp needs a wide encoding. A VOP3 with clamp and the DPP16 source selector is invalid.
     programs.append((vop3(0x32, 3, 250, 258, clamp=1) + [0xbf810000], 'unsupported v_add_f16 clamp or omod'))
     programs.append((vop3(0x35, 3, 257, 258, clamp=1) + [0xbf810000], 'unsupported v_mul_f16 clamp or omod'))
@@ -507,6 +508,18 @@ def _exec(line, values, memory, stores):
             argument = re.search(r'i32 33,\s*i32 ([^,\s\)]+)\)', rhs)
             x = _i32(argument.group(1), values) & 0xffffffff
             values[name] = ('i32', (32 - x.bit_length()) if x else 0xffffffff)
+        elif 'unary.f32(i32 7,' in rhs:
+            argument = re.search(r'i32 7,\s*float ([^,\s\)]+)\)', rhs)
+            token = argument.group(1)
+            if token.startswith('%'):
+                kind, bits = values[token]
+                if kind != 'float':
+                    raise AssertionError(rhs)
+            else:
+                bits = struct.unpack('<I', struct.pack('<f', float(token)))[0]
+            val = _f32(bits)
+            clamped = 0.0 if (math.isnan(val) or val <= 0.0) else (1.0 if val >= 1.0 else val)
+            values[name] = ('float', struct.unpack('<I', struct.pack('<f', clamped))[0])
         elif 'createHandleFromBinding' in rhs or 'annotateHandle' in rhs:
             values[name] = ('handle', 0)
         else:

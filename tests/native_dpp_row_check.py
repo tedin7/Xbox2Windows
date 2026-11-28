@@ -84,7 +84,7 @@ def reference(op, direction, amount, fi, bound_zero):
 
 
 def request(work, root, op, instruction, control, threads=64):
-    sa = struct.pack("<7I", 0, 0, 0, threads | (1 << 16), 1, 0, 0x8A)
+    sa = struct.pack("<7I", 0, 0, 0, threads | (1 << 16), 1 | (1 << 20), 0, 0x8A)
     return write_request(work, program(op, instruction, control), root, sa)
 
 

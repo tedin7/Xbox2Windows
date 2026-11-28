@@ -1,5 +1,6 @@
 #include "shader_dxil_compiler.h"
 #include "direct_compute_cache.h"
+#include "native_compute_output.h"
 #include "gfx1013_pixel.h"
 #include "gfx1013_sampled_pixel.h"
 #include "gfx1013_vertex_id.h"
@@ -645,6 +646,19 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
     if (has_manifest && !lost) {
+        if (req.compute) {
+            // A native manifest from another revision, or an unmarked one without the Python translator's
+            // <key>.cs.hlsl, is stale. Other outputs, and a manifest that cannot be read, go on to the usual
+            // timestamp and bytecode checks.
+            if (std::ifstream file{manifest_path, std::ios::binary}) {
+                const std::string manifest((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                const auto output = x2w::native_compute_output(manifest);
+                const bool python = fs::is_regular_file(fs::path(stem) += L".cs.hlsl", ec);
+                if (output == x2w::NativeComputeOutput::incompatible ||
+                    (output == x2w::NativeComputeOutput::unmarked && !python))
+                    return true;
+            }
+        }
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
         if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
@@ -715,6 +729,9 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
     fs::remove(manifest_path, ignored);
     std::ostringstream sink;
     if (req.compute) {
+        // A Python translation's sidecar must not outlive its manifest: the stand-in reads an unmarked manifest
+        // next to a <key>.cs.hlsl as the Python translator's output.
+        fs::remove(fs::path(stem) += L".cs.hlsl", ignored);
         bool hit = false;
         auto program = x2w::prepare_direct_compute(req.marker, 0, false, cache_dir, hit, x2w::HeapViewContract::none);
         auto manifest = x2w::format_compute_runtime_manifest(program);
@@ -1001,6 +1018,7 @@ int wmain(int argc, wchar_t** argv) {
                 const fs::path manifest_path = fs::path(stems[i]) += L".txt";
                 std::error_code ignored;
                 fs::remove(manifest_path, ignored);
+                fs::remove(fs::path(stems[i]) += L".cs.hlsl", ignored);  // see compile_watch_item
                 auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true);
                 if (manifest) publish_atomic(manifest_path, manifest->data(), manifest->size());
                 fs::remove(fs::path(stems[i]) += L".fail", ignored);

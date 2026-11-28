@@ -69,7 +69,7 @@ def main(cli, gpu, sdk):
         src, root = work/"root.hlsl", work/"root.bin"
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([Path(sdk)/"dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, src], check=True)
-        sa = struct.pack("<7I",0,0,0,32 | 1<<16,1,0,0x8a)
+        sa = struct.pack("<7I",0,0,0,32 | 1<<16,1 | (1 << 20),0,0x8a)
         previous = None
         for mutant in (False, True):
             words = program(mutant)

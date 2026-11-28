@@ -62,9 +62,9 @@ void report_adapter(ID3D12Device* device) {
 // A reference directory supplies independently compiled DXIL and its user-data layout.
 // --direct exercises the same direct DXIL frontend used by the runtime.
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 6 && argc != 7) return 2;
+    if (argc < 6 || argc > 8) return 2;
     try {
-        const auto mode = argc == 7 ? std::wstring_view(argv[6]) : std::wstring_view{};
+        const auto mode = argc >= 7 ? std::wstring_view(argv[6]) : std::wstring_view{};
         const bool warp = mode == L"--direct-warp";
         ComPtr<IDXGIAdapter> adapter;
         if (warp) {
@@ -102,6 +102,7 @@ int wmain(int argc, wchar_t **argv) {
         fs::path marker=argv[2], dest=argv[5];
         const bool null_array = mode == L"--direct-null-srv";
         const bool direct = null_array || warp || mode == L"--direct";
+        if (argc == 8 && !direct) return 2;
         if (direct) {
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
             D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
@@ -119,6 +120,13 @@ int wmain(int argc, wchar_t **argv) {
         UINT index=0;
         for (auto &block:p.constants)
             for (unsigned j=0;j<block.count;++j) args[index++]=constant(j);
+        std::vector<unsigned> strides;
+        if (argc == 8) {
+            std::ifstream input{fs::path(argv[7])};
+            unsigned stride;
+            while (input >> stride) strides.push_back(stride);
+            if (!input.eof()) throw std::runtime_error("invalid descriptor stride metadata");
+        }
         UINT roots[64]{};
         if (reference) {
             fs::path base=fs::path(argv[6])/marker.stem().wstring().substr(4);
@@ -231,7 +239,8 @@ int wmain(int argc, wchar_t **argv) {
         if(reference){
             ID3D12DescriptorHeap* h=heap.Get();cmd.list->SetDescriptorHeaps(1,&h);cmd.list->SetComputeRootSignature(p.root.Get());
             cmd.list->SetComputeRoot32BitConstants(0,64,roots,0);
-        } else p.bind(cmd.list.Get(),heap.Get(),heap->GetGPUDescriptorHandleForHeapStart(),step,args.data(),atomic);
+        } else p.bind(cmd.list.Get(),heap.Get(),heap->GetGPUDescriptorHandleForHeapStart(),step,args.data(),atomic,
+                      nullptr,strides);
         cmd.list->Dispatch(2,1,1);
         for(auto &w:windows) if(w.write) {
             transition(cmd.list.Get(),w.resource.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);

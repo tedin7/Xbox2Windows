@@ -19,7 +19,7 @@ def main(gpu, sdk):
                  0xf408040a, 0x16000020, 0xf408080b, 0xfa000000,
                  scalar(0x1e, 12, 6, 130), vmove(8, 12), sop1(3, 126, 129), vmove(3, 130),
                  0xe0002000, 0x80040103, 0xe0701000, 0x80080108, 0xbf810000]
-        sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 6 << 1)
+        sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 6 << 1)
         for name, second, reason in (
                 ("append", "SRV(t18, space=2)", ""),
                 ("null", "SRV(t18, space=2)", ""),

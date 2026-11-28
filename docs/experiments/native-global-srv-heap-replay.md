@@ -92,6 +92,16 @@ The check runs, in order:
    for selections 0 and 1 (output equals the slot's data), compiled by `compile_dxil --requests`, replayed with the
    same result, and replaying selection 0 against the slot 1 reference reports a mismatch.
 
+Section 11 of the check (#3224) forms the heap descriptor address the way a waterfall loop over a lane-selected slot
+does: `s_add_u32 s24, s2, s17`, `s_add_u32 s25, 0, src_scc`, `s_load_dwordx4 s[20:23], s[24:25], 0x0` instead of the
+SGPR offset of the load. The compiler tracks SCC as the carry of that add and reads the pair as the same indexed heap
+descriptor, under the same contract. Without `.views` it is refused with the heap text. The program is recorded,
+compiled and replayed for selections 0 and 1 like PROGRAM, with the slot 1 mismatch control. The other operand order
+with `s_addc_u32 s25, 0, 0` compiles. These stay refused: a constant offset (`unbound numeric SGPR s2`), `s_mov_b32
+s25, 0` or an `s_cmp` between the adds (`heap descriptor address high word is not the carry of its offset add`) and an
+immediate offset on the load. `tests/native_heap_offset_add_check.py` compiles the same form from a slot 67 request with
+both heap flags: it reaches the heap text like the SGPR-offset form, and the controls keep their refusals.
+
 ## Result
 
 ```
@@ -122,6 +132,15 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   load (`buffer_load_format_*`) through the heap descriptor. After the change, the test passes with 84 assertions. The
   run against the earlier commit `7582c01d` fails at the `window_loop` shape (old text "heap byte window in a program
   with a backward branch"). The run stops there.
+- Added heap address (#3224), dev build on `main` `8007a539` plus the change, NVIDIA GeForce RTX 4090 (driver
+  32.0.16.1088), Windows 11 build 26300, Windows SDK 10.0.26100 DXC, D3D12 debug layer not enabled:
+  `native_global_srv_heap_replay_hardware` passed, 118 assertions. `native_heap_offset_add` passed, 5 of 5. `_warp`
+  skipped (77) as above.
+  - With the compiler sources of `8007a539` (before the change), the replay fails at the first section 11 assertion
+    (`unbound numeric SGPR s2`) and `native_heap_offset_add` fails 3 of 5 (`unbound numeric SGPR s5`).
+  - With the high-word check removed, both tests fail at the `mov_high` controls.
+  - `ctest --preset dev --no-tests=error -R "native_|startup_compute|compile_dxil" -j 8`: 415 tests, 404 passed and
+    11 skipped (77, WARP).
 
 ## Limits
 

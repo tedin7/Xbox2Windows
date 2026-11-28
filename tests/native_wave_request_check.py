@@ -165,7 +165,7 @@ def main(cli, gpu, sdk):
         source.write_text('#define SIG "DescriptorTable(SRV(t0,numDescriptors=16)),DescriptorTable(UAV(u0,numDescriptors=16))"')
         root = work / "root.bin"
         subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, source], check=True)
-        sa = struct.pack("<7I", 0, 0, 0, 8 | (8 << 16), 1, 0, 0x8d8c)
+        sa = struct.pack("<7I", 0, 0, 0, 8 | (8 << 16), 1 | (1 << 20), 0, 0x8d8c)
         # s4 and s5 are the two guest tables. The byte offsets deliberately differ
         # from the desktop registers that the translator assigns to them.
         words = [
@@ -206,7 +206,7 @@ def main(cli, gpu, sdk):
         source.write_text('#define SIG "DescriptorTable(SRV(t0,numDescriptors=16)),'
                           'DescriptorTable(UAV(u0,numDescriptors=16)),RootConstants(num32BitConstants=4,b0)"')
         subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, source], check=True)
-        sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1, 0, 0x198)
+        sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, 0x198)
         # One 32-lane group per tile. s6/s7 are root constants and s12/s13 are the group IDs.
         code = [
             0xbe940304, 0xbe950380, 0xbe960305, 0xbe970380,

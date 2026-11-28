@@ -315,7 +315,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             want_output = [prefix + FAKE_USER_WARNING, *want_output]
             printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
-        found.append(f"stub exit {code}: printed {printed}, expected {want_output}")
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
+                     f"(stderr: {error_text!r})")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
     elif emit_stderr and ([line for line in summary_lines if line in STUB_LINES] != STUB_LINES or

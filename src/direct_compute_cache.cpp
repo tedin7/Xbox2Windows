@@ -3,6 +3,7 @@
 #include "gfx1013_isa.h"
 #include "native_graphics_bindings.h"
 #include "shader_compute_request.h"
+#include "native_compute_output.h"
 #include "native_shader_revision.h"
 #include "shader_dxil_compiler.h"
 #include <atomic>
@@ -96,6 +97,9 @@ Bytes encode(const NativeComputeShader &program) {
     for (const auto &c : program.constants)
         for (unsigned n : {c.root_parameter, c.first_sgpr, c.count})
             word(out, n);
+    word(out, static_cast<unsigned>(program.stride_srvs.size()));
+    for (unsigned srv : program.stride_srvs)
+        word(out, srv);
     word(out, static_cast<uint32_t>(program.samplers.size()));
     for (const auto &s : program.samplers) {
         for (auto n : s.words)
@@ -127,7 +131,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::uint_texture_uav)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::float3_texture_uav)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -144,6 +148,9 @@ NativeComputeShader decode(std::string_view bytes) {
             throw std::runtime_error("invalid cached constants");
         shader.constants.push_back(c);
     }
+    n = in.count(32);
+    for (unsigned j = 0; j < n; ++j)
+        shader.stride_srvs.push_back(in.count(31));
     n = in.count(2048);
     for (unsigned j = 0; j < n; ++j) {
         ComputeSampler sampler{};
@@ -729,6 +736,7 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             return std::nullopt;
         ud_count += block.count;
     }
+    ud_count += static_cast<unsigned>(program.stride_srvs.size());
     if (ud_count > 32)
         return std::nullopt;
 
@@ -767,6 +775,11 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";
+            } else if (const auto channels = exact_texture_uav_channels(b.kind); channels && b.array_count == 1 &&
+                       (b.image_dimension == 1 || b.image_dimension == 2 || b.image_dimension == 5)) {
+                const char *dimension = b.image_dimension == 2 ? "tex3d" : b.image_dimension == 5 ? "tex2da" : "tex2d";
+                uav_lines << "uav " << b.shader_register << ' ' << dimension << " float table " << b.root_parameter
+                          << ' ' << b.byte_offset << " channels " << channels << '\n';
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
                        (b.image_dimension == 1 || b.image_dimension == 5) && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
@@ -796,7 +809,14 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     for (const auto &block : program.constants)
         for (unsigned j = 0; j < block.count; ++j)
             out << "udsrc " << ud_index++ << " rootconst " << block.root_parameter << ' ' << j << '\n';
-    out << srv_lines.str() << uav_lines.str() << sampler_lines.str();
+    for (unsigned srv : program.stride_srvs) {
+        if (srv >= srv_count || sorted[srv].kind != ComputeViewKind::raw_vector_srv ||
+            sorted[srv].array_count != 1)
+            return std::nullopt;
+        out << "udsrc " << ud_index++ << " stride " << srv << '\n';
+    }
+    out << srv_lines.str() << uav_lines.str() << sampler_lines.str()
+        << "native " << native_compute_output_revision << '\n';
     return out.str();
 }
 

@@ -6,7 +6,7 @@ using 32-bit DXIL `unaryBits.i32` (`31` `Countbits`, `32` `FirstbitLo`, `33` `Fi
 `tools/startup/gfx2hlsl.py`:
 
 - **Destination:** general 32-bit SGPR (`s0..s105`), leaving `s[dst + 1]` untouched.
-- **Source `S0`:** aligned SGPR pair (`s0..s104` even), inline integer (`-16..64`, sign-extended when negative), or
+- **Source `S0`:** aligned SGPR pair (`s0..s104` even), EXEC (`exec_lo`/`exec_hi`, both words, in wave32 and wave64), inline integer (`-16..64`, sign-extended when negative), or
   32-bit literal (sign-extended for `s_flbit_i32_i64`, zero-extended for `_b64`).
 - **Semantics & `SCC`:** `s_bcnt0_i32_b64` and `s_bcnt1_i32_b64` sum 32-bit `Countbits` over both halves and write
   `SCC = (D != 0)`. `s_ff0_i32_b64`, `s_ff1_i32_b64`, `s_flbit_i32_b64` and `s_flbit_i32_i64` preserve `SCC` and return
@@ -23,8 +23,11 @@ Encodings were verified with LLVM 15.0.7 (`clang -cc1as -triple amdgcn -target-c
 
 - **Controls:** compiles all 6 ops and checks `dxc.exe -dumpbin` for `@dx.op.unaryBits.i32` opcodes `31`, `32`, `33`
   with no `i64` shifts; tests `s_ff1_i32_b64 s31, s[22:23]` right below `s[32:35]` to verify `s32` stays intact;
-  checks 6 invalid destination/source refusals (`vcc`/`exec` dst, odd/`vcc`/`exec`/float `S0`); checks 6 mutant
+  checks 6 invalid destination/source refusals (`vcc`/`exec` dst, odd/`vcc`/`exec_hi`/float `S0`; since EXEC became a valid `S0`, the source control uses the odd `exec_hi`); checks 6 mutant
   references differ.
+- **EXEC as `S0`:** read back with `s_bcnt1_i32_b64` by `tests/native_wave64_exec_salu_check.py`, including masks that
+  span both host halves of a wave64 (`ctest --preset dev --no-tests=error -R '^native_wave64_exec_salu_hardware$' -V`).
+  The other five ops accept EXEC through the same source check but are not run with it.
 - **Hardware cases:** all 6 ops across `(0, 0)`, `(0xffffffff, 0xffffffff)`, `(0, 1)`, `(0x80000000, 0)`,
   `(0xfffffffe, 0xffffffff)`, `(0, 0x80000000)`, `(1, 0)`; inline `-1`; 32-bit literal `0x80000001`; explicit `SCC`
   preservation (`0` and `1`) across count-then-scan sequences; overlapping `s22 = ff1(s[22:23])`.

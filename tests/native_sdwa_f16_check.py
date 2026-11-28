@@ -12,6 +12,7 @@ from native_compute_clear_check import write_request
 BYTE_1, WORD_0, WORD_1, DWORD = 1, 4, 5, 6
 PAD, SEXT, PRESERVE = 0, 1, 2
 NEG, ABS, SCALAR = 0x10, 0x20, 0x80
+CLAMP = 1 << 13
 OLD = 0xa55a1357
 GUARD = 0x69696969
 ADD_CO_CI, PKRTZ = 0x28, 0x2f
@@ -23,6 +24,33 @@ def sdwa(opcode, dst, unused, src0, src1, reg0=1, reg1=2, dst_mod=0):
     ext = (reg0 | (dst << 8) | (unused << 11) | dst_mod |
            (src0 << 16) | (src1 << 24))
     return fixture.vop2(opcode, 3, 249, reg1) + [ext]
+
+
+def cvt_sdwa(src0, dst_mod=CLAMP):
+    # VOP1 opcode 0x0b, v3 destination, SDWA escape, then v1 with DWORD/PAD.
+    return [0x7e000000 | (3 << 17) | (0x0b << 9) | 249,
+            1 | (DWORD << 8) | dst_mod | (src0 << 16)]
+
+
+class ClampCase:
+    op = 'v_cvt_f32_f16 clamp'
+    dest = 3
+
+    def __init__(self, half, selector):
+        self.selector = selector
+        # Put a distinct in-range value in the other half to expose a wrong selector.
+        other = 0x3400
+        self.word = (half << 16) | other if selector == WORD_1 else (other << 16) | half
+        value = struct.unpack('<e', struct.pack('<H', half))[0]
+        # An ordered > comparison maps NaN, negative values and -0.0 to +0.0.
+        result = min(value, 1.0) if value > 0.0 else 0.0
+        self.want = struct.unpack('<I', struct.pack('<f', result))[0]
+
+    def emit(self):
+        return fixture.mov(1, self.word) + fixture.mov(self.dest, OLD) + cvt_sdwa(self.selector)
+
+    def matches(self, got):
+        return got == self.want
 
 
 class Case:
@@ -73,6 +101,12 @@ def cases():
     return items
 
 
+def clamp_cases():
+    # -1, 2, quiet NaN, -0, smallest positive subnormal, 0.5, and 1.
+    halves = (0xbc00, 0x4000, 0x7e01, 0x8000, 0x0001, 0x3800, 0x3c00)
+    return [ClampCase(half, selector) for selector in (WORD_0, WORD_1) for half in halves]
+
+
 def check_mutants(items):
     # Manual lowering mutants that must fail: swap WORD_0/WORD_1 on either
     # source, or ignore UNUSED_PRESERVE by zeroing the other destination half.
@@ -90,16 +124,15 @@ def refusals():
     add = fixture.OP_CODE['add']
     dest_error = 'unsupported SDWA destination modifier'
     src_error = 'invalid SDWA source modifier'
-    vgpr_error = 'SDWA binary16 source must be a VGPR'
     return [
         (sdwa(add, DWORD, PAD, WORD_0, WORD_0), dest_error),
         (sdwa(add, WORD_0, PAD, BYTE_1, WORD_0), src_error),
-        (sdwa(add, WORD_0, PAD, WORD_0 | SCALAR, WORD_0), vgpr_error),
-        (sdwa(add, WORD_0, PAD, WORD_0, WORD_0 | SCALAR, reg1=242), vgpr_error),
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0 | 8), src_error),
         (sdwa(add, WORD_0, SEXT, WORD_0, WORD_0), dest_error),
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0, dst_mod=1 << 13), dest_error),
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0, dst_mod=1 << 14), dest_error),
+        (cvt_sdwa(WORD_0, 1 << 14), dest_error),
+        (cvt_sdwa(WORD_1, CLAMP | (1 << 14)), dest_error),
         (sdwa(0x39, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # max
         (sdwa(0x3a, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # min
     ] + [
@@ -205,6 +238,8 @@ def run_gpu(gpu, sdk, items, code):
 if __name__ == '__main__':
     items = cases()
     check_mutants(items)
+    items += clamp_cases()
+    assert len(items) < fixture.STRIDE
     code, _ = fixture.program(items)
     if len(sys.argv) == 3 and sys.argv[1] == 'ir':
         run_ir(sys.argv[2], items, code)

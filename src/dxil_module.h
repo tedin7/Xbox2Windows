@@ -165,6 +165,9 @@ class DxilModule {
              << "b, %dx.types.ResourceProperties { i32 14, i32 0 })\n";
         return h;
     }
+    // DXIL validator 1.8 accepts implicit-derivative operations in compute; every other
+    // module keeps validator 1.6.
+    unsigned validator_minor = 6;
     Text finish_compute(unsigned x, unsigned y, unsigned z, const Text &stage = "cs") {
         std::ostringstream out;
         out << "target datalayout = "
@@ -293,7 +296,7 @@ class DxilModule {
                    "readnone\n"
                    "declare %dx.types.Handle "
                    "@dx.op.annotateHandle(i32,%dx.types.Handle,%dx.types.ResourceProperties) nounwind readnone\n";
-        out << "!llvm.ident = !{" << ident << "}\n!dx.version = !{" << version << "}\n!dx.valver = !{" << version
+        out << "!llvm.ident = !{" << ident << "}\n!dx.version = !{" << version << "}\n!dx.valver = !{" << node("i32 1, i32 " + std::to_string(validator_minor))
             << "}\n!dx.shaderModel = !{" << model << "}\n";
         if (res != "null")
             out << "!dx.resources = !{" << res << "}\n";

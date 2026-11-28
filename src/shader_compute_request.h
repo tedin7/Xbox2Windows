@@ -8,6 +8,7 @@ namespace x2w {
 struct ComputeRequest {
     std::string code, data, root, description, sa, sb;
     uint64_t key;
+    bool wave32 = true;
 };
 struct ComputeContainer {
     std::string bytes, root;

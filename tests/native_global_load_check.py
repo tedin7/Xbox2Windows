@@ -38,7 +38,7 @@ def words(hexes):
 
 
 ROOT = 'SRV(t0),DescriptorTable(UAV(u0,numDescriptors=8))'
-SA = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 7 << 1)
+SA = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 7 << 1)
 # s_mov_b32 s20, s6 / s_mov_b32 s21, 0 / s_load_dwordx4 s[40:43], s[20:21], 0x20 / s_load_dword s30, s[4:5], 0xfc /
 # s_lshl_b32 s12, s7, 10 / v_lshlrev_b32 v8, 5, v0 / v_add_nc_u32 v8, s12, v8 / v_lshlrev_b32 v1, 2, v0 /
 # v_and_b32 v2, 3, v0 / v_lshlrev_b32 v2, 2, v2 / v_or_b32 v2, -16, v2 / v_add_nc_u32 v3, 1, v1

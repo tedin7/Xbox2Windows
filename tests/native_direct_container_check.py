@@ -13,7 +13,7 @@ def words(*values):
     return struct.pack(f"<{len(values)}I", *values)
 
 
-def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=()):
+def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=(), *, group=None):
     body = bytearray(256)
     struct.pack_into("<Q", body, 0, 6)
     for offset in (8, 16, 24, 32, 40, 48, 72):
@@ -33,7 +33,8 @@ def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, u
     struct.pack_into("<I", body, record+20, 32 if wave32 else 0)
     struct.pack_into("<II", body, record+76, 512, 4)
     user_flags = 4 if root_descriptor else (0x1002 if table else 0)
-    struct.pack_into("<IIII", body, record+120, 0x8400 | user_flags, threads, 1, 1)
+    group = (threads, 1, 1) if group is None else group
+    struct.pack_into("<IIII", body, record+120, 0x8400 | user_flags, *group)
     body.extend(code)
     return pack(body)
 
@@ -344,6 +345,10 @@ def main():
         check("descriptor-sop1-before-scc-read", cs,
               compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        or_saveexec = 0xbe983dc1  # s_or_saveexec_b32 s24, -1
+        check("descriptor-or-saveexec-kill", cs, compute(words(*address_field, or_saveexec, read_scc, end), table=True))
+        check("or-saveexec-exec-destination", cs, compute(words(0xbefe3dc1, end)),
+              "unsupported wave32 SAVEEXEC destination")
         # The previous symbolic SCC is dead at WQM. Reading it before WQM
         # must still refuse. The nonzero high word supplies the new SCC.
         numeric_wqm = [0xbe9a0380, 0xbe9b0381, 0xbe980a1a]  # s[24:25] = WQM(s[26:27])
@@ -786,7 +791,8 @@ def main():
                       0xbe840380, 0xbe8503ff, 0x00fff000, 0xbe8603ff, 0x04000000, 0xbe870380,
                       0x7e0002f0, 0x7e0202f2, 0x7e0402f4, 0xf0000108 | op << 18, 0x00220000]
             check(f"sample{op}", "gfx1013-container-ps", patched_pixel(len(prefix), prefix, True))
-            check(f"derivative{op}", cs, compute(words(*prefix, end), table=True),
+            # Six threads do not form complete compute quads, so implicit derivatives stay refused.
+            check(f"derivative{op}", cs, compute(words(*prefix, end), threads=6, table=True),
                   "implicit derivatives require a pixel stage")
         image_setup = prefix[:-2]
         for op in (32, 34, 36, 37, 39):

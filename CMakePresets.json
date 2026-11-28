@@ -47,7 +47,7 @@
       "displayName": "Windows pull request smoke tests",
       "filter": {
         "include": {
-          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint|startup_gfx2hlsl_cvt_off_f32_i4_controls|startup_gfx2hlsl_sad_hi_msad_controls|startup_indirect_(dispatch|count_split|draw(_indexed)?|mesh(_xmem_arguments(_skip_wait)?)?|counts_control)_warp|startup_indirect_mesh_lease_warp_dual(-trace(-disabled)?)?|startup_shader_cache_key|startup_present_readback|xmem_(run_break_readers|cross_call_merge|placeholder_split|map_split_first)(_[a-z_]+)?|startup_dstorage_break_window(_[a-z_]+)?|xmem_page_runs_device(_join)?_warp|linear_buffer_backing_share_warp)$"
+          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint|startup_gfx2hlsl_cvt_off_f32_i4_controls|startup_gfx2hlsl_sad_hi_msad_controls|startup_indirect_(dispatch|count_split|draw(_indexed)?|mesh(_xmem_arguments(_skip_wait)?)?|counts_control)_warp|startup_indirect_mesh_lease_warp_dual(-trace(-disabled)?)?|startup_shader_cache_key|startup_present_readback|xmem_(run_break_readers|cross_call_merge|placeholder_split|map_split_first)(_[a-z_]+)?|startup_dstorage_break_window(_[a-z_]+)?|xmem_page_runs_device(_join)?_warp|linear_buffer_backing_share_warp|startup_stage_package)$"
         }
       }
     },

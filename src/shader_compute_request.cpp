@@ -243,7 +243,11 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
         throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
                                                  : "inconsistent compute request");
-    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
+    // Bit 20 of dword 4 (bits 15:0 are Z): set for wave32, clear for wave64. Inferred from captured requests
+    // (docs/experiments/native-slot67-wave-size.md).
+    const bool wave32 = (static_cast<unsigned char>(sa[18]) & 0x10) != 0;
+    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected,
+            wave32};
 }
 
 std::string x2w::read_shader_container_bytes(const fs::path &file) {

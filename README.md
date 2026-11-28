@@ -1,6 +1,6 @@
 # Xbox2Windows
 
-**[Join the Xbox2Windows Dev Discord](https://discord.gg/DMcmNtpd6R)** · [Project status](#current-results-and-open-work) · [Get involved](#community-and-contributions) · [Build on Windows](#first-build) · [Run the GPU check](#run-the-gpu-check)
+**[Join the Xbox2Windows Dev Discord](https://discord.gg/DMcmNtpd6R)** · [Project status](#current-results-and-open-work) · [Get involved](#community-and-contributions) · [Build on Windows](#first-build) · [Choose an experiment](#choose-an-experiment) · [Coverage chart](#instruction-coverage) · [Run the GPU check](#run-the-gpu-check)
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 

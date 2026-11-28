@@ -192,6 +192,9 @@ struct Translation {
     bool mesh = false;
     bool mesh_pixel = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
+#ifdef X2W_NATIVE_SHADERS
+    bool native_graphics_attempted = false;
+#endif
     x2w_startup::ManifestRetry manifest_retry;  // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     x2w_startup::IntegerTextureSrvs integer_srvs;
@@ -898,15 +901,15 @@ HRESULT create_title_translated_root(ID3D12Device* device, UINT constants, UINT 
     return hr;
 }
 
-void load_translation(Translation& tr, const std::string& rtv_request = {})
+void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {})
 {
     tr.snorm_refusal = Translation::SnormRefusal::unchecked;
     tr.state = 2;
     wchar_t path[MAX_PATH];
-    std::string manifest;
     if (!cache_path(path, L"", tr.key, tr.mesh ? L".ms57.txt" : L".txt")) return;
-    const bool present = tr.mesh ? mesh_manifest_prefetch().fetch(tr.key, manifest)
-                                 : lookup_manifest(tr.key, tr.manifest_retry.pending(), manifest, false);
+    const bool provided = !manifest.empty();
+    const bool present = provided || (tr.mesh ? mesh_manifest_prefetch().fetch(tr.key, manifest)
+                                              : lookup_manifest(tr.key, tr.manifest_retry.pending(), manifest, false));
     if (!present) {
         if (!tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
@@ -1159,8 +1162,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         }
         return SUCCEEDED(D3DReadFileToBlob(path, blob));
     };
-    if (!load_stage(tr.mesh ? L".ms57.cso" : L".vs.cso", &tr.vs) ||
-        ((!tr.mesh || tr.mesh_pixel) && !load_stage(tr.mesh ? L".ps57.cso" : L".ps.cso", &tr.ps))) {
+    if (!provided && (!load_stage(tr.mesh ? L".ms57.cso" : L".vs.cso", &tr.vs) ||
+                      ((!tr.mesh || tr.mesh_pixel) && !load_stage(tr.mesh ? L".ps57.cso" : L".ps.cso", &tr.ps)))) {
         if (tr.mesh) log("x2w-draw slot57 mesh %016llx: missing or invalid bytecode", tr.key);
         return;
     }
@@ -1192,6 +1195,58 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable views, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
+
+#ifdef X2W_NATIVE_SHADERS
+static bool try_native_graphics(Translation& tr)
+{
+    wchar_t sdk[MAX_PATH], path[MAX_PATH];
+    const auto length = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
+    if (!length || length >= MAX_PATH || !cache_path(path, L"req_", tr.key, L".a")) return false;
+    try {
+        const auto request = x2w::read_graphics_request(path);
+        const auto cache = std::filesystem::path(path).parent_path();
+        bool frontend_hit = false;
+        const auto pair = x2w::prepare_direct_graphics(request.a, request.b, cache, frontend_hit,
+            request.root, request.input_layout, request.pixel_entry);
+        auto manifest = x2w::format_graphics_runtime_manifest(pair);
+        if (!manifest) throw std::runtime_error("unsupported graphics binding layout");
+        auto compiler = x2w::ShaderDxilCompiler::runtime_worker(sdk);
+        auto stage = [&](const std::string& ir, const wchar_t* profile, bool& hit) {
+            const auto output = compiler.compile(ir, profile, cache, x2w::ShaderSourceFormat::dxil_ir);
+            hit = output.cache_hit;
+            x2w_startup::ComPtr<ID3DBlob> blob;
+            if (FAILED(D3DCreateBlob(output.dxil.size(), &blob))) throw std::bad_alloc();
+            std::memcpy(blob->GetBufferPointer(), output.dxil.data(), output.dxil.size());
+            return blob;
+        };
+        bool vs_hit, ps_hit;
+        auto vs = stage(pair.vertex.dxil_ir, L"vs_6_6", vs_hit);
+        auto ps = stage(pair.pixel.dxil_ir, L"ps_6_6", ps_hit);
+        Translation candidate;
+        candidate.key = tr.key;
+        candidate.manifest_retry = tr.manifest_retry;
+        candidate.native_graphics_attempted = true;
+        candidate.vs = vs.Get();
+        candidate.ps = ps.Get();
+        // Source-built first-draw fixture: fail after both stages have compiled and
+        // the local candidate holds both blobs. The later disk load stays valid.
+        if (GetEnvironmentVariableW(L"X2W_TEST_NATIVE_GRAPHICS_BAD_MANIFEST", nullptr, 0))
+            *manifest = "x2w-manifest 0\n";
+        load_translation(candidate, {}, std::move(*manifest));
+        const bool ready = candidate.state == 1;
+        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
+            tr.key, ready, frontend_hit, vs_hit, ps_hit);
+        if (!ready) return false;
+        vs.Detach();
+        ps.Detach();
+        tr = std::move(candidate);
+        return true;
+    } catch (const std::exception& error) {
+        log("x2w-draw native graphics %016llx refused: %s", tr.key, error.what());
+        return false;
+    }
+}
+#endif
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
@@ -1850,6 +1905,12 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (!variant) {
         if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
+#ifdef X2W_NATIVE_SHADERS
+        if (base->manifest_retry.pending() && !base->native_graphics_attempted) {
+            base->native_graphics_attempted = true;
+            try_native_graphics(*base);
+        }
+#endif
         return base;
     }
     std::string request = "rtv1 " + std::to_string(base->key);

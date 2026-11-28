@@ -164,7 +164,7 @@ def run_gpu(gpu, sdk):
         src, root = work / 'root.hlsl', work / 'root.bin'
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([Path(sdk) / 'dxc.exe', '-T', 'rootsig_1_1', '-E', 'SIG', '-Fo', root, src], check=True)
-        sa = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 5 << 1)
+        sa = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 5 << 1)
         checked = 0
         for a, b in PAIRS:
             # Same preamble as half_mad_readback in native_scalar_lds_check.py: s20:21 table, v8 = group * 512 bytes (STRIDE words).

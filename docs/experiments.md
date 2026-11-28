@@ -10,6 +10,28 @@ New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiment
 
 [Startup pixel EXEC masks and binary16 compares](experiments/startup-pixel-interp-masks.md) records the explicit-LOD and mask subset proofs and their synthetic readback fixtures.
 
+## First native graphics draw through the stand-in
+
+Set `X2W_NATIVE_SHADERS` to the desktop DXC directory and `X2W_SHADER_CACHE` to a writable cache.
+The stand-in reads the published graphics request, links the pair, and uses the compiler's persistent
+frontend and bytecode caches. The runtime consumes the same supported binding manifest as the offline
+compiler. The source-built triangle fixture uses one RGBA8 target and checks all 32 pixels in each
+of two processes. A third process supplies an unsupported pixel stage and checks the untouched clear.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer d3d12_xs_shim compile_dxil
+ctest --preset dev --no-tests=error -V -R '^startup_native_graphics_draw_(hardware|warp)$'
+```
+
+## Implicit derivatives in direct compute
+
+[Group shapes, lane mapping and readback fixtures](experiments/native-compute-implicit-derivatives.md)
+
+## Slot 67 wave size in direct compute
+
+State block A bit 20 of dword 4 selects the guest wave size.
+[Capture inference and hardware fixture](experiments/native-slot67-wave-size.md)
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
@@ -77,6 +99,8 @@ permutation. The compute shader exchanges the first operand before applying the
 local second operand. A sparse EXEC mask distinguishes fetching an inactive
 source, supplying zero and retaining the destination. The test checks both
 workgroups and the surrounding buffer guards.
+
+Wave32 direct compute lowers `s_or_saveexec_b32`. As with `s_mov_b32 exec_lo`, EXEC keeps bits past the group; a lane runs only if its own bit is set.
 
 The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
 lane writes and reads back lanes in each half of a guest wave64. The compiler

@@ -7,6 +7,8 @@ two-bit field in the control byte. It adds that field to the base of the
 destination lane's quad and reads source 0 from that physical wave32 lane.
 Quads fit within each physical half of a split guest wave64.
 
+Direct compute also lowers DPP8 selectors within each eight-lane group. FI reads the saved source VGPR and otherwise an inactive source supplies zero.
+
 Without FI, the guest EXEC bit of the selected source decides whether it can
 be read. BOUND_CTRL supplies a zero source for a disabled lane. With
 BOUND_CTRL clear, the instruction preserves the old destination. FI reads the

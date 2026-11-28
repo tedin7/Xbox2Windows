@@ -64,7 +64,7 @@ def built_root_readback(work, gpu, sdk):
     source, root = work / "built.hlsl", work / "built.root"
     source.write_text('#define SIG "SRV(t0),DescriptorTable(UAV(u0,numDescriptors=8))"')
     subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, source], check=True)
-    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 7 << 1)
+    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 7 << 1)
     for offset in (96, 92):
         # Build the byte-address V# in s16:19 from root SRV s4:5. Each
         # group selects an aligned index. Group 1 ends at the view limit.
@@ -127,7 +127,7 @@ def vector_carry_readback(work, gpu, sdk):
                 expected[pos] = exact & full if enabled else a
         for lane in range(64):
             expected[8 + 32 * lane + 2 * idx + 1] = ballot
-    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 5 << 1)
+    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 5 << 1)
     marker = write_request(work, words + [0xbf810000], (work / "root.bin").read_bytes(), sa)
     dest = work / "carry-readback.bin"
     subprocess.run([gpu, sdk, marker, work / "cache", "0", dest, "--direct"], check=True)
@@ -163,7 +163,7 @@ def half_mad_readback(work, gpu, sdk):
                         low, high = (-2**31, 2**31-1) if signed else (0, 2**32-1)
                         exact = min(high, max(low, exact))
                     values.append(exact & 0xffffffff)
-    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 5 << 1)
+    sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 5 << 1)
     marker = write_request(work, words + [0xbf810000], (work / "root.bin").read_bytes(), sa)
     dest = work / "half-mad-readback.bin"
     subprocess.run([gpu, sdk, marker, work / "cache", "0", dest, "--direct"], check=True)
@@ -195,7 +195,7 @@ def descriptor_scc_readback(work, gpu, sdk):
              0x7d100af9, 0x00968e80, vmove(9, 14), 0xe070100c, 0x80080908,
              0xbf810000]
     marker = write_request(work, words, (work / "root.bin").read_bytes(),
-                           struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 5 << 1))
+                           struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 5 << 1))
     dest = work / "descriptor-scc.bin"
     subprocess.run([gpu, sdk, marker, work / "cache", "0", dest, "--direct"], check=True)
     expected = [0x69696969] * 2064
@@ -212,7 +212,7 @@ def main(gpu, sdk):
         src, root = work / "root.hlsl", work / "root.bin"
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, src], check=True)
-        sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x808a)
+        sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x808a)
         expected = [0x69696969] * 2064
         for group in range(2):
             start = 8 + 16 * group

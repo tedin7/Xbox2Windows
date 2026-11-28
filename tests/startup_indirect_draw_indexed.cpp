@@ -1189,7 +1189,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         std::memcpy(allocation, contents, vertex_bytes);
         const UINT bytes = vertex_bytes + (refusal == Refusal::indexed_vertex_range ? 4 : 0);
         const D3D12_VERTEX_BUFFER_VIEW vertex{reinterpret_cast<UINT64>(allocation), bytes,
-            rect ? sizeof(RectVertex) : sizeof(std::uint32_t)};
+            static_cast<UINT>(rect ? sizeof(RectVertex) : sizeof(std::uint32_t))};
         slot<VertexBuffer>(wrapped, 48)(wrapped, 0, 1, &vertex);
     }
     if (index_buffer) {

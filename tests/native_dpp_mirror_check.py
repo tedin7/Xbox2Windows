@@ -89,7 +89,7 @@ def main(cli, replay, raster, sdk):
         root, vs = work/"root", work/"vs.cso"
         subprocess.run([dxc,"-T","rootsig_1_1","-E","SIG","-Fo",root,shader],check=True)
         subprocess.run([dxc,"-T","vs_6_6","-E","vs","-Fo",vs,shader],check=True)
-        sa = struct.pack("<7I",0,0,0,32 | 1 << 16,1,0,0x8a)
+        sa = struct.pack("<7I",0,0,0,32 | 1 << 16,1 | (1 << 20),0,0x8a)
         sparse = 0x955ad3b6
         for mask, active, fi, zero in ((7,0xffffffff,1,0), (15,0xffffffff,1,0),
                                         (7,sparse,1,0), (7,sparse,0,0), (7,sparse,0,1)):

@@ -182,7 +182,7 @@ def controls(cli, sdk, work, root):
         ([sop1(FF1_64, EXEC, 22), 0xBF810000], 'invalid s_ff1_i32_b64 destination'),
         ([sop1(FF0_64, 24, 23), 0xBF810000], 'invalid s_ff0_i32_b64 source'),
         ([sop1(FLBIT_B64, 24, VCC), 0xBF810000], 'invalid s_flbit_i32_b64 source'),
-        ([sop1(BCNT0_64, 24, EXEC), 0xBF810000], 'invalid s_bcnt0_i32_b64 source'),
+        ([sop1(BCNT0_64, 24, EXEC + 1), 0xBF810000], 'invalid s_bcnt0_i32_b64 source'),
         ([sop1(FLBIT_I64, 24, FLOAT_ONE), 0xBF810000], 'invalid s_flbit_i32_i64 source'),
     )
     for n, (words, error) in enumerate(refused):

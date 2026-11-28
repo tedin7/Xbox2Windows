@@ -288,7 +288,8 @@ def check_e2e(cli, consumer, sdk, backend):
             key = G.fnv(line.encode('ascii'))
             assert (cache / f'req_{key:016x}.rtv').read_bytes() == line.encode('ascii'), line
             variants.append((key, line, types, target))
-        assert sorted(p.name for p in cache.iterdir()) == sorted(
+        # The first request also writes the stand-in's revision.txt; it is not a request.
+        assert sorted(p.name for p in cache.iterdir() if p.name != 'revision.txt') == sorted(
             [f'req_{base:016x}{e}' for e in ('.a', '.b', '.root')] + [f'req_{key:016x}.rtv' for key, *_ in variants])
 
         check_published(cli, sdk, work / 'frontend', cache, base, variants)

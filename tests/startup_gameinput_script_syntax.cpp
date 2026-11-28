@@ -43,7 +43,7 @@ struct PadShared {
 };
 
 struct IGameInputReading {
-    const void* const* vtbl;
+    void* const* vtbl;
     std::uint32_t Release()
     {
         using Fn = std::uint64_t(__stdcall*)(IGameInputReading*);
@@ -56,7 +56,7 @@ struct IGameInputReading {
     }
 };
 struct IGameInput {
-    const void* const* vtbl;
+    void* const* vtbl;
     HRESULT GetCurrentReading(std::uint32_t kind, void* device, IGameInputReading** reading)
     {
         using Fn = HRESULT(__stdcall*)(IGameInput*, std::uint32_t, void*, IGameInputReading**);

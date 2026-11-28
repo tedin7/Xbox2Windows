@@ -107,6 +107,45 @@ def main(argv: list[str]) -> int:
         assert (d1 / f"{g_key:016x}.txt").stat().st_mtime_ns == txt_mtime
         assert (d1 / f"{c_key:016x}.txt").stat().st_mtime_ns == cs_mtime
 
+        # Seed outputs that satisfy the old watcher's completeness check.
+        cs_manifest = d1 / f"{c_key:016x}.txt"
+        cs_cso = d1 / f"{c_key:016x}.cs.cso"
+        cs_hlsl = d1 / f"{c_key:016x}.cs.hlsl"
+        current_manifest = cs_manifest.read_bytes()
+        old_manifest = b"".join(line for line in current_manifest.splitlines(keepends=True)
+                                if not line.startswith(b"native "))
+        assert current_manifest.splitlines().count(b"native 1") == 1
+        assert not cs_hlsl.exists()
+        dummy_cso = b"DXBC" + b"\0" * 20 + struct.pack("<III", 36, 1, 0)
+        for stale_manifest in (old_manifest, old_manifest + b"native 0\n"):
+            cs_cso.write_bytes(dummy_cso)
+            cs_manifest.write_bytes(stale_manifest)
+            refreshed = run_once(cli, sdk, frontend, d1)
+            assert refreshed.returncode == 0, (refreshed.stdout, refreshed.stderr)
+            assert f"{c_key:016x}: compiled compute" in refreshed.stdout, refreshed.stdout
+            assert cs_manifest.read_bytes() == current_manifest
+            assert cs_cso.read_bytes().startswith(b"DXBC") and cs_cso.read_bytes() != dummy_cso
+            assert not cs_hlsl.exists()
+
+        cs_hlsl.write_bytes(b"// Python output\n")
+        cs_cso.write_bytes(dummy_cso)
+        cs_manifest.write_bytes(old_manifest)
+        python_outputs = (cs_hlsl, cs_cso, cs_manifest)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in python_outputs]
+        skipped = run_once(cli, sdk, frontend, d1)
+        assert skipped.returncode == 0, (skipped.stdout, skipped.stderr)
+        assert f"{c_key:016x}:" not in skipped.stdout, skipped.stdout
+        assert [(path.read_bytes(), path.stat().st_mtime_ns) for path in python_outputs] == before
+
+        # A Python output with incomplete bytecode is still pending. The native rebuild removes its sidecar, so
+        # the stand-in no longer reads the new unmarked-looking pair as a Python output.
+        cs_cso.write_bytes(dummy_cso[:16])
+        rebuilt = run_once(cli, sdk, frontend, d1)
+        assert rebuilt.returncode == 0, (rebuilt.stdout, rebuilt.stderr)
+        assert f"{c_key:016x}: compiled compute" in rebuilt.stdout, rebuilt.stdout
+        assert cs_manifest.read_bytes() == current_manifest
+        assert not cs_hlsl.exists()
+
         # Corrupting/truncating a stage .cso triggers resume and restores valid DXBC.
         vs_cso = d1 / f"{g_key:016x}.vs.cso"
         orig_vs = vs_cso.read_bytes()

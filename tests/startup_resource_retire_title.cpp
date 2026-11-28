@@ -292,7 +292,9 @@ struct Context {
         upload->Unmap(0, nullptr);
         if (!require(own_allocator->Reset(), "own allocator") || !require(own_list->Reset(own_allocator.Get(), nullptr), "own list"))
             return false;
-        own_list->CopyTextureRegion(&footprint_tex(real.Get()), 0, 0, 0, &footprint(upload.Get()), nullptr);
+        D3D12_TEXTURE_COPY_LOCATION tex_dst = footprint_tex(real.Get());
+        D3D12_TEXTURE_COPY_LOCATION tex_src = footprint(upload.Get());
+        own_list->CopyTextureRegion(&tex_dst, 0, 0, 0, &tex_src, nullptr);
         D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
         b.Transition = {real.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_COMMON};
@@ -314,7 +316,9 @@ struct Context {
         b.Transition = {real.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_SOURCE};
         own_list->ResourceBarrier(1, &b);
-        own_list->CopyTextureRegion(&footprint(readback.Get(), fmt, width), 0, 0, 0, &footprint_tex(real.Get()), nullptr);
+        D3D12_TEXTURE_COPY_LOCATION tex_dst = footprint(readback.Get(), fmt, width);
+        D3D12_TEXTURE_COPY_LOCATION tex_src = footprint_tex(real.Get());
+        own_list->CopyTextureRegion(&tex_dst, 0, 0, 0, &tex_src, nullptr);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         own_list->ResourceBarrier(1, &b);

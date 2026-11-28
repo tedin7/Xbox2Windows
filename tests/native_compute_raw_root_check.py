@@ -22,7 +22,7 @@ def main(exe, sdk):
             return binary.read_bytes()
 
         def compile_case(code, root, user=10, error=None):
-            sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1, 0, user << 1)
+            sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, user << 1)
             marker = write_request(work, code, root, sa)
             result = subprocess.run([exe, sdk, work / "cache", "gfx1013-direct-cs@0",
                                      marker, marker.with_suffix(".cso")], text=True, capture_output=True)

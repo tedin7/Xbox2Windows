@@ -49,6 +49,7 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
     }
     pipeline.uav_count = counts[1];
     pipeline.constants = std::move(program.constants);
+    pipeline.stride_srvs = std::move(program.stride_srvs);
     for (const auto &block : pipeline.constants)
         pipeline.constant_words += block.count;
     pipeline.srv_count = counts[0];
@@ -68,7 +69,8 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     for (const auto &b : pipeline.bindings)
         pipeline.atomic_views += b.kind == ComputeViewKind::indexed_atomic_uav;
-    if (unsigned(bool(counts[0])) + unsigned(bool(counts[1])) + pipeline.constant_words +
+    const auto b0_words = pipeline.constant_words + static_cast<unsigned>(pipeline.stride_srvs.size());
+    if (unsigned(bool(counts[0])) + unsigned(bool(counts[1])) + b0_words +
         2 * pipeline.atomic_views > D3D12_MAX_ROOT_COST)
         throw UnsupportedComputeShader("indexed atomic view metadata exceeds root parameter budget");
     std::vector<D3D12_ROOT_PARAMETER> params(3 + pipeline.atomic_views);
@@ -82,10 +84,10 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         param.DescriptorTable = {1, &ranges[i]};
     }
-    if (pipeline.constant_words) {
+    if (b0_words) {
         auto &param = params[param_count++];
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        param.Constants.Num32BitValues = pipeline.constant_words;
+        param.Constants.Num32BitValues = b0_words;
     }
     for (const auto &b : pipeline.bindings) {
         if (b.kind != ComputeViewKind::indexed_atomic_uav) continue;
@@ -113,11 +115,14 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
 
 void NativeComputePipeline::bind(ID3D12GraphicsCommandList *list, ID3D12DescriptorHeap *heap,
                                  D3D12_GPU_DESCRIPTOR_HANDLE first, UINT increment, const unsigned *words,
-                                 const std::vector<IndexedAtomicView> &atomic, ID3D12DescriptorHeap *sampler_heap) const {
+                                 const std::vector<IndexedAtomicView> &atomic, ID3D12DescriptorHeap *sampler_heap,
+                                 const std::vector<unsigned> &strides) const {
     if (constant_words && !words)
         throw std::runtime_error("compute root constants missing");
     if (atomic.size() != atomic_views)
         throw std::runtime_error("indexed atomic view metadata missing");
+    if (strides.size() != stride_srvs.size())
+        throw std::runtime_error("compute descriptor stride metadata missing");
     const bool views = srv_count || uav_count || heap_indexed;
     if (sampler_heap_indexed) {
         if (!sampler_heap)
@@ -141,7 +146,10 @@ void NativeComputePipeline::bind(ID3D12GraphicsCommandList *list, ID3D12Descript
     if (uav_count)
         list->SetComputeRootDescriptorTable(parameter++, first);
     if (constant_words)
-        list->SetComputeRoot32BitConstants(parameter++, constant_words, words, 0);
+        list->SetComputeRoot32BitConstants(parameter, constant_words, words, 0);
+    if (!strides.empty())
+        list->SetComputeRoot32BitConstants(parameter, static_cast<UINT>(strides.size()), strides.data(), constant_words);
+    if (constant_words || !strides.empty()) ++parameter;
     for (const auto &shape : atomic) {
         const unsigned pair[]{shape.stride, shape.count};
         list->SetComputeRoot32BitConstants(parameter++, 2, pair, 0);
