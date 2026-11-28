@@ -12,6 +12,7 @@ The instruction bytes are **constructed here** from the field layout the checked
 decodes it, and only then translates it, so the test exercises the same path the pipeline uses.
 """
 import hashlib
+import hlsl_pin  # noqa: E402
 import os
 import struct
 import sys
@@ -171,7 +172,7 @@ def check_formatted_heap():
         table = translate('L-uint').hlsl_cs().encode()
     finally:
         del os.environ['X2W_EXTENDED_BUFFER_FORMATS']
-    assert hashlib.sha256(table).hexdigest() == 'caf208eeba14c16771ec99e4fbf30d091614d9d82550ed681f32c66ab17a4c30'
+    assert hlsl_pin.digest(table) == 'b4843d8d08d9057658506c13569d7c39ac8922403264e22492617e4fff8046f9'
     print('formatted heap manifest, rewritten-word refusal and byte-identical table HLSL: ok')
 
 

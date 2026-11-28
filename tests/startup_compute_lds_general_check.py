@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compute LDS b64 ordered-pair controls and D3D12 readback."""
 import hashlib
+import hlsl_pin  # noqa: E402
 import struct
 import subprocess
 import sys
@@ -323,7 +324,7 @@ def branch_reference(name, root_constant=0, reverse=False):
 
 def controls():
     legacy = sibling.translate_case('P').hlsl_cs()
-    assert hashlib.sha256(legacy.encode()).hexdigest() == '920db36066e6e5286765fa178d7a367014ddd94a1f2af28d9636340fe3d11741'
+    assert hlsl_pin.digest(legacy) == 'f69df3e96605f7ddeb4ea17d95241d924117ac5d821554ef39f7dd4eaa78fba0'
     text = shader()
     assert text.count('GroupMemoryBarrierWithGroupSync();') == 1
     assert text.index('lds[(a + 16u) >> 2] =') < text.index('GroupMemoryBarrierWithGroupSync();') < text.index('w = lds[(a + 16u) >> 2]')

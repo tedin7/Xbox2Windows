@@ -27,6 +27,7 @@ formats, and refuses upper-half uses of odd-dmask tails. Plain VGPR copies retai
 """
 from fractions import Fraction
 import hashlib
+import hlsl_pin  # noqa: E402
 import re
 import struct
 import subprocess
@@ -1411,8 +1412,8 @@ def check_repaired_odd_sample():
     # Baseline captured from the pre-change translator for an unrelated program.
     pipe = G.Pipeline(VS_WORDS, odd_tail_program(3), root_blob(),
                       ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
-    assert hashlib.sha256(pipe.hlsl_vs().encode()).hexdigest() == 'f85ae4c1203104786d2b9e23560300f73bb04ea923f4a18182ec161e48585768'
-    assert hashlib.sha256(pipe.hlsl_ps().encode()).hexdigest() == 'fac60e62abde72dd302b231e1042995c97b62605618fb809eca82a3c90d9145e'
+    assert hlsl_pin.digest(pipe.hlsl_vs()) == '52286e12cceda8bae1aab98a90731a27dd3728176cfaa4fe941bd0d4d0c7893b'
+    assert hlsl_pin.digest(pipe.hlsl_ps()) == '8277dfe84854994a29e58432c6e76901ad2da03532f2d660ab51d36a863c1cef'
     assert hashlib.sha256(pipe.manifest().encode()).hexdigest() == '7b710cc0d0fe56ab4d0f3af31121a25a928a33f57894c4f79a03acbdd70f5801'
     return source
 
