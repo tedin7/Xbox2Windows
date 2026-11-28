@@ -93,6 +93,11 @@ struct Range {
 };
 
 struct Player {
+    // X2W_REPLAY_INFER_EXECUTE=1 (opt-in, for recordings made before the recorder captured the list array of the title's
+    // ExecuteCommandLists on queue slot 35): a queue submit call whose array the file does not hold submits the next
+    // closed command lists in Close order. A recorded array always wins; this is a reconstruction, not recorded data.
+    std::vector<u64> closed_lists;
+    std::vector<u64> exec_array;
     std::vector<std::pair<long long, long long>> draw_series;  // cumulative translated draws drawn / not drawn at each present
     UINT recorded_increments[4] = {};
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
@@ -486,6 +491,33 @@ int written_arg(const CallRecord& c)
     return x2w_replay_slots::output_arg(c.kind, c.slot);
 }
 
+// X2W_REPLAY_INFER_EXECUTE=1: see Player::closed_lists. Close (list slot 9) queues the list; a queue submit call (slot 10 or the
+// title's slot 35) with a count of 1 to 64 and no recorded array takes that many queued lists, oldest first.
+void infer_execute(Player& p, const CallRecord& c, Played& call)
+{
+    static const bool enabled = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_REPLAY_INFER_EXECUTE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    constexpr std::uint16_t list_object_kind = 4, close_slot = 9, execute_slot = 10, title_execute_slot = 35;
+    if (!enabled) return;
+    if (c.kind == list_object_kind && c.slot == close_slot) {
+        p.closed_lists.push_back(call.self);
+        return;
+    }
+    if (c.kind != queue_kind || (c.slot != execute_slot && c.slot != title_execute_slot) || call.top[1] ||
+        c.args[0] < 1 || c.args[0] > 64 || p.closed_lists.size() < c.args[0])
+        return;
+    const std::size_t n = static_cast<std::size_t>(c.args[0]);
+    p.exec_array.assign(p.closed_lists.begin(), p.closed_lists.begin() + n);
+    p.closed_lists.erase(p.closed_lists.begin(), p.closed_lists.begin() + n);
+    call.top[1] = reinterpret_cast<u64>(p.exec_array.data());
+    static LONG announced;
+    if (InterlockedIncrement(&announced) == 1)
+        say("replay: X2W_REPLAY_INFER_EXECUTE=1: queue slot %u call %llu has no recorded list array; submitting the next %zu closed list(s) in Close order",
+            static_cast<unsigned>(c.slot), static_cast<unsigned long long>(c.seq), n);
+}
+
 bool play(Player& p, const Recording& r, const Step& step)
 {
     current_step = &step;
@@ -518,6 +550,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     // Map's CPU address is an output too, but not a wrapper, so it has no OUTP: sample it for the mapped dump.
     if (c.kind == resource_kind && c.slot == resource_map)
         call.sampled[2] = call.read_output(2, call.before[2]);
+    infer_execute(p, c, call);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     // An argument the stand-in reads as memory (the recorder's declared captures) that the file does not hold: passing
