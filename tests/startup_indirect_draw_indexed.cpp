@@ -7,6 +7,7 @@
 #include "desktop_gpu.h"
 #include "xmem_section_lease.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/manifest_retry.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -1271,7 +1272,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
                                external_arguments ? leased->argument_offset : offset, nullptr, 0);
     if (mesh57_runtime) {
-        Sleep(350);  // Allow the asynchronous manifest prefetch to publish before retrying.
+        // Allow the asynchronous manifest prefetch to publish and the first manifest retry delay to pass.
+        Sleep(static_cast<DWORD>(x2w_startup::manifest_retry_first_ms + 300));
         slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments->wrapped.Get(), offset, nullptr, 0);
     }
     if (restore_compute) {
