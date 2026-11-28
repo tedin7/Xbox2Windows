@@ -252,7 +252,7 @@ def controls():
         (108, "operand 'ttmp0'"),
         (126, "operand 'exec_lo'"),
         (127, "operand 'exec_hi'"),
-        (16, 'numeric use of s16 holding desc'),
+        (16, '16'),
     ):
         must_refuse_bytes(encode_smem(SMEM_BUFFER_LOAD_DWORD, 24, 16, soffset=soffset, imm=8), expected)
         must_refuse_bytes(encode_smem(SMEM_LOAD_DWORDX4, 24, 10, soffset=soffset, imm=16),

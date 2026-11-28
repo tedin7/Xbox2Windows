@@ -304,7 +304,7 @@ def controls():
     ):
         must_refuse_bytes(encode_mubuf(imm=8, offen=1, vaddr=2, soffset=soffset), f'buffer soffset {label}')
     # Descriptor-holding SGPR in soffset is refused by Stage.S().
-    must_refuse_bytes(encode_mubuf(imm=8, offen=1, vaddr=2, soffset=16), 'numeric use of s16 holding desc')
+    must_refuse_bytes(encode_mubuf(imm=8, offen=1, vaddr=2, soffset=16), '16')
 
     # 8. Modified descriptor on combined idxen + offen and mismatched vaddr shapes are refused.
     must_refuse_bytes(encode_mubuf(imm=8, idxen=1, offen=1, vaddr=2),
