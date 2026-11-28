@@ -30,6 +30,8 @@ LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped;
 u64 draw_table_spans, draw_descriptor_buffers;
 u64 draw_indirect_args, draw_indirect_counts;
+u64 draw_copy_sources, draw_copy_source_misses;  // copy sources in a mapped upload buffer: captured, not mapped by the title
+
 u64 draw_ranges_gathered;
 double draw_time_used, draw_ranges_ms;
 bool draw_time_logged;
@@ -531,10 +533,10 @@ const PageRange* draw_find_range(u64 address)
 void draw_log_counters(LONG present, double used)
 {
     log("x2w-replay draw pages: captures %llu, plain memory spans %llu, outside title memory %llu, over the per-present time %llu, "
-        "pending dropped %llu, table spans %llu, descriptor buffers %llu, indirect args %llu, counts %llu, "
+        "pending dropped %llu, table spans %llu, descriptor buffers %llu, indirect args %llu, counts %llu, copy sources %llu (unmapped %llu), "
         "ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
         draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
-        draw_indirect_args, draw_indirect_counts,
+        draw_indirect_args, draw_indirect_counts, draw_copy_sources, draw_copy_source_misses,
         draw_ranges_gathered, draw_ranges_ms,
         used, draw_pages_ms, present);
 }
@@ -547,13 +549,13 @@ bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
     return true;
 }
 
-u64 draw_plain_end(u64 address, u64 end)
+u64 draw_plain_end(u64 address, u64 end, bool any_type = false)
 {
     if (on_current_stack(address)) return 0;
 
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
-        !committed_region_readable(info) || (info.Type != MEM_PRIVATE && info.Type != MEM_IMAGE))
+        !committed_region_readable(info) || (!any_type && info.Type != MEM_PRIVATE && info.Type != MEM_IMAGE))
         return 0;
 
     const void* allocation = info.AllocationBase;
@@ -565,7 +567,7 @@ u64 draw_plain_end(u64 address, u64 end)
     return at;
 }
 
-void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INTEGER& start)
+void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INTEGER& start, bool mapped = false)
 {
     if (draw_time_exhausted(start, 1)) return;
     // Reuse the ranges across Presents. Refresh on the first miss in a Present.
@@ -605,7 +607,7 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
         if (page_after_cut(*range)) return;
         end = (std::min)(end, range->address + range->bytes);
     } else {
-        end = draw_plain_end(span.address, end);
+        end = draw_plain_end(span.address, end, mapped);
         if (!end) { ++draw_outside; return; }
         ++draw_plain_spans;
     }
@@ -659,12 +661,75 @@ void draw_end_capture(LONG present, const LARGE_INTEGER& start)
     }
 }
 
+// A buffer in an upload heap that the title maps on the desktop (no title memory behind it): its CPU address, kept from Map.
+// The title rewrites it with the CPU and the GPU reads it later through a copy, so no title-memory scan sees the words
+// the copy consumes. The copy call captures the source span from here.
+struct MappedUpload {
+    u64 address, bytes;
+};
+SRWLOCK mapped_uploads_lock = SRWLOCK_INIT;
+std::unordered_map<u64, MappedUpload> mapped_uploads;  // by resource wrapper
+
+void note_mapped_upload(u64 object, u64 out_address)
+{
+    const Wrapper* w = as_wrapper(reinterpret_cast<void*>(object));
+    if (!w || w->own().kind != resource_kind || w->own().title_memory || !w->own().real) return;
+    auto* real = static_cast<ID3D12Resource*>(w->own().real);
+    D3D12_HEAP_PROPERTIES heap{};
+    const D3D12_RESOURCE_DESC desc = real->GetDesc();
+    u64 address = 0;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || FAILED(real->GetHeapProperties(&heap, nullptr)) ||
+        heap.Type != D3D12_HEAP_TYPE_UPLOAD || !out_address || !copy_readable(out_address, &address, sizeof(address)) || !address)
+        return;
+    AcquireSRWLockExclusive(&mapped_uploads_lock);
+    mapped_uploads[object] = {address, desc.Width};
+    ReleaseSRWLockExclusive(&mapped_uploads_lock);
+}
+
+// Slots 15, 16 and 17 (CopyBufferRegion, CopyTextureRegion, CopyResource): the bytes the copy reads from a mapped upload
+// buffer, captured now, at the stamp of the copy. A source in title memory is named by the page ranges already.
+void draw_copy_source(u64 object, u64 offset, u64 bytes, LONG present, u64 stamp, LARGE_INTEGER& start)
+{
+    if (!object || !bytes) return;
+    MappedUpload upload{};
+    AcquireSRWLockShared(&mapped_uploads_lock);
+    const auto found = mapped_uploads.find(object);
+    if (found != mapped_uploads.end()) upload = found->second;
+    ReleaseSRWLockShared(&mapped_uploads_lock);
+    if (!upload.address) return;
+    if (offset >= upload.bytes) return;
+    const u64 before = draw_captures;
+    draw_capture_span({upload.address + offset, (std::min)(bytes, upload.bytes - offset)}, present, stamp, start, true);
+    if (draw_captures != before) ++draw_copy_sources;
+    else ++draw_copy_source_misses;
+}
+
+void draw_copy_at_call(int slot, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, LONG present, u64 stamp, LARGE_INTEGER& start)
+{
+    constexpr u64 whole = ~u64{};
+    if (slot == 15) {  // (destination, destination offset, source, source offset, bytes)
+        draw_copy_source(r9, s0, s1, present, stamp, start);
+    } else if (slot == 17) {  // (destination, source)
+        draw_copy_source(r8, 0, whole, present, stamp, start);
+    } else if (slot == 16 && s1) {  // (destination, x, y, z, source location, box): a placed footprint of a buffer
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        if (copy_readable(s1, &source, sizeof(source)) && source.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            const auto& f = source.PlacedFootprint.Footprint;
+            const u64 bytes = u64{f.RowPitch} * f.Height * f.Depth;
+            draw_copy_source(reinterpret_cast<u64>(source.pResource), source.PlacedFootprint.Offset, bytes ? bytes : whole,
+                             present, stamp, start);
+        }
+    }
+}
+
 void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 stamp)
 {
     const LONG present = draw_begin_capture();
     LARGE_INTEGER start{};
     QueryPerformanceCounter(&start);
-    if (slot <= 14 || slot == 61) {
+    if (slot >= 15 && slot <= 17) {
+        draw_copy_at_call(slot, rdx, r8, r9, s0, s1, s2, present, stamp, start);
+    } else if (slot <= 14 || slot == 61) {
         draw_consume_pending(list, present, stamp, start);
         if (slot == 61) {
             const auto capture_buffer = [&](u64 object, u64 offset, u64 bytes, u64& counter) {
@@ -772,7 +837,7 @@ u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9,
         if (submit) page_last_submit = (std::max)(page_last_submit, seq);
     }
     const bool draw_slot = kind == list_kind &&
-        (slot == 12 || slot == 13 || slot == 14 || slot == 61 || (slot >= 41 && slot <= 48));
+        (slot == 12 || slot == 13 || slot == 14 || (slot >= 15 && slot <= 17) || slot == 61 || (slot >= 41 && slot <= 48));
     // No flush here: the chunks stay in the thread buffer (page_sink writes it out past 1 MiB, record_call when it is
     // full), so a draw costs no file write.
     if (draw_slot && draw_pages && window_open && page_writer && !page_budget_reached && !stop_requested && active) {

@@ -816,6 +816,7 @@ bool draw_pages;
 double draw_pages_ms = 100.0;
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
+void note_mapped_upload(u64 object, u64 out_address);  // d3d12_record_pages.inl
 u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9,
                       u64 s0, u64 s1, u64 s2, bool root, bool submit, bool scan);
 void remember_cbv_pages(u64 desc);
@@ -863,13 +864,13 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
                                     (K == device_kind && (N == 23 || N == 24)) || submit;
     constexpr bool draw_page_slot = K == list_kind &&
-        (N == 12 || N == 13 || N == 14 || N == 35 || N == 36 || N == 61 || (N >= 41 && N <= 48));
+        (N == 12 || N == 13 || N == 14 || (N >= 15 && N <= 17) || N == 35 || N == 36 || N == 61 || (N >= 41 && N <= 48));
     u64 seq;
     if constexpr (consumes_pages || draw_page_slot) {
         const bool scan = consumes_pages && (extra_title_pages ||
             (submit && (scan_submit_pages || replay_dump_enabled()) && window_open));
         const bool capture = draw_page_slot && draw_pages && window_open.load(std::memory_order_relaxed);
-        constexpr bool indirect = K == list_kind && N == 61;
+        constexpr bool indirect = K == list_kind && (N == 61 || (N >= 15 && N <= 17));
         seq = scan || capture ? pages_before_call(K, N, rcx, rdx, r8, r9,
                                                  indirect ? s0 : 0, indirect ? s1 : 0, indirect ? s2 : 0,
                                                  root, submit, scan)
@@ -904,6 +905,8 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     carry_target = carry;
     record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
     carry_target = nullptr;
+    if constexpr (K == resource_kind && N == 8)
+        if (draw_pages && static_cast<LONG>(ret) >= 0) note_mapped_upload(rcx, r9);
     if constexpr (K == descriptor_heap_kind && N == 9)
         if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false, true);  // after the window's last present: that Present call is in the file
