@@ -126,7 +126,7 @@ float4 ps() : SV_Target { return float4(1, 0, 1, 1); }
         assert played.keys() == live.keys()
         mismatches = [frame for frame, name in enumerate(live) if played[name] != live[name]]
         if enabled == "1":
-            assert not mismatches, ("late indirect replay mismatches", mismatches, mode, [l for l in text.splitlines() if "x2w-replay" in l and "pages" in l][-6:])
+            assert not mismatches, ("late indirect replay mismatches", mismatches, mode, [l[:230] for l in text.splitlines() if "x2w-replay" in l][-14:])
             reference = live
         else:
             assert live == reference, "draw pages changed the live pictures"
