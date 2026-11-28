@@ -166,6 +166,8 @@ def main():
         old_names = {gkey(older, g1), gkey(older, g2), ckey(older, COMPUTE)}
         current_names = {gkey(G, g1), gkey(G, g2), ckey(G, COMPUTE)}
         check('older-revision names differ from the current keys', not old_names & current_names)
+        check('seed preflight counts graphics, compute and mesh but skips RTV and slot 86',
+              G.key_mismatch_count(src) == (4, 7))
 
         # (a) re-keyed names use the current key functions, with the same bytes.
         dst = tmp / 'rekeyed'
@@ -173,6 +175,8 @@ def main():
         check('re-key exits 0', first.returncode == 0, first.stderr.strip())
         want = expected_files(G, (g1, g2, g3), (COMPUTE,), (g1,), meshes)
         got = contents(dst) if dst.is_dir() else {}
+        check('re-key stamps the translator seed on a single line',
+              got.pop(G.KEY_SEED_NAME, b'').splitlines() == [G.key_seed_line().encode('ascii')])
         check('re-keyed files are exactly the current requests', got == want,
               'extra %s missing %s' % (sorted(set(got) - set(want)), sorted(set(want) - set(got))))
         check('no results or .fail written', all(name.startswith('req_') for name in got))
@@ -200,10 +204,19 @@ def main():
               and 'files: 0 written, %d already present' % len(want) in second.stdout, second.stdout + second.stderr)
         check('second run leaves the re-keyed files unchanged', snapshot(dst) == after_first)
 
+        wrong_seed = tmp / 'wrong_seed'
+        wrong_seed.mkdir()
+        (wrong_seed / G.KEY_SEED_NAME).write_text(older.key_seed_line() + '\n', encoding='ascii')
+        stamped_before = snapshot(wrong_seed)
+        rejected = run(src, wrong_seed)
+        check('destination with another seed is refused before copying', rejected.returncode == 1
+              and 'destination key seed mismatch' in rejected.stderr and older.key_seed_line() in rejected.stderr
+              and G.key_seed_line() in rejected.stderr and snapshot(wrong_seed) == stamped_before, rejected.stderr)
+
         # (d) re-keying a current cache keeps every name and byte.
         again = tmp / 'again'
         third = run(dst, again, jobs='1')
-        check('current requests keep their names', third.returncode == 0 and contents(again) == want
+        check('current requests keep their names', third.returncode == 0 and contents(again) == contents(dst)
               and 'graphics: 3 requests, 3 already current -> 3 keys' in third.stdout
               and 'compute: 1 requests, 1 already current -> 1 keys' in third.stdout
               and 'm57: 2 requests, 2 already current -> 2 keys' in third.stdout, third.stdout + third.stderr)
@@ -217,6 +230,8 @@ def main():
         finally:
             R.g = saved
         got_newer = contents(newest) if newest.is_dir() else {}
+        check('re-key uses the new translator revision in the stamp',
+              got_newer.pop(G.KEY_SEED_NAME, b'').splitlines() == [newer.key_seed_line().encode('ascii')])
         check('newer revision re-keys to its own names', code == 0
               and got_newer == expected_files(newer, (g1, g2, g3), (COMPUTE,), (g1,), meshes))
         check('only mesh names are shared between the graphics and compute revisions',
@@ -239,6 +254,8 @@ def main():
             bad = tmp / ('bad_' + label.replace(' ', '_'))
             shutil.copytree(src, bad)
             damage(bad)
+            if label == 'missing .root':
+                check('unreadable requests count toward the total only', G.key_mismatch_count(bad) == (3, 7))
             out = tmp / ('out_' + label.replace(' ', '_'))
             result = run(bad, out)
             check('%s exits 1' % label, result.returncode == 1, '%d %s' % (result.returncode, result.stderr))

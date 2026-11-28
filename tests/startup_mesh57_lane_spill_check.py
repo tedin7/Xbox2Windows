@@ -150,7 +150,7 @@ def controls():
 
 def binary(mc):
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
-    insert = mesh.replace('v_cmpx_gt_i32 s14, v0', SPILL_ASM + '\nv_cmpx_gt_i32 s14, v0')
+    insert = mesh.replace('v_cmpx_gt_i32 s22, v0', SPILL_ASM + '\nv_cmpx_gt_i32 s22, v0')
     insert = insert.replace('exp pos0', 'v_mov_b32 v20, v7\nexp pos0')
     expect('spill mesh words match llvm-mc', assemble(mc, insert), SPILL_MESH)
     expect('pixel words match llvm-mc', assemble(mc, PIXEL_ASM), PIXEL)

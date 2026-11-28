@@ -77,6 +77,49 @@ The four new kernels and their mutations previously reported
 ctest --preset dev --no-tests=error -R '^startup_compute_readfirstlane_wave_(controls|warp)$' -V
 ```
 
+## Constant EXEC across compute waves
+
+After the existing compute retries end in a uniform-source refusal, the
+translator can project a constant EXEC write onto each guest lane. It uses
+the flattened thread ID modulo the guest wave width. A group larger than
+32 threads requires a proven width. The first active lane must exist in
+every wave, including the tail wave.
+
+The fallback tracks the lanes that received each uniform VGPR definition.
+Each thread computes a copy of the value in a temporary, while the original
+VGPR assignment keeps its EXEC guard. A later uniform definition replaces the
+proof for the lanes it writes. The read uses the temporary that covers the
+lowest set EXEC bit. A varying write invalidates the VGPR proof. A branch or
+block boundary clears the mask and all VGPR proofs.
+
+Moves and bitwise scalar EXEC writes retain a constant mask when their inputs
+are known. SAVEEXEC records the previous mask in the destination SGPRs.
+Bitwise writes set SCC from the scalar result. See SOP1, SOP2, and VOP1 in the
+[RDNA 2 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+The piecewise fixture runs with 128 and 16×16 threads in wave64 and 64 threads
+in wave32. Lane zero receives three uniform values. A complementary EXEC
+write enables the other lanes to overwrite their copies with zero. A scalar
+load then clobbers one of the original SGPRs. After EXEC is restored, every
+lane stores each first-lane result packed with its own VGPR value. The WARP
+leg compares those words with an independent guest-wave interpreter.
+Controls cover an unknown mask write, a missing lane definition, empty EXEC,
+and a first set bit absent from a partial wave.
+
+```bash
+env -u X2W_DXC nice -n 15 python3 -B tests/startup_compute_const_exec_check.py
+```
+
+The Python controls passed on x86-64 Linux with Python 3.14.8.
+`8b483922a` refused the second readfirstlane in all three new layouts.
+The 40 general compute fixtures and four earlier constant-EXEC fixtures
+emitted byte-identical HLSL and matching manifests against that revision.
+The nine WARP case files were checked in Python. GPU readback is pending.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_const_exec_(controls|warp)$' -V
+```
+
 ## Wide vector raw loads
 
 The same waterfall proof accepts one to four dwords per raw vector load. With

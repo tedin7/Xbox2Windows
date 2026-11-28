@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
@@ -257,7 +258,7 @@ def decode_instruction(blob, offset):
 def cli(cache, *flags):
     out = io.StringIO()
     with patch.object(sys, 'argv', ['gfx2hlsl.py', *flags, '--refusals', str(cache)]), contextlib.redirect_stdout(out):
-        G.main()
+        assert G.main() is None
     return out.getvalue()
 
 
@@ -294,8 +295,18 @@ def check_cli():
         before = {p.name: p.read_bytes() for p in cache.iterdir()}
 
         with patch.object(G, 'translate_to', side_effect=PublishingEntered):
-            report_json = cli(cache, '--json')
+            with patch.dict(os.environ, {'X2W_REPLAY_SHA': 'replay-from-env'}):
+                report_json = cli(cache, '--json', '--replay-sha', 'replay-from-flag')
+                report_text = cli(cache)
             report = json.loads(report_json)
+            translator = G.translator_version()[:12]
+            seed = G.key_seed_line()
+            check('matching unstamped cache reports JSON header and the replay flag takes precedence',
+                  report['header'] == dict(translator=translator, cache_key_seed='unstamped',
+                                           translator_key_seed=seed, replay='replay-from-flag'))
+            check('text header precedes the report and uses the environment replay', report_text.startswith(
+                f'Translator: {translator}\nCache key seed: unstamped\nTranslator key seed: {seed}\n'
+                'Replay: replay-from-env\nPer request key\n'))
             requests = report['per_request']
             check('base, RTV variant and dangling variant are each counted', requests['examined'] == 3)
             check('histogram counts sites per request', requests['no_refusal'] == 0 and
@@ -309,7 +320,6 @@ def check_cli():
                 dict(reason=FIRST, scope='ps', under_every_root=1, under_some_roots=0),
                 dict(reason=SECOND, scope='ps', under_every_root=1, under_some_roots=0),
             ]))
-            report_text = cli(cache)
             check('text reports the request, site and code pair views',
                   'Requests examined: 3' in report_text and 'Code pairs examined: 1' in report_text and
                   'Refusal sites per request' in report_text and '2\t2\t0\tps\t' + FIRST in report_text and
@@ -441,6 +451,71 @@ def check_pairs():
               report['per_request']['no_refusal'] == 1)
 
 
+def check_key_seed_mismatch():
+    vs = struct.pack('<2I', 1, END)
+    ps = struct.pack('<I', END)
+    with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {'X2W_EXTENDED_BUFFER_FORMATS': '1'}):
+        cache = Path(work)
+        stamp = cache / G.KEY_SEED_NAME
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            G.translate_pending(cache, jobs=1)
+        ours = G.key_seed_line()
+        check('pending stamps a fresh cache quietly', stamp.read_text(encoding='ascii') == ours + '\n'
+              and not stderr.getvalue())
+
+        stamp.unlink()
+        with patch.dict(os.environ, {'X2W_EXTENDED_BUFFER_FORMATS': '0'}):
+            theirs = G.key_seed_line()
+            old_key = put_request(cache, vs, ps, root_blob())
+        stamp.write_text(theirs + '\nextra line\n', encoding='ascii')
+        check('key seed reader returns the first line', G.read_key_seed(cache) == theirs)
+        argv = [sys.executable, '-B', G.__file__, '--refusals', str(cache), '--json']
+        env = {key: value for key, value in os.environ.items() if key != 'X2W_REPLAY_SHA'}
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
+        check('census exits 3 without a report for a request written with another seed',
+              result.returncode == 3 and not result.stdout and
+              'refusals: 1 of 1 requests (100.0%) are request-key mismatches' in result.stderr and
+              theirs in result.stderr and ours in result.stderr and
+              f'tools/startup/shader_cache_rekey.py {cache} <new dir>' in result.stderr and
+              '--allow-key-mismatch reports anyway' in result.stderr)
+
+        result = subprocess.run([*argv, '--allow-key-mismatch'], capture_output=True, text=True, env=env, timeout=60)
+        report = json.loads(result.stdout) if result.returncode == 0 else {}
+        reason = 'shader request source key mismatch'
+        check('override reports the request-key refusal and identifies the old cache seed',
+              result.returncode == 0 and not result.stderr and report['header']['cache_key_seed'] == theirs and
+              report['header']['replay'] == 'unknown' and G.is_key_mismatch(G.Unsupported(reason)) and
+              report['per_request']['reasons'] == [dict(reason=reason, scope='pipeline', containing=1, first=1, only=1)])
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            G.stamp_key_seed(cache)
+        check('stamp warns once and preserves the existing different seed',
+              stderr.getvalue().count('x2w-gfx key seed mismatch:') == 1 and
+              stamp.read_text(encoding='ascii') == theirs + '\nextra line\n')
+
+        stamp.unlink()
+        current_key = put_request(cache, vs, ps, root_blob())
+        stderr = io.StringIO()
+        with patch.object(G.D, 'decode_instruction', decode_instruction), contextlib.redirect_stderr(stderr):
+            G.translate_pending(cache, jobs=1)
+        warning = stderr.getvalue()
+        check('pending warns once for an unstamped cache with stale keys and still translates current requests',
+              warning.count('x2w-gfx key seed mismatch:') == 1 and
+              '1 of 2 requests (50.0%)' in warning and "(cache seed: 'unstamped')" in warning and
+              (cache / ('%016x.fail' % old_key)).read_text() == reason + '\n' and
+              (cache / ('%016x.txt' % current_key)).is_file())
+
+        # The --watch loop calls translate_pending every few seconds: the count rereads every request, so a
+        # folder whose stamp did not change is not counted or reported again.
+        stderr = io.StringIO()
+        with patch.object(G, 'key_mismatch_count', side_effect=AssertionError('counted again')), \
+                contextlib.redirect_stderr(stderr):
+            G.translate_pending(cache, jobs=1)
+        check('a repeated pending pass over the same stamped cache stays quiet', 'key seed' not in stderr.getvalue())
+
+
 def check_normalization():
     for raw, normalized in (
             ('undecodable word at +0x10: exp v3', 'undecodable word'),
@@ -470,5 +545,6 @@ if __name__ == '__main__':
         check_cli()
         check_request_failures()
         check_pairs()
+        check_key_seed_mismatch()
         check_normalization()
     sys.exit(bool(failures))

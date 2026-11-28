@@ -28,6 +28,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent / 'tools'
@@ -284,7 +285,12 @@ def controls(module=G, quiet=False):
         reason = refusal(name, module)
         verdict('fixture %s translates (%s)' % (name, reason), reason is None)
     for name, (_, _, fragment, why) in VARIANTS.items():
-        reason = refusal(name, module)
+        if name == 'write-in-execz':
+            # Exercise the per-lane EXECZ check before group voting changes the spill rules.
+            with patch.object(module.ComputePipeline, 'retry_group_vote_for', return_value=False):
+                reason = refusal(name, module)
+        else:
+            reason = refusal(name, module)
         verdict('refused: %s (%s)' % (why, reason), reason is not None and fragment in reason, reason)
     verdict('mask spills stay refused in a pixel stage (%s)' % probe_pixel(module), 'holds a lane mask or descriptor' in
             probe_pixel(module))

@@ -83,7 +83,7 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
 // multi_primitive: one native color draw whose export trace size comes from the fixture.
-enum class MeshDrawMode { color, textured, mesh_texture_load, depth_pair, multi_primitive };
+enum class MeshDrawMode { heap, color, textured, mesh_texture_load, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;
@@ -93,7 +93,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr,
-                           const char* amplification = nullptr);
+                           const char* amplification = nullptr, unsigned groups = 1);
 bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
                                const char* pixel, const char* fixture);
 bool check_mesh_shader_pipeline(ID3D12Device* device, bool force_fallback);

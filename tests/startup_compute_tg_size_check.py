@@ -436,7 +436,8 @@ def check_controls():
         vop1(V_MOV_B32, 3, 20),
         S_ENDPGM,
     ])
-    refused('definition of s20, live where the block joins', lambda: translate(code=execz_live).hlsl_cs())
+    refused('definition of s20, live where the block joins',
+            lambda: translate(code=execz_live, group=(128, 1, 1), wave_size=32).hlsl_cs())
 
     execz_dead = b''.join([
         sopp(0x08, 2),  # s_cbranch_execz +2 dwords

@@ -128,7 +128,7 @@ PATCHES = (
      'v_readfirstlane_b32 requires a proven uniform source'),
     ('loop counter updated from lane mask',
      [(pack_hex(*sop2('s_add_u32', 's22', 's22', 1)), pack_hex(*sop1('s_mov_b32', 's22', 'vcc_lo')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
+     's_cmp_lt_u32 reads lane mask s22 as numeric data'),
     # RF1 negative controls: the integer chain stays refused when a source differs between lanes.
     ('integer chain from the thread id',
      [(pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))],
@@ -214,7 +214,8 @@ def controls(llvm_mc=None):
         code = PROGRAM_WORDS
         for old_hex, new_hex in replacements:
             code = patch(code, old_hex, new_hex)
-        refused(reason, lambda code=code: translate(code))
+        group = (65, 1, 1) if reason.startswith('v_readfirstlane_b32') else LOCAL
+        refused(reason, lambda code=code: translate(code, group=group))
 
     if llvm_mc:
         check_binary(llvm_mc)
@@ -263,11 +264,12 @@ def log_ceil_controls(llvm_mc=None):
             (vop1('v_log_f32_e32', 'v7', 'v7'), vop1('v_log_f32_e32', 'v7', 'v0')),
             (vop1('v_ceil_f32_e32', 'v9', 'v7'), vop1('v_ceil_f32_e32', 'v9', 'v0'))):
         refused('v_readfirstlane_b32 requires a proven uniform source',
-                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code, group=(8, 1, 1)))
+                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code, group=(65, 1, 1)))
     # Isolate the original proof's opcode dependencies from the new retry.
     retry = G.ComputePipeline.retry_readfirstlane
     with mock_patch.object(G.ComputePipeline, 'retry_readfirstlane',
-                           lambda pipe: not pipe.retry_entry_exec and retry(pipe)):
+                           lambda pipe: not pipe.retry_entry_exec and retry(pipe)), \
+            mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
         for removed in ('v_log_f32', 'v_ceil_f32'):
             with mock_patch.object(G, 'UNIFORM_VALU', G.UNIFORM_VALU - {removed}):
                 refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(LOG_CEIL_WORDS))
@@ -384,17 +386,19 @@ def img_load_controls(llvm_mc=None):
         assert hlsl.count(snippet) == 1, (snippet, hlsl)
     # Varying coordinate control: image_load v[7:8], v[0:1], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D.
     refused('v_readfirstlane_b32 requires a proven uniform source',
-            lambda: translate(patch(IMG_LOAD_WORDS, '080300f002070400', '080300f000070400')))
+            lambda: translate(patch(IMG_LOAD_WORDS, '080300f002070400', '080300f000070400'), group=(65, 1, 1)))
     # Image store on a different descriptor slot in the same dispatch must block the uniform image_load proof.
     store_prefix = (sop1('s_mov_b32', 's10', 's6') + sop1('s_mov_b32', 's11', 0)
                     + [0xf40c0605, 0xfa000040, 0xbf8cc07f]  # s_load_dwordx8 s[24:31], s[10:11], 0x40; s_waitcnt lgkmcnt(0)
                     + [0xf0200f08, 0x00060a02])             # image_store v[10:13], v[2:3], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D
     refused('v_readfirstlane_b32 requires a proven uniform source',
-            lambda: translate(struct.pack('<%dI' % len(store_prefix), *store_prefix) + IMG_LOAD_WORDS[8:]))
+            lambda: translate(struct.pack('<%dI' % len(store_prefix), *store_prefix) + IMG_LOAD_WORDS[8:], group=(65, 1, 1)))
     saved = G.UNIFORM_IMAGE_LOADS
     G.UNIFORM_IMAGE_LOADS = frozenset()
     try:
-        refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(IMG_LOAD_WORDS))
+        # Keep the small fixture's coordinates while isolating the original image-load proof.
+        with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(IMG_LOAD_WORDS))
     finally:
         G.UNIFORM_IMAGE_LOADS = saved
     if llvm_mc:

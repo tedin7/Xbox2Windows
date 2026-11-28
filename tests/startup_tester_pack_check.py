@@ -831,7 +831,11 @@ def check_seed_cache():
         assert T.seed_line(result) == "pre-translate: 5 requests from 1 older cache(s) in %g s" % result["seconds"]
         assert sorted(os.listdir(old)) == old_names, "the old cache is only read"
         names = os.listdir(new)
-        # Requests only, under new names, and no result of the old revision.
+        # Requests only, under new names, and no result of the old revision. The re-keying tool stamps the new cache
+        # with the key seed it wrote the requests under (x2w_key_seed.txt).
+        import gfx2hlsl
+        assert (new / gfx2hlsl.KEY_SEED_NAME).read_text() == gfx2hlsl.key_seed_line() + "\n"
+        names = [n for n in names if n != gfx2hlsl.KEY_SEED_NAME]
         assert not [n for n in names if n.endswith((".txt", ".fail", ".cso", ".hlsl", ".tmp"))], names
         assert not [n for n in names if n.startswith(("req_00000000000000a", "req_00000000000000c0", "req_00000000000000e0"))], names
         assert T.request_count(str(new)) == 5, names

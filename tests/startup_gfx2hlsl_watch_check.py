@@ -721,8 +721,9 @@ try:
                (any(n.endswith('.txt') for n in tree(ref)), any(n.endswith('.fail') for n in tree(ref))), (True, True))
         code, _, _ = pending_run(par, 4)
         expect('parallel --pending exit', code, 0)
-        expect('parallel --pending leaves the same files as one request at a time', tree(par), tree(ref))
-        expect('a --watch pass leaves the same files as one request at a time', tree(watched), tree(ref))
+        expected = tree(ref) | {gfx2hlsl.KEY_SEED_NAME: (gfx2hlsl.key_seed_line() + os.linesep).encode('ascii')}
+        expect('parallel --pending leaves the same files and adds a key seed stamp', tree(par), expected)
+        expect('a --watch pass leaves the same files and adds a key seed stamp', tree(watched), expected)
 finally:
     if saved_fxc is None:
         os.environ.pop('X2W_FXC', None)

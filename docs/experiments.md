@@ -2,6 +2,8 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+[General compute LDS lowering](experiments/compute-lds-general.md) documents the straight-line retry and its readback fixture.
+
 [Indexed indirect draws from title memory](experiments/indirect-index-shadow.md) documents the opt-in index staging path and its WARP fixture.
 
 [Startup pixel image atomics](experiments/startup-pixel-image-atomics.md) documents the unsigned UAV readback and runtime format checks.
@@ -16031,7 +16033,7 @@ SGPRs, with no gap for an omitted axis (`SV_GroupID`). v0-v2 hold `SV_GroupThrea
 `TIDIG_COMP_CNT`. This is how `compute_store_aot` decodes `COMPUTE_PGM_RSRC2` (#1608).
 `TG_SIZE_EN` stays refused.
 
-Root parameters are placed from s4, which is an inference, like the graphics stages' s8. #1608 defines no
+Root parameters are placed from s4, which is an inference, like the pixel and vertex stages' s8. #1608 defines no
 root placement. The only in-repo evidence is the local compute-record scan above, whose table bindings
 used s4 or s5. A numeric read of a user SGPR that the root signature does not place, including s0-s3,
 is refused because its value is unknown.
@@ -16446,6 +16448,8 @@ Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), sub-dword L
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
 `python -B tools/startup/gfx2hlsl.py --refusals <cache-dir> [--json]` surveys an existing cache directory, including requests that already have a `.txt` or `.fail`. The diagnostic writes nothing and translates in memory without invoking fxc. On older translator revisions, `--refusals DIR` is treated as `--pending DIR` and writes into that directory.
+
+Pending translation and re-keying write `x2w_key_seed.txt` when absent. The census reports the cache and translator seeds and exits with status 3 before translation if more than 1% of ready base request keys differ, unless `--allow-key-mismatch` is set.
 
 The text and JSON reports show two views.
 
