@@ -3,7 +3,8 @@
 usage: startup_mesh57_oracle_check.py <dxc> <offscreen_check> <warp|hardware> <startup_indirect_draw_indexed>
 
 The slot 57 group fixture of startup_mesh57_skeleton_check.py is published through the stand-in, translated with
-X2W_MESH_WAVELOOP=oracle (the proof translation plus its serial wave-loop sibling) and drawn by the stand-in, which
+X2W_MESH_WAVELOOP=oracle (the proof translation plus its serial wave-loop sibling) and drawn by the stand-in (submitted
+through its queue slot 10, X2W_TEST_MESH57_GUEST_QUEUE=1, where the oracle compares), which
 reads the target back:
   1. oracle on, both translations right: the picture is the CPU reference and oracle.jsonl says equal;
   2. the published proof translation is made wrong (each lane reads its neighbour's vertex slot) and recompiled:
@@ -62,7 +63,8 @@ def run(dxc, renderer, adapter, publisher):
         arguments.write_bytes(b'\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00')
         base = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
                     X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data), X2W_TEST_MESH57_ARGS=str(arguments),
-                    X2W_TEST_MESH57_PIXELS=str(pixels), X2W_TRAP_LOG=str(log), X2W_REPLAY_ORACLE_FILE=str(oracle))
+                    X2W_TEST_MESH57_PIXELS=str(pixels), X2W_TRAP_LOG=str(log), X2W_REPLAY_ORACLE_FILE=str(oracle),
+                    X2W_TEST_MESH57_GUEST_QUEUE='1')
         for variable in ('X2W_REPLAY_ORACLE', 'X2W_TEST_MESH57_NO_CONSTANTS', 'X2W_TEST_MESH57_HEAP'):
             base.pop(variable, None)
         last_output = ['']

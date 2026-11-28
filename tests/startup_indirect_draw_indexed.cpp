@@ -1321,6 +1321,19 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         if (leased->queued) leased->queued(completion.Get());
         check(mesh_fence_reached(completion.Get(), 5000) ? S_OK : E_FAIL, "wait for mesh consumer");
         check(device->GetDeviceRemovedReason(), "leased mesh GPU completion");
+    } else if (mesh57_runtime && GetEnvironmentVariableA("X2W_TEST_MESH57_GUEST_QUEUE", nullptr, 0)) {
+        // Through the stand-in's queue slot 10, as a title submits (the mesh replay oracle compares there).
+        const D3D12_COMMAND_QUEUE_DESC desc{};
+        ComPtr<IUnknown> guest_queue;
+        check(guest->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(guest_queue.GetAddressOf())),
+              "create guest queue");
+        const auto queue = native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
+        ComPtr<ID3D12Fence> completion;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)), "create guest queue fence");
+        submit_wrapped(guest_queue.Get(), wrapped);
+        check(queue->Signal(completion.Get(), 1), "signal guest queue completion");
+        check(mesh_fence_reached(completion.Get(), 5000) ? S_OK : E_FAIL, "wait for the guest queue");
+        check(device->GetDeviceRemovedReason(), "guest queue GPU completion");
     } else {
         if (gate) {
             recording.unlock();
