@@ -320,7 +320,11 @@ DESC_FORMAT_CODES.update({
     'BUF_FMT_16_16_16_16_SINT': 70,
     'BUF_FMT_32_32_32_32_UINT': 75,
     'BUF_FMT_32_32_32_32_SINT': 76,
+    # Fields are listed most significant first: x is the 2-bit field in bits 1:0, y, z and w are 10 bits each.
+    # No DXGI typed view has this layout, so only a hardware descriptor reaches it (see DESCRIPTOR_ONLY_FORMATS).
+    'BUF_FMT_10_10_10_2_SSCALED': 47,
 })
+DESCRIPTOR_ONLY_FORMATS = frozenset({'BUF_FMT_10_10_10_2_SSCALED'})
 DESC_FORMAT_SHIFT, DESC_FORMAT_MASK = 12, 127
 # Integer formats read a DST_SEL constant 1 as the integer 1, every other format as 1.0.
 DESC_ONE_INTEGER = frozenset(fmt for fmt in DESC_FORMAT_CODES if fmt.endswith(('_UINT', '_SINT')))
@@ -345,7 +349,7 @@ def extended_format_body(fmt, buf):
         mask = (1 << width) - 1
         raw = load if width == 32 else '((%s >> %du) & %du)' % (load, bit, mask)
         body.append('{ uint x = %s;' % raw)
-        if kind in ('SINT', 'SNORM') and width < 32:
+        if kind in ('SINT', 'SNORM', 'SSCALED') and width < 32:
             shift = 32 - width
             body.append('int s = asint(x << %du) >> %du;' % (shift, shift))
         if kind == 'FLOAT' and width < 32:
@@ -353,6 +357,9 @@ def extended_format_body(fmt, buf):
             # exponent and mantissa into the half layout also preserves subnormals.
             half = 'x' if width == 16 else 'x << %du' % (15 - width)
             body.append('c%d = U(f16tof32(%s));' % (i, half))
+        elif kind == 'SSCALED':
+            # The signed field converted to a float as is (no division): -2..1 for a 2-bit field.
+            body.append('c%d = U(float(s));' % i)
         elif kind in ('UNORM', 'SNORM'):
             bits = width - (kind == 'SNORM')
             denominator = (1 << bits) - 1

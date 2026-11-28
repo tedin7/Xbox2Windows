@@ -4686,6 +4686,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
     add_test(NAME startup_vertex_fetch_formats_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_formats_check.py" controls)
+    add_test(NAME startup_vertex_fetch_sscaled_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_sscaled_check.py" controls)
     add_test(NAME startup_buffer_address_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_buffer_address_check.py" controls)
     add_test(NAME startup_smem_address_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4700,6 +4702,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_formats_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_vertex_fetch_formats_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # FORMAT 47 (10_10_10_2 SSCALED), reachable only through a hardware descriptor.
+        add_test(NAME startup_vertex_fetch_sscaled_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_sscaled_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_vertex_fetch_sscaled_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_buffer_address_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_buffer_address_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
