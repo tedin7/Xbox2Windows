@@ -2753,6 +2753,10 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool desktop_array = tiled_address && original && slot70_desktop_arrays_enabled() &&
                                x2w_startup::desktop_address_array(original->console);
     const bool console = tiled_address && original && console_layout_srv(original->console);
+    if (console && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        static LONG called;
+        if (first_calls(called, 4)) log("x2w-draw upload_texture 1D console: memory %p list %p", static_cast<const void*>(memory), static_cast<void*>(list));
+    }
     const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
     const bool single = tiled_address && x2w_startup::single_element_bytes(desc) != 0;
@@ -2768,10 +2772,17 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 desc.Width, desc.Height, desc.Format, desc.Flags, desc.Dimension, static_cast<const void*>(memory));
         }
     }
-    if (!memory || !list || !uploadable) return !console;
-    if (list_wrote(self, texture)) return !console;  // this recording's own copy; not yet submitted
-    if (const auto written_by_gpu = texture_uploads().find(texture); written_by_gpu != texture_uploads().end() && written_by_gpu->second.gpu_written) return !console;
-    if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return !console;
+    // Diagnostic: why a console texture is not uploaded (first few per reason).
+    const auto bail = [&](const char* why) {
+        static LONG bails;
+        if (console && first_calls(bails, 12))
+            log("x2w-draw console texture upload skipped (%s): %llux%u dim %d format %d", why, desc.Width, desc.Height, desc.Dimension, desc.Format);
+        return !console;
+    };
+    if (!memory || !list || !uploadable) return bail(!memory ? "no title memory" : !list ? "no recording" : "not uploadable");
+    if (list_wrote(self, texture)) return bail("list wrote");  // this recording's own copy; not yet submitted
+    if (const auto written_by_gpu = texture_uploads().find(texture); written_by_gpu != texture_uploads().end() && written_by_gpu->second.gpu_written) return bail("gpu written");
+    if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return bail("target flags");
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
     // For Texture3D, depth slices are carried in Footprint.Depth and spanned by SliceFootprints::bytes().
     const UINT slices = (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || !desc.DepthOrArraySize) ? 1 : desc.DepthOrArraySize;
@@ -2861,6 +2872,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
+        if (console) bail("title memory not readable");
         if (console || placed_1d || desktop_array) return false;
         state.done = true;
         state.staged = false;
