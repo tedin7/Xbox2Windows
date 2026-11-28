@@ -7674,7 +7674,7 @@ class Stage:
         if not r or r[2] - r[1] != 3:
             return None
         first = self.sym.get(r[1])
-        if first and first[0] == 'desc' and self.pipe.sampler_heap:
+        if first and first[0] == 'desc' and getattr(self.pipe, 'sampler_heap', False):
             return self.heap_sampler_record(tok, r)
         if not first or first[0] != 'smpheap':
             return None
