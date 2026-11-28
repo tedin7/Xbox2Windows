@@ -507,9 +507,12 @@ Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOUR
     };
     constexpr u64 max_view_bytes = 1ull << 20;
     constexpr u64 budget = 128ull << 20;
-    if (view.Format != DXGI_FORMAT_UNKNOWN || view.Buffer.FirstElement != 0 ||
-        view.Buffer.NumElements != 1 || view.Buffer.StructureByteStride != requested.Width ||
-        !bytes || bytes > UINT64_MAX - address)
+    // Any valid buffer view shape (structured, typed or raw; one or several elements, from any first element) that ends inside the
+    // requested resource: the snapshot holds the bytes from the resource start to the end of the view, and the shadow buffer
+    // has the requested size, so the same view describes the same elements.
+    const u64 element_bytes = x2w_startup::buffer_srv_element_bytes(view);
+    if (!element_bytes || !bytes || bytes > UINT64_MAX - address || bytes > requested.Width ||
+        bytes != (u64{view.Buffer.FirstElement} + view.Buffer.NumElements) * element_bytes)
         return failed(counts.view_does_not_fit);
     if (bytes > max_view_bytes) return failed(counts.over_limit);
     const auto placed = placed_buffer_range(device, address, bytes);

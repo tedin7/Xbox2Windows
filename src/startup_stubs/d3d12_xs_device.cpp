@@ -10138,6 +10138,27 @@ extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type
             removal_device ? removal_device->GetDescriptorHandleIncrementSize(static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type)) : 0);
 }
 
+// The replay player's draw scoreboard: translated draws drawn and refused so far (counters of every draw, not the capped
+// "-> drawn" log lines) and the refusals by cause as a JSON object. Returns the length of `reasons` (0 when it did not fit).
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size)
+{
+    if (drawn) *drawn = InterlockedCompareExchange(&translated_draws, 0, 0);
+    if (not_drawn) *not_drawn = InterlockedCompareExchange(&untranslated_draws, 0, 0);
+    if (!reasons || size < 3) return 0;
+    int used = std::snprintf(reasons, size, "{");
+    bool first = true;
+    for (int i = 0; i < not_drawn_sites && used > 0 && used < static_cast<int>(size) - 64; ++i) {
+        const LONG count = InterlockedCompareExchange(&not_drawn_counts[i], 0, 0);
+        if (!count) continue;
+        used += std::snprintf(reasons + used, size - used, "%s\"%s\": %ld", first ? "" : ", ", not_drawn_names[i], count);
+        first = false;
+    }
+    if (used <= 0 || used >= static_cast<int>(size) - 2) return 0;
+    reasons[used++] = '}';
+    reasons[used] = 0;
+    return static_cast<unsigned>(used);
+}
+
 extern "C" void x2w_d3d12_exit_report()
 {
     char line[1024];
