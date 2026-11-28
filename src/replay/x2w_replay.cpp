@@ -59,6 +59,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
     void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
 namespace x2w_replay {
@@ -92,6 +93,7 @@ struct Range {
 };
 
 struct Player {
+    std::vector<std::pair<long long, long long>> draw_series;  // cumulative translated draws drawn / not drawn at each present
     UINT recorded_increments[4] = {};
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
@@ -668,7 +670,13 @@ bool play(Player& p, const Recording& r, const Step& step)
             call.ret = call_slot(call.self, rcx, c.slot, a);
         if (call.ret < c.ret) ++p.fence_timeouts;
     }
-    if (c.kind == queue_kind && c.slot == queue_present) ++p.presents;
+    if (c.kind == queue_kind && c.slot == queue_present) {
+        ++p.presents;
+        // Cumulative draw counters at each present: the summary lists the draws of every present.
+        long long drawn = 0, not_drawn = 0;
+        x2w_d3d12_draw_totals(&drawn, &not_drawn, nullptr, 0);
+        p.draw_series.push_back({drawn, not_drawn});
+    }
     learn_after(p, r, call);
     ++p.played;
     return true;
@@ -858,6 +866,21 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
                             "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
+        {
+            long long drawn = 0, not_drawn = 0;
+            char reasons[2048];
+            const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
+            std::fprintf(f, ", \"draws\": {\"drawn\": %lld, \"not_drawn\": %lld, \"not_drawn_by_reason\": %s, \"per_present\": [",
+                         drawn, not_drawn, length ? reasons : "{}");
+            long long previous_drawn = 0, previous_refused = 0;
+            for (std::size_t i = 0; i < p.draw_series.size(); ++i) {
+                std::fprintf(f, "%s{\"drawn\": %lld, \"not_drawn\": %lld}", i ? ", " : "",
+                             p.draw_series[i].first - previous_drawn, p.draw_series[i].second - previous_refused);
+                previous_drawn = p.draw_series[i].first;
+                previous_refused = p.draw_series[i].second;
+            }
+            std::fprintf(f, "]}");
+        }
         std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"left_out\": %llu, \"wall_s\": %.3f}",
                      p.prefix_calls, p.prefix_played, p.prefix_left_out, p.prefix_seconds);
         if (timing) timing->write_json(f);
@@ -868,6 +891,12 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
                 "wall_s %.3f fps %.2f%s\n",
                 p.presents, p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.fence_timeouts, wall, fps,
                 stopped ? " stopped_at_max_seconds" : "");
+    {
+        long long drawn = 0, not_drawn = 0;
+        char reasons[2048];
+        const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
+        std::printf("x2w-replay draws drawn %lld not_drawn %lld by_reason %s\n", drawn, not_drawn, length ? reasons : "{}");
+    }
     std::fflush(stdout);
 }
 

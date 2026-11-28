@@ -157,6 +157,13 @@ def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False
     summary = json.loads((out / "replay_summary.json").read_text())
     assert summary["unknown_object"] == 0 and summary["missing_blob"] == 0, summary
     assert summary["presents"] == presents and summary["fence_timeouts"] == 0, summary
+    # The draw scoreboard counts every draw, not the capped log lines: one entry per present, adding up to the totals.
+    draws = summary["draws"]
+    assert len(draws["per_present"]) == presents, draws
+    assert sum(entry["drawn"] for entry in draws["per_present"]) <= draws["drawn"], draws
+    assert sum(draws["not_drawn_by_reason"].values()) <= draws["not_drawn"], draws
+    assert any(line.startswith("x2w-replay draws drawn %d not_drawn %d " % (draws["drawn"], draws["not_drawn"]))
+               for line in text.splitlines()), (draws, text[-500:])
     progress = [line for line in text.splitlines() if line.startswith("x2w-replay timing ")]
     if timing:
         check_timing(summary, recording, progress)
