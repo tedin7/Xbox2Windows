@@ -9744,7 +9744,8 @@ extern "C" __declspec(dllexport) std::uint64_t x2w_d3d12_take_view_id()
 extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment)
 {
     if (type >= 4) return;
-    const UINT minimum = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 16 : 32;
+    // The console's depth stencil descriptors are 8 bytes; its other view types are 32 bytes and its samplers 16.
+    const UINT minimum = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 16 : type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV ? 8 : 32;
     if (increment < minimum || increment > 256 || (increment & (increment - 1))) {
         log("x2w-d3d12 replay: invalid heap type %u title increment %u: ignored", type, increment);
         return;
