@@ -28,6 +28,7 @@
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/mesh_oracle_compare.h"
 #include "startup_stubs/present_readback_state.h"
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/draw_cube_srv.h"
@@ -1718,6 +1719,8 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 }
 
 LONG draw_dump_frame();
+void mesh_oracle_discard(ID3D12CommandList* list);  // d3d12_mesh_oracle.inl
+void mesh_oracle_executed(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
 void discard_red_producer(ID3D12GraphicsCommandList* list);
 void pass_stats_close(Wrapper* self);
 void pass_stats_discard(ID3D12GraphicsCommandList* list);
@@ -2481,6 +2484,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
+        mesh_oracle_discard(previous);
         discard_red_producer(previous);
         pass_stats_discard(previous);
     }
@@ -2523,6 +2527,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         discard_mesh_lease_recording(list);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(list);
+        mesh_oracle_discard(list);
         discard_red_producer(list);
         pass_stats_discard(list);
         static LONG failures;
@@ -6138,6 +6143,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 }
             });
             pass_stats_execute(queue, native_lists);
+            mesh_oracle_executed(queue, ready_count, native_lists.data());  // X2W_REPLAY_ORACLE=mesh
             if (split && replay_dump_enabled()) dump_lists.insert(dump_lists.end(), wrappers.begin(), wrappers.end());
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
@@ -10312,6 +10318,7 @@ extern "C" void x2w_d3d12_exit_report()
     if (indirect_totals_line(line, sizeof(line)))
         log("x2w-render indirect at exit:%s", line + sizeof("x2w-render indirect:") - 1);
     provenance_report();
+    mesh_oracle_exit_report();  // X2W_REPLAY_ORACLE=mesh: per-key draw counts
 }
 
 // The offline player owns these heap references and keys them by recorded creation ID.

@@ -119,6 +119,7 @@ def main():
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     if len(sys.argv) == 3 and sys.argv[1] == 'binary':
         binary(sys.argv[2])
         raise SystemExit(1 if FAILED else 0)

@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
@@ -246,14 +247,17 @@ endpgm = 0xbf810000
 mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
 pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
 vertex = struct.pack('<3I', *position, endpgm)
-mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
-# A pair without a pixel stage is translated when the mesh has the accepted shape; this synthetic mesh does not.
-mesh57_fixture(mesh, b'', 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
-mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
-# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check;
-# the pair is translated when the mesh has the accepted shape, which this synthetic mesh does not.
+# A null-only export is a depth-only pixel stage. A mesh without a pixel stage is
+# also valid, so all three requests reach the same mesh diagnostic.
 null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
-mesh57_fixture(mesh, null_export, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
+proof_refusal = 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent'
+serial_refusal = ('slot 57 mesh wave loop: wave loop: m0 may be read before it is written '
+                  '(proof path: ' + proof_refusal[:80] + ')')
+for mode, diagnostic in (('0', proof_refusal), ('1', serial_refusal)):
+    with patch.dict(os.environ, {'X2W_MESH_WAVELOOP': mode, 'X2W_MESH_WAVELOOP_STUBS': '0'}):
+        for ps in (pixel, b'', null_export):
+            mesh57_fixture(mesh, ps, diagnostic)
+mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
 # Controls: a position export, or a null export mixed with one, stays refused.
 mesh57_fixture(mesh, struct.pack('<3I', *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')

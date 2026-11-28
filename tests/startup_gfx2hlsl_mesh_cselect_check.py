@@ -129,6 +129,7 @@ def draw(dxc, renderer):
 
 
 if __name__ == '__main__':
+    os.environ['X2W_MESH_WAVELOOP'] = '0'  # Exercise the proof-path contract.
     # Keep fixture products under the repository's ignored output directory.
     output = Path(__file__).resolve().parent.parent / 'out'
     output.mkdir(exist_ok=True)

@@ -6234,7 +6234,7 @@ class Stage:
             if not self.embedded_buffer:
                 self.embedded_scalar_buffer = embedded_scalar_buffer_proof(self.raw_code, self.ins)
         self.pixel_table = embedded_pixel_table(self.raw_code, self.ins) if kind == 'ps' else None
-        if kind == 'ms':
+        if kind == 'ms' and not getattr(self, 'serial_mesh', False):
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
@@ -6721,7 +6721,7 @@ class Stage:
             source, offset, word = args
             if fixed_only and node in getattr(self, 'advanced_descriptor_words', ()):
                 raise Unsupported('cannot materialize descriptor word %d from an advanced descriptor' % word)
-            if (getattr(self, 'kind', None) in ('ps', 'vs') and source[0] == 'table' and 0 <= source[1] < 16
+            if (getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and source[0] == 'table' and 0 <= source[1] < 16
                     and offset is not None and offset % 4 == 0 and 0 <= offset + 4 * word <= 0x7ffffffc):
                 return 'ud' if probe else 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
             if getattr(self, 'kind', None) == 'cs' and source[0] == 'table' and offset is not None and word % 4 == 3:
@@ -6738,7 +6738,7 @@ class Stage:
         reg = reg_range(token)
         symbol = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
         if symbol and symbol[0] == 'desc' and names_one_value(symbol):
-            if getattr(self, 'kind', None) in ('ps', 'vs'):
+            if getattr(self, 'kind', None) in ('ps', 'vs', 'ms'):
                 return self.descriptor_number(symbol[:4], fixed_only=True)
         if symbol and symbol[0] == 'descnum' and len(symbol) == 3:
             return self.descriptor_number(self.descriptor_number_node(symbol), fixed_only=True)
@@ -13021,6 +13021,9 @@ class Stage:
             selection = fields.get('src%d_sel' % index)
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            if base == 'v_cvt_f16_f32' and selection == 'DWORD' and not sext:
+                sources.append(self.u_src(token))
+                continue
             low16 = selection in ('BYTE_0', 'BYTE_1', 'WORD_0') or (
                 selection == 'DWORD' and not sext and base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1'))
             if base == 'v_cvt_f16_f32' and not sext:
@@ -13626,7 +13629,7 @@ class Stage:
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
-            if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
+            if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
                 result = self.descriptor_alu(text, srcs, syms)
                 if getattr(self, 'retry_heap_dimensions', False) and self.heap_image_source(result[2]):
@@ -14721,7 +14724,7 @@ class Stage:
             return
         if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
-        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) in ('ps', 'vs'):
+        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) in ('ps', 'vs', 'ms'):
             return self.dynamic_heap_image_record(dst, base, token, imm)
         if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps', 'ms'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
@@ -14733,7 +14736,7 @@ class Stage:
         # A vertex or mesh stage may load the record inside a branch arm: the index lives in a temporary that is declared at
         # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
         # it. Pixel and compute stages keep refusing the load in a branch.
-        in_branch = self.has_branches
+        in_branch = self.has_branches or getattr(self, 'serial_mesh', False)
         if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) not in ('vs', 'ms'))
                 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
                 or self.sym.get(base[2]) != ('const', 0)):
@@ -14784,7 +14787,7 @@ class Stage:
         of the bound heap slot; any other key is a normal SRV resource."""
         if key is None or key[0][0] != 'dynamic_heap':
             return self.pipe.resource(key, kind) if key is not None else None
-        if (self.kind not in ('ps', 'vs') or len(key[0]) != 3 or kind not in HEAP_IMAGE_TYPES
+        if (self.kind not in ('ps', 'vs', 'ms') or len(key[0]) != 3 or kind not in HEAP_IMAGE_TYPES
                 or key[1] != 0 or key in self.pipe.modified):
             raise Unsupported('dynamic resource heap views require a raw buffer load')
         assumed = getattr(self, 'heap_image_kinds', {}).get(key[0])
@@ -17100,7 +17103,7 @@ class Stage:
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
                         array_ok=False):
         level_zero = name == 'image_gather4_lz'
-        if self.kind == 'vs' and level_zero:
+        if self.kind in ('vs', 'ms') and level_zero:
             if len(ops) != 4:
                 raise Unsupported('%s requires four operands' % name)
         elif self.kind not in ('ps', 'cs') or len(ops) != 4:
@@ -17170,7 +17173,11 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
-        tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d') if key is not None else None
+        kind = 'tex2da' if array else 'tex2d'
+        if self.kind == 'ms':
+            tex = self.image_texture(key, kind)
+        else:
+            tex = self.pipe.resource(key, kind) if key is not None else None
         if array and tex is not None:
             # The compute runtime binds a Texture2DArray input only under the typed-SRV manifest line.
             self.pipe.typed_srvs = True
@@ -21390,7 +21397,7 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 if len(ops) != 2:
                     raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
                 symbols = [self.sym.get(r[1]) if (r := reg_range(t)) and r[0] == 's' else None for t in ops]
-                descriptor = (getattr(self, 'kind', None) in ('ps', 'vs')
+                descriptor = (getattr(self, 'kind', None) in ('ps', 'vs', 'ms')
                               and any(s and s[0] in ('desc', 'descnum') for s in symbols))
                 if descriptor and not mods and self.heap_image_null_compare(name, ops, symbols):
                     self.mark_descriptor_scc()
@@ -21967,6 +21974,8 @@ BVH_HELPERS = (
 
 
 class Pipeline:
+    stage_class = Stage
+
     vertex_kind = 'vs'
     uses_dynamic_heap = False
     uses_dynamic_heap_formats = False
@@ -22051,7 +22060,12 @@ class Pipeline:
 
     def _build_graphics_stage(self, kind, code, refusals=None, decoded=None, *, split_vcc=True):
         if kind not in ('vs', 'ps'):
-            return Stage(self, kind, code, refusals=refusals, decoded=decoded)
+            try:
+                return self.stage_class(self, kind, code, refusals=refusals, decoded=decoded)
+            except Unsupported as reason:
+                if kind == 'ms':
+                    reason.mesh_stage = True  # the serial wave-loop fallback may take this refusal
+                raise
         split_vcc = split_vcc and self.vertex_kind == 'vs'
         # Translation can allocate bindings before refusing. Restore the state left
         # by the previous stage so each retry allocates only the bindings it uses.
@@ -23485,12 +23499,18 @@ class MeshPipeline(Pipeline):
     def mesh_profile(self):
         return 'ms_6_6' if self.uses_dynamic_heap else 'ms_6_5'
 
+    def mesh_output_line(self, line):
+        return re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
+                      re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
+                             lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
+
+    def mesh_param_line(self, line):
+        # Drop writes to unread parameters but keep the EXEC guard and mesh_vertex assignment.
+        return re.sub(r' o\.param\d+ = [^;]*;', '', line) if self.ps is None else line
+
     def hlsl_ms(self):
         s = self.vs
-        lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
-                        re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
-                               lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
-                 for line in s.body()]
+        lines = [self.mesh_output_line(line) for line in s.body()]
         # Omit an unused group exchange, including its otherwise unused declaration.
         unused_group_regs = set()
         for index in range(len(lines) - 1, -1, -1):
@@ -23499,10 +23519,7 @@ class MeshPipeline(Pipeline):
                                  for other in lines[:index] + lines[index + 1:] + s.entry):
                 del lines[index]
                 unused_group_regs.add(int(match[1][1:]))
-        if self.ps is None:
-            # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
-            # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
-            lines = [re.sub(r' o\.param\d+ = [^;]*;', '', line) for line in lines]
+        lines = [self.mesh_param_line(line) for line in lines]
         mask_collectives = []
         if s.mesh_collect_masks:
             mask_collectives = [
@@ -24175,8 +24192,80 @@ def validate_mesh57_pixel(ps):
         raise Unsupported('slot 57 pixel stage mixes the null export with another export')
 
 
+MESH_WAVELOOP_MODES = ('0', '1', 'force', 'oracle')
+
+
+def mesh_waveloop_mode():
+    """X2W_MESH_WAVELOOP (default 0, the proof path only): 1 = the serial wave loop takes the proof-family refusals,
+    force = every key goes through the serial wave loop, oracle = the proof path publishes as with 0 and the serial wave
+    loop of the same key is published beside it as <key>.ms57w.* for the replay oracle (X2W_REPLAY_ORACLE=mesh)."""
+    mode = os.environ.get('X2W_MESH_WAVELOOP', '0') or '0'
+    if mode not in MESH_WAVELOOP_MODES:
+        raise Unsupported('X2W_MESH_WAVELOOP=%s is not one of %s' % (mode, ', '.join(MESH_WAVELOOP_MODES)))
+    return mode
+
+
+def mesh57_serial_pipeline(ms, ps, root, pixel_refusal):
+    from mesh_waveloop import translate_serial
+    return translate_serial(sys.modules[__name__], ms, ps or None, root, pixel_refusal)
+
+
+def mesh57_pipeline(ms, ps, root, pixel_refusal, mode):
+    """The proof path, or the serial wave loop when the mode asks for it (see mesh_waveloop_mode)."""
+    proof_refusal = None
+    try:
+        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
+    except Unsupported as reason:
+        if mode not in ('1', 'force') or not getattr(reason, 'mesh_stage', False):
+            raise
+        from mesh_waveloop import proof_family
+        if not proof_family(sys.modules[__name__], str(reason)):
+            raise
+        proof_refusal = str(reason)
+    if proof_refusal is None and mode != 'force':
+        return pipe
+    try:
+        return mesh57_serial_pipeline(ms, ps, root, pixel_refusal)
+    except Unsupported as reason:
+        if proof_refusal is None or not getattr(reason, 'mesh_stage', False):
+            raise
+        raise Unsupported('slot 57 mesh wave loop: %s (proof path: %s)' % (reason, proof_refusal[:80])) from reason
+
+
+def publish_mesh57_stages(name, sources, out_dir, compile_enabled, tag='57'):
+    """Write <name>.<stage><tag>.hlsl for each source and, with compile_enabled, its .cso (all stages or none)."""
+    for stage, _, hlsl in sources:
+        open('%s.%s%s.hlsl' % (name, stage, tag), 'w').write(hlsl)
+    if not compile_enabled:
+        return
+    compiler = find_dxc()
+    if compiler is None:
+        raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
+    import subprocess
+    # Publish bytecode only after all requested stages compile successfully.
+    with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
+        for stage, profile, _ in sources:
+            bytecode = os.path.join(staging, stage + '.cso')
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode,
+                                '%s.%s%s.hlsl' % (name, stage, tag)], capture_output=True, text=True)
+            if r.returncode or not has_complete_mesh57_bytecode(bytecode):
+                # DXC names the source path; keep only the diagnostic after it.
+                lines = [re.sub(r'^.*?57w?\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
+                raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
+        for stage, _, _ in sources:
+            os.replace(os.path.join(staging, stage + '.cso'), '%s.%s%s.cso' % (name, stage, tag))
+
+
+def mesh57_sources(pipe, ps):
+    """(stage sources, manifest) of a translated slot 57 pipeline."""
+    sources = [('ms', pipe.mesh_profile(), pipe.hlsl_ms())]
+    if ps:
+        sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
+    return sources, pipe.manifest()
+
+
 def translate_mesh57(out_dir, key):
-    """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
+    """Translate a slot 57 mesh request through the proof path or serial fallback, or raise Unsupported.
 
     Writes <key>.ms57.hlsl and the compiled .ms57.cso, their .ps57 counterparts if present, and <key>.ms57.txt (last).
     No runtime path loads these names yet."""
@@ -24201,13 +24290,11 @@ def translate_mesh57(out_dir, key):
             if not placeholder_ps_enabled():
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
+    mode = mesh_waveloop_mode()
+
     def lower():
-        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
-        mesh_hlsl = pipe.hlsl_ms()
-        sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
-        if ps:
-            sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
-        return pipe, sources, pipe.manifest()
+        pipe = mesh57_pipeline(ms, ps, root, pixel_refusal, mode)
+        return (pipe,) + mesh57_sources(pipe, ps)
     pipe, sources, manifest = approximate_translation(lower)
     base = name
     output_key, marker = approx_result(key, pipe)
@@ -24216,26 +24303,8 @@ def translate_mesh57(out_dir, key):
     manifest = manifest.replace('\n', '\nkey %016x\n' % output_key, 1)
     if marker:
         manifest += '# ' + marker + '\n'
-    for stage, _, hlsl in sources:
-        open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
     compile_enabled = os.environ.get('X2W_FXC') != ''
-    if compile_enabled:
-        compiler = find_dxc()
-        if compiler is None:
-            raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
-        import subprocess
-        # Publish bytecode only after all requested stages compile successfully.
-        with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
-            for stage, profile, _ in sources:
-                bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
-                                   capture_output=True, text=True)
-                if r.returncode or not has_complete_mesh57_bytecode(bytecode):
-                    # DXC names the source path; keep only the diagnostic after it.
-                    lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
-            for stage, _, _ in sources:
-                os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
+    publish_mesh57_stages(name, sources, out_dir, compile_enabled)
     placeholder = isinstance(pipe.ps, PlaceholderPixelStage)
     if placeholder:
         publish_placeholder_failure(name, pipe.ps, compile_enabled, ('.ms57.cso', '.ps57.cso'))
@@ -24247,6 +24316,10 @@ def translate_mesh57(out_dir, key):
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
     publish_approx(base, marker)
+    if mode == 'oracle':
+        from mesh_waveloop import publish_oracle_sibling
+        publish_oracle_sibling(sys.modules[__name__], name, (ms, ps, root, pixel_refusal), manifest, marker,
+                               out_dir, compile_enabled)
     return 'ok'
 
 
@@ -24651,13 +24724,13 @@ def jobs_argument(args):
 
 
 def translator_stamp():
-    """The newest modification time of the translator's own files (this module and the modules it loaded from its
-    folder): a .fail older than this was written by another build and is tried again. None with X2W_RETRY_FAILED=1,
+    """The newest modification time of the translator's own files. Include the serial mesh backend before its
+    first use so a cold pending scan can retry a mesh failure from an older backend. None with X2W_RETRY_FAILED=1,
     which retries every failure."""
     if os.environ.get('X2W_RETRY_FAILED') == '1':
         return None
     here = os.path.dirname(os.path.abspath(__file__))
-    files = {os.path.abspath(__file__)} | {
+    files = {os.path.abspath(__file__), os.path.join(here, 'mesh_waveloop.py')} | {
         os.path.abspath(module.__file__) for module in list(sys.modules.values())
         if getattr(module, '__file__', None) and os.path.dirname(os.path.abspath(module.__file__)) == here}
     return max(os.path.getmtime(name) for name in files if os.path.isfile(name))
@@ -24758,6 +24831,9 @@ def translator_version():
                *(tools / (name + '.py') for name in (
                    'disasm_rdna2', 'pixel_aot', 'resource_inventory', 'verify_build',
                    'shader_minmax', 'compute_store_aot', 'mesh_param_link')))
+    serial_mesh = script.with_name('mesh_waveloop.py')
+    if serial_mesh.is_file():
+        sources += (serial_mesh,)
     digest = hashlib.sha256()
     for source in sources:
         digest.update(source.name.encode('ascii') + b'\0')
