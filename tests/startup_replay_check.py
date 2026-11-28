@@ -385,7 +385,8 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     assert not early, "the carry-off recording holds list calls from before its window: %s\n%s" % (early, text[-1500:])
     equal = [a for a, b in pairs if lacking.get(a) == whole[b]]
     assert not equal, "without the carry the replay still drew the list's corner in %s: replayed first pixel %r" % (
-        equal, lacking[equal[0]][1][1:5] if equal else None)
+        equal, lacking[equal[0]][1][1:5] if equal else None) + "\n" + (directory / "static_bare_replayed" / "stderr.txt").read_text(
+        errors="replace")[:3500]
     print("static_list: presents 7-12 replay equal with the carried list, all differ without it")
     return 0
 
