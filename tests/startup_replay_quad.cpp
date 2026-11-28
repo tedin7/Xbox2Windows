@@ -38,6 +38,9 @@ struct Scene {
     void* offscreen = nullptr;
     void* history = nullptr;
     void* window_copy = nullptr;
+    void* snapshot_buffer = nullptr;
+    void* snapshot_upload = nullptr;
+    UINT64 snapshot_bytes = 0;
     void* title_buffer = nullptr;
     void* rtv_heap = nullptr;
     void* queue = nullptr;
@@ -383,6 +386,35 @@ int wait_for_frame(const Scene& s, UINT frame)
     return 0;
 }
 
+bool create_snapshot_buffer(void* device, Scene& s)
+{
+    char value[32]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_TEST_REPLAY_GPU_STATE_BIG", value, sizeof(value));
+    if (!length) return true;
+    char* end = nullptr;
+    const auto mib = std::strtoull(value, &end, 10);
+    if (length >= sizeof(value) || value[0] < '0' || value[0] > '9' || *end || !mib || mib > (UINT64_MAX >> 20))
+        return false;
+    s.snapshot_bytes = mib << 20;
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, s.snapshot_bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    const D3D12_HEAP_PROPERTIES target_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const auto create = [&](const D3D12_HEAP_PROPERTIES& heap, D3D12_RESOURCE_STATES state, void*& resource) {
+        return SUCCEEDED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+            state, 0, arg(&__uuidof(ID3D12Resource)), arg(&resource)))) && resource;
+    };
+    if (!create(target_heap, D3D12_RESOURCE_STATE_COMMON, s.snapshot_buffer)) return false;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (!create(upload_heap, D3D12_RESOURCE_STATE_GENERIC_READ, s.snapshot_upload)) return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{0, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(s.snapshot_upload, 8, 0, arg(&no_reads), arg(&mapped)))) || !mapped)
+        return false;
+    std::memset(mapped, 0, static_cast<std::size_t>(s.snapshot_bytes));
+    invoke(s.snapshot_upload, 9, 0, 0);
+    return true;
+}
+
 int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool slot_layouts)
 {
     if (s.history && frame == 2 && !create_copy_texture(device, s.window_copy)) return 28;
@@ -439,6 +471,8 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         const float fallback[] = {1.0f, 1.0f, 0.0f, 1.0f};
         invoke(s.list, 52, s.fallback_rtv, arg(fallback));
     }
+    if (frame == 0 && s.snapshot_buffer)
+        invoke(s.list, 15, arg(s.snapshot_buffer), 0, arg(s.snapshot_upload), 0, s.snapshot_bytes);
     if (s.offscreen) {
         constexpr float history[]{1.0f, 0.0f, 1.0f, 1.0f};
         if (frame < 2) {
@@ -526,6 +560,7 @@ int main(int argc, char** argv)
                                                device, pso))
         return rc;
     if (const int rc = create_scene(device, scene)) return rc;
+    if (!create_snapshot_buffer(device, scene)) return 28;
     if (const int rc = create_title_range(device, scene)) return rc;
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", nullptr, 0)) {
         if (frames != 3) return 2;
@@ -563,6 +598,7 @@ int main(int argc, char** argv)
         Word token = 0;
         if (paced && (invoke(device, 80, 0, 0xFFFFFFFFu, 0, 0, arg(&token)) != S_OK || !token)) return 38;
         if (const int rc = draw_frame(scene, device, pso, frame, frames, slot_layouts)) return rc;
+        if (frame == 0 && scene.snapshot_upload) invoke(scene.snapshot_upload, 2);
     }
     if (std::strcmp(recorder_case, "cap") == 0)
         std::printf("replay quad: recorder calls after scene %llu\n",
