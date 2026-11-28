@@ -583,6 +583,14 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
                 if (s.title_range == TitleRange::root) {
                     invoke(s.list, 42, 0, arg(s.constants));
                 } else {
+                    // X2W_TEST_REPLAY_TABLE_PADDING=N: N root-address binds first, so a tiny draw page time budget is
+                    // spent before the descriptor table of the frame is bound.
+                    static const UINT padding = [] {
+                        char value[8]{};
+                        return GetEnvironmentVariableA("X2W_TEST_REPLAY_TABLE_PADDING", value, sizeof(value)) ?
+                            static_cast<UINT>(std::atoi(value)) : 0u;
+                    }();
+                    for (UINT pad = 0; pad < padding; ++pad) invoke(s.list, 42, 0, arg(s.constants));
                     invoke(s.list, 32, 1, arg(&s.view_heap));
                     invoke(s.list, 36, 0, s.view_gpu + s.view_stride);
                 }

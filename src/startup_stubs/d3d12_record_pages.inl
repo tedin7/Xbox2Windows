@@ -17,7 +17,7 @@
 //   reserved (not committed) H, unreadable R, scan T ms
 constexpr std::size_t page_slab_bytes = 1u << 20;
 
-struct PageRange { u64 address, bytes; };
+struct PageRange { u64 address, bytes; bool exempt = false; };  // exempt: a table span, never held back by the time cap
 // Draw capture state (pages_lock).
 constexpr u64 draw_root_window = 0x10000;   // a root address has no size: the stand-in reads up to 64 KiB from it
 constexpr u64 draw_span_limit = 4ull << 20;  // larger vertex/index spans are left to the page scans
@@ -28,6 +28,9 @@ std::vector<PageRange> draw_ranges;  // the title ranges by address
 bool draw_ranges_missed;             // gathered again this Present for a span outside them
 LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped;
+u64 draw_table_over_time, draw_submit_page_bytes, draw_submit_tables_dropped;  // table spans past the time cap (captured anyway)
+constexpr std::size_t draw_submit_tables_limit = 2048;
+std::vector<PageRange> draw_submit_tables;  // table spans noted since the last queue submit (pages_lock)
 u64 draw_table_spans, draw_descriptor_buffers;
 u64 draw_indirect_args, draw_indirect_counts;
 u64 draw_copy_sources, draw_copy_source_misses;  // copy sources in a mapped upload buffer: captured, not mapped by the title
@@ -533,9 +536,10 @@ const PageRange* draw_find_range(u64 address)
 void draw_log_counters(LONG present, double used)
 {
     log("x2w-replay draw pages: captures %llu, plain memory spans %llu, outside title memory %llu, over the per-present time %llu, "
-        "pending dropped %llu, table spans %llu, descriptor buffers %llu, indirect args %llu, counts %llu, copy sources %llu (unmapped %llu), "
+        "pending dropped %llu, table spans over the time cap %llu (captured anyway), table pages captured at submit %llu, table spans dropped at submit %llu, table spans %llu, descriptor buffers %llu, indirect args %llu, counts %llu, copy sources %llu (unmapped %llu), "
         "ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
-        draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
+        draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped, draw_table_over_time,
+        draw_submit_page_bytes / x2w_replay::page_bytes, draw_submit_tables_dropped, draw_table_spans, draw_descriptor_buffers,
         draw_indirect_args, draw_indirect_counts, draw_copy_sources, draw_copy_source_misses,
         draw_ranges_gathered, draw_ranges_ms,
         used, draw_pages_ms, present);
@@ -567,9 +571,18 @@ u64 draw_plain_end(u64 address, u64 end, bool any_type = false)
     return at;
 }
 
+// A table span (what a draw or dispatch reads as descriptors) is exempt from the time cap: only the page budget and the
+// recording's cap bound it. It is counted when the cap would have stopped it.
+bool draw_span_held_back(const PageRange& span, const LARGE_INTEGER& start)
+{
+    if (!span.exempt) return draw_time_exhausted(start, 1);
+    if (draw_time_used + page_ms_since(start) >= draw_pages_ms) ++draw_table_over_time;
+    return false;
+}
+
 void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INTEGER& start, bool mapped = false)
 {
-    if (draw_time_exhausted(start, 1)) return;
+    if (draw_span_held_back(span, start)) return;
     // Reuse the ranges across Presents. Refresh on the first miss in a Present.
     if (draw_ranges_present != present) {
         draw_ranges_present = present;
@@ -613,7 +626,7 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
     }
     bool captured = false;
     for (u64 at = span.address & ~mask; at < end; at += page_slab_bytes) {
-        if (page_budget_or_cap_reached() || draw_time_exhausted(start, 1)) break;
+        if (page_budget_or_cap_reached() || (!span.exempt && draw_time_exhausted(start, 1))) break;
         if (draw_read_buffer.empty()) draw_read_buffer.resize(page_slab_bytes);
         page_capture_slab(at, static_cast<std::size_t>((std::min<u64>)(end - at, page_slab_bytes)), draw_read_buffer, stamp);
         captured = true;
@@ -621,17 +634,18 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
     if (captured) ++draw_captures;
 }
 
-void draw_add_pending(u64 list, u64 address, u64 bytes)
+void draw_add_pending(u64 list, u64 address, u64 bytes, bool exempt = false)
 {
     if (!address || !bytes) return;
     auto& spans = draw_pending[list];
     for (auto& span : spans) {
         if (span.address != address) continue;
         span.bytes = (std::max)(span.bytes, bytes);
+        span.exempt = span.exempt || exempt;
         return;
     }
     if (spans.size() == draw_pending_limit) { ++draw_pending_dropped; return; }
-    spans.push_back({address, bytes});
+    spans.push_back({address, bytes, exempt});
 }
 
 void draw_consume_pending(u64 list, LONG present, u64 stamp, LARGE_INTEGER& start)
@@ -768,6 +782,43 @@ void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     draw_end_capture(present, start);
 }
 
+// The title may rewrite a table after the draw that read it and before the queue submit: the spans are kept to be read again
+// at the submit (pages_lock held).
+void draw_note_submit_table(u64 address, u64 bytes)
+{
+    for (auto& span : draw_submit_tables) {
+        if (span.address != address) continue;
+        span.bytes = (std::max)(span.bytes, bytes);
+        return;
+    }
+    if (draw_submit_tables.size() >= draw_submit_tables_limit) { ++draw_submit_tables_dropped; return; }
+    draw_submit_tables.push_back({address, bytes, true});
+}
+
+// A queue submit: every table span noted since the last submit is captured again. The page writer's dedupe drops the pages
+// that did not change, so only the rewritten ones are written. The stamp is the submit's own sequence.
+void draw_tables_at_submit(u64 stamp)
+{
+    if (!draw_pages) return;
+    ThreadBuffer& b = my_buffer();
+    AcquireSRWLockExclusive(&b.lock);
+    AcquireSRWLockExclusive(&pages_lock);
+    if (window_open && page_writer && !page_budget_reached && !stop_requested && active && !draw_submit_tables.empty()) {
+        const LONG present = draw_begin_capture();
+        LARGE_INTEGER start{};
+        QueryPerformanceCounter(&start);
+        const u64 before = page_writer->stats().bytes_written;
+        page_target = &b;
+        for (const PageRange& span : draw_submit_tables) draw_capture_span(span, present, stamp, start);
+        page_target = nullptr;
+        draw_submit_page_bytes += page_writer->stats().bytes_written - before;
+        draw_submit_tables.clear();
+        draw_end_capture(present, start);
+    }
+    ReleaseSRWLockExclusive(&pages_lock);
+    ReleaseSRWLockExclusive(&b.lock);
+}
+
 void draw_note_span(u64 list, u64 address, u64 bytes, bool pending, bool table)
 {
     if (!call_seq || !draw_pages || !window_open || !address || !bytes) return;
@@ -780,11 +831,12 @@ void draw_note_span(u64 list, u64 address, u64 bytes, bool pending, bool table)
         LARGE_INTEGER start{};
         QueryPerformanceCounter(&start);
         page_target = &b;
-        draw_capture_span({address, bytes}, present, call_seq - 1, start);
+        draw_capture_span({address, bytes, true}, present, call_seq - 1, start);
         page_target = nullptr;
+        draw_note_submit_table(address, bytes);
         if (table) ++draw_table_spans;
         else ++draw_descriptor_buffers;
-        if (pending) draw_add_pending(list, address, bytes);
+        if (pending) draw_add_pending(list, address, bytes, true);
         draw_end_capture(present, start);
     }
     ReleaseSRWLockExclusive(&pages_lock);

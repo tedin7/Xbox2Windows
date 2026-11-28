@@ -817,6 +817,7 @@ double draw_pages_ms = 100.0;
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
 void note_mapped_upload(u64 object, u64 out_address);  // d3d12_record_pages.inl
+void draw_tables_at_submit(u64 stamp);  // d3d12_record_pages.inl
 u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9,
                       u64 s0, u64 s1, u64 s2, bool root, bool submit, bool scan);
 void remember_cbv_pages(u64 desc);
@@ -896,6 +897,9 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
             carry_forget(rcx);
         }
     }
+    if constexpr (K == queue_kind)
+        if (draw_pages && window_open.load(std::memory_order_relaxed) && (N == 10 || execute_shaped(rdx, r8)))
+            draw_tables_at_submit(seq - 1);
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     call_seq = previous_seq;
     if constexpr (K == device_kind && N == 133) active_placement = previous;
