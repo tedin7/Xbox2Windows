@@ -2394,6 +2394,55 @@ heaps backed by existing CPU memory.
 ctest --preset dev --no-tests=error -R '^startup_replay_submit_pages_(warp|hardware)$' --output-on-failure
 ```
 
+## Pass thermometer
+
+`X2W_PASS_STATS=1` measures, on the GPU, what every pass of a frame left in the resources it wrote, so a run or a
+replay says by itself where the picture is lost (`src/startup_stubs/pass_stats.inl`). Off, nothing changes.
+
+A pass is a run of writes to one set of resources on one command list. It closes when the bound render-target and
+depth set changes, when a dispatch writes a different set of unordered-access outputs, when a copy follows other
+work, and at Close. Draws (refused and not-drawn ones too) belong to the pass of the bound targets; consecutive
+dispatches with the same outputs, consecutive copies to resources with render-target or unordered-access flags,
+and clears are passes of their own (a clear followed by draws or a dispatch on the same resources joins them).
+At the close, the list copies the written subresource of each resource into a snapshot. After the list is executed, a
+compute reduction on the same queue reads each snapshot (64 groups at most, 24 words each) and the next present
+folds the results. No target is read back whole.
+
+`passes.jsonl` (next to `replay_summary.json` in a replay; `X2W_PASS_STATS_DIR`, else `X2W_PRESENT_PICTURES`, else
+the working directory) gets one line per pass and execution, in submission order:
+
+| Field | Value |
+|---|---|
+| `present`, `pass` | the present the pass was executed for, and its index within that present |
+| `kind` | `graphics`, `compute`, `copy` or `clear` |
+| `calls` | first and last recorded call of the pass (`x2w_replay` passes each call's sequence number), or null |
+| `recorded`, `refused` | write calls seen; refused or not-drawn calls in the pass (a refused dispatch outside a compute pass counts in the next pass) |
+| `keys` | writer shader keys (draw or dispatch translation keys, 16 at most) |
+| `inputs` | creation ids of the resources a dispatch or copy read; null for graphics passes, whose inputs are not followed |
+| `writes` | per resource: creation id, resource and view format, size, mip and slice; `stats` or `stats: null` with a `reason` |
+| `signal` | true when a written colour channel (the first three) holds a finite nonzero value, false when none does, null without stats |
+
+`stats` has the texel count and, per channel, `min`, `max` and `mean` of the finite values (null when there is
+none) and the counts of exact zeros, NaN and Inf. Buffers are read as 32-bit floats over the written range (64 MiB at
+most). Reasons for no stats: `pass cap` (more than `X2W_PASS_STATS_CAP` passes in one present, default 256), `memory
+budget` (snapshots over `X2W_PASS_STATS_MB` per present, default 2048), `format`, `multisampled`, `texture
+dimension` (only 2D textures), `list type` (copy lists), `queue type`, `snapshot allocation`, `reduction timeout`.
+
+Each present also logs one line that walks back from the presented surface. A pass depends on the earlier writers
+of what it writes and of its known inputs; a graphics pass depends on every earlier pass of the present:
+
+```text
+x2w-replay pass collapse: present P: last pass with signal = #A (key K, kind), first all-zero/NaN pass after it = #B (key K, kind, refused calls N)
+```
+
+Clear-only passes are never named as the first all-zero pass. `no collapse` means the last writer of the presented
+surface has signal; `no recorded pass wrote the presented surface` means the picture came from an earlier present
+or from a write the thermometer does not see (pixel-shader UAV writes, for one).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_pass_stats_(warp|hardware)$' --output-on-failure
+```
+
 ## D3D12 view census
 
 The stand-in keeps one record per distinct view: slot, resource, counter,

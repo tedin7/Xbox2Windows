@@ -206,6 +206,7 @@ bool replay_dump_enabled()
     return enabled;
 }
 void replay_dump_tag(Wrapper* wrapper, ID3D12Resource* resource);
+bool pass_stats_enabled();  // X2W_PASS_STATS=1 (pass_stats.inl)
 enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
 struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
@@ -690,7 +691,7 @@ Wrapper* wrap(IUnknown* real, Kind kind, bool gpu_state_unsupported = false)
         _aligned_free(block);
         return nullptr;
     }
-    if (kind == resource_kind && replay_dump_enabled()) {
+    if (kind == resource_kind && (replay_dump_enabled() || pass_stats_enabled())) {
         static volatile LONG64 next_id = 0;
         w->own().replay_resource_id = InterlockedIncrement64(&next_id);
     }
@@ -1716,6 +1717,8 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 
 LONG draw_dump_frame();
 void discard_red_producer(ID3D12GraphicsCommandList* list);
+void pass_stats_close(Wrapper* self);
+void pass_stats_discard(ID3D12GraphicsCommandList* list);
 x2w_startup::DrawReadbacks& draw_dumps()
 {
     static x2w_startup::DrawReadbacks tracker;
@@ -2477,6 +2480,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
         discard_red_producer(previous);
+        pass_stats_discard(previous);
     }
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
     static LONG failures;
@@ -2496,6 +2500,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(state.real);
     end_open_queries(self, list);
+    pass_stats_close(self);
     release_targets(self);
     const HRESULT hr = list->Close();
     state.list_open = false;
@@ -2517,6 +2522,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(list);
         discard_red_producer(list);
+        pass_stats_discard(list);
         static LONG failures;
         if (first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
     }
@@ -4321,6 +4327,7 @@ void replay_dump_draw(Wrapper* list)
 
 #include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
+#include "startup_stubs/pass_stats.inl"
 
 void note_target_draw(const Pass& pass, LONG frame, bool poisoned = false,
                       ID3D12Resource* const* inputs = nullptr, unsigned input_count = 0);
@@ -5025,7 +5032,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
     if (translated_compute) {
         const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset};
-        if (const char* failure = record_translated_dispatch(self, dispatch)) return refuse(failure, indirect_compute_pipeline);
+        if (const char* failure = record_translated_dispatch(self, dispatch)) {
+            pass_stats_refused(self);
+            return refuse(failure, indirect_compute_pipeline);
+        }
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
         return;
     }
@@ -5218,6 +5228,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!leased_arguments && !rect_list) {
         require_state(self, resource, argument_state);
     }
+    if (graphics) pass_stats_draw(self, list, 0);
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
@@ -5412,6 +5423,7 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
     depth_clear_census().executed(target, depth, static_cast<unsigned>(flags));
+    pass_stats_clear(self, target, DXGI_FORMAT_UNKNOWN);
     if (flags & D3D12_CLEAR_FLAG_DEPTH) debug_present::note_clear(target, depth, rect_count);
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
                                 rect_count, rect_count ? rects : nullptr);
@@ -5445,6 +5457,7 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     use_as_target(self, target);
     if (replay_dump_enabled()) replay_dump::note(self, target, view_format_of(desktop, target));
     const auto red_sample = red_producers().before(self, list, target, "clear-rtv", 0, 0);
+    pass_stats_clear(self, target, view_format_of(desktop, target));
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
     red_producers().after(self, red_sample);
@@ -5515,6 +5528,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const D3D12_GPU_DESCRIPTOR_HANDLE gpu{desktop_gpu};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     replay_dump::note(self, target);
+    pass_stats_clear(self, target, DXGI_FORMAT_UNKNOWN);
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
     InterlockedIncrement(&render_clears);
@@ -5849,7 +5863,7 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     if (list && pass.pipeline && pass.pipeline->own().builder_pipeline &&
         !compute_builder_dispatch_allowed(self, "Dispatch")) return;
     if (list && pass.pipeline && pass.pipeline->own().compute_request_key) {
-        record_translated_dispatch(self, {{x, y, z}});
+        if (record_translated_dispatch(self, {{x, y, z}})) pass_stats_refused(self);
         return;
     }
     x2w_startup::ListDispatch request;
@@ -5904,6 +5918,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
+        pass_stats_draw(self, list, 0);
         const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         if (vertices && instances) replay_dump_draw(self);
@@ -6024,6 +6039,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            pass_stats_execute(queue, native_lists);
             if (split && replay_dump_enabled()) dump_lists.insert(dump_lists.end(), wrappers.begin(), wrappers.end());
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
@@ -9621,6 +9637,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         present_pictures::present(self, surface, frame);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
+        pass_stats_present(frame, surface);
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
         // by default, every plane with X2W_PRESENT_COMPOSITE=1. The compositor draws the steps in order.
         if (render_mode()) {

@@ -1217,6 +1217,8 @@ static int texture_slot67(void* device, const std::string& mode)
     return output ? 0 : 2;
 }
 
+#include "startup_pass_stats_scene.h"
+
 static bool create_slot67(void* device, const char* code_path, const char* data_path, const char* state_path, const char* mode)
 {
     std::ifstream code_file(code_path, std::ios::binary), data_file(data_path, std::ios::binary), state_file(state_path, std::ios::binary);
@@ -1574,6 +1576,8 @@ int main(int argc, char** argv)
         }
         return dispatch_slot67(adapter.Get(), device, argv[8]);
     }
+    if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "pass-stats", 10) == 0)
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? pass_stats_slot67(device, argv[8]) : 10;
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "texture", 7) == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(device, argv[8]) : 10;
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)

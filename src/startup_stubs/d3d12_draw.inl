@@ -4778,6 +4778,7 @@ static bool not_drawn(const Pass& pass, ID3D12GraphicsCommandList* list, u64 key
         ReleaseSRWLockExclusive(&target_draw_census_lock);
     }
     red_producer_attachments(pass, list, "not-drawn", key, not_drawn_names[site]);
+    pass_stats_not_drawn(pass, list, key);
     const LONG seen = InterlockedIncrement(&not_drawn_counts[site]);
     if (seen <= 3)
         log("x2w-draw not drawn: %s (call %ld at this site)", not_drawn_names[site], seen);
@@ -5857,6 +5858,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    pass_stats_draw(self, list, tr->key);
     bool drawn = false;
     bool index_refusal = false;
     if (indirect) {
