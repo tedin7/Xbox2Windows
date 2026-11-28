@@ -13,7 +13,7 @@
 
 // A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
 // for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
-// root table P. Only that form is read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// root table P. The native compiler also emits raw table views; a view qualifier or a 'channels' field, as in the compute line, is refused.
 // A trailing 'typedload' means the binding must also support a typed UAV load. The translator does not emit it
 // for a component store, which does not read the texel.
 struct PixelUav {
@@ -44,9 +44,9 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     };
     if (w.size() < 2 || w[0] != "uav" || !number(w[1], out.index)) return "malformed view index";
     if (w.size() < 3) return "missing view kind";
-    if (w[2] == "table") return "buffer view (raw uav) is not bound";
+    if (w[2] == "table") return "legacy untyped buffer view is not bound";
     out.raw = w[2] == "raw";
-    if (!out.raw && w[2] != "tex2d" && w[2] != "tex2da" && w[2] != "tex2du") return "only tex2d, tex2da and tex2du views are bound";
+    if (!out.raw && w[2] != "tex2d" && w[2] != "tex2da" && w[2] != "tex2du") return "only tex2d, tex2da, tex2du and raw views are bound";
     out.array = w[2] == "tex2da";
     out.uint_atomic = w[2] == "tex2du";
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
@@ -56,6 +56,7 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (!number(w[4], out.parameter) || out.parameter >= 16) return "table parameter out of range";
     if (!number(w[5], out.offset)) return "malformed table offset";
     out.needs_typed_load = w.size() == 7;
+    if (out.raw && (out.needs_typed_load || out.offset % 32)) return "raw view requires an aligned table record without typedload";
     return nullptr;
 }
 
@@ -938,12 +939,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         uav_entries[ud.a] |= bit;
     }
     for (const auto& uav : tr.uavs) {
-        if (uav.raw && uav_entries[uav.index] != 7) {
+        // A raw view with no entry sources is a buffer UAV named by a view token; one with sources is a descriptor
+        // the title wrote (buffer_store_format_xyzw) and needs all three.
+        if (uav.raw && uav_entries[uav.index] != 0 && uav_entries[uav.index] != 7) {
             log("x2w-draw pipeline %016llx uav line refused (buffer view (raw uav) is not bound): "
                 "uav %u needs all three formatted-store entry sources", tr.key, uav.index);
             return;
         }
-        if (uav.raw && static_cast<std::size_t>(declared_ud) != tr.uds.size()) {
+        if (uav.raw && uav_entries[uav.index] == 7 && static_cast<std::size_t>(declared_ud) != tr.uds.size()) {
             log("x2w-draw pipeline %016llx uav %u entry count refused; translation not used", tr.key, uav.index);
             return;
         }
@@ -971,7 +974,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     load_pso_recipes(tr);
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
-    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
+    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable views, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
@@ -1550,6 +1553,75 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
 {
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+}
+
+// Called under draw_lock. The fallback uses only the bound attachments and
+// never binds a descriptor heap or reads a guest buffer.
+bool draw_missing_translation(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Pass& pass,
+                              UINT count, UINT instances, UINT start, UINT start_instance)
+{
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"X2W_DRAW_MISSING_SHADER", value, 2) == 1 && value[0] == L'1';
+    }();
+    if (!enabled || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST || !pass.targets_single_sample ||
+        !pass.viewport_set || !pass.scissor_set) return false;
+
+    struct Pipeline {
+        x2w_startup::ComPtr<ID3D12RootSignature> root;
+        x2w_startup::ComPtr<ID3D12PipelineState> state;
+    };
+    static std::unordered_map<u64, Pipeline> pipelines;
+    u64 key = fnv_bytes(&device, sizeof(device));
+    key = fnv_bytes(&pass.graphics_root, sizeof(pass.graphics_root), key);
+    key = fnv_bytes(&pass.dsv_format, sizeof(pass.dsv_format), key);
+    key = fnv_bytes(pass.target_formats, pass.target_count * sizeof(DXGI_FORMAT), key);
+    auto [entry, inserted] = pipelines.try_emplace(key);
+    auto& pipeline = entry->second;
+    if (inserted) {
+        pipeline.root = pass.graphics_root;
+        HRESULT hr = S_OK;
+        if (!pipeline.root) {
+            const D3D12_ROOT_SIGNATURE_DESC empty{};
+            x2w_startup::ComPtr<ID3DBlob> signature;
+            hr = D3D12SerializeRootSignature(&empty, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr);
+            if (SUCCEEDED(hr))
+                hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                                 IID_PPV_ARGS(&pipeline.root));
+        }
+        constexpr char source[] =
+            "float4 vertex() : SV_Position { return float4(2, 0, 0, 1); }\n"
+            "void pixel() { clip(-1); }\n";
+        x2w_startup::ComPtr<ID3DBlob> vs, ps;
+        if (SUCCEEDED(hr))
+            hr = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "vertex", "vs_5_0", 0, 0, &vs, nullptr);
+        if (SUCCEEDED(hr))
+            hr = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "pixel", "ps_5_0", 0, 0, &ps, nullptr);
+        if (SUCCEEDED(hr)) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = pipeline.root.Get();
+            desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+            desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+            desc.SampleMask = ~0u;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.DepthClipEnable = TRUE;
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = pass.target_count;
+            std::copy_n(pass.target_formats, pass.target_count, desc.RTVFormats);
+            desc.DSVFormat = pass.dsv_format;
+            desc.SampleDesc.Count = 1;
+            hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline.state));
+        }
+        if (FAILED(hr))
+            log("x2w-draw missing shader fallback setup failed 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    if (!pipeline.state) return false;
+    list->SetPipelineState(pipeline.state.Get());
+    list->SetGraphicsRootSignature(pipeline.root.Get());
+    list->DrawInstanced(count, instances, start, start_instance);
+    return true;
 }
 
 bool effective_blend_state(const BoundPipeline& bound, const Translation& tr, UINT target_count, D3D12_BLEND_DESC& blend)
@@ -2921,6 +2993,14 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
+// The view dimension a manifest texture kind declares (Translation::Srv::kind 1 to 5).
+D3D12_SRV_DIMENSION translated_view_dimension(int kind)
+{
+    return kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D : kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+           kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE :
+                       D3D12_SRV_DIMENSION_TEXTURE3D;
+}
+
 bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
 {
     if (!tr.d16_srvs.any()) return true;
@@ -2936,9 +3016,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         // Cube sampling does not support the D16 result path.
         if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(i, "non-table texture binding", srv.kind);
-        const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                               srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        const auto dimension = translated_view_dimension(srv.kind);
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
@@ -3859,6 +3937,11 @@ bool resolve_pixel_uavs(Wrapper* self, const Translation& tr, const Pass& pass, 
     };
     for (std::size_t i = 0; i < tr.uavs.size(); ++i) {
         const PixelUav& uav = tr.uavs[i];
+        if (uav.raw) {
+            const UINT stride = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (stride < 32 || uav.offset % stride)
+                return refuse(i, "raw UAV offset is not a descriptor boundary", uav.offset);
+        }
         const x2w_startup::ViewTable& table = pass.view_tables[uav.parameter];
         if (!table.address) return refuse(i, "no descriptor table at the parameter", uav.parameter);
         const unsigned size = uav.raw ? 16 : 32;
@@ -3867,7 +3950,9 @@ bool resolve_pixel_uavs(Wrapper* self, const Translation& tr, const Pass& pass, 
         std::uint32_t words[8] = {};
         if (!x2w_local::readable(reinterpret_cast<const void*>(entry), size)) return refuse(i, "table entry unreadable", entry);
         std::memcpy(words, reinterpret_cast<const void*>(entry), size);
-        if (uav.raw) {
+        // A raw view is either a descriptor the title wrote (its words are the buffer, bound through a placed alias)
+        // or a view token naming a buffer UAV the title created (resolved below like a texture view).
+        if (uav.raw && words[0] != view_token_magic) {
             if (const char* reason = pixel_raw_uav(self, words, out[i])) return refuse(i, reason, entry);
             for (std::size_t j = 0; j < i; ++j)
                 if (out[j].resource == out[i].resource) return refuse(i, "raw output also bound as a UAV", j);
@@ -3893,7 +3978,21 @@ bool resolve_pixel_uavs(Wrapper* self, const Translation& tr, const Pass& pass, 
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav, out[i].view);
+        const char* reason = nullptr;
+        if (uav.raw) {
+            const auto* info = resource_info(resource);
+            if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                return refuse(i, "resource lacks ALLOW_UNORDERED_ACCESS", record.resource);
+            const x2w::ComputeViewBinding binding{x2w::ComputeViewKind::raw_buffer_uav, uav.parameter, uav.offset, uav.index, 4};
+            if (!described || record.counter || !info || info->initial_state != D3D12_RESOURCE_STATE_COMMON ||
+                desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                !x2w::native_buffer_store_view(binding, title_view, desc.Width))
+                return refuse(i, "incompatible raw buffer UAV", record.resource);
+            out[i].view = title_view;
+        } else {
+            reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr,
+                                    uav, out[i].view);
+        }
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -4256,7 +4355,7 @@ u64 refused_pipeline_key(Wrapper* pipeline, int site)
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
-                     TranslatedIndirectDraw* indirect)
+                     TranslatedIndirectDraw* indirect, bool* used_fallback = nullptr)
 {
     u64 not_drawn_key = 0;
     auto* list = recording(self);
@@ -4274,6 +4373,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    if (used_fallback && tr && tr->manifest_retry.pending() &&
+        draw_missing_translation(device_of(self->own().list_device), list, pass, count, instances, start, start_instance)) {
+        *used_fallback = true;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return true;
+    }
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     std::uint32_t d16_unorm16[32] = {};
@@ -4362,6 +4467,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
     if (!resolve_pixel_uavs(self, *tr, pass, uav_bindings)) {
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, 8);
+    }
+    // A raw view named by a view token (a buffer UAV the title created, no descriptor words) is proven with one
+    // writable view and a direct non-indexed draw without SRVs first: SRVs and indexed draws can alias it through
+    // guest addresses, so their independence is not guessed. A raw descriptor the title wrote is checked against
+    // the draw's inputs by raw_output_overlaps instead.
+    bool token_raw_uav = false;
+    for (std::size_t i = 0; i < tr->uavs.size(); ++i)
+        if (tr->uavs[i].raw && !uav_bindings[i].allocation_size) token_raw_uav = true;
+    if (token_raw_uav && (indexed || indirect || tr->uavs.size() != 1 || !tr->srvs.empty())) {
+        log("x2w-draw %016llx raw UAV requires one writable view and a direct non-indexed draw without SRVs", tr->key);
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, 8);
+    }
+    if (token_raw_uav && !retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(uav_bindings[0].resource))) {
         draw_lock_release_exclusive();
         return not_drawn(pass, list, not_drawn_key, 8);
     }
@@ -5053,7 +5174,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + srv_count + j} * draw_heap_increment};
         auto* resource = uav_bindings[j].resource;
         require_state(self, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (tr->uavs[j].load || tr->uavs[j].uint_atomic) {
+        if (tr->uavs[j].load || tr->uavs[j].uint_atomic || tr->uavs[j].raw) {
             // Order earlier UAV writes before a draw that reads the current contents.
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -5233,6 +5354,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     return draw_translated(self, indexed, count, instances, start, base_vertex, start_instance, nullptr);
+}
+
+LONG missing_shader_fallback_draws;
+
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance)
+{
+    bool used_fallback = false;
+    const bool drawn = draw_translated(self, false, count, instances, start, 0, start_instance, nullptr, &used_fallback);
+    if (used_fallback) {
+        const LONG n = InterlockedIncrement(&missing_shader_fallback_draws);
+        if (n == 1) log("x2w-draw recorded first missing shader fallback");
+    } else {
+        InterlockedIncrement(drawn ? &translated_draws : &untranslated_draws);
+    }
 }
 
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset,

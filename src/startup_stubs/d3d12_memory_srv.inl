@@ -162,6 +162,8 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
                      : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
                                                                          : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
     if (!(storage.Support1 & req)) return blocked("format_dimension_support");
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE && !(storage.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE))
+        return blocked("format_cube_support");
     if (r.MipLevels != 1 && !(storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP)) return blocked("format_mip_support");
     return true;
 }
@@ -234,7 +236,8 @@ bool address_resource_overlap(u64 address, u64 span)
     bool found = false;
     note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+        if (wrapper->own().tiled_address_srv || wrapper->own().unplaced_srv_backing ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
@@ -408,7 +411,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||
-            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            wrapper->own().exact_copy || info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
@@ -573,7 +576,7 @@ void clear_unplaced_buffers(Wrapper* device)
 // allocation the buffer does not fit (fully_committed), or by one page that is not committed (witness_page).
 // A nullptr from a later step carries no proof (proven stays false).
 Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
-                                u64 elem_bytes, x2w_startup::SrvRefusalProof* refusal = nullptr)
+                                u64 elem_bytes, bool raw, x2w_startup::SrvRefusalProof* refusal = nullptr)
 {
     if (refusal) *refusal = x2w_startup::SrvRefusalProof{};
     const auto prove = [&](x2w_startup::SrvRefusalKind kind, u64 witness = 0, u64 base = 0) {
@@ -608,7 +611,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
     // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
     // starts at the address itself (checked above to lie inside memory the title owns).
-    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes, raw);
     if (exact) {
         page_start = address;
         page_span = span_bytes;
@@ -731,6 +734,8 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+    w->own().unplaced_srv_backing = true;
+    w->own().exact_copy = exact;
     note_resource(w, &rdesc, page_span);
     if (!is_upload) {
         w->own().budget = x2w_budget::resource(desktop, native_resource.Get(), x2w_budget::placed);
@@ -1306,10 +1311,22 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted);
         Wrapper* buffer = nullptr;
         x2w_startup::SrvRefusalProof refusal_proof;
+        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        const auto resolve = [&](Wrapper* candidate) {
+            const auto* candidate_info = candidate ? resource_info(candidate) : nullptr;
+            return candidate_info && x2w_startup::resolve_buffer_srv_desc(
+                reinterpret_cast<u64>(candidate->own().title_memory), candidate_info->console.Width,
+                input->address, input->view, adjusted);
+        };
+        bool resolved = false;
         if (!cached_refusal) {
             buffer = existing_memory_buffer(self, input->address, span_bytes);
-            if (!buffer)
-                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, &refusal_proof);
+            resolved = resolve(buffer);
+            if (!buffer || (!resolved && buffer->own().unplaced_srv_backing)) {
+                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes,
+                                                input->view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW, &refusal_proof);
+                resolved = resolve(buffer);
+            }
         }
         static const bool shadow_enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_BUFFER");
         // The cached proof covers the regular buffer lookup, not the smaller snapshot range.
@@ -1329,11 +1346,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                               destination);
             return;
         }
-        const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
-        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        if (!buffer || !info ||
-            !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
-                                                  info->console.Width, input->address, input->view, adjusted)) {
+        if (!resolved) {
             // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
             if (buffer) refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
             buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), refusal_proof);

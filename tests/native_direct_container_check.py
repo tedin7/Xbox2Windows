@@ -208,8 +208,9 @@ def main():
             marker = folder / "sample.cdx"
             marker.write_bytes(compute(words(*code, 0xbf810000), table=True))
             raise SystemExit(subprocess.run([probe, "--sampler", sdk, marker, folder/"cache"]).returncode)
-    if len(sys.argv)==5 and sys.argv[1]=="--rect-pso":
-        exe,sdk,probe=sys.argv[2:]
+    if len(sys.argv) in (5, 6) and sys.argv[1]=="--rect-pso":
+        exe,sdk,probe=sys.argv[2:5]
+        rect_geometry=sys.argv[5] if len(sys.argv)==6 else None
         with tempfile.TemporaryDirectory() as tmp:
             folder=pathlib.Path(tmp)
             source=folder/"inputs"
@@ -220,7 +221,21 @@ def main():
             root=b"DXBC"+bytes(16)+words(1,68,1,36)+b"RTS0"+words(24,2,0,24,0,24,0)
             stem=publish(source,vs,interpolated_pixel(),root)
             subprocess.run([exe,sdk,folder/"cache","gfx1013-container-rect","--requests",source,out],check=True)
-            raise SystemExit(subprocess.run([probe,*(out/f"{stem}.{stage}.cso" for stage in ("vs","gs","ps"))]).returncode)
+            result=subprocess.run([probe,*(out/f"{stem}.{stage}.cso" for stage in ("vs","gs","ps"))])
+            if result.returncode or not rect_geometry:
+                raise SystemExit(result.returncode)
+            # A second pair exports only SV_Position, matching the standalone geometry fixture's HLSL
+            # VS/PS. Draw the same rotated scenes through that native GS instead of the HLSL stage.
+            native_source=folder/"native-inputs"
+            native_out=folder/"native-compiled"
+            from startup_stream_draw_check import vop1
+            native_ps=patched_pixel(2,[vop1(1,0,128),vop1(1,1,242)],export=(0xf800180f,0x01000001))
+            native_stem=publish(native_source,vertex(fetch=True),native_ps,root,
+                                b"ia1 1\nPOSITION 0 6 0 4 0 0\n")
+            subprocess.run([exe,sdk,folder/"cache","gfx1013-container-rect","--requests",native_source,native_out],check=True)
+            native_stages=[str(native_out/f"{native_stem}.{stage}.cso") for stage in ("vs","ps","gs")]
+            raise SystemExit(subprocess.run([rect_geometry,"--native-vs",native_stages[0],
+                                             "--native-ps",native_stages[1],"--native-gs",native_stages[2]]).returncode)
     exe, sdk = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         folder = pathlib.Path(tmp)

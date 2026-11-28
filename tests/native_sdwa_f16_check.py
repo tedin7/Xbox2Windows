@@ -1,4 +1,4 @@
-"""Direct compute SDWA binary16 arithmetic. Use ir DUMPER or gpu STORE_REPLAY SDK."""
+"""Direct compute SDWA arithmetic and conversion. Use ir DUMPER or gpu STORE_REPLAY SDK."""
 import struct
 import subprocess
 import sys
@@ -14,6 +14,9 @@ PAD, SEXT, PRESERVE = 0, 1, 2
 NEG, ABS, SCALAR = 0x10, 0x20, 0x80
 OLD = 0xa55a1357
 GUARD = 0x69696969
+ADD_CO_CI, PKRTZ = 0x28, 0x2f
+LANE_STRIDE = fixture.STRIDE // 2
+LANE_BYTE_SHIFT = fixture.SHIFT - 1
 
 
 def sdwa(opcode, dst, unused, src0, src1, reg0=1, reg1=2, dst_mod=0):
@@ -99,6 +102,9 @@ def refusals():
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0, dst_mod=1 << 14), dest_error),
         (sdwa(0x39, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # max
         (sdwa(0x3a, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # min
+    ] + [
+        (sdwa(op, WORD_0, PAD, DWORD, DWORD, dst_mod=1 << modifier), dest_error)
+        for op in (PKRTZ, ADD_CO_CI) for modifier in (13, 14)
     ]
 
 
@@ -117,26 +123,80 @@ def run_ir(dumper, items, code):
     print('native_sdwa_f16 IR: %d results and %d refusals' % (len(items), len(refusals())))
 
 
+def extend_gpu_program(code, items):
+    code = code[:-1]  # Append cases just before s_endpgm.
+    expected = {(0, slot): (case.want, None) for slot, case in enumerate(items)}
+    slot = len(items)
+    # The expected half is the RTZ conversion of the first source after abs/neg.
+    for a, dst, unused, src0, half in (
+            (0x3f801800, WORD_0, PAD, DWORD, 0x3c00),
+            (0xbf801800, WORD_1, PRESERVE, DWORD | ABS, 0x3c00),
+            (0x7f800000, WORD_0, PAD, DWORD | NEG, 0xfc00),
+            (0x7fc00001, WORD_1, PRESERVE, DWORD, 0x7e00)):
+        code += fixture.mov(1, a) + fixture.mov(3, OLD)
+        code += sdwa(PKRTZ, dst, unused, src0, DWORD | SCALAR, reg1=128)
+        code += fixture.store(4 * slot, 3)
+        shift = 16 if dst == WORD_1 else 0
+        expected[0, slot] = ((half << shift) | (OLD & 0xffff if unused == PRESERVE else 0), shift)
+        slot += 1
+
+    # Enable lanes 0 and 1. v8 is the group base and v0 is the local thread ID.
+    code += [fixture.sop1(3, 126, 131)]
+    code += fixture.vop2(0x1a, 7, 128 + LANE_BYTE_SHIFT, 0)
+    code += fixture.vop2(0x25, 8, 256 + 7, 8)
+    carry_in = 0b10
+    for a, b, dst, src0, src1 in (
+            (0xffffffff, 0, WORD_1, DWORD, DWORD),
+            (0xffffffff, 0x1235, WORD_1, DWORD, DWORD),
+            (0xfffffffe, 0xffff0001, WORD_1, WORD_0, DWORD),
+            (0xaaaa1234, 0xbeefffff, DWORD, WORD_0, WORD_1)):
+        code += fixture.mov(1, a) + fixture.mov(2, b) + fixture.mov(4, 1)
+        code += [fixture.sop1(3, 106, 128 + carry_in)]
+        code += sdwa(ADD_CO_CI, dst, PAD, src0, src1)
+        code += fixture.vop2(0x01, 4, 128, 4)  # v_cndmask_b32 v4, 0, v4, vcc_lo
+        code += fixture.store(4 * slot, 3) + fixture.store(4 * (slot + 1), 4)
+        left = a if src0 == DWORD else a & 0xffff
+        right = b if src1 == DWORD else b >> 16
+        for lane in range(2):
+            total = left + right + ((carry_in >> lane) & 1)
+            result = (total & 0xffff) << 16 if dst == WORD_1 else total & 0xffffffff
+            expected[lane, slot] = (result, None)
+            expected[lane, slot + 1] = (total >> 32, None)
+        slot += 2
+    assert slot <= LANE_STRIDE
+    return code + [0xbf810000], expected
+
+
 def run_gpu(gpu, sdk, items, code):
+    code, expected = extend_gpu_program(code, items)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         src, root = work / 'root.hlsl', work / 'root.bin'
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([str(Path(sdk) / 'dxc.exe'), '-T', 'rootsig_1_1', '-E', 'SIG', '-Fo', root, src], check=True)
-        sa = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1, 0, 0x80 | (5 << 1))
+        sa = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, 0x80 | (5 << 1))
         marker = write_request(work, code, root.read_bytes(), sa)
         dest = work / 'sdwa-f16-readback.bin'
         run = subprocess.run([gpu, sdk, str(marker), str(work / 'cache'), '0', str(dest), '--direct'])
         if run.returncode == 77:
             sys.exit(77)
         run.check_returncode()
-        offsets = fixture.group_offsets(len(items))
-        stores = {slot: case for group in offsets for slot, case in zip(group, items)}
+        stores = {base + lane * LANE_STRIDE + slot: (slot, want, shift)
+                  for (base,) in fixture.group_offsets(1)
+                  for (lane, slot), (want, shift) in expected.items()}
         actual = struct.unpack(f'<{fixture.WORDS}I', dest.read_bytes())
         for index, got in enumerate(actual):
             if index in stores:
-                case = stores[index]
-                assert case.matches(got), (index, case.op, hex(got), hex(case.want))
+                slot, want, shift = stores[index]
+                if slot < len(items):
+                    matches = items[slot].matches(got)
+                elif shift is not None:
+                    mask = 0xffff << shift
+                    matches = (got & ~mask == want & ~mask and
+                               fixture.same_binary16((got & mask) >> shift, (want & mask) >> shift))
+                else:
+                    matches = got == want
+                assert matches, (index, slot, hex(got), hex(want))
             else:
                 assert got == GUARD, (index, hex(got), hex(GUARD))
     print('native_sdwa_f16 GPU: %d results and %d guards' % (len(stores), fixture.WORDS - len(stores)))

@@ -102,6 +102,7 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "startup_stubs/xmem_section_buffer.h"
+#include "native_buffer_store_view.h"
 #ifdef X2W_NATIVE_SHADERS  // d3d12_xs_shim only: the C++ shader compiler (startup_stubs/d3d12_compute_dispatch.inl)
 #include "gfx1013_compute_native.h"
 #include "shader_dxil_compiler.h"
@@ -216,6 +217,8 @@ struct alignas(16) WrapperOwn {
     UploadChunkMask large_upload_buffers;  // Dedicated buffers referenced by this recording.
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
+    bool unplaced_srv_backing;  // Resource: synthetic backing for an address-only buffer SRV.
+    bool exact_copy;            // Resource: synthetic backing that starts at the view address.
     bool tiled_address_srv; // Cached address SRV backed by guest memory.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
     bool lazy_view_created;    // Resource: at least one materialized view was created referencing this wrapper.
@@ -3337,7 +3340,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     };
     if (!new_compute_chunk && !chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) return finish(active);
+        if (reservation.mapped) {
+            return finish(active);
+        }
     }
 
     // A failed compute snapshot may request one additional chunk beyond the ordinary ring cap.
@@ -3364,7 +3369,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     for (unsigned index = 0; index < chunks.size(); ++index) {
         if (chunks[index].overflow) continue;
         reservation = reserve_upload_chunk(chunks[index], rounded);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            return finish(index);
+        }
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
@@ -5445,14 +5452,14 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 }
 extern LONG translated_draws, untranslated_draws;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        draw_startup_direct(self, vertices, instances, first_vertex, first_instance);
         return;
     }
     if (list && pass.root_heap_flags) {
@@ -6078,7 +6085,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? ViewRecord::srv_desc_bytes :
+            N == 19 ? ViewRecord::uav_desc_bytes : N == 20 ? 20 : 16;
         note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
                   described_bytes, title_dest, args[D], materialized);
     };
@@ -8987,7 +8995,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
+            "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals,
             formatted_draws_refused, textures_uploaded,
@@ -8996,7 +9005,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
-            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words,
+            missing_shader_fallback_draws);
     }
     null_report.emit([](const char* line) { log("%s", line); });
     if (totals_due || null_report_due)

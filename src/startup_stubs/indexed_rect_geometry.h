@@ -72,6 +72,17 @@ bool corner_between(float2 p, float2 a, float2 b) {
     return (p.x == a.x && p.y == b.y && p.y != a.y && p.x != b.x) ||
            (p.x == b.x && p.y == a.y && p.y != b.y && p.x != a.x);
 }
+// The right-angle corner is the vertex opposite the rectangle's diagonal, which is the longest of its three
+// edges: for the corner c with neighbours a and b, |a - b| is the diagonal and is longer than both sides. The
+// axis test above is one case of this; a rotated rectangle has no corner that shares an axis with a neighbour,
+// so without this test the stage drops it and leaves the region it covers unpainted (#3131). The two sides must
+// also meet at a right angle, so a shape that is not a rectangle stays undrawn as before.
+bool corner_off_longest(float2 p, float2 a, float2 b) {
+    float2 pa = p - a, pb = p - b, ab = a - b;
+    const float across = dot(ab, ab), side_a = dot(pa, pa), side_b = dot(pb, pb);
+    const float angle = dot(pa, pb);
+    return across > side_a && across > side_b && angle * angle <= 1e-6 * side_a * side_b;
+}
 [maxvertexcount(6)]
 void main(triangle Vertex input[3], inout TriangleStream<Vertex> stream) {
     Vertex v[3] = input;
@@ -80,6 +91,9 @@ void main(triangle Vertex input[3], inout TriangleStream<Vertex> stream) {
     uint corner = 3;
     [unroll] for (uint i = 0; i < 3; ++i)
         if (corner_between(v[i].pos.xy, v[(i + 1) % 3].pos.xy, v[(i + 2) % 3].pos.xy)) corner = i;
+    if (corner == 3)
+        [unroll] for (uint j = 0; j < 3; ++j)
+            if (corner_off_longest(v[j].pos.xy, v[(j + 1) % 3].pos.xy, v[(j + 2) % 3].pos.xy)) corner = j;
     if (corner == 3) return;
     uint a = (corner + 1) % 3, b = (corner + 2) % 3;
 )";

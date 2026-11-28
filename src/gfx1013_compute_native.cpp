@@ -59,6 +59,7 @@ struct Inst {
     bool clamp = false, wide = false, subword = false;
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
+    unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -275,13 +276,17 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.enc = Encoding::Vop1;
             i.op -= 0x180;
         }
+        if (direct && !graphics && i.enc == Encoding::Vop3 && (i.op == 0x377 || i.op == 0x378)) {
+            // The shared extent decoder already counts the trailing literal word.
+            // S1 and S2 may both reference that word.
+            if (i.src[0] == 255)
+                refuse(pc, "permlane S0 cannot be a literal");
+        }
         lit = std::find(i.src.begin(), i.src.end(), 255) != i.src.end();
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
         const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
-        if (direct && half_alu && i.src[0] == 250)
-            refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -291,7 +296,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             // decoder. Admit only profiles with a direct result placement.
             static const std::set<Name> bits{
                 "v_mov_b32", "v_not_b32", "v_cndmask_b32", "v_bfrev_b32", "v_mul_u32_u24",
-                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
+                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_co_ci_u32",
                 "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_min_u32", "v_max_u32",
                 "v_min_i32", "v_max_i32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"};
             static const std::set<Name> floats{
@@ -300,11 +305,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
-                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" ||
+                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
                                   (sdwa_compare && (name.substr(name.size()-4) == "_f32" || name.substr(name.size()-4) == "_f16"));
             const bool conversion = name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" ||
                                     name.substr(0,15) == "v_cvt_f32_ubyte";
-            if (!(fp_input || conversion || bits.count(name) || sdwa_compare))
+            if (!(fp_input || conversion || bits.count(name) || sdwa_compare) ||
+                (graphics && (name == "v_cvt_pkrtz_f16_f32" || name == "v_add_co_ci_u32")))
                 refuse(pc, "unimplemented direct SDWA operand profile");
             const Word ext = take();
             const unsigned sources = i.enc == Encoding::Vop1 ? 1 : 2;
@@ -380,10 +386,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             auto control=take();
             // DPP_CTRL[8] selects patterns outside a quad; bit 17 is
             // reserved. FI and BOUND_CTRL are independent of the pattern.
-            if ((control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
+            if (!half_alu && (control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
             if (control & (1u << 17)) refuse(pc,"reserved DPP16 control bit");
             const auto pattern = (control >> 8) & 0x1ff;
             i.dpp_control = pattern;
+            i.dpp_row_mask = control >> 28;
+            i.dpp_bank_mask = (control >> 24) & 15;
             if (pattern > 255 && !i.mirror_mask() && i.dpp_row().op == Inst::DppRowOp::None)
                 refuse(pc,"unsupported DPP lane selection");
             i.dpp_fetch_inactive = (control & (1u << 18)) != 0;
@@ -429,7 +437,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     if(i.next-pc!=encoded.size)refuse(pc,"instruction extent mismatch for "+string(encoded.name));
     return i;
 }
-// VOP3B carries a scalar destination in the field used for ABS in VOP3A.
+// VOP2 (including SDWA) writes carry to VCC. VOP3B encodes its own scalar destination.
 static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
@@ -1091,8 +1099,8 @@ struct Emit {
             }
     }
     void require_numeric(const Inst &i, unsigned reg, unsigned limit = 106) const {
-        if (reg < limit && !program.before[program.at.at(i.pc)][reg].numeric())
-            refuse(i.pc, "unbound numeric SGPR s" + to_string(reg));
+        if ((reg < limit || reg == 124) && !program.before[program.at.at(i.pc)][reg].numeric())
+            refuse(i.pc, reg == 124 ? "unbound numeric M0" : "unbound numeric SGPR s" + to_string(reg));
     }
     void scalar(const Inst &i) {
         auto n = i.name;
@@ -1617,6 +1625,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     State initial{};
     for (unsigned k = 0; k <= 105; ++k)
         initial[k].type = Symbol::Type::unbound;
+    initial[124].type = Symbol::Type::unbound; // RDNA2 M0 is a separate 32-bit register.
     std::vector<ComputeConstants> constants;
     if (stage) {
         std::array<bool,32> assigned{};

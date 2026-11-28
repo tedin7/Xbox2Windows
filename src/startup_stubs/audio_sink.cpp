@@ -124,7 +124,10 @@ void AudioSink::observe(bool withholding)
 Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* bytes)
 {
     const uint32_t call = calls_++;
-    if (!p_) return Submit::NotOpen;
+    if (!p_) {
+        ++r_.not_open;
+        return Submit::NotOpen;
+    }
     ResampleState trial = resample_;  // committed only once the block is accepted
     if (!convert_block(in, bytes, frames, mix_, conv_buf_, &trial)) {
         ++r_.unsupported;
@@ -132,7 +135,10 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
     }
     const uint32_t out_frames = static_cast<uint32_t>(conv_buf_.size() / mix_.frame_bytes());
     const uint32_t pad = padding();
-    if (pad == padding_failed) return Submit::NotOpen;
+    if (pad == padding_failed) {
+        ++r_.not_open;
+        return Submit::NotOpen;
+    }
     if (out_frames > buffer_frames_ - pad) {
         ++r_.rejected_full;
         return Submit::Full;
@@ -141,9 +147,15 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
     if (timer_.drained_start >= 0) timer_.resume(now_ms(), r_.consumed_frames);  // the producer is back
     if (out_frames > 0) {
         BYTE* dst = nullptr;
-        if (FAILED(p_->render->GetBuffer(out_frames, &dst)) || !dst) return Submit::NotOpen;
+        if (FAILED(p_->render->GetBuffer(out_frames, &dst)) || !dst) {
+            ++r_.not_open;
+            return Submit::NotOpen;
+        }
         std::memcpy(dst, conv_buf_.data(), conv_buf_.size());
-        if (FAILED(p_->render->ReleaseBuffer(out_frames, 0))) return Submit::NotOpen;
+        if (FAILED(p_->render->ReleaseBuffer(out_frames, 0))) {
+            ++r_.not_open;
+            return Submit::NotOpen;
+        }
     }
     resample_ = std::move(trial);
     if (r_.first_block < 0) {
@@ -153,6 +165,7 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
     r_.frames.push_back(out_frames);
     r_.peaks.push_back(block_peak(in, bytes, frames));
     r_.submitted_frames += out_frames;
+    ++r_.accepted;
     if (!started_ && SUCCEEDED(p_->client->Start())) started_ = true;
     return Submit::Accepted;
 }

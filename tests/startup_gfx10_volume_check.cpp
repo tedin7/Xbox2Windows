@@ -1,16 +1,19 @@
-// Checks the volume layout of src/startup_stubs/gfx10_layout.h (a single-mip 3D texture in the 4 KiB
-// standard mode, 0x105, which addrlib lays out in thick blocks) without a device:
+// Checks the volume layout of src/startup_stubs/gfx10_layout.h (a 3D texture in the 4 KiB standard mode,
+// 0x105, which addrlib lays out in thick blocks) without a device:
 // - the address bit of every x, y and z bit against the one-pipe rows of addrlib's GFX10_SW_4K_S3_PATINFO,
 //   restated below, and the block each element size gives;
 // - the order of blocks: along x, then y, then a layer of blocks at a time along z, with the sides of
 //   the texture padded to whole blocks;
+// - a mip chain: each layer of blocks holds the tail block, then the mips from the smallest to the largest,
+//   and the tail mips sit at their origins inside the tail block;
 // - that every element of a volume gets its own bytes inside the texture, and that a tile followed by a
-//   detile (with padded row and layer pitches) returns the texels it started from;
+//   detile (with padded row and layer pitches) returns the texels it started from, for every mip;
 // - the descriptions it takes and refuses, and the slot-70 views it allows on them.
 // `--addrlib` compares the size and every element address of a set of volumes with
 // Addr2ComputeSurfaceInfo and Addr2ComputeSurfaceAddrFromCoord (ADDR_RSRC_TEX_3D, ADDR_SW_4KB_S) and
 // skips (77) when the build has no addrlib. `--mutate thin` lays each volume out as a thin 2D array of
-// its depth layers and is the negative control: it must fail.
+// its depth layers, and `--mutate tail` puts every mip of the tail at the start of the tail block; both
+// are negative controls and must fail.
 //
 // Reference: AMD addrlib as Mesa carries it under src/amd/addrlib, at the revision tools/fetch_addrlib.py
 // pins (Mesa 25.1.0, commit 5c142e46f3f6e752ed745fd48912ebb8fad67145): src/gfx10/gfx10SwizzlePattern.h,
@@ -21,6 +24,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/gfx10_layout.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -29,7 +33,8 @@
 namespace {
 using x2w_startup::gfx10::Layout;
 int failures = 0;
-bool thin = false; // --mutate thin
+bool thin = false;      // --mutate thin
+bool flat_tail = false; // --mutate tail
 
 void fail(const std::string& what)
 {
@@ -50,15 +55,18 @@ D3D12_RESOURCE_DESC volume(UINT width, UINT height, UINT depth, DXGI_FORMAT form
     return d;
 }
 
-// The layout under test; the control reads the volume as a thin array of its layers.
+// The layout under test; the controls read the volume as a thin array of its layers, or move every tail
+// mip to the start of the tail block.
 Layout layout_of(D3D12_RESOURCE_DESC d)
 {
     if (thin) d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    return Layout(d);
+    Layout l(d);
+    for (UINT mip = l.first_tail; flat_tail && mip < l.mips; ++mip) l.origin_x[mip] = l.origin_y[mip] = 0;
+    return l;
 }
-std::uint64_t at(const Layout& l, UINT x, UINT y, UINT z)
+std::uint64_t at(const Layout& l, UINT x, UINT y, UINT z, UINT mip = 0)
 {
-    return thin ? l.address(0, x, y, z) : l.address(0, x, y, 0, z);
+    return thin ? l.address(mip, x, y, z) : l.address(mip, x, y, 0, z);
 }
 
 // One format per element size: 1, 2, 4, 8 and 16 bytes.
@@ -111,23 +119,54 @@ void check_block_order()
     expect("last element", at(l, 16, 16, 16), (2ull * 6 + 1 * 3 + 2) * 4096);
 }
 
+// 32x32x32 RGBA8 with six mips, in 8x16x8 blocks. Mips 2 to 5 (8x8 and smaller, at most five from the
+// end) share the tail block. A layer of blocks holds the tail block, mip 1 (2x1 blocks) and mip 0 (4x2
+// blocks): 11 blocks. The tail mips sit at byte (k << 8) of the tail block for k = 4, 3, 2, 1, read as
+// 4x4x4 micro blocks: (0,8), (4,4), (4,0) and (0,4).
+void check_mip_chain()
+{
+    const Layout l = layout_of(volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105, 6));
+    const auto expect = [](const char* what, std::uint64_t got, std::uint64_t want) {
+        if (got != want) fail(std::string("mip chain: ") + what + " " + std::to_string(got) + ", expected " + std::to_string(want));
+    };
+    expect("bytes", l.bytes(), 4ull * 11 * 4096);
+    expect("mip 0", at(l, 0, 0, 0, 0), 3 * 4096);
+    expect("mip 0 next row of blocks", at(l, 0, 16, 0, 0), 7 * 4096);
+    expect("mip 0 next layer of blocks", at(l, 0, 0, 8, 0), 14 * 4096);
+    expect("mip 1", at(l, 0, 0, 0, 1), 4096);
+    expect("mip 1 next block in x", at(l, 8, 0, 0, 1), 2 * 4096);
+    expect("mip 1 next layer of blocks", at(l, 0, 0, 8, 1), 12 * 4096);
+    expect("mip 2 at (0,8)", at(l, 0, 0, 0, 2), 0x800); // y 8: Y3, bit 11
+    expect("mip 3 at (4,4)", at(l, 0, 0, 0, 3), 0x300); // x 4: X2, bit 9; y 4: Y2, bit 8
+    expect("mip 4 at (4,0)", at(l, 0, 0, 0, 4), 0x200);
+    expect("mip 5 at (0,4)", at(l, 0, 0, 0, 5), 0x100);
+    expect("mip 2 next layer of blocks", at(l, 0, 0, 8, 2), 11 * 4096 + 0x800);
+}
+
 struct Shape {
     UINT width, height, depth;
     DXGI_FORMAT format;
+    UINT mips = 1;
 };
 const Shape shapes[] = {
     {17, 17, 17, DXGI_FORMAT_R16G16B16A16_FLOAT}, {32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM}, {33, 33, 33, DXGI_FORMAT_R16G16B16A16_FLOAT},
     {32, 32, 32, DXGI_FORMAT_A8_UNORM},           {16, 16, 8, DXGI_FORMAT_R16_FLOAT},       {16, 16, 16, DXGI_FORMAT_R8G8_UNORM},
     {32, 32, 32, DXGI_FORMAT_R10G10B10A2_UNORM},  {5, 3, 7, DXGI_FORMAT_R32G32B32A32_FLOAT}, {1, 1, 2, DXGI_FORMAT_R8_UNORM},
     {64, 8, 40, DXGI_FORMAT_R32_FLOAT},
+    // Mip chains: whole and partial, a tail that starts at mip 0, a chain with no tail, odd sides.
+    {32, 32, 32, DXGI_FORMAT_R8_UNORM, 6},           {32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 6},
+    {64, 64, 32, DXGI_FORMAT_R16G16_FLOAT, 7},       {128, 128, 128, DXGI_FORMAT_R16G16B16A16_FLOAT, 8},
+    {16, 16, 16, DXGI_FORMAT_R32G32B32A32_FLOAT, 5}, {8, 4, 8, DXGI_FORMAT_R8G8B8A8_UNORM, 4},
+    {64, 64, 64, DXGI_FORMAT_R16_FLOAT, 2},          {33, 17, 9, DXGI_FORMAT_R16G16B16A16_FLOAT, 6},
+    {4, 4, 64, DXGI_FORMAT_R8_UNORM, 7},             {256, 32, 8, DXGI_FORMAT_R16_FLOAT, 9},
 };
 
 void check_distinct_and_round_trip()
 {
     for (const Shape& s : shapes) {
-        const D3D12_RESOURCE_DESC d = volume(s.width, s.height, s.depth, s.format);
+        const D3D12_RESOURCE_DESC d = volume(s.width, s.height, s.depth, s.format, 0x105, s.mips);
         const std::string name = std::to_string(s.width) + "x" + std::to_string(s.height) + "x" + std::to_string(s.depth) +
-                                 " format " + std::to_string(s.format);
+                                 " format " + std::to_string(s.format) + " mips " + std::to_string(s.mips);
         if (!x2w_startup::gfx10::supports(d)) {
             fail(name + ": refused");
             continue;
@@ -136,32 +175,39 @@ void check_distinct_and_round_trip()
         const UINT e = l.bytes_per_element;
         const std::uint64_t size = l.bytes();
         std::vector<unsigned char> used(static_cast<std::size_t>(size));
+        // Every element of every mip has its own bytes.
         bool clash = false;
-        for (UINT z = 0; z < s.depth; ++z)
-            for (UINT y = 0; y < s.height; ++y)
-                for (UINT x = 0; x < s.width; ++x) {
-                    const std::uint64_t a = at(l, x, y, z);
-                    if (a % e || a + e > size) {
-                        clash = true;
-                        continue;
+        for (UINT mip = 0; mip < s.mips; ++mip)
+            for (UINT z = 0; z < l.layers(mip); ++z)
+                for (UINT y = 0; y < l.rows(mip); ++y)
+                    for (UINT x = 0; x < l.columns(mip); ++x) {
+                        const std::uint64_t a = at(l, x, y, z, mip);
+                        if (a % e || a + e > size) {
+                            clash = true;
+                            continue;
+                        }
+                        if (used[static_cast<std::size_t>(a)]) clash = true;
+                        used[static_cast<std::size_t>(a)] = 1;
                     }
-                    if (used[static_cast<std::size_t>(a)]) clash = true;
-                    used[static_cast<std::size_t>(a)] = 1;
-                }
         if (clash) fail(name + ": elements share bytes or fall outside the texture");
         if (thin) continue;
-        const std::size_t pitch = (std::size_t{s.width} * e + 255) & ~std::size_t{255}, layer = pitch * (s.height + 1);
-        std::vector<unsigned char> rows(layer * s.depth), back(rows.size()), tiled(static_cast<std::size_t>(size));
-        for (std::size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<unsigned char>(i * 131 + 7);
-        l.tile(0, 0, tiled.data(), rows.data(), pitch, layer);
-        l.detile(0, 0, tiled.data(), back.data(), pitch, layer);
-        for (UINT z = 0; z < s.depth; ++z)
-            for (UINT y = 0; y < s.height; ++y)
-                if (std::memcmp(&rows[z * layer + y * pitch], &back[z * layer + y * pitch], std::size_t{s.width} * e)) {
-                    fail(name + ": round trip differs at layer " + std::to_string(z) + " row " + std::to_string(y));
-                    z = s.depth;
-                    break;
-                }
+        std::vector<unsigned char> tiled(static_cast<std::size_t>(size));
+        for (UINT mip = 0; mip < s.mips; ++mip) {
+            const UINT w = l.columns(mip), h = l.rows(mip), n = l.layers(mip);
+            const std::size_t pitch = (std::size_t{w} * e + 255) & ~std::size_t{255}, layer = pitch * (h + 1);
+            std::vector<unsigned char> rows(layer * n), back(rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<unsigned char>(i * 131 + 7 + mip);
+            l.tile(mip, 0, tiled.data(), rows.data(), pitch, layer);
+            l.detile(mip, 0, tiled.data(), back.data(), pitch, layer);
+            for (UINT z = 0; z < n; ++z)
+                for (UINT y = 0; y < h; ++y)
+                    if (std::memcmp(&rows[z * layer + y * pitch], &back[z * layer + y * pitch], std::size_t{w} * e)) {
+                        fail(name + ": round trip differs in mip " + std::to_string(mip) + " at layer " + std::to_string(z) +
+                             " row " + std::to_string(y));
+                        z = n;
+                        break;
+                    }
+        }
     }
 }
 
@@ -173,8 +219,12 @@ void check_descriptions()
     const D3D12_RESOURCE_DESC good = volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM);
     supported("4 KiB standard RGBA8", good, true);
     D3D12_RESOURCE_DESC d = good;
-    d.MipLevels = 2;
-    supported("two mips", d, false);
+    d.MipLevels = 6;
+    supported("a whole mip chain", d, true);
+    d.MipLevels = 16;
+    supported("more mips than a layout holds", d, false);
+    d.MipLevels = 0;
+    supported("no mips", d, false);
     supported("BC1", volume(32, 32, 32, DXGI_FORMAT_BC1_UNORM), false);
     supported("BC7", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM), false);
     supported("4 KiB display", volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 0x106), false);
@@ -203,7 +253,10 @@ void check_descriptions()
     address("BC7", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM), false);
     d = good;
     d.MipLevels = 6;
-    address("mip chain", d, false);
+    address("mip chain", d, true);
+    d.MipLevels = 7;
+    address("more mips than the sides allow", d, false);
+    address("mips the depth allows", volume(4, 4, 64, DXGI_FORMAT_R8_UNORM, 0x105, 7), true);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC v{};
     v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -215,6 +268,14 @@ void check_descriptions()
     if (!x2w_startup::address_view_fits(good, v)) fail("view: one mip");
     v.Texture3D.MostDetailedMip = 1;
     if (x2w_startup::address_view_fits(good, v)) fail("view: mip past the volume");
+    D3D12_RESOURCE_DESC chain = good;
+    chain.MipLevels = 6;
+    v.Texture3D.MostDetailedMip = 2;
+    v.Texture3D.MipLevels = 4;
+    if (!x2w_startup::address_view_fits(chain, v)) fail("view: the last four mips of a chain");
+    v.Texture3D.MipLevels = 5;
+    if (x2w_startup::address_view_fits(chain, v)) fail("view: mips past the chain");
+    v.Texture3D.MipLevels = 1;
     v.Texture3D.MostDetailedMip = 0;
     D3D12_RESOURCE_DESC typeless = good;
     typeless.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
@@ -269,11 +330,18 @@ int addrlib_check()
     if (AddrCreate(&create, &created) != ADDR_OK) return 1;
     const AddrFormat addr_formats[5] = {ADDR_FMT_8, ADDR_FMT_16, ADDR_FMT_8_8_8_8, ADDR_FMT_16_16_16_16, ADDR_FMT_32_32_32_32};
     std::vector<D3D12_RESOURCE_DESC> cases;
-    for (const Shape& s : shapes) cases.push_back(volume(s.width, s.height, s.depth, s.format));
+    for (const Shape& s : shapes) cases.push_back(volume(s.width, s.height, s.depth, s.format, 0x105, s.mips));
     for (UINT size = 0; size < 5; ++size)
         for (UINT w : {1u, 3u, 9u, 24u})
             for (UINT h : {1u, 7u, 17u})
                 for (UINT dep : {1u, 5u, 18u}) cases.push_back(volume(w, h, dep, by_size[size]));
+    // Every mip count of a set of chains, so that each mip in turn is the first in the tail or the last
+    // outside it.
+    constexpr UINT chains[4][3] = {{64, 64, 64}, {40, 24, 12}, {17, 33, 5}, {8, 8, 32}};
+    for (UINT size = 0; size < 5; ++size)
+        for (const auto& side : chains)
+            for (UINT mips = 2; ((std::max)({side[0], side[1], side[2]}) >> (mips - 1)) != 0; ++mips)
+                cases.push_back(volume(side[0], side[1], side[2], by_size[size], 0x105, mips));
     unsigned compared = 0, elements = 0, mismatches = 0;
     for (const D3D12_RESOURCE_DESC& d : cases) {
         const Layout l(d);
@@ -291,47 +359,49 @@ int addrlib_check()
         in.width = l.width;
         in.height = l.height;
         in.numSlices = l.depth;
-        in.numMipLevels = 1;
+        in.numMipLevels = l.mips;
         in.numSamples = 1;
         in.numFrags = 1;
         ++compared;
         char name[64];
-        std::snprintf(name, sizeof name, "%ux%ux%u %u-byte", l.width, l.height, l.depth, l.bytes_per_element);
+        std::snprintf(name, sizeof name, "%ux%ux%u %u-byte %u mips", l.width, l.height, l.depth, l.bytes_per_element, l.mips);
         if (Addr2ComputeSurfaceInfo(created.hLib, &in, &out) != ADDR_OK || out.surfSize != l.bytes()) {
             if (++mismatches <= 12)
                 std::printf("FAIL %s: size 0x%llx, addrlib 0x%llx\n", name, static_cast<unsigned long long>(l.bytes()),
                             static_cast<unsigned long long>(out.surfSize));
             continue;
         }
-        for (UINT z = 0; z < l.depth; ++z)
-            for (UINT y = 0; y < l.height; ++y)
-                for (UINT x = 0; x < l.width; ++x) {
-                    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT ain{};
-                    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT aout{};
-                    ain.size = sizeof ain;
-                    aout.size = sizeof aout;
-                    ain.x = x;
-                    ain.y = y;
-                    ain.slice = z;
-                    ain.swizzleMode = ADDR_SW_4KB_S;
-                    ain.flags.texture = 1;
-                    ain.resourceType = ADDR_RSRC_TEX_3D;
-                    ain.bpp = in.bpp;
-                    ain.unalignedWidth = l.width;
-                    ain.unalignedHeight = l.height;
-                    ain.numSlices = l.depth;
-                    ain.numMipLevels = 1;
-                    ain.numSamples = 1;
-                    ain.numFrags = 1;
-                    ain.pitchInElement = out.pitch;
-                    ++elements;
-                    const std::uint64_t mine = l.address(0, x, y, 0, z);
-                    if (Addr2ComputeSurfaceAddrFromCoord(created.hLib, &ain, &aout) != ADDR_OK || aout.addr != mine) {
-                        if (++mismatches <= 12)
-                            std::printf("FAIL %s (%u,%u,%u): 0x%llx, addrlib 0x%llx\n", name, x, y, z,
-                                        static_cast<unsigned long long>(mine), static_cast<unsigned long long>(aout.addr));
+        for (UINT mip = 0; mip < l.mips; ++mip)
+            for (UINT z = 0; z < l.layers(mip); ++z)
+                for (UINT y = 0; y < l.rows(mip); ++y)
+                    for (UINT x = 0; x < l.columns(mip); ++x) {
+                        ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT ain{};
+                        ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT aout{};
+                        ain.size = sizeof ain;
+                        aout.size = sizeof aout;
+                        ain.x = x;
+                        ain.y = y;
+                        ain.slice = z;
+                        ain.mipId = mip;
+                        ain.swizzleMode = ADDR_SW_4KB_S;
+                        ain.flags.texture = 1;
+                        ain.resourceType = ADDR_RSRC_TEX_3D;
+                        ain.bpp = in.bpp;
+                        ain.unalignedWidth = l.width;
+                        ain.unalignedHeight = l.height;
+                        ain.numSlices = l.depth;
+                        ain.numMipLevels = l.mips;
+                        ain.numSamples = 1;
+                        ain.numFrags = 1;
+                        ain.pitchInElement = out.pitch;
+                        ++elements;
+                        const std::uint64_t mine = l.address(mip, x, y, 0, z);
+                        if (Addr2ComputeSurfaceAddrFromCoord(created.hLib, &ain, &aout) != ADDR_OK || aout.addr != mine) {
+                            if (++mismatches <= 12)
+                                std::printf("FAIL %s mip %u (%u,%u,%u): 0x%llx, addrlib 0x%llx\n", name, mip, x, y, z,
+                                            static_cast<unsigned long long>(mine), static_cast<unsigned long long>(aout.addr));
+                        }
                     }
-                }
     }
     AddrDestroy(created.hLib);
     std::printf("startup_gfx10_volume --addrlib: %u volumes, %u element addresses compared, %u mismatches (Mesa 25.1.0 addrlib, "
@@ -343,20 +413,23 @@ int addrlib_check()
 int main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "--addrlib") == 0) return addrlib_check();
-    thin = argc == 3 && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "thin") == 0;
-    if (argc != 1 && !thin) {
-        std::printf("usage: startup_gfx10_volume_check [--addrlib | --mutate thin]\n");
+    const bool mutate = argc == 3 && std::strcmp(argv[1], "--mutate") == 0;
+    thin = mutate && std::strcmp(argv[2], "thin") == 0;
+    flat_tail = mutate && std::strcmp(argv[2], "tail") == 0;
+    if (argc != 1 && !thin && !flat_tail) {
+        std::printf("usage: startup_gfx10_volume_check [--addrlib | --mutate thin | --mutate tail]\n");
         return 2;
     }
     check_equations();
     check_block_order();
+    check_mip_chain();
     check_distinct_and_round_trip();
     check_descriptions();
     if (failures) {
         std::printf("startup_gfx10_volume: %d failures\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_volume: PASS (5 element sizes, block order, %zu round trips, 15 layouts, 6 address descriptions, "
-                "7 views)\n", sizeof(shapes) / sizeof(shapes[0]));
+    std::printf("startup_gfx10_volume: PASS (5 element sizes, block order, a mip chain, %zu volumes round-tripped mip by mip, "
+                "17 layouts, 8 address descriptions, 9 views)\n", sizeof(shapes) / sizeof(shapes[0]));
     return 0;
 }

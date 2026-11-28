@@ -9,6 +9,7 @@ Lowers VOP2 and VOP3 `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and `v_mul_f16` in
 - The operation is an f32 add, sub or mul. An f32 value has a 24-bit significand, which covers a correctly rounded binary16 add, sub or mul.
 - The result is rounded with the same integer round-to-nearest-even conversion `v_cvt_f16_f32` uses. The low 16 bits are written and the high half is zero.
 - `v_subrev_f16` subtracts the first source from the second.
+- DPP16 VOP2 permutes the full src0 VGPR word before selecting its low half and honors FI, BOUND_CTRL, and row and bank write masks.
 
 The bit-exact reference is `half_op` in [`tests/f16_packed_model.py`](../../tests/f16_packed_model.py). NaN results match by class. The check is [`tests/native_f16_alu_check.py`](../../tests/native_f16_alu_check.py).
 
@@ -18,7 +19,7 @@ The SDWA operand profile is covered by the [SDWA experiment](native-sdwa-f16.md)
 
 Each of these is a named diagnostic:
 
-- DPP
+- DPP8
 - clamp or omod
 - a high-half `op_sel` (instruction bits 11 through 14)
 - a binary16 rounding mode other than round-to-nearest-even, an f16 denormal mode other than keep on input and output, or `FP16_OVFL`

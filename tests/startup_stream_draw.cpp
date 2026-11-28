@@ -441,7 +441,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     char placeholder_mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_PLACEHOLDER_DRAW", placeholder_mode, sizeof(placeholder_mode));
     const bool placeholder_fixture = placeholder_mode[0] != 0;
-    const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0) ? 15 : 8;
     const bool pixel_uav_rw = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
     const UINT height = placeholder_fixture ? 8 : mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : pixel_uav_rw ? 8 : 4;
     ComPtr<ID3D12Device> desktop;
@@ -644,6 +644,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_RECT_GAP", nullptr, 0)) {
+        extern int draw_rect_gap(void*, void*);
+        if (const int result = draw_rect_gap(guest, list)) return result;
     } else if (frame_copy) {
         extern int draw_frame_copies(ID3D12Device*, void*, StreamTarget&, void*, UINT, UINT, const char*, const char*);
         const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, frame_copy_mode);

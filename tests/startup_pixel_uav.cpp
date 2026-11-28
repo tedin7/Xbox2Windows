@@ -41,7 +41,7 @@ std::uint32_t array_sentinel(UINT s, UINT m, UINT texel, UINT c) { return 0xd000
 
 struct Fixture {
     ID3D12Device* desktop = nullptr;
-    bool array_mode = false;
+    bool array_mode = false, raw_mode = false;
     bool atomic_mode = false;
     bool read_write = false;
     UINT side = side_default;
@@ -275,6 +275,95 @@ bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t
     return true;
 }
 
+// Two 32-DWORD buffers, distinct sentinels, and an explicit view of words 4..19.
+bool copy_raw(ID3D12Device* device, bool upload, std::vector<std::uint32_t>* words)
+{
+    constexpr UINT bytes = 32 * 4;
+    auto staging = buffer(device, upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, 2 * bytes,
+                          upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
+    Copier copier;
+    if (!staging || !copier.open(device)) return false;
+    std::uint32_t* data = nullptr;
+    if (upload) {
+        if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&data)))) return false;
+        for (UINT i = 0; i < 64; ++i) data[i] = 0xabcd0000u + i;
+        staging->Unmap(0, nullptr);
+    }
+    for (UINT t = 0; t < 2; ++t) {
+        auto* resource = fixture.natives[t].Get();
+        const auto state = upload ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier(copier.list.Get(), resource, D3D12_RESOURCE_STATE_COMMON, state);
+        if (upload) copier.list->CopyBufferRegion(resource, 0, staging.Get(), t * bytes, bytes);
+        else copier.list->CopyBufferRegion(staging.Get(), t * bytes, resource, 0, bytes);
+        barrier(copier.list.Get(), resource, state, D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (!copier.run()) return false;
+    if (upload) return true;
+    if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&data)))) return false;
+    words->assign(data, data + 64);
+    staging->Unmap(0, nullptr);
+    return true;
+}
+
+int draw_raw_uavs(ID3D12Device* desktop, void* guest, void* list, const std::string& mode)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_6};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model))) ||
+        shader_model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+        std::puts("raw pixel UAV: shader model 6.6 unavailable (skip)");
+        return 77;
+    }
+    using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                     const void*, void*, UINT, const void*, REFIID, void**);
+    const auto create = reinterpret_cast<Create>((*static_cast<void***>(guest))[127]);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    for (UINT t = 0; t < 2; ++t) {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 128, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+            {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, t == 1 && mode == "raw-no-ua" ? D3D12_RESOURCE_FLAG_NONE :
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+        if (FAILED(create(guest, &heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
+                          __uuidof(ID3D12Resource), &fixture.resources[t])) || !fixture.resources[t]) return 70;
+        fixture.natives[t] = native_of(guest, fixture.resources[t]);
+        if (!fixture.natives[t]) return 71;
+    }
+    if (!copy_raw(desktop, true, nullptr)) return 72;
+    struct Extended { D3D12_DESCRIPTOR_HEAP_DESC desc; Word address, bytes; };
+    Extended desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* views = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&views))))) return 73;
+    const Word cpu = invoke(views, 9), gpu = invoke(views, 10);
+    const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (!cpu || !gpu || stride < 32) return 73;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+    view.Buffer.FirstElement = 4;
+    const bool atomic = mode.rfind("raw-atomic", 0) == 0;
+    view.Buffer.NumElements = atomic ? 20 : 16;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&view), cpu);
+    if (mode == "raw-short") view.Buffer.NumElements = 8;
+    if (mode == "raw-last") view.Buffer.FirstElement = 16;
+    if (mode == "raw-typed") { view.Format = DXGI_FORMAT_R32_UINT; view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE; }
+    if (mode == "raw-structured") {
+        view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE; view.Buffer.StructureByteStride = 4;
+    }
+    if (mode == "raw-srv") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        srv.Buffer.NumElements = 32; srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        invoke(guest, 18, ptr(fixture.resources[1]), ptr(&srv), cpu + stride);
+    } else if (mode != "raw-missing") {
+        invoke(guest, 19, ptr(fixture.resources[1]), 0, ptr(&view), cpu + stride);
+    }
+    std::printf("raw pixel UAV case %s, title descriptor stride %u\n", mode.c_str(), stride);
+    invoke(list, 32, 1, ptr(&views));
+    if (mode != "raw-no-table") invoke(list, 36, 0, gpu);
+    if (mode == "raw-atomic-edge") {
+        const D3D12_RECT scissor{0, 0, 3, 3};
+        invoke(list, 22, 1, ptr(&scissor));
+    }
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 ID3D12InfoQueue* debug_messages()
 {
     static ComPtr<ID3D12InfoQueue> queue;
@@ -289,6 +378,8 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     GetEnvironmentVariableA("X2W_TEST_PIXEL_UAV", mode, sizeof(mode));
     const std::string which(mode);
     fixture.desktop = desktop;
+    fixture.raw_mode = which.rfind("raw-", 0) == 0;
+    if (fixture.raw_mode) return draw_raw_uavs(desktop, guest, list, which);
     fixture.array_mode = which.rfind("arr-", 0) == 0;
     fixture.atomic_mode = which.rfind("atomic-", 0) == 0;
     fixture.read_write = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
@@ -470,7 +561,8 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
 int report_pixel_uavs(const char* pixels)
 {
     std::vector<std::uint32_t> words;
-    const bool copied = fixture.array_mode ? copy_array(fixture.desktop, false, &words) : copy_all(fixture.desktop, false, &words);
+    const bool copied = fixture.raw_mode ? copy_raw(fixture.desktop, false, &words) :
+        fixture.array_mode ? copy_array(fixture.desktop, false, &words) : copy_all(fixture.desktop, false, &words);
     if (copied) {
         std::ofstream out(std::string(pixels) + ".uav", std::ios::binary);
         out.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));

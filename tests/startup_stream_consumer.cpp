@@ -20,6 +20,13 @@
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
 
+#ifdef OFFSCREEN_AGILITY_620
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
+__declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
+
 using Microsoft::WRL::ComPtr;
 
 static_assert(!x2w_startup::buffer_input_addressing_refusal(0, 0));
@@ -271,8 +278,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const UINT record_offsets[] = {0, range_fixture ? 48u : input_bytes / 2, range_fixture ? 64u : input_bytes - 16};
     const bool shared_uav = mode == "dispatch-read-write-uav";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
+    const bool write_zero = mode == "dispatch-indirect-pixel-zero";
     const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
-    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
+    const UINT groups = mode == "dispatch-indirect-zero" || write_zero || mode == "dispatch-indirect-pixel-omit" ? 0u :
+                        mode == "dispatch-indirect-2" || mode == "dispatch-indirect-pixel-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, (indirect || root_srv) ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
@@ -488,8 +498,37 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    const auto submit = [&](UINT64 value) -> int {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), value)))) return 76;
+        // Render mode publishes the guest fence value after desktop queue completion.
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        for (;;) {
+            const auto completed = invoke(fence, 8);
+            const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
+            if (completed == ~UINT64{0} || FAILED(removed)) {
+                std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
+                return 78;
+            }
+            if (completed == value) break;
+            if (GetTickCount64() >= deadline) {
+                std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
+                return 78;
+            }
+            Sleep(1);
+        }
+        return 0;
+    };
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups, write_zero,
+                                 pixel ? queue : nullptr, pixel ? placed[1] : nullptr);
+    if (pixel) {
+        if (const int rc = submit(1)) return rc;
+        std::printf("guest queue=%p writer fence=1 completed\n", queue);
+        if (!record.check_record(groups, write_zero)) return 80;
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    }
     bind(list);
     if (mode.rfind("dispatch-texel-", 0) == 0) {
         const auto format = mode == "dispatch-texel-float" ? DXGI_FORMAT_R32_FLOAT :
@@ -703,6 +742,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 37, 0, constants[0], 0);
         invoke(list, 39, 0, 1, word(&constants[1]), 1);
     }
+    if (pixel) record.capture_before_consumer(adapter, device, list);
     if (dynamic_heap) invoke(list, 14, 1, 1, 1);
     else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
@@ -825,26 +865,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 15, word(title_readback), 0, word(placed[1]), 0, sizeof(input));
     } else if (mode != "dispatch-none" && mode != "dispatch-root-srv-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    // Render mode publishes the guest fence value after desktop queue completion.
-    const ULONGLONG deadline = GetTickCount64() + 10000;
-    for (;;) {
-        const auto completed = invoke(fence, 8);
-        const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
-        if (completed == ~UINT64{0} || FAILED(removed)) {
-            std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
-            return 78;
-        }
-        if (completed == 1) break;
-        if (GetTickCount64() >= deadline) {
-            std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
-            return 78;
-        }
-        Sleep(1);
+    if (const int rc = submit(pixel ? 2 : 1)) return rc;
+    if (pixel) {
+        std::printf("guest queue=%p consumer fence=2 completed\n", queue);
+        if (!record.check_record(groups, write_zero, true)) return 80;
+        const bool stale = mode == "dispatch-indirect-pixel-5-stale";
+        record.draw_pixels(adapter, device, queue, placed[stale ? 0 : 1], stale);
     }
-    if (indirect && !record.check_record(groups)) return 80;
+    if (indirect && !pixel && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();
@@ -875,19 +903,21 @@ static int texture_slot67(void* device, const std::string& mode)
     const UINT first_mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
     const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
+    const bool atomic_uint = mode == "texture-store-atomic";
     const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
     const UINT subresources = volume ? 1 : layers;
     const bool swapped = mode == "texture-store-mips-swapped";
     const bool dual = swapped || mode == "texture-store-mips";
     const UINT mips = dual ? 2 : 1;
-    const UINT pixel_bytes = fp32 ? 16 : 8, pitch = width * pixel_bytes;
+    const UINT pixel_bytes = atomic_uint ? 4 : fp32 ? 16 : 8;
+    const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
     const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
     const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+    const DXGI_FORMAT format = atomic_uint ? DXGI_FORMAT_R32_UINT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
         D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -902,7 +932,12 @@ static int texture_slot67(void* device, const std::string& mode)
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    if (fp32) {
+    if (atomic_uint) {
+        auto* words = static_cast<UINT*>(memory);
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x)
+                words[y * pitch / sizeof(UINT) + x] = 0x10f00000u + y * width + x;
+    } else if (fp32) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;

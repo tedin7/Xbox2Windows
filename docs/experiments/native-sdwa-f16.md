@@ -16,6 +16,8 @@ Direct wave32 compute SDWA VOPC compares can write a 32-bit mask to `vcc_hi` and
 
 ## Fixture
 
+The wave32 GPU fixture also covers SDWA packed RTZ f32-to-f16 placement and add-with-carry, including per-lane VCC input and output before destination placement.
+
 The fixture compares the IR and hardware results against the same exact binary16
 model as the plain-form fixture. The hardware run dispatches two wave32 groups,
 with one lane per group writing the case words. Every untouched word must keep

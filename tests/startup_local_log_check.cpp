@@ -713,12 +713,48 @@ void test_protected_prefix_not_counted()
     check(judged, "one round kept the free tail free to be judged");
 }
 
+// Without a debugger and without X2W_PROBE_PRECHECK the pre-check is off: a free range is still refused, but by
+// the touch / __try path (nothing counted in faults_avoided) and the touch is a real first-chance fault.
+int precheck_off_child()
+{
+    if (IsDebuggerPresent()) return 0;  // a debugger turns the pre-check on by design
+    constexpr std::size_t kPage = 0x1000;
+    counted_thread = static_cast<LONG>(GetCurrentThreadId());
+    void* const handler = AddVectoredExceptionHandler(1, count_first_chance);
+    int judged = 0, refused = 0, counted_rounds = 0, faulted = 0;
+    for (int round = 0; round < 40 && judged < 5; ++round) {
+        void* const block = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!block) continue;
+        const auto base = reinterpret_cast<std::uintptr_t>(block);
+        VirtualFree(block, 0, MEM_RELEASE);
+        if (!range_is_free(base, kPage)) continue;
+        InterlockedExchange(&first_chance_faults, 0);
+        const LONG before = x2w_local::faults_avoided;
+        const bool zero = x2w_local::probe_readable(base, 16) == 0;
+        const LONG faults = first_chance_faults;
+        const LONG counted = x2w_local::faults_avoided - before;
+        if (!range_is_free(base, kPage)) continue;
+        ++judged;
+        if (zero) ++refused;
+        if (counted != 0) ++counted_rounds;
+        if (faults != 0) ++faulted;
+    }
+    RemoveVectoredExceptionHandler(handler);
+    check(judged >= 5, "precheck off: enough rounds judged");
+    check(refused == judged, "precheck off: a free range is still not readable");
+    check(counted_rounds == 0, "precheck off: no refusal is counted as an avoided fault");
+    check(faulted == judged, "precheck off: the free range is found by the touch, one first-chance fault each");
+    std::printf("startup_local_log precheck off: %d of %d FAILED\n", failures, cases);
+    return failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     const bool two_args = argc == 3;
     if (two_args && std::strcmp(argv[1], "--phase") == 0) {
+        if (std::strcmp(argv[2], "precheck-off") == 0) return precheck_off_child();
         if (std::strcmp(argv[2], "concurrency") == 0) return concurrency_child(false);
         if (std::strcmp(argv[2], "concurrency-reopen") == 0) return concurrency_child(true);
         if (std::strcmp(argv[2], "recovery-missing") == 0) return recovery_child(Recovery::missing);
@@ -757,6 +793,7 @@ int main(int argc, char** argv)
         std::printf("startup_local_log: wrap control %d of %d FAILED\n", failures, cases);
         return failures ? 1 : 0;
     }
+    SetEnvironmentVariableA("X2W_PROBE_PRECHECK", "1");  // the pre-check cases below need it on (read once)
     test_env_on();
     test_first_calls();
     test_first_calls_wrap(false);

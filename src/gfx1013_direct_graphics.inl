@@ -805,6 +805,7 @@ struct GraphicsMaskRegions {
                 if (two_arms && (j == middle || j == middle + 1)) continue;
                 if (body.pc != program.code[j - 1].next || body.next != program.code[j + 1].pc ||
                     !(local_alu(body) || body.name == "s_waitcnt" || body.name == "s_nop" ||
+                      (!vertex && body.name == "buffer_atomic_add" && !(body.a & 0x2000)) ||
                       (body.enc == Encoding::Image && body.op == 0x27)))
                     refuse(body.pc, "masked graphics region requires lane-local vector arithmetic");
             }
@@ -1771,7 +1772,8 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             i.enc != Encoding::Sop1 && i.enc != Encoding::Sop2 && i.enc != Encoding::Sopk &&
             i.enc != Encoding::Export &&
             !(i.name == "v_mov_b32" && i.dst >= 256 && !i.dpp_control && !i.subword) &&
-            !(i.enc==Encoding::Image && i.op>=0x20 && i.op<=0x3f))
+            !(i.enc==Encoding::Image && i.op>=0x20 && i.op<=0x3f) &&
+            !(i.name == "buffer_atomic_add" && !(i.a & 0x2000)))
             refuse(pc,"unsupported exact-mask operation after whole-quad entry");
         if ((i.name == "s_wqm_b32" || i.name == "s_wqm_b64") && i.dst == 126 && i.src[0] == 126) {
             if (!stage.wave32 && i.name == "s_wqm_b32")
@@ -1942,8 +1944,19 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             i.name.find("mbcnt") != Name::npos || i.name == "v_cndmask_b32")
             refuse(i.pc, "graphics wave or control-flow instruction");
         if (i.enc == Encoding::Smem || i.enc == Encoding::Mubuf) {
-            if (i.name.find("atomic") != Name::npos)
-                refuse(i.pc, "graphics buffer atomic");
+            if (i.name.find("atomic") != Name::npos) {
+                // ponytail: branch splitting stays inside one guest block; general
+                // graphics CFG edges would need to track the new predecessor labels.
+                if (!pixel || i.name != "buffer_atomic_add" || (i.a & 0x2000) || !straight)
+                    refuse(i.pc, "graphics buffer atomic requires a straight-line pixel raw DWORD add");
+                if (whole_quad && !exact_after_wqm)
+                    refuse(i.pc, "pixel atomic requires exact coverage after WQM");
+                auto pred = covered_lane();
+                if (!alu.graphics_predicate.empty())
+                    pred = alu.ir.value("and i1 " + pred + ", " + alu.graphics_predicate);
+                alu.buffer_atomic(i, state, pred);
+                return;
+            }
             alu.memory(i, state);
             if (i.name == "buffer_load_format" && (i.a & 0x3ffffu) == 0 && alu.graphics_predicate.empty()) {
                 // A read-only uniform table entry and the literal element zero

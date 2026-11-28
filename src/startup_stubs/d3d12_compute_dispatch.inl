@@ -38,6 +38,7 @@ struct ComputeTranslation {
         bool load = false;  // typed UAV load for a partial image store
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
         bool root = false;
+        bool atomic_uint_texture = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -332,6 +333,12 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
+                 whole() && i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            tr.uavs.back().atomic_uint_texture = true;
+        }
         else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels 4%n", &i, name, &a, &b, &used) == 4 && whole() &&
                  i == tr.uavs.size() && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
             tr.uavs.push_back({a, b, true});
@@ -608,7 +615,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         ID3D12Resource* resource;
         u64 offset, bytes;
         bool transition, texture, described;
-        unsigned char desc[40];  // a texture view's description, as the title gave it with a desktop format
+        union {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+        } desc;  // a texture view's description, as the title gave it with a desktop format
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
@@ -616,7 +626,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         ID3D12Resource* snapshot;     // its copy from before the dispatch, bound as the input (held by the recording)
     } views[40]{};
     bool formatted_inputs[32]{};  // input count is bounded by the manifest parser
-    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
+    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) >= ViewRecord::srv_desc_bytes);
+    static_assert(sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) >= ViewRecord::uav_desc_bytes);
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
     draw_lock_acquire_exclusive();
@@ -746,8 +757,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
             if (!output) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-                const bool described = record.desc_bytes >= sizeof(desc);
-                if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+                const bool described = record.desc_bytes >= ViewRecord::srv_desc_bytes;
+                if (described) std::memcpy(&desc, record.desc, ViewRecord::srv_desc_bytes);
                 if (desc.Format) desc.Format = desktop_format(desc.Format);
                 words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
@@ -781,13 +792,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
                 views[i] = {texture, 0, 0, true, true, described};
-                std::memcpy(views[i].desc, &desc, sizeof(desc));
+                views[i].desc.srv = desc;
                 views[i].wrapper = wrapper;
                 continue;
             }
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-            const bool described = record.desc_bytes >= sizeof(desc);
-            if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+            const bool described = record.desc_bytes >= ViewRecord::uav_desc_bytes;
+            if (described) std::memcpy(&desc, record.desc, ViewRecord::uav_desc_bytes);
             if (desc.Format) desc.Format = desktop_format(desc.Format);
             const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
             words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
@@ -826,7 +837,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
+                reason = "an image atomic requires an R32_UINT UAV";
+            if (!reason && !slot.atomic_uint_texture && !float_output_format(format))
+                reason = "an output texture format is not a float or normalized one";
             if (!reason && slot.load) {
                 D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
                 auto* device = device_of(self->own().list_device);
@@ -840,7 +854,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].wrapper == wrapper) views[input].aliased_output = true;
             views[i] = {texture, 0, 0, true, true, described};
-            std::memcpy(views[i].desc, &desc, sizeof(desc));
+            views[i].desc.uav = desc;
             views[i].wrapper = wrapper;
             continue;
         }
@@ -1022,7 +1036,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             ID3D12Resource* const shader_input = view.snapshot ? view.snapshot : view.resource;
             require_state(self, shader_input, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, shader_input) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            const auto* desc = view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr;
+            const auto* desc = view.described ? &view.desc.srv : nullptr;
             const auto dimension = tr->srvs[i].srv_dimension;
             const UINT integer = shader_input ? integer_view_type(desc ? desc->Format : shader_input->GetDesc().Format) : 0;
             if (const auto* twin = tr->integer_srvs.find(static_cast<UINT>(i))) {
@@ -1047,7 +1061,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (view.resource) require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (view.texture) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
-                view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
+                view.described ? &view.desc.uav : nullptr, dest);
             continue;
         }
         if (view.wrapper) retire_hold(self, view.wrapper);

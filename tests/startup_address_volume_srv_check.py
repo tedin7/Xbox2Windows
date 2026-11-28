@@ -38,9 +38,10 @@ def check_refusal_lines(log):
         + res_base
         + r" view\{dim=8 fmt=28 map=0x1688 mostmip=1 mips=1 clamp=1\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
-        # 5. Wrong layout (0x105)
+        # 5. A console layout (0x105) over the live desktop-layout volume: the description is one slot 70
+        #    reads by address, but the address is inside a live resource.
         prefix
-        + r"unsupported memory SRV arguments: reason=unsupported_description "
+        + r"unavailable texture at the supplied base and layout: reason=overlapping_resource "
         + res_swizzle
         + r" view\{dim=8 fmt=28 map=0x1688 mostmip=1 mips=1 clamp=0\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",

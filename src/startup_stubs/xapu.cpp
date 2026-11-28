@@ -4,8 +4,10 @@
 #define X2W_TRAP_MODULE_ID 3
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/audio_telemetry.h"
 #include <timeapi.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #ifdef X2W_HAVE_OPUS
@@ -28,6 +30,8 @@
 // Older untyped-format fixtures describe their decode rate and buffer layout on the type 3 command.
 // Type 2 frees the slot's decoder and type 5 resets it. A command with no packet completes with 0 bytes.
 // A refused decode returns an error, queues nothing and leaves the output untouched.
+// The same build keeps bounded counters for decoded packets, dequeued decoded completions and
+// refusals by reason, and writes one stable summary at the last disconnect and at process exit.
 namespace {
 using u64 = std::uint64_t;
 constexpr long hr_ok = 0;
@@ -50,6 +54,7 @@ struct QueueEntry {
     std::uint32_t slot = 0;
     std::uint32_t value = 0;  // typed result +0x34: decoded bytes of a type 3 command
 #ifdef X2W_HAVE_OPUS
+    bool decoded = false;     // this result came from a successful libopus call
     bool stream_command = false;
     unsigned char command_tag[16]{}; // sequence, options, caller context
     std::uint32_t frames = 0, input_bytes = 0;
@@ -88,6 +93,64 @@ SRWLOCK connection_lock = SRWLOCK_INIT;
 Connection* connections = nullptr;
 u64 next_handle = 0x5841500000000001ULL;
 bool timer_active = false;
+
+#ifdef X2W_HAVE_OPUS
+// Telemetry for the optional decode path. It starts with the first readable type-3 command, so a
+// default run with typed completions off reads and writes nothing here.
+x2w_audio::OpusCounters opus_counts;
+std::atomic<bool> opus_counters_on{false};
+SRWLOCK opus_summary_lock = SRWLOCK_INIT;
+x2w_audio::OpusCounterSnapshot reported_opus_counts{};
+
+bool same_opus_counts(const x2w_audio::OpusCounterSnapshot& a, const x2w_audio::OpusCounterSnapshot& b) noexcept
+{
+    return a.type3_commands == b.type3_commands && a.packets_decoded == b.packets_decoded &&
+           a.decoded_completions == b.decoded_completions && a.refused_header == b.refused_header &&
+           a.refused_short_command == b.refused_short_command &&
+           a.refused_unknown_handle == b.refused_unknown_handle &&
+           a.refused_queue_full == b.refused_queue_full &&
+           a.refused_invalid_argument == b.refused_invalid_argument &&
+           a.refused_opus_error == b.refused_opus_error && a.refused_capacity == b.refused_capacity &&
+           a.refused_out_of_memory == b.refused_out_of_memory;
+}
+
+// Writes the totals since the previous summary, when they moved. Called at the last disconnect and
+// from atexit, so a run that never disconnects still ends with one line on stderr and X2W_TRAP_LOG.
+void log_opus_summary() noexcept
+{
+    if (!opus_counters_on.load(std::memory_order_relaxed)) return;
+    const x2w_audio::OpusCounterSnapshot now = x2w_audio::snapshot(opus_counts);
+    AcquireSRWLockExclusive(&opus_summary_lock);
+    const bool changed = !same_opus_counts(now, reported_opus_counts);
+    if (changed) reported_opus_counts = now;
+    ReleaseSRWLockExclusive(&opus_summary_lock);
+    if (!changed || (!now.type3_commands && !x2w_audio::refused_total(now))) return;
+    x2w_local::logf("x2w-audio XApu opus summary: type3=%llu packets=%llu completions=%llu refusals=%llu "
+                    "invalid_argument=%llu opus_error=%llu capacity=%llu queue_full=%llu short_command=%llu "
+                    "unknown_handle=%llu out_of_memory=%llu header=%llu",
+                    static_cast<unsigned long long>(now.type3_commands),
+                    static_cast<unsigned long long>(now.packets_decoded),
+                    static_cast<unsigned long long>(now.decoded_completions),
+                    static_cast<unsigned long long>(x2w_audio::refused_total(now)),
+                    static_cast<unsigned long long>(now.refused_invalid_argument),
+                    static_cast<unsigned long long>(now.refused_opus_error),
+                    static_cast<unsigned long long>(now.refused_capacity),
+                    static_cast<unsigned long long>(now.refused_queue_full),
+                    static_cast<unsigned long long>(now.refused_short_command),
+                    static_cast<unsigned long long>(now.refused_unknown_handle),
+                    static_cast<unsigned long long>(now.refused_out_of_memory),
+                    static_cast<unsigned long long>(now.refused_header));
+}
+
+void start_opus_counters() noexcept
+{
+    bool expected = false;
+    if (!opus_counters_on.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+    std::atexit(log_opus_summary);
+}
+
+enum class DecodeRefusal { none, invalid_argument, opus_error, capacity, out_of_memory };
+#endif
 
 // Makes room for one more entry, so a following place_result cannot fail.
 bool reserve_result(Connection& conn) noexcept
@@ -166,12 +229,16 @@ void drop_decoder(Connection& conn, std::uint32_t slot, bool destroy) noexcept
 }
 
 // Decodes the packet of a type 3 command into a scratch buffer, so a refusal never touches the
-// caller's output. On S_OK, *pcm holds entry.value bytes of float PCM for *dest. Called with
-// connection_lock held, which also guards the scratch buffer.
-long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, const float** pcm, void** dest) noexcept
+// caller's output. On S_OK, *pcm holds entry.value bytes of float PCM for *dest. `decoded_packet`
+// distinguishes a libopus decode from the no-packet completion, and `refusal` names the first check
+// that refused the command. Called with connection_lock held, which also guards the scratch buffer.
+long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, const float** pcm, void** dest,
+                   bool& decoded_packet, DecodeRefusal& refusal) noexcept
 {
     static float scratch[max_frames * 2];
     static float planar[max_frames * 2];
+    decoded_packet = false;
+    refusal = DecodeRefusal::none;
     std::uint32_t slot = 0, frames = 0, packet_bytes = 0, out_bytes = 0;
     std::uint32_t first_frame = 0;
     float rate_f = 0;
@@ -192,7 +259,10 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
     if (!packet && !packet_bytes) {  // no packet: complete with 0 bytes, as without libopus
         return hr_ok;
     }
-    if (slot >= max_slots) return hr_invalid_arg;
+    if (slot >= max_slots) {
+        refusal = DecodeRefusal::invalid_argument;
+        return hr_invalid_arg;
+    }
     SlotDecoder& d = conn.decoders[slot];
     const int rate = conn.opus_streams ? 48000 : rate_f == 8000.0f ? 8000 : rate_f == 12000.0f ? 12000 : rate_f == 16000.0f ? 16000
                    : rate_f == 24000.0f ? 24000 : rate_f == 48000.0f ? 48000 : 0;
@@ -200,8 +270,10 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
         frames && frames <= max_frames && out_bytes % (frames * 4) == 0 ? out_bytes / (frames * 4) : 0;
     if (!rate || (channels != 1 && channels != 2) || packet_bytes == 0 || packet_bytes > max_packet_bytes ||
         !x2w_local::readable(reinterpret_cast<const void*>(packet), packet_bytes) ||
-        !x2w_local::writable(reinterpret_cast<const void*>(out), out_bytes))
+        !x2w_local::writable(reinterpret_cast<const void*>(out), out_bytes)) {
+        refusal = DecodeRefusal::invalid_argument;
         return hr_invalid_arg;
+    }
     // A new rate or channel count gets a new decoder, which replaces the slot's only after a good decode.
     OpusDecoder* decoder = d.decoder;
     const bool fresh = !decoder || d.channels != static_cast<int>(channels) || d.rate != rate;
@@ -210,6 +282,7 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
         decoder = opus_decoder_create(rate, static_cast<int>(channels), &error);
         if (!decoder || error != OPUS_OK) {
             if (decoder) opus_decoder_destroy(decoder);
+            refusal = DecodeRefusal::out_of_memory;
             return hr_out_of_memory;
         }
     }
@@ -217,6 +290,7 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
                                           static_cast<opus_int32>(packet_bytes), scratch, conn.opus_streams ? max_frames : static_cast<int>(frames), 0);
     if (decoded < 0) {
         if (fresh) opus_decoder_destroy(decoder);
+        refusal = decoded == OPUS_BUFFER_TOO_SMALL ? DecodeRefusal::capacity : DecodeRefusal::opus_error;
         static LONG errors;
         if (x2w_local::first_calls(errors, 8))
             x2w_local::logf("x2w-audio XApu decode slot=%u bytes=%u -> opus error %d", slot, packet_bytes, decoded);
@@ -237,6 +311,7 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
         }
         kept = planar;
     }
+    decoded_packet = true;
     *pcm = kept;
     *dest = reinterpret_cast<void*>(out);
     return hr_ok;
@@ -342,6 +417,10 @@ extern "C" __declspec(noinline) long XApuDequeueResult(u64 rcx, u64 rdx, u64 r8,
         if (conn->count > 0) {
             entry = pop_result(*conn);
             hr = hr_ok;
+#ifdef X2W_HAVE_OPUS
+            if (entry.decoded && typed_completions())
+                x2w_audio::saturating_add(opus_counts.decoded_completions);
+#endif
         } else {
             hr = hr_pending_results;
         }
@@ -378,6 +457,12 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XApuEnqueueCommand", 3, rcx, rdx, r8, r9, _ReturnAddress());
     if (!rdx || !x2w_local::readable(reinterpret_cast<const void*>(rdx), command_header_size)) {
+#ifdef X2W_HAVE_OPUS
+        if (typed_completions()) {
+            start_opus_counters();
+            x2w_audio::saturating_add(opus_counts.refused_header);
+        }
+#endif
         static LONG bad_cmd_calls;
         if (x2w_local::first_calls(bad_cmd_calls, 2))
             x2w_local::logf("x2w-audio XApuEnqueueCommand handle=0x%llx -> E_POINTER", rcx);
@@ -388,7 +473,15 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
     std::memcpy(&entry.slot, reinterpret_cast<const unsigned char*>(rdx) + 4, sizeof(entry.slot));
 #ifdef X2W_HAVE_OPUS
     const bool decode = entry.type == 3 && typed_completions();
+    DecodeRefusal refusal = DecodeRefusal::none;
+    bool decoded_packet = false;
+    bool queue_refused = false;
+    if (decode) {
+        start_opus_counters();
+        x2w_audio::saturating_add(opus_counts.type3_commands);
+    }
     if (decode && !x2w_local::readable(reinterpret_cast<const void*>(rdx), decode_command_size)) {
+        x2w_audio::saturating_add(opus_counts.refused_short_command);
         x2w_local::logf("x2w-audio XApuEnqueueCommand handle=0x%llx short decode command -> E_POINTER", rcx);
         return hr_pointer;
     }
@@ -402,11 +495,13 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
         void* dest = nullptr;
         // Refuse a full queue before touching any decoder state.
         hr = reserve_result(*conn) ? hr_ok : hr_out_of_memory;
+        queue_refused = hr != hr_ok;
         if (hr == hr_ok && conn->opus_streams && typed_completions()) {
             const auto* command = reinterpret_cast<const unsigned char*>(rdx);
             if (!x2w_local::readable(command, entry.type == 1 ? 28 : 24)) {
                 hr = hr_pointer;
             } else if (entry.slot >= max_slots) {
+                refusal = DecodeRefusal::invalid_argument;
                 hr = hr_invalid_arg;
             } else {
                 entry.stream_command = true;
@@ -414,18 +509,29 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
                 if (entry.type == 1) {
                     std::uint32_t channels = 0;
                     std::memcpy(&channels, command + 24, 4);
-                    if (channels != 1 && channels != 2) hr = hr_invalid_arg;
-                    else if (conn->decoders[entry.slot].channels) hr = hr_invalid_arg;
-                    else conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    if (channels != 1 && channels != 2) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else if (conn->decoders[entry.slot].channels) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else {
+                        conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    }
                 }
             }
         }
         if (hr == hr_ok && decode) {
-            hr = decode_packet(*conn, reinterpret_cast<const unsigned char*>(rdx), entry, &pcm, &dest);
+            hr = decode_packet(*conn, reinterpret_cast<const unsigned char*>(rdx), entry, &pcm, &dest,
+                               decoded_packet, refusal);
         } else if (hr == hr_ok && (entry.type == 2 || entry.type == 5)) {
             drop_decoder(*conn, entry.slot, entry.type == 2);
         }
         if (hr == hr_ok) {
+            if (decode) {
+                entry.decoded = decoded_packet;
+                if (decoded_packet) x2w_audio::saturating_add(opus_counts.packets_decoded);
+            }
             place_result(*conn, entry);
             if (pcm) std::memcpy(dest, pcm, entry.value);
         }
@@ -434,6 +540,22 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
 #endif
     }
     ReleaseSRWLockExclusive(&connection_lock);
+#ifdef X2W_HAVE_OPUS
+    if (decode && hr != hr_ok) {
+        if (!conn)
+            x2w_audio::saturating_add(opus_counts.refused_unknown_handle);
+        else if (queue_refused)
+            x2w_audio::saturating_add(opus_counts.refused_queue_full);
+        else if (refusal == DecodeRefusal::invalid_argument)
+            x2w_audio::saturating_add(opus_counts.refused_invalid_argument);
+        else if (refusal == DecodeRefusal::opus_error)
+            x2w_audio::saturating_add(opus_counts.refused_opus_error);
+        else if (refusal == DecodeRefusal::capacity)
+            x2w_audio::saturating_add(opus_counts.refused_capacity);
+        else if (refusal == DecodeRefusal::out_of_memory)
+            x2w_audio::saturating_add(opus_counts.refused_out_of_memory);
+    }
+#endif
     static LONG calls;
     if (x2w_local::first_calls(calls, 24)) {
         char command[3 * 0x60 + 1];
@@ -454,6 +576,9 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
     while (*slot && (*slot)->handle != rcx) slot = &(*slot)->next;
     Connection* conn = *slot;
     if (conn) *slot = conn->next;
+#ifdef X2W_HAVE_OPUS
+    const bool last_connection = conn && !connections;
+#endif
     if (conn && !connections && timer_active) {
         timeEndPeriod(1);
         timer_active = false;
@@ -470,5 +595,8 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
     delete[] conn->entries;
     delete conn;
     x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> S_OK", rcx);
+#ifdef X2W_HAVE_OPUS
+    if (last_connection) log_opus_summary();
+#endif
     return hr_ok;
 }

@@ -1495,11 +1495,13 @@ bool check_translated_refusal_census(const std::wstring& log_path)
 
 bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root,
                               ID3D12PipelineState* writer, ID3D12RootSignature* title_root, IUnknown* pso,
-                              ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding)
+                              ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding,
+                              const std::filesystem::path& delayed_manifest = {}, bool fallback_enabled = false)
 {
     const TranslatedDrawFixture alias_binding(guest, red, nullptr, false, false, false, true);
-    enum class Mode { mrt_two, color_and_dsv, depth_only, no_attachments, alias_rtv1 };
+    enum class Mode { mrt_two, color_and_dsv, depth_only, no_attachments, alias_rtv1, direct_missing, direct_ready };
     const auto run_mode = [&](Mode mode, const char* label) -> bool {
+        const bool direct = mode == Mode::direct_missing || mode == Mode::direct_ready;
         const auto& binding = mode == Mode::alias_rtv1 ? alias_binding : red_binding;
         PlacedBuffer arguments(device, guest, static_cast<UINT>(sizeof(initial)), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         Words initial_words = initial;
@@ -1577,7 +1579,7 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         if (mode == Mode::mrt_two) slot<Clear>(wrapped, 52)(wrapped, rtvs[1].ptr, clear, 0, nullptr);
         if (mode == Mode::mrt_two || mode == Mode::alias_rtv1)
             slot<Targets>(wrapped, 50)(wrapped, 2, rtvs, FALSE, nullptr);
-        else if (mode == Mode::color_and_dsv) {
+        else if (mode == Mode::color_and_dsv || direct) {
             slot<Targets>(wrapped, 50)(wrapped, 1, rtvs, FALSE, &guest_dsv);
             list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         } else if (mode == Mode::depth_only) {
@@ -1594,6 +1596,12 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create depth-only occlusion query heap");
             query_readback = make_buffer(device, sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         }
+        if (direct) {
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 1, 0};
+            check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create direct draw query heap");
+            query_readback = make_buffer(device, sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),
+                                         D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
 
         const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
         const D3D12_RECT scissor{0, 0, width, height};
@@ -1606,7 +1614,15 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
         slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
         if (mode == Mode::depth_only) list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
-        slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        if (direct) {
+            using Draw = void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT);
+            list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            slot<Draw>(wrapped, 12)(wrapped, 3, 1, 0, 0);
+            list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, query_readback.Get(), 0);
+        } else {
+            slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        }
         if (mode == Mode::depth_only) {
             list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
             list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback.Get(), 0);
@@ -1643,10 +1659,23 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             }
         }
 
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT64 bytes = 0;
-        device->GetCopyableFootprints(&color_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-        const auto read_pixels = [&](ID3D12Resource* target, std::uint32_t expected_colour, const char* which) -> bool {
+        if (direct) {
+            D3D12_QUERY_DATA_PIPELINE_STATISTICS stats{};
+            const D3D12_RANGE range{0, sizeof(stats)};
+            check(query_readback->Map(0, &range, &memory), "map direct draw query");
+            std::memcpy(&stats, memory, sizeof(stats));
+            query_readback->Unmap(0, &untouched);
+            const UINT64 expected = mode == Mode::direct_ready || fallback_enabled ? 3 : 0;
+            if (stats.IAVertices != expected) {
+                std::fprintf(stderr, "%s: IA vertices %llu, expected %llu\n", label, stats.IAVertices, expected);
+                return false;
+            }
+        }
+        const auto read_pixels = [&](ID3D12Resource* target, std::uint32_t expected_pixel, const char* which) -> bool {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            UINT64 bytes = 0;
+            const auto desc = target->GetDesc();
+            device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
             const auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
             transition(copy.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1661,22 +1690,38 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             for (UINT y = 0; y < height; ++y)
                 for (UINT x = 0; x < width; ++x) {
                     std::uint32_t actual = 0;
-                    std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual), sizeof(actual));
-                    if (actual != expected_colour) {
+                    const auto size = desc.Format == DXGI_FORMAT_D16_UNORM ? sizeof(std::uint16_t) : sizeof(actual);
+                    std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * size, size);
+                    if (actual != expected_pixel) {
                         std::fprintf(stderr, "%s (%s) pixel (%u,%u): got 0x%08x, expected 0x%08x\n",
-                                     label, which, x, y, actual, expected_colour);
+                                     label, which, x, y, actual, expected_pixel);
                         ok = false;
                     }
                 }
             readback->Unmap(0, &untouched);
             return ok;
         };
-        const bool expect_draw = mode == Mode::mrt_two || mode == Mode::color_and_dsv;
+        const bool expect_draw = mode == Mode::mrt_two || mode == Mode::color_and_dsv || mode == Mode::direct_ready;
         if (!read_pixels(color0.Get(), expect_draw ? red : black, "rtv0")) return false;
         if (mode == Mode::mrt_two && !read_pixels(color1.Get(), black, "rtv1")) return false;
+        if (mode == Mode::direct_missing && !read_pixels(depth.Get(), 0xffff, "dsv")) return false;
         std::printf("%s: OK\n", label);
         return true;
     };
+    if (!delayed_manifest.empty()) {
+        auto staged_manifest = delayed_manifest;
+        staged_manifest += ".staged";
+        std::filesystem::rename(delayed_manifest, staged_manifest);
+        if (!run_mode(Mode::direct_missing, "missing translation")) return false;
+        const auto request = delayed_manifest.parent_path() / ("req_" + delayed_manifest.stem().string() + ".a");
+        if (!std::filesystem::exists(request)) {
+            std::fprintf(stderr, "missing draw did not publish its shader request\n");
+            return false;
+        }
+        std::filesystem::rename(staged_manifest, delayed_manifest);
+        Sleep(1100);  // The runtime polls absent manifests at one-second intervals.
+        return run_mode(Mode::direct_ready, "published translation");
+    }
     const bool ok =
         run_mode(Mode::mrt_two, "translated indirect MRT (2 color targets)") &&
         run_mode(Mode::color_and_dsv, "translated indirect color + DSV") &&
@@ -2359,6 +2404,9 @@ int main(int argc, char** argv) try
     const bool starvation = starvation_control || starvation_mutant ||
                             (argc == 3 && std::strcmp(argv[2], "starved-target") == 0);
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
+    const bool fallback_enabled = argc == 3 && std::strcmp(argv[2], "missing-shader-fallback") == 0;
+    const bool fallback_fixture = fallback_enabled ||
+        (argc == 3 && std::strcmp(argv[2], "missing-shader-fallback-off") == 0);
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool root_fix_control = argc == 3 && std::strcmp(argv[2], "translated-root-control") == 0;
@@ -2387,7 +2435,8 @@ int main(int argc, char** argv) try
     const bool index_copy = index_copy_off || index_copy_late || index_copy_wide ||
         (argc == 3 && std::strcmp(argv[2], "index-copy") == 0);
     const bool translated_indexed = index_copy || alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets ||
+        fallback_fixture || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2917,6 +2966,21 @@ int main(int argc, char** argv) try
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
         }
         const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
+        if (fallback_fixture) {
+            check(SetEnvironmentVariableW(L"X2W_DRAW_MISSING_SHADER", fallback_enabled ? L"1" : L"0") ? S_OK : E_FAIL,
+                  "configure missing shader fallback");
+            std::filesystem::path manifest;
+            for (const auto& file : std::filesystem::directory_iterator(cache))
+                if (file.path().extension() == ".txt") manifest = file.path();
+            check(manifest.empty() ? E_FAIL : S_OK, "find fixture manifest");
+            const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
+            const TranslatedDrawFixture binding(guest.Get(), red);
+            const bool ok = check_translated_targets(device.Get(), guest.Get(), writer.Get(), producer.Get(),
+                                                     title_root.Get(), pso.Get(), nullptr, binding,
+                                                     manifest, fallback_enabled);
+            std::filesystem::remove_all(cache);
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
         const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");

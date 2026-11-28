@@ -1108,6 +1108,17 @@ if(X2W_WITH_OPUS)
     add_dependencies(startup_xapu_opus_check startup_stub_xapu)
     add_test(NAME startup_xapu_opus COMMAND startup_xapu_opus_check "$<TARGET_FILE:startup_stub_xapu>")
     set_tests_properties(startup_xapu_opus PROPERTIES TIMEOUT 60)
+
+    # Bounded telemetry for the same optional decode path: decoded packets, dequeued completions and
+    # refusals by reason. Generates its tones with libopus; no captured packet is stored.
+    add_executable(startup_xapu_opus_count_check tests/startup_xapu_opus_count_check.cpp)
+    target_compile_features(startup_xapu_opus_count_check PRIVATE cxx_std_17)
+    target_include_directories(startup_xapu_opus_count_check PRIVATE src)
+    target_link_libraries(startup_xapu_opus_count_check PRIVATE Opus::opus)
+    set_target_properties(startup_xapu_opus_count_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_dependencies(startup_xapu_opus_count_check startup_stub_xapu)
+    add_test(NAME startup_xapu_opus_count COMMAND startup_xapu_opus_count_check "$<TARGET_FILE:startup_stub_xapu>")
+    set_tests_properties(startup_xapu_opus_count PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(startup_chad_check tests/startup_chad_check.cpp)
@@ -1464,7 +1475,16 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
+target_sources(startup_stream_consumer PRIVATE tests/startup_rect_gap.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
+
+# The shared indexed rectangle-expansion stage (startup_stubs/indexed_rect_geometry.h) drawn on its own, with
+# back-face culling on: the axis order, a swung order of the same corners and a rotated rectangle (#3131).
+# tests/cmake/startup_rect_gap.cmake registers its tests and the runtime draw.
+add_executable(startup_rect_geometry tests/startup_rect_geometry.cpp)
+target_compile_features(startup_rect_geometry PRIVATE cxx_std_17)
+target_include_directories(startup_rect_geometry PRIVATE src)
+target_link_libraries(startup_rect_geometry PRIVATE d3d12 dxgi d3dcompiler)
 
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
@@ -1894,6 +1914,9 @@ set_tests_properties(startup_indirect_index_shadow_stale_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "stale index mutant failed the WARP pixel comparison")
 set_tests_properties(startup_indirect_index_shadow_padding_control_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "staged R16 padding mutant failed the WARP pixel comparison with a clear target")
+add_test(NAME startup_missing_shader_fallback_warp COMMAND startup_indirect_draw_indexed warp missing-shader-fallback)
+add_test(NAME startup_missing_shader_fallback_off_warp COMMAND startup_indirect_draw_indexed warp missing-shader-fallback-off)
+set_tests_properties(startup_missing_shader_fallback_warp startup_missing_shader_fallback_off_warp PROPERTIES TIMEOUT 60)
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
@@ -2204,6 +2227,11 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --rect-pso
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
     set_tests_properties(native_rectangle_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME native_rectangle_geometry_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --rect-pso
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>"
+        "$<TARGET_FILE:startup_rect_geometry>")
+    set_tests_properties(native_rectangle_geometry_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_test(NAME native_pixel_dxil
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_pixel_dxil_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
@@ -2278,6 +2306,7 @@ if(OFFSCREEN_AGILITY_620_DIR)
     endforeach()
     target_compile_definitions(offscreen_check PRIVATE OFFSCREEN_AGILITY_620)
     target_compile_definitions(startup_indirect_draw_indexed PRIVATE OFFSCREEN_AGILITY_620)
+    target_compile_definitions(startup_stream_consumer PRIVATE OFFSCREEN_AGILITY_620)
 endif()
 set(OFFSCREEN_WARP_DIR "" CACHE PATH "Directory containing an app-local x64 d3d10warp.dll (Microsoft.Direct3D.WARP)")
 if(OFFSCREEN_WARP_DIR)
@@ -2590,7 +2619,7 @@ add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_c
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
-foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start)
+foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start raw-exact)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
@@ -2805,6 +2834,8 @@ add_test(NAME dispatch_phases COMMAND dispatch_phases_check)
 add_test(NAME dispatch_phases_single_lock_control COMMAND dispatch_phases_check single 4 1.45)
 set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+add_test(NAME startup_local_log_precheck_off COMMAND startup_local_log_check --phase precheck-off)
+set_tests_properties(startup_local_log_precheck_off PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 # A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/dsv_planes.h), debug layer on.
 add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
@@ -3791,14 +3822,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
     # `cmake --build --preset runtime` builds the eight DLLs run.ps1 copies and no executable.
+    # It deletes and rebuilds the DLLs other tests load, so it must not run beside them (RUN_SERIAL).
     add_test(NAME startup_runtime_target COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_target_check.py" "${CMAKE_COMMAND}" "${CMAKE_BINARY_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/startup/run.ps1"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>"
         "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
         "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>")
-    # The check deletes the DLLs and rebuilds them: any test running at the same time loads a missing d3d12_xs.dll
-    # (0xc0000135, "Not Run"), so it runs alone.
     set_tests_properties(startup_runtime_target PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
     add_test(NAME startup_storage_directory_batch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_storage_directory_batch.py" "$<TARGET_FILE:startup_stub_consumer>")
@@ -8948,6 +8978,43 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${tsc_controls})
     endforeach()
     set_tests_properties(cpu_aot_rdtscp PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_amd_monitor_rdpru_aot_exports
+        "op_rdpru_mperf,op_rdpru_aperf,op_rdpru_twice,op_rdpru_unused,"
+        "op_monitorx_mwaitx_r8,op_monitorx_mwaitx_intbrk,op_monitorx_rcx_rdx,"
+        "op_add32_rdpru,op_cmp32_mwaitx")
+    string(CONCAT cpu_amd_monitor_rdpru_aot_exports ${cpu_amd_monitor_rdpru_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_amd_monitor_rdpru_aot_${variant} amd_monitor_rdpru_aot)
+        cpu_translation(cpu_amd_monitor_rdpru_aot_${variant} cpu_amd_monitor_rdpru_aot "${cpu_amd_monitor_rdpru_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_amd_monitor_rdpru_aot_altered PRIVATE ALTER_AMD_EXT)
+    set(cpu_amd_monitor_rdpru_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_original_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_amd_monitor_rdpru_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_original_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_original_lifted_o2.obj"
+            "/Fe${cpu_amd_monitor_rdpru_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_original_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_amd_monitor_rdpru_aot_original_lifted_o2 ALL DEPENDS "${cpu_amd_monitor_rdpru_o2}")
+    set(cpu_amd_monitor_rdpru_mutants_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_mutants.cpp")
+    add_custom_command(OUTPUT "${cpu_amd_monitor_rdpru_mutants_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/amd_monitor_rdpru_aot_check.py"
+            emit-mutants "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original>" "${cpu_amd_monitor_rdpru_mutants_cpp}"
+        DEPENDS cpu_amd_monitor_rdpru_aot_original tests/cpu/amd_monitor_rdpru_aot_check.py
+            tools/cpu_amd_monitor_rdpru_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_amd_monitor_rdpru_aot_mutants SHARED "${cpu_amd_monitor_rdpru_mutants_cpp}")
+    add_dependencies(cpu_amd_monitor_rdpru_aot_mutants cpu_amd_monitor_rdpru_aot_original_lifted_o2)
+    add_test(NAME cpu_aot_amd_monitor_rdpru COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/amd_monitor_rdpru_aot_check.py"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original>"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original_lifted>"
+        "${cpu_amd_monitor_rdpru_o2}"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_altered>"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_altered_lifted>"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_mutants>")
+    set_tests_properties(cpu_aot_amd_monitor_rdpru PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_amd_monitor_rdpru.txt")
     cpu_asm_fixture(cpu_rdrand_harness rdrand_harness)
     # The opt-in host-entropy profile. RDRAND and RDSEED have their own fixtures and tests, each exiting 77 when
     # the host lacks the instruction. Each part has the lifted DLL, deterministic succeed and fail variants that

@@ -3,8 +3,11 @@
 `mutation` runs the device-free half: it builds the same 320-word expectation as `check()`, verifies that the
 prefilled sentinel readback matches zero written words, that one flipped consumer word and one flipped sentinel are
 both caught, and that the 2-group and 5-group references differ only at indices 2, 3 and 4.
+#3209 additionally fences the writer and consumer separately and draws actual GPU output to an offscreen target.
 """
 import os
+import re
+import struct
 from pathlib import Path
 import subprocess
 import sys
@@ -83,6 +86,54 @@ def check(directory, consumer, env, mode, groups, written, direct=False):
     return result
 
 
+def expected_pixels(words):
+    # Eight columns, four rows. The native observer discards sentinel pixels and encodes
+    # the low three bytes of each actual GPU output word into an RGBA8 render target.
+    return [(0xff000000 if word == C.SENTINEL else 0xff000000 | (word & 0xffffff))
+            for word in words[:8]] * 4
+
+
+def check_pixels(directory, consumer, env, mode, groups, written, writer=True, stale=False):
+    path = directory / 'pixels.bin'
+    path.unlink(missing_ok=True)
+    actual, run = dispatch(directory, consumer, dict(env, X2W_TEST_INDIRECT_PIXEL_OUT=str(path)),
+                           'dispatch-indirect-pixel-' + mode)
+    print(run.stdout, end='')
+    assert not lines(run, 'ExecuteIndirect refused'), run.stderr[-3000:]
+    census = lines(run, 'x2w-render compute census key ')
+    assert any('1 dispatches, 1 translated' in line for line in census), run.stderr[-3000:]
+    assert compare_words(actual, expected_words(written)) == [], (mode, 'compute output mismatch')
+    identity = re.findall(r'(?:writer|consumer) resource=(\S+) gpu=(\S+) interval=\[4,16\)', run.stdout)
+    assert len(identity) == 2 and identity[0] == identity[1], run.stdout
+    yz = int(writer)
+    record = f'a5a5a5a5 [{groups},{yz},{yz}] 5a5a5a5a 12345678 9abcdef0'
+    assert f'GPU argument record: {record} (after writer)' in run.stdout, run.stdout
+    assert f'GPU argument record: {record} (before consumer)' in run.stdout, run.stdout
+    assert f'writer={"dispatch" if writer else "omitted"}' in run.stdout, run.stdout
+    queues = re.findall(r'guest queue=(\S+) (?:writer fence=1|consumer fence=2) completed', run.stdout)
+    assert len(queues) == 2 and queues[0] == queues[1], run.stdout
+    native = re.findall(r'(?:chain|graphics) queue=(\S+) output=(\S+) gpu=(\S+)', run.stdout)
+    assert len(native) == 2 and native[0][0] == native[1][0], run.stdout
+    assert (native[0][1:] != native[1][1:]) == stale, run.stdout
+    stages = ['writer fence=1 completed', '(after writer)', 'consumer resource=', 'consumer fence=2 completed',
+              '(before consumer)', 'graphics queue=', 'graphics fence completed']
+    assert [run.stdout.index(stage) for stage in stages] == sorted(run.stdout.index(stage) for stage in stages), run.stdout
+    pixels = list(struct.unpack('<64I', path.read_bytes()))
+    assert pixels[:32] == [0xff000000] * 32, (mode, 'clear capture')
+    expected = expected_pixels(expected_words(written))
+    if stale:
+        assert compare_words(pixels[32:], expected), 'stale SRV incorrectly passed the positive oracle'
+        expected = expected_pixels([(0x8b02a7f1 + i * 0x413b1) & C.MASK for i in range(8)])
+    assert compare_words(pixels[32:], expected) == [], (mode, pixels[32:], expected)
+    for line in lines(run, 'x2w-d3d12-debug '):
+        assert ' sev=0 ' not in line and ' sev=1 ' not in line, line
+    print('pixel first row:', ' '.join(f'{word:08x}' for word in pixels[32:40]))
+    print(f'pixel {mode}: 320 compute words, two 7-DWORD argument snapshots, 64 RGBA8 pixels match; '
+          f'{sum(v != 0xff000000 for v in pixels[32:])}/32 changed' +
+          (' (stale SRV rejected by positive oracle)' if stale else ''))
+    return run
+
+
 def check_mutation():
     sentinel = [C.SENTINEL] * C.WORDS
     assert len(sentinel) == 320 and C.WORDS == 320, (len(sentinel), C.WORDS)
@@ -102,6 +153,14 @@ def check_mutation():
     differing = [i for i in range(C.WORDS) if two[i] != five[i]]
     assert differing == [2, 3, 4], f'2/5 group references differ at {differing}'
     assert compare_words(two, five) == [2, 3, 4]
+    for groups in (0, 2, 5):
+        pixels = expected_pixels(expected_words(groups))
+        for index in (0, 7, 31):
+            mutant = list(pixels)
+            mutant[index] ^= 1
+            assert compare_words(mutant, pixels) == [index]
+        assert compare_words(pixels[:-1], pixels)
+    assert compare_words(expected_pixels(two), expected_pixels(five)) == [y * 8 + x for y in range(4) for x in (2, 3, 4)]
     print(f'mutation oracle: {C.WORDS} words, sentinel 0x{C.SENTINEL:08x}; consumer and sentinel flips detected; '
           '2/5 references differ at [2, 3, 4]')
 
@@ -134,6 +193,9 @@ def main(consumer, dxc, adapter):
             assert not lines(run, 'refused:'), run.stderr[-2500:]
             if groups:
                 check(directory, consumer, env, str(groups), groups, groups, direct=True)
+        for mode, groups, writer in (('2', 2, True), ('5', 5, True), ('zero', 0, True), ('omit', 0, False)):
+            check_pixels(directory, consumer, env, mode, groups, groups, writer)
+        check_pixels(directory, consumer, env, '5-stale', 5, 5, stale=True)
         for mode, reason in (('multi', 'one rootless command'), ('counted', 'no count buffer'),
                              ('outside', 'outside a unique placed buffer'), ('output-alias', 'also a bound shader resource')):
             run = check(directory, consumer, env, mode, 5, 0)

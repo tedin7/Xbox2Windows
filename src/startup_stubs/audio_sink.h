@@ -259,7 +259,8 @@ struct Report {
     uint64_t submitted_frames = 0;    // frames written to the endpoint
     uint64_t consumed_frames = 0;     // submitted frames minus frames still queued
     uint64_t clock_frames = 0;        // IAudioClock position converted to frames
-    uint32_t unsupported = 0, rejected_full = 0;
+    uint64_t accepted = 0;            // submit() calls that returned Submit::Accepted
+    uint32_t unsupported = 0, rejected_full = 0, not_open = 0;
     uint32_t padding_errors = 0;      // GetCurrentPadding failed (e.g. the endpoint went away): not a measurement
     double drained_ms = 0, recovery_ms = -1;  // recovery_ms < 0: not measured
     // Glitches: the render API exposes no discontinuity flag, so this stays "not available".

@@ -156,10 +156,12 @@ inline bool unplaced_buffer_extent(std::uint64_t address, std::uint64_t span_byt
 }
 
 // A structured or typed view needs (address - base) to be a whole number of elements. For a base at the 64 KiB page start
-// that fails for most sub-allocated addresses; those views take a copy that starts at the address.
-inline bool unplaced_view_needs_exact_start(std::uint64_t address, std::uint64_t page_start, std::uint64_t elem_bytes)
+// that fails for most sub-allocated addresses; those views take a copy that starts at the address. A raw view never does:
+// it keeps the page base so its 16-byte alignment check still sees the address.
+inline bool unplaced_view_needs_exact_start(std::uint64_t address, std::uint64_t page_start, std::uint64_t elem_bytes,
+                                            bool raw)
 {
-    return elem_bytes > 1 && address >= page_start && (address - page_start) % elem_bytes != 0;
+    return !raw && elem_bytes > 1 && address >= page_start && (address - page_start) % elem_bytes != 0;
 }
 
 // Checks whether an existing cached page range completely covers the requested [address, address + span_bytes).

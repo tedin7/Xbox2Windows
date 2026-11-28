@@ -113,6 +113,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |
 | [Experimental startup stand-ins and debugger (trap-by-default DLLs)](docs/startup-runtime.md) | `ctest --preset release --no-tests=error -R '^startup_stubs$' -V` |
 | [Persistent mirror for large raw graphics bindings](docs/experiments/startup-gpu-mirror.md) | `ctest --preset release --no-tests=error -R '^startup_gpu_mirror_warp$' -V` |
+| [Diagnostic fallback for missing graphics shader translations](docs/experiments/missing-shader-fallback.md) | `ctest --preset dev --no-tests=error -R '^startup_missing_shader_fallback(_off)?_warp$' -V` |
 | [Remap XMem pool pages through queue slot 31](docs/experiments.md#queue-page-batches-on-xmem-sections) · [page runs](docs/experiments/xmem-page-runs.md) | `ctest --preset release --no-tests=error -R 'queue_page_batch|xmem_page_batch_inflight|xmem_placeholder_split' -V` |
 | [Sample a texture by address in a translated draw](docs/startup-runtime.md#textures-published-by-address-device-slot-70) | `ctest --preset release --no-tests=error -R '^startup_address_console_' -V` |
 | [Publish a placed 1D texture or array SRV by address](docs/experiments.md#publish-a-placed-r8-texture-srv-by-its-title-address) with `X2W_PLACED_SRV_1D=1` | `ctest --preset release --no-tests=error -R '^startup_address_srv_warp$' -V` |

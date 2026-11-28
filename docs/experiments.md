@@ -37,6 +37,11 @@ The compute fixture checks arithmetic, lane selection and disabled sources.
 Full-mask row shifts and rotates stay inside each 16-lane row and apply
 BOUND_CTRL to unusable sources. [Experiment and reproduction commands](experiments/native-dpp-row.md)
 
+## Guest permlane16 and permlanex16 in direct compute
+
+VOP3A row permutations select lanes using uniform packed selectors.
+[Experiment and reproduction commands](experiments/native-permlane.md)
+
 ## Guest lane reads and writes in direct compute
 
 `v_readlane_b32` and `v_writelane_b32` lower with a constant or SGPR lane; lane writes ignore EXEC.
@@ -2057,6 +2062,8 @@ A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + i
 XLATB replaces AL with the byte at RBX + AL. AL is zero-extended, and bits 8 to 63 of RAX and the flags are unchanged. With a 67h prefix the base is EBX and the sum wraps at 32 bits, so the upper half of RBX is ignored. A REX.W prefix (`48 d7`) does not change the operation. `cpu_aot_xlatb` builds four exports from [MASM source](../tests/cpu/xlatb.asm): the plain, REX.W and 67h forms, and two lookups in a row. Each export runs on a 256-byte permutation table in a page committed below 4 GiB. The check compares RAX and ZF/CF for every AL value, with noise in the upper bits of RAX and, for the 67h form, in the upper half of RBX, against the native DLL and an independent reference. Three controls mutate the generated C++ and must mismatch: `signed` sign-extends AL, `noaddr32` keeps the upper half of RBX in the 67h sum (whose reads fault), and `clear` writes the loaded byte over all of RAX. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_xlatb$' -V`.
 
 RDTSC and RDTSCP use an explicit host TSC profile: they supply host ticks and, for RDTSCP, the host IA32_TSC_AUX, with no guarantee of a guest TSC frequency or of a virtual-CPU number. The counter passes through unscaled: EAX holds the low 32 bits and EDX the high 32 bits, with the upper halves of RAX and RDX zeroed and the flags unchanged. RDTSCP also writes TSC_AUX to ECX, zero-extending RCX. The lowering calls `__rdtsc()` and `__rdtscp()`, so each keeps its own instruction, with no fence added to the generated code. It stores the result in a `volatile` local, so a read stays in the code even when the guest overwrites its result; without it, MSVC `/O2` removes such an RDTSC. Because the counter changes between reads, the checks test properties rather than bytes. The [RDTSC source](../tests/cpu/rdtsc.asm) has one RDTSC and two RDTSC in a row, and the [RDTSCP source](../tests/cpu/rdtscp.asm) one RDTSCP, each after `add r8, r8` sets ZF and CF from one of four presets; each file also has one read without a preset whose result is overwritten with 7. The single reads first fill RAX and RDX, and RDTSCP also RCX, with all ones. A [native harness](../tests/cpu/rdtsc_harness.asm), never translated, supplies CPUID and the measurement reads. The checks pin the thread to one logical processor and confirm that it runs there before reading. For the single RDTSC and the RDTSCP they require that the translated read lies between two native reads, each serialized by LFENCE before and after. For every read with a preset they require that the upper halves of the results are zero and that ZF and CF keep their preset. The second of two RDTSC must not be earlier than the first and must differ from it in at least one of the 2,000 rounds. RDTSCP must return the TSC_AUX of the pinned processor, which the RDTSCP check chooses as the highest of the affinity mask with a nonzero TSC_AUX. The exports with overwritten results must return 7. Controls mutate the generated C++ and must break a property: `constant` returns a zero RDTSC counter, `swap` exchanges the halves, `noext` leaves the whole counter in RAX, `noaux` drops TSC_AUX, `stale` keeps the value of each RDTSC's first call, and `flags` and `pflags` flip ZF and CF after RDTSC and RDTSCP. The translation is also built with `cl /O2`. A walk that follows every branch from each export must find every RDTSC and RDTSCP of the source, including the overwritten ones, and the `/O2` build must keep the properties above. The `plain` control removes `volatile` and is built only at `/O2`; there the walk must find the overwritten RDTSC missing. `cpu_aot_rdtsc` checks RDTSC with `constant`, `swap`, `noext`, `stale`, `flags` and both `/O2` builds, and runs on every host. `cpu_aot_rdtscp` checks RDTSCP with `swap`, `noext`, `noaux`, `pflags` and the translated `/O2` build. Each source counts toward coverage only through its own test. `cpu_aot_rdtscp` exits 77 on a host without RDTSCP (CPUID 80000000h reports no leaf 80000001h, or its EDX bit 27 is clear). It also exits 77, after its other checks, on a host whose TSC_AUX is 0 on every processor of the affinity mask, where `noaux` cannot fail. Guest code that converts ticks with its own frequency will see host time; whether a guest-frequency profile belongs in the runtime is open in [#739](https://github.com/R0Y00/Xbox2Windows/issues/739). Run `ctest --preset dev --no-tests=error -R '^cpu_aot_rdtscp?$' -V`.
+
+`cpu_aot_amd_monitor_rdpru` ([lifter](../tools/cpu_amd_monitor_rdpru_aot.py), [fixture](../tests/cpu/amd_monitor_rdpru_aot.asm), [check](../tests/cpu/amd_monitor_rdpru_aot_check.py)) lifts bounded Windows x64 leaf functions using AMD Zen 2 user-mode `monitorx`, `mwaitx`, and `rdpru` alongside bounded volatile GPR arithmetic/flags (`add`/`cmp` 32/64-bit, `xor`, `or`, `shl`, `setcc`, `lea`, `[r8 + disp]` stores). Under the lifter's bounded approximations, `rdpru` statically validates `ECX` (`0` = MPERF, `1` = APERF) and **maps both selectors to a serialized host `RDTSC` read** (verifying monotonic progression, `EAX->RAX` / `EDX->RDX` zero-extension, `RCX`/`RFLAGS` preservation, and `/O2` anti-CSE/anti-DCE barriers rather than distinct hardware MPERF/APERF counter values), `mwaitx` lowers to a **fenced `_mm_pause()`** (an allowed early wake-up preserving GPRs, `RFLAGS`, and surrounding store order, with timer extension `ECX[1]` rejected), and `monitorx` probes flat `[rcx|rdx|r8]` readability preserving `#PF` fault ordering. On `13th Gen Intel(R) Core(TM) i7-13620H` (`dev` and `release`), 6 sequences were accepted, 41 rejection controls, `/O2` `RDTSC`/`PAUSE` barrier walks, 579 lifted Debug checks, 579 `/O2` checks (including 32-bit `add`/`cmp` flag paths and NULL fault ordering), 6 altered-build controls, and 6 compiled C++ mutant controls (including an `op_cmp32` CF comparison flip) passed before exiting 77 (capability skip: host lacks `CPUID Fn8000_0001:ECX[29]` MWAITX and `Fn8000_0008:EBX[4]` RDPRU). Run `ctest --preset release --no-tests=error -j 1 -R '^cpu_aot_amd_monitor_rdpru$' -V`.
 
 RDRAND and RDSEED are lowered only in an opt-in host-entropy profile, `lower(..., host_entropy=True)`; the default profile still rejects both. Their precondition is the host CPUID bit: CPUID.01H:ECX bit 30 for RDRAND and CPUID.(EAX=07H,ECX=0):EBX bit 18 for RDSEED. Each guest execution runs the host instruction once through `_rdrand16_step` to `_rdseed64_step`, with no retry and no fence; CF is the intrinsic's result, so guest code keeps control of retrying. On CF=0 the destination gets zero at its width. A 16-bit destination keeps bits 16 to 63, and a 32-bit one clears the upper half. The lowering clears ZF and OF, and PF only in a checked x87 function whose body reads it (JP, JNP, FCMOVU or FCMOVNU). SF and AF are not modelled by the shared lowering, so the translation cannot show the hardware's clearing of them. The result is a `volatile` local, so a read stays in the code when the guest discards it; without it, MSVC `/O2` removes such a read. `cpu_aot_rdrand` ([source](../tests/cpu/rdrand.asm)) and `cpu_aot_rdseed` ([source](../tests/cpu/rdseed.asm)) each exit 77 when the host lacks their own instruction. A [native harness](../tests/cpu/rdrand_harness.asm), never translated, supplies CPUID and confirms on the host that OF, SF, ZF, AF and PF are 0 after the 64-bit instruction, from two `add` presets that set them first. Each check confirms that the default profile rejects every read, then runs 2,000 rounds of the 16-, 32- and 64-bit reads, natively and translated, after `add r8, r8` sets ZF, CF and OF from four presets. Every read must be a success (CF 1) or a failure (CF 0, zero at the width) with ZF and OF clear and the width rules above. Natural failures are counted and printed, never required. Two deterministic variants replace the host read and must pass on every host: `succeed` reports CF 1 with a fixed pattern, and `fail` reports CF 0 after storing that pattern, so the zero and carry rules are checked even when the host never fails. The reads whose result is discarded must return the overwritten value. Controls mutate the generated C++ and must break a rule: `constant` succeeds with a fixed value, `nocarry` drops CF, `noext` keeps the upper half of a 32-bit destination, `wide16` replaces a 16-bit destination's upper bits, `flags` leaves ZF and OF as preset, and `nozero` keeps the pattern after a failed read. The translation is also built with `cl /O2`. A walk that follows every branch must find each RDRAND or RDSEED of the source, including the discarded one, and the `/O2` build must keep the rules. The `plain` control removes `volatile` and is built only at `/O2`; there the walk must find the discarded read missing. Variation checks require at least two different successful values at each width and one 64-bit success with a nonzero upper half. They catch a constant translation and do not assess entropy quality. A host with fewer than two natural successes at a width still runs every deterministic check, then exits 77 with the variation named as not measurable. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_rd(rand|seed)$' -V`.
 
@@ -16848,7 +16855,7 @@ ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_ad
 
 #### Volumes in the 4 KiB standard layout
 
-Slot 70 also reads a single-mip, uncompressed 3D texture whose layout is `0x105`. addrlib lays it
+Slot 70 also reads an uncompressed 3D texture whose layout is `0x105`, at first a single mip. addrlib lays it
 out in thick 4 KiB blocks (`GFX10_SW_4K_S3_PATINFO`). `startup_gfx10_volume` needs no device. It
 checks the address bit of every x, y and z bit against the restated one-pipe rows for the five element
 sizes, the block sizes, and the order of blocks in a 17 by 17 by 17 RGBA8 volume. It also checks that
@@ -16871,6 +16878,26 @@ published.
 Two local mutations were run once and are not registered tests: the layer pitch of the upload set
 to zero, and the hold counting one footprint per layer. Each fails `startup_address_console_warp`:
 the first on the first volume's pixels, the second on the held volume.
+
+Volumes with a mip chain are read too. Each layer of blocks holds that layer of every mip: the tail
+block first, then the mips from the smallest to the largest. A mip at most a block wide and half a
+block high goes in the tail while at most five mips remain, at an origin read from its byte offset
+in the tail block. `startup_gfx10_volume` checks the addresses of a 32 by 32 by 32 RGBA8 volume with
+six mips: 11 blocks to a layer, mip 1 after the tail block, mip 0 after mip 1, and mips 2 to 5 at
+(0,8), (4,4), (4,0) and (0,4) in the tail block. It also checks the distinct bytes and tile/detile
+round trips of every mip of ten chains (a tail from mip 0, a chain with no tail, odd sides, a deep
+volume whose depth allows the mip count), and the mip chains slot 70 takes and the views of them it
+allows. `startup_gfx10_volume_tail_control` puts every tail mip at the start of the tail block and
+must fail. `startup_gfx10_volume_addrlib` now also compares every mip count of four chains for each
+element size: 305 volumes and 12,704,487 element addresses with 0 mismatches.
+
+`startup_address_console_{warp,hardware}` draws four mips of two chains, RGBA8 32 by 32 by 32 with
+six mips (mip 1, and mip 3 in the tail) and 20 by 24 by 16 with five mips (mip 1, and mip 3 in the
+tail), from a backing that holds every mip with its own texels. All 65,536 pixels of each must match.
+A local mutation that drops the tail origins of a volume, run once, fails it on the first tail mip,
+which then reads another mip's texels. A chain whose layout runs past the size the XG stand-in
+reports is held as before: RGBA8 33 by 9 by 18 with six mips takes 135,168 bytes in the layout against
+65,536 reported.
 
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_volume'
@@ -17407,7 +17434,14 @@ With a device slot 67 placeholder bound, command-list slot 14 looks up the trans
 
 `startup_compute_dispatch_two_mips_` writes two distinct patterns through two UAVs of one RGBA16_FLOAT texture in the same translated Dispatch. The test compares all 1,280 half values in the 32×8 and 16×4 subresources, including the sentinel values outside the written rectangles. Before translation both mips keep their sentinels. Exchanging the two views moves the patterns to opposite mips and changes 64 half values relative to the ordered case.
 
-The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>` follows the render totals; "not modelled" counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
+Every 300 render frames, `x2w-render upload ring: reserved <n> MiB in <n> reservations, refusals <n>, capacity <n> MiB` reports
+cumulative successful reservations and their 512-byte-rounded sizes, including reservations in recycled chunks.
+`refusals` counts reservation attempts that exhaust the allocator's available options. The submit-time rejection
+of a list whose chunks were recycled is logged separately. `capacity` is the total allocated chunk size.
+With `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1`, completed fenced submits can make chunks reusable sooner,
+so cumulative reserved bytes can exceed capacity. These totals do not measure current occupancy.
+
+The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>, builder gate refused <n>` follows the upload ring totals. The builder gate field counts dispatches refused by `X2W_COMPUTE_BUILDER_GATE`. The "not modelled" field counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
 
 The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
@@ -17430,7 +17464,8 @@ Dispatch record in a placed argument buffer. It binds the same translated pipeli
 Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
 
 The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
-After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
+After the queue fence it checks the leading guard, the neighboring three-word guard record, all three argument words,
+the input and all 320 output words.
 Counts of 2 and 5 write exactly that many words. Direct Dispatch with the same bindings and counts must produce
 the same outputs. Omitting the producer leaves the zero record and the output sentinel intact. Omitting the
 translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
@@ -17441,6 +17476,40 @@ cmake --build --preset release --target startup_stream_consumer
 ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
 python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
+
+#### GPU-written indirect Dispatch to an offscreen pixel (#3209)
+
+The same fixture also records the GPU writer on a first guest DIRECT list submission, waits for guest
+fence value 1, and checks the seven DWORDs (leading guard, 12-byte Dispatch at byte interval [4,16),
+neighboring three-DWORD guard at [16,28)). A second recording on that queue copies the same placed
+resource immediately before guest list slot 61, then submits and waits for value 2 before checking the
+second snapshot. The native resource pointer and GPU virtual address must agree across both boundaries.
+The translated slot 67 shader reads its normal raw-buffer table and XORs one input word per group into
+the aliased output UAV. The check requires a translated dispatch in the census, not just an untouched buffer.
+
+A source-built desktop vertex/pixel shader draws a fullscreen triangle to an 8x4 RGBA8 offscreen target.
+The pixel shader reads the actual output buffer via a root SRV, discards the sentinel, and writes the
+low three bytes of the compute word as RGB. The graphics recording uses the same underlying DIRECT
+queue after the guest consumer fence; no CPU readback is copied into the graphics input. The native
+queue and output resource identities are checked. Separate clear and post-draw copies are checked
+after the graphics fence. The input and all 320 output words are also checked.
+
+| Case | Both argument snapshots | Changed pixels / 32 |
+| --- | --- | ---: |
+| GPU writer, X=2 | (2,1,1) | 8 |
+| GPU writer, X=5 | (5,1,1) | 20 |
+| GPU writer, X=0 | (0,1,1) | 0 |
+| Writer omitted | (0,0,0) | 0 |
+
+The unchanged pixels must match the clear value, and all changed pixels must match their exact RGB
+reference. The stale-SRV control binds the original input instead of the compute output; the unchanged
+positive pixel oracle rejects it, while the independently predicted stale colours match the GPU readback.
+The device-free mutation mode also detects individual changed pixel words and short readbacks.
+The existing outside-record, multi-command, count-buffer, output-alias and manifest refusal controls
+remain in the same test. The observer checks native D3D12 debug errors when the info queue is available.
+The commands above run both the original and extended fixtures; use dev instead of release for Debug.
+This is a synthetic producer-to-pixel proof through translated indirect Compute, with a desktop graphics
+observer; it does not establish a translated graphics shader, a retail-scene producer, or a performance gain.
 
 ### Entry values from a buffer descriptor
 
@@ -18129,3 +18198,27 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_cvt_norm_warp|pixel_aot_
 Linux controls (including exhaustive verification against `fractions.Fraction` across all 63,488 finite binary16 values and single-instruction DPP16/DPP8 permutation-to-intrinsic checks pinning `QuadReadAcross{X,Y,Diagonal}` and `QuadReadLaneAt` lane order), `form_coverage_check.check_f16_cvt_norm_forms`, and Python mutation checks ran locally; Ubuntu LLVM 15 `pixel_aot_binary` round-trips run on PR CI, while `pixel_aot_f16_cvt_norm_{warp,hardware}` runs in `dev`/`release` presets and `main` CI (not `ctest --preset pr`). The draw harness compiles each fixture both optimized (`-denorm preserve`) and unoptimized (`-Od -denorm ftz`) so DXC retains the pure-`uint` conversion arithmetic in DXIL rather than constant-folding `plain_e32`/`plain_e64`/`sdwa` to immediate stores (note: because no binary32 float ops are emitted in `cvt_norm_{i16,u16}_f16`, `-denorm ftz` produces the same integer instructions as `-denorm preserve`).
 
 Independent Windows 11 (`26200.9974`, DXC `1.9.2602.17`, `debug_layer=unavailable`) measurements on `bd8f6f42` ([comment 1](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7196200555)) and `3100f363` ([comment 2](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7200844836)) passed `pixel_aot_f16_cvt_norm_hardware` (`AMD Radeon RX 9070 XT` `1002:7550`, driver `32.0.32029.2010`) and `pixel_aot_f16_cvt_norm_warp` with `max_absolute_error=0`, all 20 mutation draws mismatching, and DXIL disassembly confirming the `-Od` pass retains the `mul`/`lshr`/`shl` integer path. Scope limits: under `#839`'s static finite-proof contract (`half16_arith_source` / `half16_dpp_source`), operands are statically known per-lane uniform values, so device draw readbacks do not distinguish lane-routing changes on `dpp16`/`dpp8` (the permutation-to-intrinsic mapping is pinned statically in `check_f16_cvt_norm_controls`), mutation draws compile optimized rather than `-Od`, and the exhaustive 63,488-value check runs in Python rather than on-device.
+
+
+## Native raw pixel buffer UAV binding
+
+The native graphics cache and draw stand-in support a single raw pixel UAV from a tracked descriptor table for a direct non-indexed draw without SRVs. The manifest records the table parameter and byte offset; the runtime requires an aligned raw R32_TYPELESS buffer view with valid bounds, UAV resource flags and compatible state, retains the resource, and orders consecutive UAV uses. Typed/structured views, mixed views and other draw paths are outside this slice (#3212, #3215; separate from #3094/#2981).
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target startup_stream_consumer d3d12_xs_shim compile_dxil native_raw_buffer_view_check
+ctest --preset dev --no-tests=error -j1 -R '^(native_pixel_raw_uav_(warp|hardware)|native_raw_buffer_view_controls)$'
+```
+
+Repeat with the release preset. The source-built shader pair goes through request publication, native DXIL, actual PSO/draw and GPU readback. The fixture checks full buffer and color-target contents, nonzero/short/end views, decoy and invalid descriptors; the validator also checks alignment and bounds. Local RX 7900 XT/WARP Debug and Release runs passed 54 cases (3,456 DWORDs and 1,728 pixels); the independent review over main 886a5a28 reproduced the same counts on RTX 4060 Laptop and WARP with the D3D12 debug layer enabled and zero errors. Actual title rendering impact is not established.
+
+## Native pixel raw DWORD atomic add
+
+The native pixel compiler supports raw DWORD buffer atomic add in a proven straight-line guest block, with exact coverage/EXEC, including restoration from whole-quad entry. GLC returns the old value, preserves inactive VGPRs, and returns zero for an active out-of-view access; without GLC the addend is unchanged. The runtime uses the single raw pixel UAV direct non-indexed draw contract above. Indexed atomics, other atomic operations, general CFG and unproven WQM remain refused (#3216, #3217).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer compile_dxil
+ctest --preset dev --no-tests=error -j1 -R '^native_pixel_atomic_(warp|hardware)$' -V
+```
+
+Repeat with the release preset. The source-built fixture verifies 13 actual draws and four refusal controls per adapter/configuration, including contention, guard words, active out-of-view, odd raster edges and real WQM quad-neighbor reads with and without GLC. WQM+GLC records returned old values through a second exact atomic in a private lane slot and checks a valid serialization of the varying addends. Local RX 7900 XT/WARP Debug/Release integration over main 4b0350e passed 52 draws, 3328 DWORD and 1664 pixel comparisons, and 16 refusal controls. The debug layer was unavailable; actual title rendering is not established.

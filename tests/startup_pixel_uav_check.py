@@ -14,8 +14,9 @@ Refused, each by its logged reason, with every word unchanged and no translated 
 view, an SRV, a texture without ALLOW_UNORDERED_ACCESS, an integer view, a view of mip 1, a 2D-array view, an
 entry outside the bound table, no table at the parameter, the same texture also bound as an SRV of the draw, and
 a texture E that is also the draw's render target (bound through list slot 50).
-Manifest lines: a view qualifier (float, uint, and the compute line with 'channels 4'), another image kind, a buffer
-line, a 'channels' field and a view index out of order are refused when the manifest is loaded.
+Manifest lines: a view qualifier (float, uint, and the compute line with 'channels 4'), another image kind,
+a 'channels' field and a view index out of order are refused when the manifest is loaded. A raw buffer
+line naming a texture is refused during view resolution.
 Exec: the v_cmpx variants of the program, through the same runtime path: exec on writes the texel, exec off
 leaves it. Control: the exec-off shader recompiled with the guard removed from the store must write the texel,
 and the check must report it.
@@ -67,8 +68,8 @@ LINES = (
     ('a.float-line', 'uav 0 tex2d float table 0 0', None, 'uav line refused (a view qualifier is not read for pixel stores)'),
     ('a.compute-line', 'uav 0 tex2d float table 0 0 channels 4', None,
      'uav line refused (a view qualifier is not read for pixel stores)'),
-    ('a.tex3d-line', 'uav 0 tex3d table 0 0', None, 'uav line refused (only tex2d, tex2da and tex2du views are bound)'),
-    ('a.buffer-line', 'uav 0 raw table 0 0', None, 'uav line refused (buffer view (raw uav) is not bound)'),
+    ('a.tex3d-line', 'uav 0 tex3d table 0 0', None, 'uav line refused (only tex2d, tex2da, tex2du and raw views are bound)'),
+    ('a.buffer-line', 'uav 0 raw table 0 0', None, 'uav 0 refused: incompatible raw buffer UAV'),
     ('a.uint-line', 'uav 0 tex2d uint table 0 0', None, 'uav line refused (a view qualifier is not read for pixel stores)'),
     ('a.channels-field', 'uav 0 tex2d table 0 0 channels 4', None,
      'uav line refused (unexpected field after the table offset)'),

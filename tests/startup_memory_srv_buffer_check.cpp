@@ -317,12 +317,14 @@ int main(int argc, char** argv)
         D3D12_SHADER_RESOURCE_VIEW_DESC out{};
         check("page-start base cannot name a sub-allocated structured view",
               !x2w_startup::resolve_buffer_srv_desc(page, 65536, address, structured, out));
-        const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page, shape[1]) && !mutated("exact-start");
+        const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page, shape[1], false) && !mutated("exact-start");
         const std::uint64_t base = exact ? address : page;
         check("exact-start base names a sub-allocated structured view",
               x2w_startup::resolve_buffer_srv_desc(base, shape[1], address, structured, out) && out.Buffer.FirstElement == 0);
     }
-    check("aligned address keeps the page base", !x2w_startup::unplaced_view_needs_exact_start(0x14000, 0x10000, 2048));
+    check("aligned address keeps the page base", !x2w_startup::unplaced_view_needs_exact_start(0x14000, 0x10000, 2048, false));
+    check("raw view keeps the page base",
+          !(x2w_startup::unplaced_view_needs_exact_start(0x10001, 0x10000, 4, true) || mutated("raw-exact")));
 
     // Existing-heap wrap of the allocation holding an unplaced buffer: up to the 256 MiB span limit only.
     check("unplaced heap 64 KiB allocation", x2w_startup::unplaced_existing_heap_allowed(65536));
