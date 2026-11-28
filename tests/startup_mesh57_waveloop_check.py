@@ -270,7 +270,7 @@ def upper_exec_case():
 
 
 def serial_shaders(directory, mesh, dxc, *, proof_accepted=False):
-    mode = 'force' if proof_accepted else '1'
+    mode = 'force' if proof_accepted else 'fallback'
     if proof_accepted:
         status, _ = run(mesh, '0', PIXEL)
         assert status == 'ok', status
@@ -394,8 +394,27 @@ def check_oracle_sibling():
     assert not any(name.startswith(('ms57w.', 'ps57w.')) and name != 'ms57w.txt' for name in refused_sibling)
 
 
+def check_fallback_mode():
+    """fallback: serial only for keys the proof path refuses; a key the proof path translates is left alone."""
+    for mesh, pixel in ((SERIAL_MESH, ()), (DATA_DEP, PIXEL)):
+        refused, _ = run(mesh, '0', pixel)
+        assert refused.startswith('unsupported:'), refused
+        status, output = run(mesh, 'fallback', pixel, artifacts=True)
+        assert status == 'ok' and output['ms57.hlsl'].startswith(b'// x2w_serial_wave 1\n'), (status, sorted(output))
+        assert run(mesh, '1', pixel, artifacts=True)[1] == output
+    for mesh in (MESH, GROUP_MESH):
+        proof = run(mesh, '0', PIXEL, artifacts=True)
+        assert run(mesh, 'fallback', PIXEL, artifacts=True) == proof
+    # A lookup miss inside the serial translator refuses the key; it does not escape as an exception.
+    with patch.object(G, 'mesh57_serial_pipeline', wraps=G.mesh57_serial_pipeline), \
+            patch('mesh_waveloop.translate_serial', side_effect=KeyError(5)):
+        status, _ = run(SERIAL_MESH, 'fallback')
+    assert status.startswith('unsupported: ') and 'wave loop: internal lookup KeyError' in status, status
+
+
 def offline(dxc=None):
     check_oracle_sibling()
+    check_fallback_mode()
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
     translated, output = run(SERIAL_MESH, '1', artifacts=True)

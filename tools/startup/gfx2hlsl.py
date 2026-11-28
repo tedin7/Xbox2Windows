@@ -24192,11 +24192,12 @@ def validate_mesh57_pixel(ps):
         raise Unsupported('slot 57 pixel stage mixes the null export with another export')
 
 
-MESH_WAVELOOP_MODES = ('0', '1', 'force', 'oracle')
+MESH_WAVELOOP_MODES = ('0', '1', 'fallback', 'force', 'oracle')
 
 
 def mesh_waveloop_mode():
-    """X2W_MESH_WAVELOOP (default 0, the proof path only): 1 = the serial wave loop takes the proof-family refusals,
+    """X2W_MESH_WAVELOOP (default 0, the proof path only): 1 or fallback = the serial wave loop takes the proof-family
+    refusals and only those (a key the proof path translates keeps its proof translation),
     force = every key goes through the serial wave loop, oracle = the proof path publishes as with 0 and the serial wave
     loop of the same key is published beside it as <key>.ms57w.* for the replay oracle (X2W_REPLAY_ORACLE=mesh)."""
     mode = os.environ.get('X2W_MESH_WAVELOOP', '0') or '0'
@@ -24207,7 +24208,12 @@ def mesh_waveloop_mode():
 
 def mesh57_serial_pipeline(ms, ps, root, pixel_refusal):
     from mesh_waveloop import translate_serial
-    return translate_serial(sys.modules[__name__], ms, ps or None, root, pixel_refusal)
+    try:
+        return translate_serial(sys.modules[__name__], ms, ps or None, root, pixel_refusal)
+    except LookupError as reason:  # a wave-loop CFG lookup that missed is a refusal of the key, not a crash
+        error = Unsupported('wave loop: internal lookup %s: %r' % (type(reason).__name__, reason.args))
+        error.mesh_stage = True
+        raise error from reason
 
 
 def mesh57_pipeline(ms, ps, root, pixel_refusal, mode):
@@ -24216,7 +24222,7 @@ def mesh57_pipeline(ms, ps, root, pixel_refusal, mode):
     try:
         pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
     except Unsupported as reason:
-        if mode not in ('1', 'force') or not getattr(reason, 'mesh_stage', False):
+        if mode not in ('1', 'fallback', 'force') or not getattr(reason, 'mesh_stage', False):
             raise
         from mesh_waveloop import proof_family
         if not proof_family(sys.modules[__name__], str(reason)):
