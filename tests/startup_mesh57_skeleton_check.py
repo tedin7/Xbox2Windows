@@ -106,6 +106,27 @@ HEAP_MESH[1:1] = HEAP_SETUP + [
 FORMATTED_HEAP_MESH = HEAP_MESH.copy()
 FORMATTED_HEAP_MESH[FORMATTED_HEAP_MESH.index('e03810c0')] = 'e00c10c0'
 
+# The colour comes from a root SRV (user data s[20:21]) instead of the table buffer: one scalar load at a byte offset
+# past the first 64 KiB of the root buffer, which a 64 KiB window would cut off.
+ROOT_SRV_BYTES = 0x20000
+ROOT_SRV_COLOUR_AT = 0x12000
+ROOT_SRV_MESH = MESH.copy()
+_root_at = ROOT_SRV_MESH.index('e03810c0')
+del ROOT_SRV_MESH[_root_at:_root_at + 2]  # the colour is not read from the table buffer
+ROOT_SRV_MESH[1:1] = [
+    'f408070a', '%08x' % (0xfa000000 | ROOT_SRV_COLOUR_AT),  # s_load_dwordx4 s[28:31], s[20:21], 0x12000
+    'bf8cc07f',  # s_waitcnt lgkmcnt(0)
+    '7e28021c', '7e2a021d', '7e2c021e', '7e2e021f',  # v_mov_b32 v20..v23, s28..s31
+]
+
+
+def root_srv_root():
+    # Parameter 0: two root constants (s16, s17). 1: a descriptor table (s18). 2: one root constant (s19). 3: a root SRV (s[20:21]).
+    params = [(1, 0, 72), (0, 0, 84), (1, 0, 92), (3, 0, 104)]
+    rts = (struct.pack('<6I', 2, 4, 24, 0, 0, 0) + b''.join(struct.pack('<3I', *p) for p in params)
+           + struct.pack('<3I', 0, 0, 2) + struct.pack('<2I', 0, 0) + struct.pack('<3I', 1, 0, 1) + struct.pack('<2I', 0, 0))
+    return b'DXBC' + bytes(16) + struct.pack('<4I', 1, 44 + len(rts), 1, 36) + b'RTS0' + struct.pack('<I', len(rts)) + rts
+
 
 def heap_root():
     params = [(1, 0, 60), (0, 0, 72), (1, 0, 80)]
@@ -2716,13 +2737,15 @@ def reference_per_lane(points, colours, triangles, bound, old, wave_red):
     return rasterise(points, rendered, triangles, 128, len(triangles))
 
 
-def publish_request(directory, publisher, adapter, mesh=MESH, heap=None):
+def publish_request(directory, publisher, adapter, mesh=MESH, heap=None, root_srv=None):
     ms, ps = code(mesh), code(PIXEL)
     (directory / 'ms.bin').write_bytes(ms)
     (directory / 'ps.bin').write_bytes(ps)
     env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
     if heap is not None:
         env['X2W_TEST_MESH57_HEAP'] = str(heap)
+    if root_srv is not None:
+        env['X2W_TEST_MESH57_ROOT_SRV'] = str(root_srv)
     result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
     print(result.stdout, end='')
     if result.returncode:
@@ -2881,6 +2904,45 @@ def runtime(dxc, renderer, adapter, publisher):
             raise AssertionError('table at heap slot 3: image differs\n' +
                                  runtime_mismatch_report(actual, images[1], images[1], images[2], clear, log))
         print('table at heap slot 3: drew record 1')
+    return runtime_root_srv(publisher, adapter, points, colours, indices, words, clear)
+
+
+def runtime_root_srv(publisher, adapter, points, colours, indices, words, clear):
+    """The slot 57 mesh reads its colour through a root SRV at byte 0x12000 of a 128 KiB buffer (past a 64 KiB window)."""
+    colour = (200, 64, 32, 255)
+    root_data = bytearray(ROOT_SRV_BYTES)
+    struct.pack_into('<4f', root_data, ROOT_SRV_COLOUR_AT, *(channel / 255 for channel in colour))
+    want = b''.join(map(bytes, rasterise(points, [colour] * len(points), indices[:2], len(points), 2)))
+    assert want != clear
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        root_file = directory / 'root.bin'
+        root_file.write_bytes(root_data)
+        status, published = publish_request(directory, publisher, adapter, ROOT_SRV_MESH, root_srv=root_file)
+        if status:
+            return status
+        cache, key, root_blob = published
+        expect('root SRV binding', 'srv 0 buf root 3' in G.MeshPipeline(
+            code(ROOT_SRV_MESH), code(PIXEL), root_blob).manifest().splitlines(), True)
+        if G.translate_request(str(cache), key) != 'ok':
+            raise AssertionError('root SRV mesh request translation failed')
+        data, arguments, pixels, log = (directory / name for name in ('data.bin', 'args.bin', 'pixels.bin', 'runtime.log'))
+        data.write_bytes(buffer(points, colours, words))
+        arguments.write_bytes(struct.pack('<3I', 1, 1, 1))
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
+                   X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data),
+                   X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
+                   X2W_TEST_MESH57_ROOT_SRV=str(root_file), X2W_TRAP_LOG=str(log))
+        result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
+        if result.returncode == 77:
+            return 77
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+        actual = pixels.read_bytes()
+        if actual != want:
+            raise AssertionError('root SRV past 64 KiB: image differs\n' +
+                                 runtime_mismatch_report(actual, want, want, want, clear, log))
+        print('root SRV at byte 0x%x of %d: drew the root colour' % (ROOT_SRV_COLOUR_AT, ROOT_SRV_BYTES))
     return 0
 
 
