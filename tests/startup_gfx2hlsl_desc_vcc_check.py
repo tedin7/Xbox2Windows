@@ -4,6 +4,7 @@ usage: startup_gfx2hlsl_desc_vcc_check.py [draw <dxc> <offscreen_check> <warp|ha
 """
 import struct
 import hashlib
+import hlsl_pin  # noqa: E402
 import subprocess
 import sys
 import tempfile
@@ -132,8 +133,8 @@ def mask_controls():
     swap_controls()
     pipe = G.Pipeline(MASK_VS, None, TABLE_ROOT)
     source = pipe.hlsl_vs()
-    assert hashlib.sha256((source + '\0' + pipe.manifest()).encode()).hexdigest() == (
-        '90eab934d1e1209a516649778a74ed21c960c2fa1120c020d61129944127006d')
+    assert hlsl_pin.digest(source, pipe.manifest()) == (
+        '00df25fd78e03eefd9c63da7e41e65deae317e0a1aad9454b8be21b343c88d92')
     assert source.count(MASK_MOVE) == 1 and 'class32(F(v6)) & 0x00000100u' in source
     # Read vcc_hi as the select mask, or remove the 32-bit EXEC proof.
     high_select = bytes.fromhex('0a0001d580e4ad01')

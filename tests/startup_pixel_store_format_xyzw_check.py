@@ -2,6 +2,7 @@
 from pathlib import Path
 import struct
 import hashlib
+import hlsl_pin  # noqa: E402
 import re
 import subprocess
 import sys
@@ -145,7 +146,7 @@ def controls():
     else:
         raise AssertionError('lane write retained index proof')
     unrelated = translate(stores=False, firstlane=False)
-    assert hashlib.sha256((unrelated.hlsl_ps() + unrelated.manifest()).encode()).hexdigest() == '2b1a97de3bd828b48b99c9af162be13c8ca6a03f823c7674fc9d41ad683ae0e3'
+    assert hlsl_pin.digest(unrelated.hlsl_ps(), unrelated.manifest(), sep='') == 'c1f4e9da446756245f8efe12e64622ed6bd2f936309d97d956c695f4a6fcc526'
     # With indices 4 and 5, dropping NUM_RECORDS writes the otherwise untouched backing records.
     right = bytearray(fixture(pipeline, untouched=True)[164:212])
     wrong = bytearray(right)

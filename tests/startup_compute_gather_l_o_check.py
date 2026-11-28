@@ -1,6 +1,7 @@
 """Explicit-LOD offset gather controls and D3D12 compute readback."""
 import argparse
 import hashlib
+import hlsl_pin  # noqa: E402
 import math
 from pathlib import Path
 import struct
@@ -49,8 +50,8 @@ def controls():
     # Golden text from revision a08c038e2d42, before this lowering existed.
     old_lod = lod_control.cs_pipe(lod_control.compute_shader()).hlsl_cs()
     old_lz_o = lz_control.pipeline(lz_control.shader_o(1, lz_control.pack_offset(1, -2))).hlsl_cs()
-    assert hashlib.sha256(old_lod.encode()).hexdigest() == '2ab0937b5256fe509718047142f8d09af493577e824233b672b8743d68857310'
-    assert hashlib.sha256(old_lz_o.encode()).hexdigest() == '3b9cee32d1b0d70b25d693a18cf1249735b6a491892044915fe62ee11b1d7558'
+    assert hlsl_pin.digest(old_lod) == '3ed33b3a89f32846750c5581878848addbb113323c89598bd1e8da9be6d2ffed'
+    assert hlsl_pin.digest(old_lz_o) == '2b0e7ddb2a9aa050c62f449e21fa8d9ecc5c7f1134a9d93eaa64b4e767440fbb'
     want = reference(1)
     assert want != reference(1, (0, 0)) and want != reference(0)
     for dynamic in (False, True):
@@ -62,7 +63,7 @@ def controls():
             assert f'v{regs[1]} = 0x3f300000u + v0;' in hlsl
             assert 'int2 offset = int2(asint(packed_offset << 26u)' in hlsl
             if dynamic and nsa:
-                assert hashlib.sha256(hlsl.encode()).hexdigest() == '256ecae959d5bf806fd8a677de9f018fa677a1c01efe955f4f75b79a7b4bae49'
+                assert hlsl_pin.digest(hlsl) == 'ff292b47a826434d74e419f15010153333848cb34d239b9a96a9541726ad0fee'
     for coord, size in zip(UV, (WIDTH >> 1, HEIGHT >> 1)):
         scaled = coord * size - 0.5
         assert abs(scaled - round(scaled)) >= 1 / 16

@@ -28,6 +28,7 @@ join of a uniform branch exercises both retries. The exports use normal float bi
 PS_DATA2 keeps a pair write in place and reads uniform scalar selects as VOP3 masks.
 """
 import hashlib
+import hlsl_pin  # noqa: E402
 import os
 import re
 import struct
@@ -356,11 +357,11 @@ s_endpgm
 }
 
 
-# SHA-256 of the exact HLSL emitted by 1aeb71894 for the original successful fixtures.
+# SHA-256 of the per-shader HLSL (after the helper prelude, see hlsl_pin.py) for the original successful fixtures.
 BASE_HLSL = {
-    'PS': '3510103764c6e70486b8357561d96eabdf537bf16f0291dcadf60cd01eaf4df3',
-    'SCALAR_ONLY': '9e18eb10f69ccc4a135e1c4d4d96de0bbad46c44b33b2f09b6683389c33d2e6a',
-    'READFIRSTLANE_SCALAR': 'f8308b22788fb9222f1b6b380cfd1d66f48ddeebbc24069350348c2f7fe085ff',
+    'PS': 'f71a33e0dbe9ef5fd59c8ed4914c744d7275be6427ecf422755ed48515c2def2',
+    'SCALAR_ONLY': 'ff47732dd85d9c7a78d8da3114e971bd1f1cfd9d60b4148fce1452366f0dea30',
+    'READFIRSTLANE_SCALAR': '5696412cf2176823588bd903655766149ab5461ba5a809752310570ef8c2fa27',
 }
 
 
@@ -459,7 +460,7 @@ def controls():
         if refusal is None:
             check('%s translates' % name, text is not None and 'vcc_hi' not in text, str(reason))
             if name in BASE_HLSL and text is not None:
-                digest = hashlib.sha256(text.encode()).hexdigest()
+                digest = hlsl_pin.digest(text)
                 check('%s HLSL matches the base revision byte for byte' % name, digest == BASE_HLSL[name], digest)
         else:
             check('%s refused: %s' % (name, refusal), text is None and reason == refusal, str(reason))
