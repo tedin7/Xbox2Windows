@@ -47,6 +47,13 @@ PS_WORDS = bytes.fromhex(
 CONST_SOURCE = PS_SOURCE.replace('s[10:11], s9', 's[10:11], 0x10')
 CONST_WORDS = PS_WORDS.replace(bytes.fromhex('050608f400000012'), bytes.fromhex('050608f4100000fa'))
 
+# One s_load_dwordx8 fetches the sampler records 0 and 1 at once (byte offset 0x0 of the heap); the sample reads the
+# second one, s[28:31], which is entry 1 whatever the root constant says.
+WIDE_SOURCE = PS_SOURCE.replace('s_load_dwordx4 s[24:27], s[10:11], s9', 's_load_dwordx8 s[24:31], s[10:11], 0x0'
+                                ).replace('s[16:23], s[24:27]', 's[16:23], s[28:31]')
+WIDE_WORDS = PS_WORDS.replace(bytes.fromhex('050608f400000012'), bytes.fromhex('05060cf4000000fa')
+                              ).replace(bytes.fromhex('080f80f00000c400'), bytes.fromhex('080f80f00000e400'))
+
 # The run-time load, then s_mov_b32 s25, 0: the sample's s[24:27] no longer holds one heap load.
 MIXED_SOURCE = PS_SOURCE.replace('v_mov_b32 v0, 0x3fa00000\n', 's_mov_b32 s25, 0\nv_mov_b32 v0, 0x3fa00000\n')
 MIXED_WORDS = PS_WORDS.replace(bytes.fromhex('ff02007e0000a03f'), bytes.fromhex('800399be' 'ff02007e0000a03f'))
@@ -117,6 +124,21 @@ def controls():
     assert 'smpheap 2048 1 fallback 2047' in manifest and not pipe.notes, (manifest, pipe.notes)
     print('constant offset 0x10: %s = 16u, qh[x2w_sampler_entry(%s)]; refused without the table' % (m.group(2), m.group(2)))
 
+    # Two records from one wide load: the second names entry 1 (byte offset 16), refused without the table.
+    try:
+        translate(WIDE_WORDS, False)
+    except G.Unsupported as error:
+        assert 'sampler from a descriptor' in str(error), error
+    else:
+        raise AssertionError('wide sampler heap load accepted without the table')
+    pipe = translate(WIDE_WORDS, True)
+    ps, manifest = pipe.hlsl_ps(), pipe.manifest()
+    m = re.search(r'(\w+)\.Sample\(qh\[x2w_sampler_entry\((s\d+)\)\], ', ps)
+    assert m and re.search(r'\b%s = 16u;' % m.group(2), ps), ps
+    assert 'smpheap 2048 1 fallback 2047' in manifest and not pipe.notes, (manifest, pipe.notes)
+    print('wide load, second record: %s = 16u, qh[x2w_sampler_entry(%s)]; refused without the table'
+          % (m.group(2), m.group(2)))
+
     # Default (X2W_SAMPLER_HEAP unset): today's shortcut, a static all-zero sampler and a note.
     pipe = translate(PS_WORDS, False)
     assert 'qh[' not in pipe.hlsl_ps() and 'smpheap' not in pipe.manifest(), pipe.manifest()
@@ -153,6 +175,7 @@ def assemble(llvm_mc, source):
 
 def check_binary(llvm_mc):
     for name, source, words in (('pixel', PS_SOURCE, PS_WORDS), ('constant pixel', CONST_SOURCE, CONST_WORDS),
+                                ('wide pixel', WIDE_SOURCE, WIDE_WORDS),
                                 ('mixed pixel', MIXED_SOURCE, MIXED_WORDS),
                                 ('vertex', VS_SOURCE, VS_WORDS)):
         built = assemble(llvm_mc, source)
@@ -222,23 +245,25 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 assert 'null_sampler_unreadable=1 null_sampler_out_of_range=2044' in run.stdout, run.stdout
                 print('%s %s offset %d: %08x' % (kind, label, offset, expected), flush=True)
 
-            # A constant byte offset 0x10 names entry 1 whatever the root constant says; dropping the index reads entry 0.
-            constant = translate(CONST_WORDS, True).hlsl_ps()
-            constant_shader = compile_hlsl(compiler, kind, constant, 'ps_const_%s' % kind, ps_profile, directory)
-            lost = re.sub(r'qh\[x2w_sampler_entry\(s\d+\)\]', 'qh[0]', constant)
-            assert lost != constant
-            constant_mutant = compile_hlsl(compiler, kind, lost, 'ps_const_lost_%s' % kind, ps_profile, directory)
-            for root_offset in (0, 32):
-                run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_shader),
-                                      str(root_offset), '3f400000', str(manifest)], capture_output=True, text=True)
-                sys.stdout.write(run.stdout)
-                assert run.returncode == 0, f'{kind} constant offset (root {root_offset})\n{run.stdout}\n{run.stderr}'
-                print(f'{kind} constant offset 0x10 (root constant {root_offset}): 3f400000', flush=True)
-            run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_mutant),
-                                  '0', '3f400000', str(manifest)], capture_output=True, text=True)
-            assert run.returncode != 0 and 'mismatch offset=0 expected=3f400000 actual=3e800000' in run.stderr, \
-                f'{kind} constant index dropped\n{run.stdout}\n{run.stderr}'
-            print(f'{kind} constant offset with the index dropped: fails at entry 1 as expected', flush=True)
+            # A constant byte offset (0x10, or the second record of a wide load) names entry 1 whatever the root constant
+            # says; dropping the index reads entry 0.
+            for tag, what, words in (('const', 'constant offset 0x10', CONST_WORDS), ('wide', 'wide load second record', WIDE_WORDS)):
+                constant = translate(words, True).hlsl_ps()
+                constant_shader = compile_hlsl(compiler, kind, constant, 'ps_%s_%s' % (tag, kind), ps_profile, directory)
+                lost = re.sub(r'qh\[x2w_sampler_entry\(s\d+\)\]', 'qh[0]', constant)
+                assert lost != constant
+                constant_mutant = compile_hlsl(compiler, kind, lost, 'ps_%s_lost_%s' % (tag, kind), ps_profile, directory)
+                for root_offset in (0, 32):
+                    run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_shader),
+                                          str(root_offset), '3f400000', str(manifest)], capture_output=True, text=True)
+                    sys.stdout.write(run.stdout)
+                    assert run.returncode == 0, f'{kind} {what} (root {root_offset})\n{run.stdout}\n{run.stderr}'
+                    print(f'{kind} {what} (root constant {root_offset}): 3f400000', flush=True)
+                run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(constant_mutant),
+                                      '0', '3f400000', str(manifest)], capture_output=True, text=True)
+                assert run.returncode != 0 and 'mismatch offset=0 expected=3f400000 actual=3e800000' in run.stderr, \
+                    f'{kind} {what} index dropped\n{run.stdout}\n{run.stderr}'
+                print(f'{kind} {what} with the index dropped: fails at entry 1 as expected', flush=True)
 
             for label, pixel, bindings, extra, failure in (
                 ('static only', static_shader, static_manifest, [], None),

@@ -7674,6 +7674,8 @@ class Stage:
         if not r or r[2] - r[1] != 3:
             return None
         first = self.sym.get(r[1])
+        if first and first[0] == 'desc' and self.pipe.sampler_heap:
+            return self.heap_sampler_record(tok, r)
         if not first or first[0] != 'smpheap':
             return None
         if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
@@ -7682,6 +7684,24 @@ class Stage:
         # Sampler descriptors are 16 bytes; x2w_sampler_entry() maps the byte offset to its entry and
         # sends unaligned or out-of-range offsets to the fallback entry.
         return 'qh[x2w_sampler_entry(s%d)]' % first[1]
+
+    def heap_sampler_record(self, tok, r):
+        """'qh[...]' for four sampler words cut from a wider constant-offset load of the sampler heap
+        (s_load_dwordx8 or x16 fetches several 16-byte records at once; word 4k + i of the load at byte offset B is
+        record B / 16 + k, "RDNA 2" Instruction Set Architecture, section 8.2 SMEM). Under X2W_SAMPLER_HEAP=1 it is
+        the same table lookup as a run-time offset, with the byte offset a constant: x2w_sampler_entry keeps the guard."""
+        first = self.sym.get(r[1])
+        if first[1] != ('smpheap',) or not isinstance(first[2], int) or first[3] % 4:
+            return None
+        for i in range(4):
+            sym = self.sym.get(r[1] + i)
+            if not sym or sym[:3] != first[:3] or sym[3] != first[3] + i:
+                raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
+        self.pipe.uses_sampler_heap = True
+        # Held in the record's first register, like the load of one record, so the index stays a run-time value.
+        self.used_s.add(r[1])
+        self.emit('s%d = %du;' % (r[1], first[2] + 4 * first[3]))
+        return 'qh[x2w_sampler_entry(s%d)]' % r[1]
 
     def const_words(self, tok):
         r = reg_range(tok)
