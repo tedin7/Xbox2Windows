@@ -100,6 +100,14 @@ bool Tracker::record_reductions(Submission& s, ID3D12Device* device, D3D12_COMMA
                                                IID_PPV_ARGS(&s.result))))
         return false;
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
+    void* zeros = nullptr;
+    if (FAILED(device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                               nullptr, IID_PPV_ARGS(&s.zeros))) ||
+        FAILED(s.zeros->Map(0, nullptr, &zeros)) || !zeros)
+        return false;
+    std::memset(zeros, 0, static_cast<std::size_t>(bytes));  // the groups fold into zeroed records with atomics
+    s.zeros->Unmap(0, nullptr);
     if (FAILED(device->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                                nullptr, IID_PPV_ARGS(&s.readback))))
         return false;
@@ -109,6 +117,9 @@ bool Tracker::record_reductions(Submission& s, ID3D12Device* device, D3D12_COMMA
     list->SetComputeRootSignature(pipelines_.root.Get());
     list->SetComputeRootUnorderedAccessView(1, s.result->GetGPUVirtualAddress());
     barrier(list, s.result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(s.result.Get(), 0, s.zeros.Get(), 0, bytes);
+    barrier(list, s.result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (std::size_t j = 0; j < s.jobs.size(); ++j) {

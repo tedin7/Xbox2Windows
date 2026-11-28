@@ -130,7 +130,8 @@ inline FormatInfo format_info(DXGI_FORMAT format, DXGI_FORMAT written, bool dept
     }
 }
 
-// The partial record one reduction group writes per channel, in dwords: min, max, sum (floats), zero, NaN, Inf.
+// The partial record of one reduction group per channel, in dwords: min (complement of its ordered word), max
+// (ordered word), sum (float bits), zeros, NaN, Inf. Ordered words keep the float order; 0 means no finite value.
 constexpr unsigned partial_words = 6;
 constexpr unsigned group_words = 4 * partial_words;
 constexpr unsigned max_groups = 64;
@@ -151,6 +152,8 @@ struct Stats {
     std::uint64_t zero[4]{}, nan[4]{}, inf[4]{};
 };
 
+inline float ordered_float(std::uint32_t word);
+
 inline float word_float(std::uint32_t word)
 {
     float value;
@@ -169,11 +172,12 @@ inline Stats combine(const std::uint32_t* words, unsigned groups, std::uint64_t 
         double sum = 0;
         for (unsigned g = 0; g < groups; ++g) {
             const std::uint32_t* p = words + g * group_words + c * partial_words;
-            const float lo = word_float(p[0]), hi = word_float(p[1]);
+            const bool seen = p[0] != 0 && p[1] != 0;  // a group that saw no finite value left both words 0
+            const float lo = seen ? ordered_float(~p[0]) : 0.0f, hi = seen ? ordered_float(p[1]) : 0.0f;
             stats.zero[c] += p[3];
             stats.nan[c] += p[4];
             stats.inf[c] += p[5];
-            if (!(lo <= hi)) continue;  // a group that saw no finite value keeps +Inf / -Inf
+            if (!seen) continue;
             stats.min[c] = stats.finite[c] ? std::min(stats.min[c], lo) : lo;
             stats.max[c] = stats.finite[c] ? std::max(stats.max[c], hi) : hi;
             stats.finite[c] = true;
@@ -183,6 +187,12 @@ inline Stats combine(const std::uint32_t* words, unsigned groups, std::uint64_t 
         if (stats.finite[c] && texels > counted) stats.mean[c] = sum / static_cast<double>(texels - counted);
     }
     return stats;
+}
+
+// The float of an order-preserving word (pass_stats_shader.h ordered).
+inline float ordered_float(std::uint32_t word)
+{
+    return word_float((word & 0x80000000u) != 0 ? word & 0x7fffffffu : ~word);
 }
 
 // Signal: a colour channel (the first three; alpha alone is not a picture) holds a finite nonzero value somewhere.
