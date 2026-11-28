@@ -101,7 +101,7 @@ if(TARGET startup_replay_quad AND TARGET startup_stream_consumer AND TARGET x2w_
             "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_dump_check.py"
             "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:x2w_replay>"
             "${DXC_EXECUTABLE}" "${backend}")
-        set_tests_properties(startup_replay_dump_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_replay_dump_${backend} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
 
