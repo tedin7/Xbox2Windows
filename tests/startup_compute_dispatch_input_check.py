@@ -273,7 +273,20 @@ void main() {
     expected = untouched.copy()
     expected[8:12] = [0xa0000000 + i * 0x101 for i in range(4, 8)]
     assert got == expected, f'UAV-token input: read {got[8:12]}, expected {expected[8:12]}'
-    print('view tokens: raw and structured output words, UAV-token input and null view match the CPU reference')
+    # A program that writes far past the end of its output view (64 threads, eight bytes each, over a 16-byte view) must not
+    # change a byte outside the view: the bytes after it, and the dwords before it, keep their sentinel.
+    program('view_token_overrun', """\
+RWByteAddressBuffer target : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID) {
+    target.Store2(tid.x * 8, uint2(0x1000 + tid.x, 0x2000 + tid.x));
+}
+""", 'x2w-manifest 2\nstage cs\nud 0\nuav 0 table 1 0\n')
+    got = run('-overrun')
+    expected = untouched.copy()
+    expected[8:12] = [0x1000, 0x2000, 0x1001, 0x2001]
+    assert got == expected, f'output overrun: read {got}, expected only dwords 8-11 changed'
+    print('view tokens: raw and structured output words, a 16-byte view that survives a 512-byte store loop, UAV-token input and null view match the CPU reference')
 
 
 def main(consumer, dxc, adapter):
