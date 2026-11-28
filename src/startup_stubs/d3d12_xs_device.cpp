@@ -312,7 +312,7 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullpt
             result = r.tail_cpu + (index - r.desktop_descriptors) * r.desktop_stride;
             room = static_cast<UINT>(limit - index);
         } else {
-            result = r.desktop + index * r.desktop_stride + offset % r.title_stride;
+            result = r.desktop + x2w_startup::desktop_descriptor_offset(offset, r.title_stride, r.desktop_stride);
             room = static_cast<UINT>(r.desktop_descriptors - index);
         }
         past_end = false;
@@ -4661,14 +4661,15 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     InterlockedIncrement(&render_clears);
 }
 // The desktop shader-visible CBV/SRV/UAV heap that owns the GPU handle's descriptor, or null.
-ID3D12DescriptorHeap* owning_view_heap(u64 gpu)
+ID3D12DescriptorHeap* owning_view_heap(u64 gpu, u64& desktop_gpu)
 {
     u64 owner = 0;
     note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
         const u64 offset = gpu - heap.desktop_gpu;
-        if (heap.increment && offset < u64{heap.count} * heap.increment && offset % heap.increment == 0) {
+        if (heap.title_increment && offset < u64{heap.count} * heap.title_increment && offset % heap.title_increment == 0) {
+            desktop_gpu = heap.desktop_gpu + (offset / heap.title_increment) * heap.increment;
             owner = heap.wrapper;
             break;
         }
@@ -4700,12 +4701,13 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const ResolvedView view = desktop ? resolve_view(desktop, 19) : ResolvedView{};
     ID3D12Resource* target = view.resource;
     ID3D12DescriptorHeap* view_heap = nullptr;
+    u64 desktop_gpu = 0;
     const char* why = nullptr;
     if (!x2w_local::readable(values, 4 * sizeof(UINT))) why = "no clear values";
     else if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) why = "unreadable rects";
     else if (!target) why = view.wrong_kind ? "view is not an unordered-access view"
                             : view.skipped ? "view was skipped at creation" : "view holds no known resource";
-    else if (!(view_heap = owning_view_heap(gpu_handle))) why = "GPU handle is on no known descriptor heap";
+    else if (!(view_heap = owning_view_heap(gpu_handle, desktop_gpu))) why = "GPU handle is on no known descriptor heap";
     else if (!(target->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) why = "resource lacks unordered access";
     else if (!tracked_from_common(title_resource)) why = "resource does not use COMMON state tracking";
     if (why) {
@@ -4720,7 +4722,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     ID3D12DescriptorHeap* bound[] = {view_heap};
     list->SetDescriptorHeaps(1, bound);
     pass_of(self).heap_set = false;
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{desktop_gpu};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
@@ -5528,7 +5530,8 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     const UINT desktop_stride = device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
     const bool raw_samplers = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
         extra[1] == u64{desc->NumDescriptors} * x2w_startup::title_sampler_stride;
-    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : desktop_stride;
+    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride :
+        x2w_startup::view_heap_title_stride(desc->Type, desc->NumDescriptors, extra[0], extra[1], desktop_stride);
     const u64 bytes = u64{desc->NumDescriptors} * title_stride;
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
@@ -5559,7 +5562,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;
-    note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
+    note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride, title_stride,
               title_memory, desktop,
               (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
               sampler_cpu);

@@ -5,6 +5,7 @@
 //   --mutate tags    the rule with the alignment test removed; must fail (negative control)
 #include "xmem_test_device.h"
 #include "../src/startup_stubs/title_heap_memory.h"
+#include "../src/startup_stubs/logical_view_table.h"
 
 #include <cstring>
 
@@ -71,6 +72,26 @@ int rule(bool mutate)
            x2w_startup::ensure_title_heap_memory(samplers, 0x74adb007, 0x1000, memory, allocate), true);
     expect("sampler backing is the allocated address and size",
            memory == 0x20000 && asked == 0x1000 && allocations == 3, true);
+    constexpr std::uint64_t cpu = 0x20000, gpu = 0x40000;
+    constexpr unsigned desktop_stride = 64, title_stride = x2w_startup::title_view_stride;
+    expect("console view size selects 32 bytes",
+           x2w_startup::view_heap_title_stride(views, 4, cpu, 4 * title_stride, desktop_stride) == title_stride, true);
+    expect("desktop view size keeps desktop stride",
+           x2w_startup::view_heap_title_stride(views, 4, cpu, 4 * desktop_stride, desktop_stride) == desktop_stride, true);
+    expect("missing backing keeps desktop stride",
+           x2w_startup::view_heap_title_stride(views, 4, 0, 4 * title_stride, desktop_stride) == desktop_stride, true);
+    expect("other heap keeps desktop stride",
+           x2w_startup::view_heap_title_stride(targets, 4, cpu, 4 * title_stride, desktop_stride) == desktop_stride, true);
+    for (unsigned i = 0; i < 4; ++i) {
+        expect("raw view CPU maps by index",
+               x2w_startup::desktop_descriptor_offset(i * title_stride, title_stride, desktop_stride) == i * desktop_stride, true);
+        expect("desktop-sized CPU keeps offset",
+               x2w_startup::desktop_descriptor_offset(i * desktop_stride, desktop_stride, desktop_stride) == i * desktop_stride, true);
+    }
+    const auto raw_table = x2w_startup::resolve_view_table(gpu, cpu, 4, title_stride, gpu + 3 * title_stride);
+    expect("raw view table at slot 3", raw_table.address == cpu + 96 && raw_table.bytes == 32, true);
+    const auto old_table = x2w_startup::resolve_view_table(gpu, cpu, 4, desktop_stride, gpu + 3 * desktop_stride);
+    expect("desktop-sized view table keeps offset", old_table.address == cpu + 192 && old_table.bytes == 64, true);
     if (failures) {
         std::printf("startup_title_heap: %d FAILED\n", failures);
         return 1;

@@ -5066,7 +5066,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
-                                                                   heap.increment, heap.desktop_gpu);
+                                                                   heap.title_increment, heap.desktop_gpu);
                     heap_entries = static_cast<UINT>((std::min)(u64{heap.logical_count}, heap_records.bytes / 32));
                 }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
@@ -5096,7 +5096,7 @@ x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
         if (pass.source_view_heap && heap.wrapper != pass.source_view_heap) continue;
         if (!pass.source_view_heap && heap.logical_count > heap.count) continue;
-        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.increment, gpu_handle);
+        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.title_increment, gpu_handle);
         if (table.address) break;
     }
     ReleaseSRWLockShared(&note_lock);
