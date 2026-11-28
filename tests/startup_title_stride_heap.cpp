@@ -231,7 +231,11 @@ int main(int argc, char** argv)
     // hardware). A replay declares 8, and title handle k * 8 must reach descriptor k of the desktop heap. Without the
     // declaration (its minimum was 32) handles k * 8 land inside one another's descriptors and the bind or clear reads garbage.
     {
-        constexpr UINT dsv_title = 8;
+        // The console's 8 where this device's depth stencil increment is larger (hardware: 32); on WARP, whose own is 8, 16
+        // stands in so that the title and desktop strides still differ.
+        const UINT dsv_desktop = probe.desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        const UINT dsv_title = dsv_desktop == 8 ? 16 : 8;
+        std::printf("DSV increments: desktop %u, title %u\n", dsv_desktop, dsv_title);
         x2w_d3d12_replay_title_increment(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsv_title);
         void* dsv_memory = VirtualAlloc(nullptr, 8 * dsv_title, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
@@ -249,7 +253,7 @@ int main(int argc, char** argv)
         for (auto& resource : depth)
             if (FAILED(probe.desktop->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)))) { std::printf("depth creation failed\n"); return 20; }
-        // Descriptor 1 and 5 (title offsets 8 and 40): 5 is not a multiple of a 32-byte desktop descriptor's 8-byte step.
+        // Descriptors 1 and 5: with an 8-byte title step and 32-byte desktop descriptors, title offset 40 is not a descriptor boundary.
         const unsigned slots[2] = {1, 5};
         const float clears[2] = {0.75f, 0.25f};
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
