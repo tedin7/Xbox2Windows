@@ -22172,27 +22172,6 @@ class Pipeline:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
                        % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
-        if self.uses_cube_dir:
-            # A direction for TextureCube from a gfx10 cube address (#2943): s and t are the face coordinates
-            # sc/|ma| + 1.5 and tc/|ma| + 1.5 and f the face id, with the per-face sc and tc of v_cubesc and
-            # v_cubetc (cube() above). A major component of +-1 reproduces u = sc/|major| and v = tc/|major|.
-            # A cube-array id (8 * layer + face) keeps only its face, so layer 0 is sampled; faces 6 and 7, a
-            # negative or NaN id become faces 5 and 0. Coordinates outside [1, 2] are assumed to clamp to face edges
-            # (untested outside [1, 2]).
-            out.extend((
-                'float3 x2w_cube_dir(float s, float t, float f) {',
-                '    float u = clamp(2.0 * (s - 1.5), -1.0, 1.0);',
-                '    float v = clamp(2.0 * (t - 1.5), -1.0, 1.0);',
-                '    int k = (f >= 0.0 && f < 2147483648.0) ? ((int)f & 7) : 0;',
-                '    k = min(k, 5);',
-                '    if (k == 0) return float3(1.0, -v, -u);',
-                '    if (k == 1) return float3(-1.0, -v, u);',
-                '    if (k == 2) return float3(u, 1.0, v);',
-                '    if (k == 3) return float3(u, -1.0, -v);',
-                '    if (k == 4) return float3(u, -v, 1.0);',
-                '    return float3(-u, -v, -1.0);',
-                '}',
-            ))
         if self.uses_pack16_rne:
             # IEEE binary32 to binary16 round-to-nearest-even (quieting NaN while preserving its sign,
             # matching RDNA 2 hardware on binary32 inputs), plus exact UNORM16 ratio-to-half conversion

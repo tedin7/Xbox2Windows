@@ -658,7 +658,7 @@ def default_typed_load(directory, consumer, dxc, env, dim):
     manifest.write_bytes(original.replace('srvtypes 1\n', '').encode())
     got, result = run(directory, consumer, env, 'dispatch-texel-float', layout)
     refused = lines(result, 'refused: ')
-    assert got == untouched and len(refused) == 1 and 'not a raw table buffer, a 2D texture or a cube map' in refused[0], (
+    assert got == untouched and len(refused) == 1 and 'not a raw table buffer, a 1D/2D/2D-array/3D texture or a cube map' in refused[0], (
         refused, result.stderr[-3000:])
     print(f'Default typed compute input {dim}: the float texels matched the CPU; without srvtypes the kind is refused')
 

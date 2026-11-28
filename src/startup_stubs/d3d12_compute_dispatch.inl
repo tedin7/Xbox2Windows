@@ -348,9 +348,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         const auto input_dimension = [&] {
             return !std::strcmp(name, "tex2d") ? D3D12_SRV_DIMENSION_TEXTURE2D :
                 !std::strcmp(name, "texcube") ? D3D12_SRV_DIMENSION_TEXTURECUBE :
-                !std::strcmp(name, "tex1d") ? D3D12_SRV_DIMENSION_TEXTURE1D :
-                !std::strcmp(name, "tex2da") ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                !std::strcmp(name, "tex3d") ? D3D12_SRV_DIMENSION_TEXTURE3D :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex1d") ? D3D12_SRV_DIMENSION_TEXTURE1D :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex2da") ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex3d") ? D3D12_SRV_DIMENSION_TEXTURE3D :
                 D3D12_SRV_DIMENSION_UNKNOWN;
         };
         const auto uav_dimension = [&] {
@@ -437,7 +437,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.samplers.read_manifest_line(line.c_str());
         else {
             // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
-            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a cube map or a 1D/2D/2D-array/3D texture"
+            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 1D/2D/2D-array/3D texture or a cube map"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
@@ -854,7 +854,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY &&
                          (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                           (described ? desc.ViewDimension != slot.srv_dimension : resource.DepthOrArraySize <= 1)))
-                    reason = "an input texture view is not a 2D array";
+                    reason = "an input texture view is not 2D array";
                 else if ((slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D || slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY ||
                           slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE3D) && !described)
                     reason = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D ? "an input 1D texture has no recorded view description"
