@@ -76,7 +76,9 @@ def main(consumer, dxc_dir, adapter):
             refused = lines(result, 'refused: ')
             assert got == untouched, 'a Dispatch with no descriptor at table byte 32 wrote the output'
             assert len(refused) == 1 and 'no translation' not in refused[0], result.stderr[-3000:]
-        published = sorted(p.name for p in cache.iterdir() if not p.name.startswith('req_') and p.name != 'native')
+        # The first request writes revision.txt; it is cache metadata, not a publication.
+        published = sorted(p.name for p in cache.iterdir()
+                           if not p.name.startswith('req_') and p.name not in ('native', 'revision.txt'))
         assert not published, f'the native route left {published} in the cache'
 
         (directory / 'program').write_bytes(case_a)
