@@ -665,8 +665,6 @@ def main():
         for description in returns.take(addr, tid, rsp):
             file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
             file_log.flush()
-        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
-        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
@@ -676,7 +674,9 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
-        # (the window opened above holds the other threads while the original instruction is stepped over)
+        # Step over the original instruction, then re-arm. Everyone else is held until the step is done (a retired
+        # breakpoint above is not stepped over, so it opens no window).
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
