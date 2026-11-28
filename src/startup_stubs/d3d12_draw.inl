@@ -5511,6 +5511,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 } else {
                     why = "the bound vertex buffer has no usable stride, size or address";
                 }
+            } else if (srv.source == 2) {
+                // A slot 57 mesh root SRV: a raw descriptor over the whole extent resolved above (address, then `bytes`).
+                const std::uint32_t root_words[4]{static_cast<std::uint32_t>(address),
+                    static_cast<std::uint32_t>(address >> 32) & 0xffffu, static_cast<std::uint32_t>(bytes), 0};
+                view = indirect_table_buffer(self, root_words, false, &why);
+                if (!view.resource) {
+                    static LONG root_refused;
+                    if (first_calls(root_refused, 8))
+                        log("x2w-draw slot57 mesh %016llx srv %u: root SRV %d at 0x%llx (%zu bytes) refused: %s", tr->key, i, srv.a,
+                            address, bytes, why ? why : "no reason");
+                }
             } else if (entry_ok) {
                 view = indirect_table_buffer(self, words, false, &why,
                                                  u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP, false, entry, tr->key);
