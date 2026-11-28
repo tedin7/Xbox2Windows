@@ -32,8 +32,11 @@ if(TARGET startup_replay_quad AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}
         add_test(NAME startup_replay_infer_execute_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_check.py"
             "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>" "${backend}" infer-execute)
+        add_test(NAME startup_replay_infer_prescan_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_check.py"
+            "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>" "${backend}" infer-prescan)
         set_tests_properties(startup_replay_${backend} startup_replay_slot_layouts_${backend} startup_replay_null_views_${backend}
-            startup_replay_paced_${backend} startup_replay_execute_slot35_${backend} startup_replay_static_list_${backend} startup_replay_static_release_${backend} startup_replay_infer_execute_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            startup_replay_paced_${backend} startup_replay_execute_slot35_${backend} startup_replay_static_list_${backend} startup_replay_static_release_${backend} startup_replay_infer_execute_${backend} startup_replay_infer_prescan_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_replay_title_ranges_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_title_ranges_check.py"

@@ -101,6 +101,7 @@ struct Player {
     // closed command lists in Close order. A recorded array always wins; this is a reconstruction, not recorded data.
     std::vector<u64> closed_lists;
     std::vector<u64> exec_array;
+    std::unordered_set<u64> uninferred_submits;  // seq of the array-less submits infer_execute leaves out (prescan_infer_execute)
     std::vector<std::pair<long long, long long>> draw_series;  // cumulative translated draws drawn / not drawn at each present
     UINT recorded_increments[4] = {};
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
@@ -494,23 +495,84 @@ int written_arg(const CallRecord& c)
     return x2w_replay_slots::output_arg(c.kind, c.slot);
 }
 
-// X2W_REPLAY_INFER_EXECUTE=1: see Player::closed_lists. Close (list slot 9) queues the list; a queue submit call (slot 10 or the
-// title's slot 35) with a count of 1 to 64 and no recorded array takes that many queued lists, oldest first.
-void infer_execute(Player& p, const CallRecord& c, Played& call)
+bool infer_execute_enabled()
 {
     static const bool enabled = [] {
         char value[4]{};
         return GetEnvironmentVariableA("X2W_REPLAY_INFER_EXECUTE", value, sizeof(value)) == 1 && value[0] == '1';
     }();
-    constexpr std::uint16_t list_object_kind = 4, close_slot = 9, execute_slot = 10, title_execute_slot = 35;
-    if (!enabled) return;
+    return enabled;
+}
+
+constexpr std::uint16_t list_object_kind = 4, close_slot = 9, execute_slot = 10, title_execute_slot = 35;
+
+bool is_list_submit(const CallRecord& c)
+{
+    return c.kind == queue_kind && (c.slot == execute_slot || c.slot == title_execute_slot) && c.args[0] >= 1 && c.args[0] <= 64;
+}
+
+// X2W_REPLAY_INFER_EXECUTE=1, before the first call: a title may submit lists the file never closed (a static list built
+// before the recorder's window). Its submit has no array in the file and no Close to pair with, so the inference would
+// hand it a list of the window and put every later submit one list behind. The array-less submits are grouped by the
+// array address the title passed; when they ask for more lists than the file closes, only the group whose lists come
+// closest to the number of Closes is inferred (within a tenth) and the other groups are skipped, as a call without its memory.
+void prescan_infer_execute(Player& p, const Recording& r, void (*log)(const char*, ...))
+{
+    struct Group {
+        u64 calls = 0, lists = 0;
+        std::vector<u64> seqs;
+    };
+    std::map<u64, Group> groups;
+    u64 closes = 0, wanted = 0;
+    Step step;
+    for (const StepRef& ref : r.steps) {
+        const CallRecord c = r.call_of(ref);
+        if (c.kind == list_object_kind && c.slot == close_slot) {
+            ++closes;
+            continue;
+        }
+        if (!is_list_submit(c)) continue;
+        r.load(ref, step);
+        bool recorded = false;
+        for (const ArgMemory& m : step.memory) recorded = recorded || m.arg == 1;
+        if (recorded) continue;
+        Group& g = groups[c.args[1]];
+        ++g.calls;
+        g.lists += c.args[0];
+        g.seqs.push_back(c.seq);
+        wanted += c.args[0];
+    }
+    if (groups.size() < 2 || wanted <= closes) return;
+    const Group* best = nullptr;
+    u64 best_gap = ~0ull;
+    for (const auto& [address, g] : groups) {
+        const u64 gap = g.lists > closes ? g.lists - closes : closes - g.lists;
+        if (gap < best_gap) best_gap = gap, best = &g;
+    }
+    if (!best || best_gap * 10 > closes) return;
+    for (const auto& [address, g] : groups) {
+        if (&g == best) continue;
+        p.uninferred_submits.insert(g.seqs.begin(), g.seqs.end());
+        log("x2w-replay: X2W_REPLAY_INFER_EXECUTE=1: %llu submit(s) of %llu list(s) from array 0x%llx are not inferred: the file closes %llu lists and the other array takes %llu",
+            static_cast<unsigned long long>(g.calls), static_cast<unsigned long long>(g.lists),
+            static_cast<unsigned long long>(address), static_cast<unsigned long long>(closes),
+            static_cast<unsigned long long>(best->lists));
+    }
+}
+
+// X2W_REPLAY_INFER_EXECUTE=1: see Player::closed_lists. Close (list slot 9) queues the list; a queue submit call (slot 10 or the
+// title's slot 35) with a count of 1 to 64 and no recorded array takes that many queued lists, oldest first.
+// True: the call is one prescan_infer_execute left out and must be skipped.
+bool infer_execute(Player& p, const CallRecord& c, Played& call)
+{
+    if (!infer_execute_enabled()) return false;
     if (c.kind == list_object_kind && c.slot == close_slot) {
         p.closed_lists.push_back(call.self);
-        return;
+        return false;
     }
-    if (c.kind != queue_kind || (c.slot != execute_slot && c.slot != title_execute_slot) || call.top[1] ||
-        c.args[0] < 1 || c.args[0] > 64 || p.closed_lists.size() < c.args[0])
-        return;
+    if (!is_list_submit(c) || call.top[1]) return false;
+    if (p.uninferred_submits.count(c.seq)) return true;
+    if (p.closed_lists.size() < c.args[0]) return false;
     const std::size_t n = static_cast<std::size_t>(c.args[0]);
     p.exec_array.assign(p.closed_lists.begin(), p.closed_lists.begin() + n);
     p.closed_lists.erase(p.closed_lists.begin(), p.closed_lists.begin() + n);
@@ -519,6 +581,7 @@ void infer_execute(Player& p, const CallRecord& c, Played& call)
     if (InterlockedIncrement(&announced) == 1)
         say("replay: X2W_REPLAY_INFER_EXECUTE=1: queue slot %u call %llu has no recorded list array; submitting the next %zu closed list(s) in Close order",
             static_cast<unsigned>(c.slot), static_cast<unsigned long long>(c.seq), n);
+    return false;
 }
 
 bool play(Player& p, const Recording& r, const Step& step)
@@ -553,7 +616,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     // Map's CPU address is an output too, but not a wrapper, so it has no OUTP: sample it for the mapped dump.
     if (c.kind == resource_kind && c.slot == resource_map)
         call.sampled[2] = call.read_output(2, call.before[2]);
-    infer_execute(p, c, call);
+    if (infer_execute(p, c, call)) return skip(p, c, "list array not in the file, its lists never closed in it");
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     // An argument the stand-in reads as memory (the recorder's declared captures) that the file does not hold: passing
@@ -1093,6 +1156,7 @@ int run(const Options& o)
         return 77;
     }
     Player p;
+    if (infer_execute_enabled()) prescan_infer_execute(p, r, say);
     const std::string slot_layout_setting = std::string(x2w_replay_slots::setting) + "=1";
     for (const std::string& entry : r.settings)
         if (entry == slot_layout_setting) p.use_slot_layouts = true;

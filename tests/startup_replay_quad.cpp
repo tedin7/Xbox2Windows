@@ -48,6 +48,8 @@ struct Scene {
     void* allocator = nullptr;
     void* list = nullptr;
     void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
+    void* extra_list = nullptr;   // X2W_TEST_REPLAY_EXTRA_LIST=1: a second list per frame, submitted with the title list in one call
+    void* extra_allocator = nullptr;
     bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: Released in the window without a submit
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
@@ -292,6 +294,13 @@ int create_scene(void* device, Scene& s)
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
         s.release_static = GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_RELEASE", nullptr, 0) != 0;
     }
+    char extra_list[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_EXTRA_LIST", extra_list, sizeof(extra_list)) == 1 && extra_list[0] == '1' &&
+        (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
+                                            arg(&s.extra_allocator)))) ||
+         FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(s.extra_allocator), 0,
+                                            arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&s.extra_list))))))
+        return 23;
     return 0;
 }
 
@@ -546,8 +555,23 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         char value[8]{};
         return GetEnvironmentVariableA("X2W_TEST_REPLAY_EXEC_SLOT", value, sizeof(value)) ? static_cast<UINT>(std::atoi(value)) : 10u;
     }();
-    invoke(s.queue, execute_slot, 1, arg(&s.list));
-    if (s.static_list) invoke(s.queue, execute_slot, 1, arg(&s.static_list));
+    if (s.extra_list) {
+        // The static list's submit comes first (count 1), then the frame's two lists in one call (count 2): closed lists
+        // outnumber what the file's arrays can name when its array words are gone.
+        if (FAILED(static_cast<HRESULT>(invoke(s.extra_allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(s.extra_list, 139, arg(s.extra_allocator)))))
+            return 30;
+        const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+        const D3D12_RECT strip{20, 0, 32, 10};
+        invoke(s.extra_list, 52, s.rtv, arg(green), 1, arg(&strip));
+        if (FAILED(static_cast<HRESULT>(invoke(s.extra_list, 9)))) return 31;
+        if (s.static_list) invoke(s.queue, execute_slot, 1, arg(&s.static_list));
+        void* pair[2]{s.list, s.extra_list};
+        invoke(s.queue, execute_slot, 2, arg(pair));
+    } else {
+        invoke(s.queue, execute_slot, 1, arg(&s.list));
+        if (s.static_list) invoke(s.queue, execute_slot, 1, arg(&s.static_list));
+    }
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
