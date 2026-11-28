@@ -155,6 +155,14 @@ void update_window(bool open)
     window_open = open;
     if (window_open) {
         if (!window_base_set) {
+            if (!slow_mode && !draw_mode) {
+                if (end_s < 1e300)
+                    log("x2w-replay record: window open at %.3f s, present %ld, ends at %.3f s",
+                        seconds_now(), presents, end_s);
+                else if (last_present != 0x7fffffff)
+                    log("x2w-replay record: window open at %.3f s, present %ld, ends after present %ld",
+                        seconds_now(), presents, last_present - 1);
+            }
             window_base_bytes = prefix_open ? bytes_written - base_prefix_bytes : 0;
             window_base_set = true;
         }
@@ -447,6 +455,22 @@ void record_generic(ArgumentCapture& capture)
     InterlockedAdd64(&generic_spent[slot], static_cast<LONG64>(before - capture.remaining));
 }
 
+// (count, array of command-list wrappers) with count 1 to 64 and a readable array of list wrappers: the shape the stand-in's
+// queue_dynamic treats as an ExecuteCommandLists on a slot whose meaning is not fixed.
+bool execute_shaped(u64 count, u64 array)
+{
+    if (count < 1 || count > 64 || array < 0x10000 || array >= 0x7fffffffffffull ||
+        !readable_range(array, static_cast<std::size_t>(count) * sizeof(u64)))
+        return false;
+    for (u64 i = 0; i < count; ++i) {
+        u64 list;
+        if (!copy_readable(array + i * sizeof(u64), &list, sizeof(list))) return false;
+        const auto* w = as_wrapper(reinterpret_cast<const void*>(list));
+        if (!w || w->own().kind != list_kind) return false;
+    }
+    return true;
+}
+
 void record_arguments(ArgumentCapture& capture)
 {
     const Call& call = capture.call;
@@ -561,7 +585,9 @@ void record_arguments(ArgumentCapture& capture)
         }
         break;
     case queue_kind:
-        if (call.slot == 10) capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
+        // ExecuteCommandLists: slot 10, and any other queue slot called with its shape (the title submits on slot 35).
+        if (call.slot == 10 || execute_shaped(a[0], a[1]))
+            capture.arg(1, static_cast<u64>(static_cast<UINT>(a[0])) * sizeof(u64));
         if (call.slot == 32) {
             const auto stride = x2w_startup::present_plane_stride;
             const auto planes = capture.memory(1, a[1], static_cast<u64>(static_cast<UINT>(a[0])) * stride, 1);
@@ -1032,7 +1058,19 @@ void present()
     // Serialize the boundary and the readback with the render submission path.
     if (gpu_lock) draw_lock_acquire_exclusive();
     const bool gpu_snapshot = gpu_lock && !window_open;
-    const u64 gpu_seq = gpu_snapshot ? gpu_state_at_window_open(b) : 0;
+    u64 gpu_seq = 0;
+    if (gpu_snapshot) {
+        const double before = seconds_now();
+        gpu_seq = gpu_state_at_window_open(b);
+        const double took = seconds_now() - before;
+        if (end_s < 1e300) {
+            const double was = end_s;
+            start_s += took;
+            end_s += took;
+            log("x2w-replay record: the GPU state took %.3f s: the window now ends at %.6f s (was %.6f s)",
+                took, end_s, was);
+        }
+    }
     if (!base_pending && !gpu_snapshot) update_window(open);
     if (window_open || (present == first_present && !base_warming)) {
         const u64 seq = gpu_seq ? gpu_seq : static_cast<u64>(InterlockedIncrement64(&next_seq));

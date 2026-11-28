@@ -1,8 +1,10 @@
-"""Check that the first replayed copy reads a DEFAULT texture written only in the prefix."""
+"""Check that the GPU snapshot restores prefix writes and preserves timed windows."""
 
 import json
+import mmap
 import os
 from pathlib import Path
+import re
 import struct
 import sys
 import tempfile
@@ -17,6 +19,47 @@ COLOUR = bytes((255, 0, 255, 255))
 ZERO = bytes(4)
 COPY_RESOURCE_SLOT = 17
 GPUR = struct.Struct("<QIIQIIIIQ")
+
+
+def check_timed_window(folder, scene, vs, ps, root, env):
+    window_seconds = 0.5
+    big_mib = 1024
+    recording = folder / "gpu-timed.x2wr"
+    code, log = run([scene, vs, ps, root, "warp", 50], dict(
+        env, X2W_TEST_REPLAY_PACED="1", X2W_TEST_REPLAY_GPU_STATE_BIG=str(big_mib),
+        X2W_REPLAY_GPU_STATE_MAX_MIB=str(big_mib + 16),
+        X2W_REPLAY_RECORD=f"3,{window_seconds}", X2W_REPLAY_RECORD_FILE=str(recording)))
+    assert code == 0, log[-3000:]
+    opened = re.findall(r"x2w-replay record: window open at [\d.]+ s, present (\d+), ends at [\d.]+ s", log)
+    assert len(opened) == 1 and int(opened[0]) > PREFIX_PRESENTS, (opened, log[-3000:])
+    snapshot = re.search(r"x2w-replay gpu state: [^\r\n]* took (\d+) ms", log)
+    assert snapshot, log[-3000:]
+    snapshot_seconds = int(snapshot[1]) / 1000
+    print(f"Timed GPU state: {big_mib} MiB buffer, snapshot took {snapshot_seconds:.3f} s")
+
+    # Walk the chunk headers without copying the 1 GiB payload into Python.
+    presents = []
+    big_slices = 0
+    with recording.open("rb") as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        for tag, header, _, _, size in chunks(data):
+            if tag == b"PRES":
+                presents.append(struct.unpack_from("<i", data, header + 8)[0])
+            elif tag == b"GPUR" and size == big_mib << 20:
+                big_slices += 1
+    assert big_slices == 1, (big_slices, log[-3000:])
+    if snapshot_seconds <= window_seconds:
+        print(f"SKIP timed GPU state: snapshot must exceed the {window_seconds:.3f} s window")
+        return 77
+
+    assert presents and presents[0] == int(opened[0]), (opened, presents)
+    assert len(presents[1:]) >= 4, f"Only {len(presents)} window presents after a {snapshot_seconds:.3f} s snapshot: {presents}"
+    shifts = re.findall(
+        r"x2w-replay record: the GPU state took ([\d.]+) s: the window now ends at ([\d.]+) s \(was ([\d.]+) s\)", log)
+    assert len(shifts) == 1, log[-3000:]
+    took, new_end, old_end = map(float, shifts[0])
+    assert abs(new_end - old_end - took) <= 0.001, shifts
+    print(f"Timed GPU state: {len(presents) - 1} presents after the opening present")
+    return 0
 
 
 def assert_colour(picture, colour):
@@ -95,7 +138,7 @@ def check(folder, scene, player):
         summary = json.loads((out / "replay_summary.json").read_text())
         assert summary["gpu_state"] == {"restored": len(slices), "failed": 0, "untranslated": 0}, summary
     print("GPU state: two replayed presents match live with capture, and are zero without capture")
-    return 0
+    return check_timed_window(folder, scene, vs, ps, root, env)
 
 
 def main(scene, player):
