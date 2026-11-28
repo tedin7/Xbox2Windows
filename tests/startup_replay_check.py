@@ -377,6 +377,12 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     assert code == 0, text[-3000:]
     assert pictures(bare_dir)["present_0007.png"] == whole["present_0007.png"], "the live pictures changed with the carry off"
     _score, lacking = replay(player, bare, directory / "static_bare_replayed", backend, env, presents=6)
+    data = bare.read_bytes()
+    first_present = min(struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data) if tag == b"PRES")
+    early = [struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data)
+             if tag == b"CALL" and struct.unpack_from("<QIHH", data, header)[2:] == (LIST_KIND, 52)
+             and struct.unpack_from("<Q", data, header)[0] < first_present]
+    assert not early, "the carry-off recording holds list calls from before its window: %s\n%s" % (early, text[-1500:])
     equal = [a for a, b in pairs if lacking.get(a) == whole[b]]
     assert not equal, "without the carry the replay still drew the list's corner in %s: replayed first pixel %r" % (
         equal, lacking[equal[0]][1][1:5] if equal else None)
