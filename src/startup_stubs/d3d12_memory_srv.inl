@@ -188,8 +188,9 @@ bool memory_srv_destination(u64 handle)
     for (const auto& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.increment) continue;
         const u64 base = heap.title_cpu ? heap.title_cpu : heap.desktop_cpu;
-        if (handle >= base && (handle - base) % heap.increment == 0 &&
-            (handle - base) / heap.increment < heap.count) {
+        const UINT stride = heap.title_cpu ? heap.title_increment : heap.increment;
+        if (handle >= base && (handle - base) % stride == 0 &&
+            (handle - base) / stride < heap.count) {
             valid = true;
             break;
         }

@@ -368,7 +368,7 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullpt
             result = r.tail_cpu + (index - r.desktop_descriptors) * r.desktop_stride;
             room = static_cast<UINT>(limit - index);
         } else {
-            result = r.desktop + index * r.desktop_stride + offset % r.title_stride;
+            result = r.desktop + x2w_startup::desktop_descriptor_offset(offset, r.title_stride, r.desktop_stride);
             room = static_cast<UINT>(r.desktop_descriptors - index);
         }
         past_end = false;
@@ -6391,7 +6391,9 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // title's handles and descriptor memory use them, and are mapped to this device's descriptors by index.
     const UINT declared = static_cast<UINT>(desc->Type) < 4
         ? static_cast<UINT>(InterlockedCompareExchange(&replay_title_increments[desc->Type], 0, 0)) : 0;
-    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : (declared ? declared : desktop_stride);
+    // A console-sized view heap (NumDescriptors * 32 bytes of title memory) keeps 32-byte title records.
+    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : (declared ? declared :
+        x2w_startup::view_heap_title_stride(desc->Type, desc->NumDescriptors, extra[0], extra[1], desktop_stride));
     const u64 bytes = u64{desc->NumDescriptors} * title_stride;
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
