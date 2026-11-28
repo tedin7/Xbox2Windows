@@ -120,6 +120,7 @@ struct Player {
     // The prefix: the calls before the window's first present (Recording::window_seq), how many were played, how long.
     u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0, prefix_left_out = 0;
     double prefix_seconds = 0;
+    u64 gpu_restored = 0, gpu_failed = 0, gpu_untranslated = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
 
@@ -860,6 +861,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
         std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"left_out\": %llu, \"wall_s\": %.3f}",
                      p.prefix_calls, p.prefix_played, p.prefix_left_out, p.prefix_seconds);
+        std::fprintf(f, ", \"gpu_state\": {\"restored\": %llu, \"failed\": %llu, \"untranslated\": %llu}",
+                     p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
         if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
@@ -1079,6 +1082,10 @@ int run(const Options& o)
     if (o.prefix_live) live = prefix_live_of(r, p.window_seq);
     p.pace = o.pace;
     bool in_prefix = true;
+    using RestoreSubresource = BOOL (*)(void*, UINT, const void*, const void*, UINT64);
+    const HMODULE shim = r.gpu_state.empty() ? nullptr : GetModuleHandleW(L"d3d12_xs.dll");
+    const auto restore = shim ? reinterpret_cast<RestoreSubresource>(GetProcAddress(shim, "x2w_d3d12_restore_subresource"))
+                              : nullptr;
     const auto end_prefix = [&](u64 calls) {
         in_prefix = false;
         p.prefix_calls = calls;
@@ -1087,6 +1094,21 @@ int run(const Options& o)
         say("x2w-replay: prefix: %llu of %llu calls played (%llu left out by --prefix-live), wall %.3f s",
             static_cast<unsigned long long>(p.prefix_played),
             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(p.prefix_left_out), p.prefix_seconds);
+        if (!r.gpu_state.empty() && p.window_seq != ~0ull)
+            apply_pages_before(r, p.window_seq + 1, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+        for (const auto& slice : r.gpu_state) {
+            const auto object = p.objects.find(slice.header.object);
+            if (object == p.objects.end() || !object->second) {
+                ++p.gpu_untranslated;
+            } else if (restore && restore(reinterpret_cast<void*>(object->second), slice.header.subresource,
+                                          &slice.header, slice.data, slice.header.bytes)) {
+                ++p.gpu_restored;
+            } else {
+                ++p.gpu_failed;
+            }
+        }
+        say("x2w-replay gpu state: %llu subresources restored, %llu failed, %llu untranslated",
+            p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
     };
     u64 index = 0;
     Step s;  // the call being played, loaded from the mapping

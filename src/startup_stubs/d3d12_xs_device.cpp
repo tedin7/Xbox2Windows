@@ -66,6 +66,7 @@
 #include "startup_stubs/target_draw_census.h"
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
+#include "startup_stubs/replay_gpu_state.h"
 #include "startup_stubs/subresource_states.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
@@ -237,6 +238,7 @@ struct alignas(16) WrapperOwn {
     UploadChunkMask large_upload_buffers;  // Dedicated buffers referenced by this recording.
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
+    bool gpu_state_unsupported; // Reserved resources or resources created outside COMMON in desktop slots.
     bool tiled_address_srv; // Cached address SRV backed by guest memory.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
     bool lazy_view_created;    // Resource: at least one materialized view was created referencing this wrapper.
@@ -637,7 +639,7 @@ constexpr u64 out_of_memory = static_cast<std::uint32_t>(E_OUTOFMEMORY);  // for
 
 // Returns nullptr when the wrapper cannot be allocated or registered (#2653). The caller still owns
 // `real` then: it releases what it created and returns E_OUTOFMEMORY.
-Wrapper* wrap(IUnknown* real, Kind kind)
+Wrapper* wrap(IUnknown* real, Kind kind, bool gpu_state_unsupported = false)
 {
     for (LONG n = wraps_to_fail; n > 0; n = wraps_to_fail)
         if (InterlockedCompareExchange(&wraps_to_fail, n - 1, n) == n) return nullptr;
@@ -654,6 +656,7 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    w->own().gpu_state_unsupported = gpu_state_unsupported;
     // The guest checks device byte +0x18 before using its inline descriptor
     // writers. Request vtable calls so the shim records the descriptor.
     static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
@@ -1075,7 +1078,10 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
             x2w_startup::mark_packed_stand_in(resource, requested_format);
             x2w_startup::mark_console_format(resource, original_format);
         }
-        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        constexpr bool explicit_initial_state = K == device_kind && (N == 27 || N == 29);
+        const bool gpu_state_unsupported = kind == resource_kind &&
+            ((K == device_kind && N == 30) || (explicit_initial_state && d != D3D12_RESOURCE_STATE_COMMON));
+        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind, gpu_state_unsupported);
         if (!child) {
             static_cast<IUnknown*>(*out)->Release();
             *out = nullptr;
@@ -2861,6 +2867,8 @@ std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
 u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc);  // d3d12_memory_srv.inl
 extern LONG translated_draws;  // d3d12_draw.inl: the recorder's "d" window counts them per frame
+inline void draw_lock_acquire_exclusive();
+inline void draw_lock_release_exclusive();
 #include "startup_stubs/d3d12_record.inl"
 #include "startup_stubs/d3d12_present_pictures.inl"
 #include "startup_stubs/d3d12_debug_present.inl"
@@ -9096,6 +9104,8 @@ bool present_composite_enabled()
 }
 
 // The planes the output window draws for a present, resolved to real resources it can draw.
+#include "startup_stubs/d3d12_replay_gpu_state.inl"
+
 // X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count). Otherwise
 // plane 0 alone is kept, unless X2W_PRESENT_COMPOSITE=1 keeps every plane for the composite
 // (present_planes.h). The baseline capture and readback do not use this: they read plane 0 as before.
@@ -9735,6 +9745,16 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_restore_subresource(
+    void* resource_wrapper, UINT subresource, const void* footprint_header, const void* data, UINT64 bytes)
+{
+    try {
+        return replay_gpu_state::restore(resource_wrapper, subresource, footprint_header, data, bytes);
+    } catch (const std::bad_alloc&) {
+        return FALSE;
+    }
+}
 
 extern "C" __declspec(dllexport) std::uint64_t x2w_d3d12_take_view_id()
 {
