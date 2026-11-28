@@ -4416,6 +4416,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # refusals (vccz loop, SCC from a lane mask, EXEC write reaching the read, late s_wqm). The draws are below.
     add_test(NAME startup_gfx2hlsl_dpp_quad_flow COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_flow_check.py")
+    # DPP16 quad reads after a window with the exact entry EXEC and a restore of the saved whole-quad mask: accepted
+    # only for registers no window wrote; the refusal controls run here, the draws below cut quads (helper lanes).
+    add_test(NAME startup_gfx2hlsl_dpp_whole_quad_window COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_whole_quad_window_check.py")
     # DPP16 quad broadcasts quad_perm:[k,k,k,k] (#2125): lowered to QuadReadLaneAt, so the pixel stage compiles as
     # ps_6_0; the controls and refusals run here, the draws below compare every pixel with a CPU reference.
     add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast COMMAND "${INTAKE_PYTHON}" -B
@@ -4985,6 +4989,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_flow_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_dpp_quad_flow_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
+    # The window fixture drawn as a triangle whose edge cuts 2 x 2 quads: the accepted read matches the guest on every
+    # pixel, helper neighbours included; reading the window register instead fails there, and only there (a
+    # full-screen draw without helper lanes cannot tell). DXC ps_6_0 only.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_whole_quad_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_whole_quad_window_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_dpp_whole_quad_window_${adapter} PROPERTIES TIMEOUT 180
+                             SKIP_RETURN_CODE 77)
     endforeach()
     # A DPP16 quad min inside an if (EXEC narrowed by s_and_saveexec): the contract of a lane-exact EXEC model (a disabled
     # source lane is invalid, BOUND_CTRL decides), drawn by hand-written HLSL against a CPU reference; reading the disabled
