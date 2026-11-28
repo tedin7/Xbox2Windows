@@ -2653,6 +2653,98 @@ void note_target_writer(const void* resource, u64 key, unsigned slot, unsigned f
     w.format = format;
     ++w.draws;
 }
+// Exposure check. A refused compute dispatch leaves its output views at zero, and a tonemapper that reads such a buffer turns a valid
+// scene black. Every translated draw's targets, sampled textures and buffer input ranges are kept (bounded), as are the output ranges
+// of refused compute dispatches. At the end of the run, going backwards from the last presented surface, the refused dispatches whose
+// output ranges overlap a buffer that a draw of the chain read are listed (x2w-render exposure check).
+struct ProvenanceDraw {
+    u64 key;
+    const void* targets[8];
+    unsigned target_count;
+    std::vector<const void*> textures;
+    std::vector<std::pair<u64, u64>> buffers;  // title address, bytes
+};
+struct ProvenanceRefusal {
+    u64 key;
+    u64 dispatches;
+    std::vector<std::pair<u64, u64>> outputs;
+};
+std::mutex provenance_mutex;
+std::vector<ProvenanceDraw> provenance_draws;
+std::vector<ProvenanceRefusal> provenance_refusals;
+const void* provenance_presented = nullptr;
+constexpr std::size_t provenance_draw_cap = 60000;
+
+void provenance_note_draw(u64 key, const void* const* targets, unsigned target_count, const void* const* textures,
+                          unsigned texture_count, const std::pair<u64, u64>* buffers, unsigned buffer_count)
+{
+    std::lock_guard<std::mutex> lock(provenance_mutex);
+    if (provenance_draws.size() >= provenance_draw_cap) return;
+    ProvenanceDraw d{};
+    d.key = key;
+    d.target_count = (std::min)(target_count, 8u);
+    for (unsigned i = 0; i < d.target_count; ++i) d.targets[i] = targets[i];
+    d.textures.assign(textures, textures + texture_count);
+    d.buffers.assign(buffers, buffers + buffer_count);
+    provenance_draws.push_back(std::move(d));
+}
+
+void provenance_note_refusal(u64 key, const std::pair<u64, u64>* outputs, unsigned output_count)
+{
+    std::lock_guard<std::mutex> lock(provenance_mutex);
+    for (auto& r : provenance_refusals)
+        if (r.key == key) {
+            ++r.dispatches;
+            for (unsigned i = 0; i < output_count; ++i)
+                if (std::find(r.outputs.begin(), r.outputs.end(), outputs[i]) == r.outputs.end() && r.outputs.size() < 16)
+                    r.outputs.push_back(outputs[i]);
+            return;
+        }
+    if (provenance_refusals.size() >= 4096) return;
+    ProvenanceRefusal r{key, 1, {}};
+    r.outputs.assign(outputs, outputs + output_count);
+    provenance_refusals.push_back(std::move(r));
+}
+
+void provenance_report()
+{
+    std::lock_guard<std::mutex> lock(provenance_mutex);
+    if (!provenance_presented) {
+        log("x2w-render exposure check: no presented surface was seen");
+        return;
+    }
+    std::vector<const void*> needed_targets{provenance_presented};
+    std::vector<std::pair<u64, u64>> needed_buffers;
+    unsigned chain_draws = 0;
+    for (auto it = provenance_draws.rbegin(); it != provenance_draws.rend(); ++it) {
+        bool writes_needed = false;
+        for (unsigned t = 0; t < it->target_count; ++t)
+            if (std::find(needed_targets.begin(), needed_targets.end(), it->targets[t]) != needed_targets.end()) writes_needed = true;
+        if (!writes_needed) continue;
+        ++chain_draws;
+        for (const void* texture : it->textures)
+            if (std::find(needed_targets.begin(), needed_targets.end(), texture) == needed_targets.end()) needed_targets.push_back(texture);
+        for (const auto& range : it->buffers) needed_buffers.push_back(range);
+    }
+    char line[1400];
+    int used = std::snprintf(line, sizeof(line), "x2w-render exposure check: %u translated draws lead to the presented surface "
+                             "(%zu sources, %zu buffer ranges); refused compute dispatches whose outputs those draws read:",
+                             chain_draws, needed_targets.size() - 1, needed_buffers.size());
+    unsigned listed = 0;
+    for (const auto& r : provenance_refusals) {
+        bool feeds = false;
+        for (const auto& out : r.outputs)
+            for (const auto& in : needed_buffers)
+                if (out.first < in.first + in.second && in.first < out.first + out.second) feeds = true;
+        if (!feeds || used <= 0 || used >= static_cast<int>(sizeof(line)) - 60) continue;
+        used += std::snprintf(line + used, sizeof(line) - used, " %016llx x%llu,", static_cast<unsigned long long>(r.key),
+                              static_cast<unsigned long long>(r.dispatches));
+        ++listed;
+    }
+    if (!listed && used > 0 && used < static_cast<int>(sizeof(line)) - 8) std::snprintf(line + used, sizeof(line) - used, " none");
+    log("%s", line);
+}
+
 // raw_plane < 0: the baseline capture of the presented surface (plane 0), reduced for the window and
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
@@ -2915,6 +3007,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         {
             // What produced this picture: the translated draw that last wrote this surface (key, target slot, format, draws into it
             // since it was first seen as a target), or "no translated draw", then the picture is a copy/clear/other writer.
+            if (!raw) { std::lock_guard<std::mutex> provenance_lock(provenance_mutex); provenance_presented = surface; }
             const TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(surface) >> 6) & 255];
             if (!raw && (periodic || moved)) {
                 if (w.resource == surface)
@@ -10170,6 +10263,7 @@ extern "C" void x2w_d3d12_exit_report()
     char line[1024];
     if (indirect_totals_line(line, sizeof(line)))
         log("x2w-render indirect at exit:%s", line + sizeof("x2w-render indirect:") - 1);
+    provenance_report();
 }
 
 // The offline player owns these heap references and keys them by recorded creation ID.

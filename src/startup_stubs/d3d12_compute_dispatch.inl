@@ -997,6 +997,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         phases.end();
         timer.finish(x2w_phase::refused);
         draw_lock_release_exclusive();
+        {
+            // The outputs the loop reached, for the exposure check: native buffer descriptors give a title address and a size.
+            std::pair<u64, u64> outputs[16];
+            unsigned output_count = 0;
+            for (std::size_t i = inputs; i < count && output_count < 16; ++i) {
+                const auto& w = views[i].words;
+                if (w[0] == view_token_magic || !(w[0] | w[1])) continue;
+                const u64 bytes_here = x2w_startup::buffer_descriptor_bytes(w[1], w[2], w[3]);
+                if (bytes_here) outputs[output_count++] = {w[0] | (u64{w[1] & 0xffff} << 32), bytes_here};
+            }
+            provenance_note_refusal(key, outputs, output_count);
+        }
         note_refused_compute_dispatch(key, reason);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.

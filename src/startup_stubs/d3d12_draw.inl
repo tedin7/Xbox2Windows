@@ -5186,6 +5186,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     phases.to(2);
     UINT indexed_vertices = UINT_MAX;
     bool has_null_input = false;
+    std::pair<u64, u64> provenance_buffers[16];
+    unsigned provenance_buffer_count = 0;
     static const bool zero_missing_buffer = x2w_local::env_on("X2W_DRAW_NULL_ZERO");
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
     std::uint32_t values[32] = {};
@@ -5469,6 +5471,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return not_drawn(pass, list, not_drawn_key, 8);
         }
         const std::size_t requested_bytes = bytes;
+        if (srv.kind == 0 && address && bytes && provenance_buffer_count < 16) provenance_buffers[provenance_buffer_count++] = {address, bytes};
         const std::size_t view_bytes = requested_bytes;  // before the 16 MiB copy cap
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
         const auto count_buffer = [&](bool bound, const char* why) {
@@ -5943,6 +5946,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) {
         note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
+        {
+            const void* provenance_targets[8];
+            for (UINT t = 0; t < pass.target_count && t < 8; ++t) provenance_targets[t] = pass.bound_targets[t];
+            provenance_note_draw(tr->key, provenance_targets, (std::min)(pass.target_count, 8u),
+                                 reinterpret_cast<const void* const*>(sampled_textures), sampled_count, provenance_buffers, provenance_buffer_count);
+        }
         {   // X2W_DEBUG_PRESENT_TARGET: the draw, and what its pipeline does with the depth buffer. A slot 57 pipeline has no desktop
             // depth-stencil state unless X2W_DEPTH_STATE=1, and then the desktop default (depth off) draws.
             const bool depth_state = bound->has_depth_stencil && (!bound->depth_from_registers || pass.dsv_format != DXGI_FORMAT_UNKNOWN);

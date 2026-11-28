@@ -1071,6 +1071,20 @@ is disabled. The synthetic Windows test uses 8×8 WARP readback with one float
 target and with mixed float and integer targets. Run it with
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_placeholder_ps(_warp)?$'`.
 
+### Magenta for refused pixel shaders and the exposure check
+
+`X2W_MAGENTA_REFUSED=1` (translator, stand-in and replay player) is the short switch for the placeholder pixel shader above:
+a draw whose vertex shader translates but whose pixel shader is refused runs with a solid magenta pixel shader on the same targets,
+viewport and depth state. `X2W_PLACEHOLDER_PS=0` wins over it; `X2W_PLACEHOLDER_RGB` still picks another colour. Without a
+translatable vertex shader the draw is still dropped. The replay's `x2w-replay draws ...` line and the `draws` object of
+`replay_summary.json` add `magenta draws N` / `magenta_draws`.
+
+At the end of a run the stand-in logs one `x2w-render exposure check:` line: going backwards from the last presented surface, how
+many translated draws lead to it, and which refused compute dispatches (key and count) wrote a buffer range that one of those
+draws read. A refused exposure or luminance pass leaves its output at zero, and a tonemapper multiplying by it makes a valid scene
+black. Only native buffer descriptors of refused outputs and buffer or texture inputs of draws are tracked.
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_placeholder_ps(_warp)?$'` covers the switch.
+
 ### Translating compute programs in the stand-in
 
 With `X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>` (`run.ps1 -Render -NativeShaders <dir>`),
