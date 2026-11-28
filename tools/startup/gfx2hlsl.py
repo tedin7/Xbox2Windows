@@ -23378,6 +23378,30 @@ def mesh57_pipeline(ms, ps, root, pixel_refusal, mode):
         raise Unsupported('slot 57 mesh wave loop: %s (proof path: %s)' % (reason, proof_refusal[:80])) from reason
 
 
+def publish_mesh57_stages(name, sources, out_dir, compile_enabled, tag='57'):
+    """Write <name>.<stage><tag>.hlsl for each source and, with compile_enabled, its .cso (all stages or none)."""
+    for stage, _, hlsl in sources:
+        open('%s.%s%s.hlsl' % (name, stage, tag), 'w').write(hlsl)
+    if not compile_enabled:
+        return
+    compiler = find_dxc()
+    if compiler is None:
+        raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
+    import subprocess
+    # Publish bytecode only after all requested stages compile successfully.
+    with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
+        for stage, profile, _ in sources:
+            bytecode = os.path.join(staging, stage + '.cso')
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode,
+                                '%s.%s%s.hlsl' % (name, stage, tag)], capture_output=True, text=True)
+            if r.returncode or not has_complete_mesh57_bytecode(bytecode):
+                # DXC names the source path; keep only the diagnostic after it.
+                lines = [re.sub(r'^.*?57w?\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
+                raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
+        for stage, _, _ in sources:
+            os.replace(os.path.join(staging, stage + '.cso'), '%s.%s%s.cso' % (name, stage, tag))
+
+
 def mesh57_sources(pipe, ps):
     """(stage sources, manifest) of a translated slot 57 pipeline."""
     sources = [('ms', pipe.mesh_profile(), pipe.hlsl_ms())]
@@ -23425,26 +23449,8 @@ def translate_mesh57(out_dir, key):
     manifest = manifest.replace('\n', '\nkey %016x\n' % output_key, 1)
     if marker:
         manifest += '# ' + marker + '\n'
-    for stage, _, hlsl in sources:
-        open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
     compile_enabled = os.environ.get('X2W_FXC') != ''
-    if compile_enabled:
-        compiler = find_dxc()
-        if compiler is None:
-            raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
-        import subprocess
-        # Publish bytecode only after all requested stages compile successfully.
-        with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
-            for stage, profile, _ in sources:
-                bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
-                                   capture_output=True, text=True)
-                if r.returncode or not has_complete_mesh57_bytecode(bytecode):
-                    # DXC names the source path; keep only the diagnostic after it.
-                    lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
-            for stage, _, _ in sources:
-                os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
+    publish_mesh57_stages(name, sources, out_dir, compile_enabled)
     placeholder = isinstance(pipe.ps, PlaceholderPixelStage)
     if placeholder:
         publish_placeholder_failure(name, pipe.ps, compile_enabled, ('.ms57.cso', '.ps57.cso'))
@@ -23456,6 +23462,10 @@ def translate_mesh57(out_dir, key):
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
     publish_approx(base, marker)
+    if mode == 'oracle':
+        from mesh_waveloop import publish_oracle_sibling
+        publish_oracle_sibling(sys.modules[__name__], name, (ms, ps, root, pixel_refusal), manifest, marker,
+                               out_dir, compile_enabled)
     return 'ok'
 
 

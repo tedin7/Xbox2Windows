@@ -1972,6 +1972,8 @@ bool prepare_translated_pso_desc(Translation& tr, bool indexed_rect, D3D12_GRAPH
     return true;
 }
 
+#include "startup_stubs/d3d12_mesh_oracle.inl"
+
 // A recipe can only be used when its draw state and the pass match the recipe's key. Other records
 // in the same translation file stay on disk for a later pass and are ignored here.
 bool replay_pso_recipes(BoundPipeline& bound, Translation& tr, const Pass& pass, DXGI_FORMAT dsv_format,
@@ -2111,6 +2113,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         x2w_startup::ComPtr<ID3D12Device2> device2;
         hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device2));
         if (SUCCEEDED(hr)) hr = device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&pipeline));
+        if (SUCCEEDED(hr) && mesh_oracle_enabled()) mesh_oracle_pipeline(device2.Get(), tr, stream, pipeline);
     } else {
         hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     }
@@ -5864,7 +5867,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const auto red_samples = trace_inputs
             ? red_producer_draw_before(self, list, "translated-indirect-draw", tr->key) : RedDrawSamples{};
         if (validated && mesh) {
-            list->ExecuteIndirect(indirect->signature, 1, validated, 4, validated, 0);
+            const auto issue = [&] { list->ExecuteIndirect(indirect->signature, 1, validated, 4, validated, 0); };
+            if (!mesh_oracle_draw(self, list, *tr, pipeline, issue)) issue();  // X2W_REPLAY_ORACLE=mesh
         } else if (validated) {
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);

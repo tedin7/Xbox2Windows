@@ -27,6 +27,7 @@
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/mesh_oracle_compare.h"
 #include "startup_stubs/present_readback_state.h"
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/draw_cube_srv.h"
@@ -1711,6 +1712,8 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 }
 
 LONG draw_dump_frame();
+void mesh_oracle_discard(ID3D12CommandList* list);  // d3d12_mesh_oracle.inl
+void mesh_oracle_executed(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
 void discard_red_producer(ID3D12GraphicsCommandList* list);
 x2w_startup::DrawReadbacks& draw_dumps()
 {
@@ -2472,6 +2475,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
+        mesh_oracle_discard(previous);
         discard_red_producer(previous);
     }
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
@@ -2512,6 +2516,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         discard_mesh_lease_recording(list);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(list);
+        mesh_oracle_discard(list);
         discard_red_producer(list);
         static LONG failures;
         if (first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
@@ -6020,6 +6025,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            mesh_oracle_executed(queue, ready_count, native_lists.data());  // X2W_REPLAY_ORACLE=mesh
             if (split && replay_dump_enabled()) dump_lists.insert(dump_lists.end(), wrappers.begin(), wrappers.end());
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);

@@ -10,7 +10,8 @@
 // The title's frame-event waits (device slot 80) are played without their timeout, so they do not sleep to the title's
 // frame interval (a loading prefix spends most of its time there); --pace on keeps the recorded timeout.
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
-// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
+// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json,
+// oracle.jsonl (X2W_REPLAY_ORACLE=mesh, startup_stubs/d3d12_mesh_oracle.inl), and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // recording could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
 // 77 no D3D12 adapter.
@@ -1039,6 +1040,9 @@ int run(const Options& o)
     // X2W_REPLAY_DUMP reaches the delay-loaded shim from the environment or the recording's XENV.
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
+    // X2W_REPLAY_ORACLE=mesh (src/startup_stubs/d3d12_mesh_oracle.inl): the verdicts go next to the pictures.
+    if (GetEnvironmentVariableW(L"X2W_REPLAY_ORACLE", nullptr, 0) && !GetEnvironmentVariableW(L"X2W_REPLAY_ORACLE_FILE", nullptr, 0))
+        SetEnvironmentVariableW(L"X2W_REPLAY_ORACLE_FILE", (o.out + L"\\oracle.jsonl").c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     phase = "seeding the shader cache";

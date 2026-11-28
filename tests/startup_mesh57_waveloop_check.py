@@ -372,7 +372,28 @@ def draw(dxc, renderer, adapter):
                       groups=groups)
 
 
+def check_oracle_sibling():
+    """X2W_MESH_WAVELOOP=oracle publishes the proof path unchanged plus the serial stages of the same key."""
+    _, proof = run(MESH, '0', PIXEL, artifacts=True)
+    status, oracle = run(MESH, 'oracle', PIXEL, artifacts=True)
+    assert status == 'ok', status
+    assert {name: oracle[name] for name in proof} == proof, sorted(oracle)
+    assert oracle['ms57w.txt'] == b'ok\n', oracle['ms57w.txt']
+    assert oracle['ms57w.hlsl'].startswith(b'// x2w_serial_wave 1\n')
+    assert 'ps57w.hlsl' in oracle, sorted(oracle)
+    # A key only the serial path translates has no proof publish, so no sibling either.
+    refused, nothing = run(SERIAL_MESH, 'oracle', artifacts=True)
+    assert refused.startswith('unsupported: slot 57 mesh') and set(nothing) <= {'fail'}, (refused, sorted(nothing))
+    # A serial refusal leaves a reason and no bytecode beside a good proof publish.
+    with patch.object(G, 'mesh57_serial_pipeline', side_effect=G.Unsupported('wave loop: test refusal')):
+        status, refused_sibling = run(MESH, 'oracle', PIXEL, artifacts=True)
+    assert status == 'ok', status
+    assert refused_sibling['ms57w.txt'] == b'unavailable serial: wave loop: test refusal\n', refused_sibling
+    assert not any(name.startswith(('ms57w.', 'ps57w.')) and name != 'ms57w.txt' for name in refused_sibling)
+
+
 def offline(dxc=None):
+    check_oracle_sibling()
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
     translated, output = run(SERIAL_MESH, '1', artifacts=True)

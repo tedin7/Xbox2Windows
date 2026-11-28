@@ -935,3 +935,45 @@ def render(pipe, G):
     if re.search(r'\[unroll\]', code):
         raise G.Unsupported('wave loop: generator leaked unroll')
     return text
+
+
+# X2W_MESH_WAVELOOP=oracle: the serial wave loop of a key the proof path translated, published beside it for the
+# replay oracle (X2W_REPLAY_ORACLE=mesh, src/startup_stubs/d3d12_mesh_oracle.inl). <name>.ms57w.txt is written last:
+# 'ok' when <name>.ms57w.cso (and .ps57w.cso when the pipeline has a pixel stage) are the serial stages of a pipeline
+# whose manifest equals the proof manifest (same root layout and bindings), else 'unavailable <reason>' and no bytecode.
+ORACLE_TAG = '57w'
+ORACLE_STAGE_SUFFIXES = ('.ms57w.cso', '.ps57w.cso', '.ms57w.hlsl', '.ps57w.hlsl')
+
+
+def publish_oracle_sibling(G, name, request, proof_manifest, marker, out_dir, compile_enabled):
+    """Publish the serial sibling of a translated slot 57 key; never raises for an oracle refusal."""
+    for suffix in ORACLE_STAGE_SUFFIXES:
+        try:
+            os.remove(name + suffix)
+        except FileNotFoundError:
+            pass
+    status = oracle_sibling_status(G, name, request, proof_manifest, marker, out_dir, compile_enabled)
+    G.atomic_retry_text(name + '.ms57w.txt', status + '\n')
+    return status
+
+
+def oracle_sibling_status(G, name, request, proof_manifest, marker, out_dir, compile_enabled):
+    ms, ps, root, pixel_refusal = request
+    if marker:
+        return 'unavailable approximate translation'
+    try:
+        pipe = G.mesh57_serial_pipeline(ms, ps, root, pixel_refusal)
+        sources, manifest = G.mesh57_sources(pipe, ps)
+    except G.Unsupported as reason:
+        return 'unavailable serial: ' + ' '.join(str(reason).split())[:300]
+    if isinstance(pipe.ps, G.PlaceholderPixelStage):
+        return 'unavailable placeholder pixel stage'
+    # The published proof manifest carries the key line the runtime checks; compare without it.
+    published = [line for line in proof_manifest.splitlines() if not line.startswith(('key ', '# '))]
+    if manifest.splitlines() != published:
+        return 'unavailable manifest differs from the proof path'
+    try:
+        G.publish_mesh57_stages(name, sources, out_dir, compile_enabled, ORACLE_TAG)
+    except G.Unsupported as reason:
+        return 'unavailable ' + ' '.join(str(reason).split())[:300]
+    return 'ok'
