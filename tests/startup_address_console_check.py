@@ -384,7 +384,7 @@ def check(directory, consumer, backend, case, extra=None, held=None, late=False,
             pixel = actual[4 * (y * TARGET_W + x):4 * (y * TARGET_W + x) + 4]
             expect = image[4 * ((y % h) * w + x % w):4 * ((y % h) * w + x % w) + 4]
             if pixel != expect and not unpadded:
-                raise AssertionError(f"{name}: pixel ({x},{y}) actual {pixel.hex()} expected {expect.hex()}")
+                raise AssertionError(f"{name}: pixel ({x},{y}) actual {pixel.hex()} expected {expect.hex()}" + chr(10) + chr(10).join(l for l in log.splitlines() if "slot70" in l or "slot 70" in l or "texture" in l)[-2500:])
             wrong += pixel != expect
     if "slot70 texture kind 1: published console layout" not in log:
         raise AssertionError(f"{name}: no 'published console layout' line in the log")
