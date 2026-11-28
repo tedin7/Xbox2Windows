@@ -19,6 +19,7 @@ The words are encoded from the SOP1 / SOP2 / SOPC / SOPP, SMEM and MUBUF field l
 `tools/disasm_rdna2.py` decodes. The first test below checks them against the decoded text.
 """
 import hashlib
+import os
 import hlsl_pin  # noqa: E402
 import re
 import struct
@@ -371,6 +372,7 @@ def expect(label, condition, detail=''):
 
 def main(dxc=None):
     vertex_image_control()
+    integer_image_control()
     vertex_image_loop_control()
     descriptor_word_control()
     image_dimensions_control()
@@ -445,7 +447,8 @@ def else_arm_controls():
     print('heap record in an else arm: controls matched')
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, heap_count=2, extra=None):
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, heap_count=2, extra=None,
+         mode='--startup-dynamic-heap'):
     """One draw of the vertex stage that reads the heap record named by `offset` (ud1) when ud2 is `cond`."""
     entry = [0] * count + [heap_count]
     entry[1], entry[2] = offset, cond
@@ -453,7 +456,7 @@ def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, he
         entry[index] = word
     as_hex = lambda words: ','.join('%08x' % word for word in words)
     expected = reference if isinstance(reference, list) else [reference] * 4
-    result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
+    result = subprocess.run([offscreen, 'warp', mode, vs, ps, as_hex(entry),
                              as_hex(expected)], capture_output=True, text=True)
     if result.returncode == 77:
         print(result.stdout, end='')
@@ -494,6 +497,52 @@ def warp_image(offscreen, dxc):
         draw(offscreen, vs, ps, 128, 0x41800000, count, heap_count=5)
         wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, '(ud1 + 0u) >> 5;', '(ud1 + 32u) >> 5;'))
         draw(offscreen, wrong, ps, 96, 0x3fa00000, count, negative=True, heap_count=5)
+
+
+IMAGE_READ_1D = bytes.fromhex('000100f00c080400')  # image_load v8, v12, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_1D
+
+
+def integer_image_pipe(env):
+    """The 1D load from a heap record, translated with X2W_INTEGER_TEXTURE_SRVS=env (None leaves it unset)."""
+    patched = dict(os.environ)
+    patched.pop('X2W_INTEGER_TEXTURE_SRVS', None)
+    if env is not None:
+        patched['X2W_INTEGER_TEXTURE_SRVS'] = env
+    with patch.dict(os.environ, patched, clear=True):
+        return translate(vertex_image(read=IMAGE_READ_1D))
+
+
+def integer_image_control():
+    pipe, vs, ps = integer_image_pipe('1')
+    manifest = pipe.manifest()
+    assert 'dynamic_heap\ndynamic_heap_images\ndynamic_heap_formats\n' in manifest, manifest
+    assert 'Texture1D<uint4>' in vs and 'Texture1D<int4>' in vs and 'x2w_heap_info(' in vs, vs
+    for env in ('0', None):
+        try:
+            integer_image_pipe(env)
+        except G.Unsupported as reason:
+            assert 'unverified 1D image load' in str(reason), reason
+        else:
+            raise AssertionError('1D heap image load translated with integer views off')
+    return pipe, vs, ps
+
+
+def warp_integer_image(offscreen, dxc):
+    """Heap slots 0..2 hold 1D views of R32_UINT, R32_SINT and R32_FLOAT whose first texel is 1.25f, 2.5f and 4.0f as
+    bits; the info table at heap_count carries the view class the runtime writes. Each record is read through its own
+    integer or float view."""
+    pipe, source, ps_source = integer_image_control()
+    count = len(pipe.uds)
+    mode = '--startup-dynamic-heap-integer'
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        for offset, word in ((0, 0x3fa00000), (32, 0x40200000), (64, 0x40800000)):
+            draw(offscreen, vs, ps, offset, word, count, heap_count=3, mode=mode)
+        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, ').y;', ').x;'))
+        draw(offscreen, wrong, ps, 0, 0x3fa00000, count, negative=True, heap_count=3, mode=mode)
+    print('heap integer image: readback and mutant matched')
 
 
 def vertex_image_loop_control():
@@ -634,6 +683,8 @@ if __name__ == '__main__':
         warp(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-image']:
         warp_image(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-integer-image']:
+        warp_integer_image(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-image-loop']:
         warp_image_loop(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-descriptor-word']:

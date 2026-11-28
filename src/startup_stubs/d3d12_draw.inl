@@ -4239,7 +4239,8 @@ struct HeapTextureCounts {
 template <typename Writable>
 bool heap_texture_view(Wrapper* self, const std::uint32_t* words, D3D12_CPU_DESCRIPTOR_HANDLE dest,
                        x2w_upload::DescriptorSnapshot& snapshot, Writable writable,
-                       std::unordered_set<ID3D12Resource*>& transitions, HeapTextureCounts& counts)
+                       std::unordered_set<ID3D12Resource*>& transitions, HeapTextureCounts& counts,
+                       UINT& view_class)
 {
     static const bool skip = x2w_local::env_on("X2W_TEST_SKIP_HEAP_TEXTURE_VIEWS");
     ViewRecord record{};
@@ -4284,6 +4285,8 @@ bool heap_texture_view(Wrapper* self, const std::uint32_t* words, D3D12_CPU_DESC
         if (!owner->own().tiled_address_srv) retire_hold(self, owner);
     }
     if (!x2w_create_srv(device, texture, &view, dest, "heap-texture", log)) return bind_null(HeapTextureCounts::incompatible);
+    // The translated shader reads an integer texel through a UINT or SINT view chosen by this class (heap info word 1).
+    view_class = integer_view_type(view.Format);
     ++counts.mirrored;
     return true;
 }
@@ -4329,8 +4332,11 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
             if (entry && (readable_heap || x2w_local::readable(entry, sizeof(words)))) {
                 std::memcpy(words, entry, sizeof(words));
                 // The heap can contain unrelated records. An unmappable entry gets a null SRV.
-                if (textures && heap_texture_view(self, words, dest, snapshot, writable, sampled, texture_counts)) {
-                    if (info) std::memset(info + std::size_t{i} * 8, 0, 8);  // a texture record has no buffer format word
+                UINT view_class = 0;
+                if (textures && heap_texture_view(self, words, dest, snapshot, writable, sampled, texture_counts, view_class)) {
+                    // A texture record has no stride or buffer format word; the second word is its integer view class.
+                    const std::uint32_t pair[2] = {0u, view_class};
+                    if (info) std::memcpy(info + std::size_t{i} * 8, pair, sizeof(pair));
                     continue;
                 }
                 if (words[0] || words[1] || words[2] || words[3])

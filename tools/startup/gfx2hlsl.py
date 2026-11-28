@@ -14931,6 +14931,24 @@ class Stage:
         self.uses_dynamic_heap_images = True
         return name
 
+    def heap_integer_load(self, tex, kind, index, location, float_call):
+        """A texel load from a dynamic heap image whose view may be UINT or SINT. The runtime writes the view class
+        into the second word of the heap info record of every mirrored texture: 1 for a UINT format, 2 for SINT, 0
+        for anything else, which reads through the float view as before. Each view is created inside its own branch,
+        so only the one that matches the descriptor is ever read."""
+        self.pipe.uses_dynamic_heap_formats = True
+        slot = '(%s < heap_count ? %s : 0u)' % (index, index)
+        texel = '%s_texel' % tex
+        cls = '%s_class' % tex
+        dim = HEAP_IMAGE_TYPES[kind][0].split('<')[0]
+        self.emit('uint %s = x2w_heap_info(%s).y;' % (cls, index))
+        self.emit('uint4 %s;' % texel)
+        for view, ctype, test in (('int4', 'sint', '%s == 2u' % cls), ('uint4', 'uint', '%s == 1u' % cls)):
+            self.emit('if (%s) { %s<%s> %s_%s = ResourceDescriptorHeap[NonUniformResourceIndex(%s)]; %s = asuint(%s_%s.Load(%s)); } else'
+                      % (test, dim, view, tex, ctype, slot, texel, tex, ctype, location))
+        self.emit('{ %s = asuint(%s); }' % (texel, float_call))
+        return 'asfloat(%s)' % texel
+
     def dynamic_heap_load(self, key, address):
         # descriptor() has just checked the registers: four intact words, or the complete raw conversion of them.
         # A write the translator could not name leaves other words behind and puts the key in other_modified.
@@ -16530,7 +16548,10 @@ class Stage:
             raise Unsupported('cube sampling requires a table TextureCube view')
         if dynamic_view and self.kind == 'vs' and how not in ('load', 'load_mip', 'l', 'lz'):
             raise Unsupported('dynamic resource heap views require a raw buffer load')
-        if dynamic_view and (integer_srvs or sample_d16 or 'd16' in mods):
+        # A dynamic heap load reads a UINT or SINT view through the class word the runtime records per heap
+        # texture (x2w_heap_info), so only d16 access and integer sampling stay refused.
+        heap_integer = dynamic_view and integer_srvs and how in ('load', 'load_mip')
+        if dynamic_view and ((integer_srvs and not heap_integer) or sample_d16 or 'd16' in mods):
             raise Unsupported('dynamic resource heap image with integer or d16 access')
         shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
                        and how == 'load'
@@ -16588,7 +16609,9 @@ class Stage:
                 self.pixel_rw_loads.setdefault(desc_key, []).append((self.pc, packed_2d, tuple(cs[:expected_addr])))
             call = ('%s[uint%d(%s)]' % (tex, axes, ', '.join(address)) if uav_load
                     else '%s.Load(%s)' % (tex, location))
-            if integer_srvs and not packed_d16:
+            if heap_integer:
+                call = self.heap_integer_load(tex, kinds[dim], desc_key[0][1], location, call)
+            elif integer_srvs and not packed_d16:
                 res = self.pipe.resources[desc_key]
                 res['integer_load'] = True
                 call = ('asfloat(%(tex)s_is_integer == 2u ? asuint(%(tex)s_sint.Load(%(loc)s)) : '
@@ -22126,6 +22149,7 @@ class Pipeline:
     pixel_formatted_stores = False
     srv_formats = ()
     integer_texture_srvs = False
+    integer_srvs_by_default = False  # the slot 57 mesh runtime binds integer views; X2W_INTEGER_TEXTURE_SRVS=0 turns them off
     typed_srvs = False  # a Texture2DArray input (compute gather) needs the runtime's typed-SRV binding
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -22176,7 +22200,8 @@ class Pipeline:
         self.uses_add_sub_sat_i32 = set()
         self.uses_bitreplicate = False
         self.uses_store_format_xyzw = False
-        self.integer_texture_srvs = os.environ.get('X2W_INTEGER_TEXTURE_SRVS') == '1'
+        integer_env = os.environ.get('X2W_INTEGER_TEXTURE_SRVS')
+        self.integer_texture_srvs = integer_env == '1' or (integer_env != '0' and self.integer_srvs_by_default)
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -23624,6 +23649,7 @@ class MeshPixelStage(Pipeline):
 class MeshPipeline(Pipeline):
     """A slot 57 mesh pipeline with an optional pixel stage. The mesh stage is self.vs."""
     vertex_kind = 'ms'
+    integer_srvs_by_default = True
 
     def mesh_profile(self):
         return 'ms_6_6' if self.uses_dynamic_heap else 'ms_6_5'

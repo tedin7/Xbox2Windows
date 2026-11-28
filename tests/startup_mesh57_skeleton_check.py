@@ -1897,6 +1897,13 @@ def controls():
     with tempfile.TemporaryDirectory() as tmp:
         expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1], 'ok')
     depth_only_controls()
+    # The slot 57 runtime binds UINT and SINT views, so a mesh pipeline types integer loads unless told not to.
+    with patch.dict(os.environ):
+        os.environ.pop('X2W_INTEGER_TEXTURE_SRVS', None)
+        expect('mesh integer texture views on by default', G.MeshPipeline(code(MESH), code(PIXEL), root()).integer_texture_srvs, True)
+        expect('graphics integer texture views stay off', G.Pipeline.integer_texture_srvs, False)
+        os.environ['X2W_INTEGER_TEXTURE_SRVS'] = '0'
+        expect('mesh integer texture views off on request', G.MeshPipeline(code(MESH), code(PIXEL), root()).integer_texture_srvs, False)
     # The request path refuses a missing s_endpgm earlier; the walk takes the last instruction as the terminator
     # unread, so the pipeline refuses it too (s_nop in its place).
     try:

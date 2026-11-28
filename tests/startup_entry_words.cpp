@@ -33,7 +33,7 @@ std::vector<char> read_blob(const char* path)
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width, UINT height, bool dynamic_heap,
-                               const std::vector<std::vector<std::uint32_t>>& records)
+                               const std::vector<std::vector<std::uint32_t>>& records, bool integer_images)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -100,7 +100,7 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     ComPtr<ID3D12Resource> source;
     ComPtr<ID3D12DescriptorHeap> views, image_rtvs;
-    ComPtr<ID3D12Resource> images[2];
+    ComPtr<ID3D12Resource> images[2], integer_textures[3], integer_uploads[3];
     constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
     constexpr UINT index_table_offset = 3 * buffer_stride;
     if (dynamic_heap && !records.empty()) {
@@ -122,6 +122,61 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
             srv.Buffer = {i * (region / 4), static_cast<UINT>(records[i].size()), 0, D3D12_BUFFER_SRV_FLAG_RAW};
             device->CreateShaderResourceView(source.Get(), &srv, cpu);
         }
+        ID3D12DescriptorHeap* binding[]{views.Get()};
+        list->SetDescriptorHeaps(1, binding);
+    } else if (integer_images) {
+        // Slots 0..2 are Texture1D views of R32_UINT, R32_SINT and R32_FLOAT, texel 0 of each holding one value.
+        // Slot 3 is the heap info table the translated shader reads (ByteAddressBuffer at heap_count): per
+        // record the stride word, then the view class the runtime writes for a mirrored texture (1 UINT, 2 SINT, 0 other).
+        constexpr std::uint32_t values[3]{0x3fa00000u, 0x40200000u, 0x40800000u};
+        constexpr DXGI_FORMAT formats[3]{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT};
+        constexpr std::uint32_t info[6]{0, 1, 0, 2, 0, 0};
+        source = make_buffer(device, index_table_offset + 16, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        const D3D12_RANGE none{0, 0};
+        check(source->Map(0, &none, &mapped), "Map integer heap info");
+        std::memset(mapped, 0, index_table_offset + 16);
+        std::memcpy(mapped, info, sizeof(info));
+        source->Unmap(0, nullptr);
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create integer fixture heap");
+        auto cpu = views->GetCPUDescriptorHandleForHeapStart();
+        const UINT increment = device->GetDescriptorHandleIncrementSize(desc.Type);
+        for (UINT i = 0; i < 3; ++i, cpu.ptr += increment) {
+            D3D12_RESOURCE_DESC texture_desc{};
+            texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+            texture_desc.Width = 4;
+            texture_desc.Height = 1;
+            texture_desc.DepthOrArraySize = 1;
+            texture_desc.MipLevels = 1;
+            texture_desc.Format = formats[i];
+            texture_desc.SampleDesc.Count = 1;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT texture_footprint{};
+            UINT64 upload_size = 0;
+            device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &texture_footprint, nullptr, nullptr, &upload_size);
+            integer_uploads[i] = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* texels = nullptr;
+            check(integer_uploads[i]->Map(0, &none, &texels), "Map integer texture upload");
+            std::memset(texels, 0, static_cast<size_t>(upload_size));
+            std::memcpy(static_cast<unsigned char*>(texels) + texture_footprint.Offset, &values[i], sizeof(values[i]));
+            integer_uploads[i]->Unmap(0, nullptr);
+            integer_textures[i] = resource(device, texture_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION to{integer_textures[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            D3D12_TEXTURE_COPY_LOCATION from{integer_uploads[i].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            from.PlacedFootprint = texture_footprint;
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            transition(list, integer_textures[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{formats[i], D3D12_SRV_DIMENSION_TEXTURE1D,
+                                                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            view.Texture1D = {0, 1, 0.0f};
+            device->CreateShaderResourceView(integer_textures[i].Get(), &view, cpu);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC table{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        table.Buffer = {0, 6, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+        device->CreateShaderResourceView(source.Get(), &table, cpu);
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);
     } else if (dynamic_heap) {

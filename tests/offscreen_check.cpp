@@ -1778,7 +1778,8 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
     const bool record_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap-records";
-    const bool dynamic_heap = record_heap || std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    const bool integer_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap-integer";
+    const bool dynamic_heap = record_heap || integer_heap || std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
     if (dynamic_heap) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
@@ -1806,7 +1807,7 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
         if (records.empty() || entry.back() >= records.size()) return {OutcomeKind::fail, "missing heap format info"};
     }
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap, records);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap, records, integer_heap);
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1954,6 +1955,7 @@ const OperationSpec kOperations[] = {
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-dynamic-heap-records", 8, 8, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
+    {"--startup-dynamic-heap-integer", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},

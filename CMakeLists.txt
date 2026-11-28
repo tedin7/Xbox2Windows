@@ -5731,6 +5731,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_resheap_vertex_image_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image
         "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_integer_image_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-integer-image
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
     add_test(NAME startup_gfx2hlsl_resheap_vertex_loop_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image-loop
         "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
@@ -5751,7 +5754,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_compute_heap_format_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_format_check.py" "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")
     set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp startup_gfx2hlsl_resheap_branch_warp
-        startup_gfx2hlsl_resheap_vertex_image_warp startup_gfx2hlsl_resheap_vertex_loop_warp
+        startup_gfx2hlsl_resheap_vertex_image_warp startup_gfx2hlsl_resheap_integer_image_warp startup_gfx2hlsl_resheap_vertex_loop_warp
         startup_gfx2hlsl_resheap_descriptor_word_warp startup_gfx2hlsl_resheap_image_dimensions_warp
         startup_gfx2hlsl_resheap_fma_mix_warp startup_gfx2hlsl_resheap_embedded_scalar_warp
         startup_gfx2hlsl_heap_format_warp startup_compute_heap_format_warp
