@@ -13,6 +13,7 @@
 // memory: seq, arg, address, bytes, blob hash), BLOB (hash, bytes; once per content), OUTP (seq, arg, the pointer an
 // output argument holds after the call), PRES (seq, present), XEND (calls, blobs, bytes, dropped).
 #include "startup_stubs/replay_pages.h"
+#include <unordered_map>
 
 namespace replay_record {
 
@@ -54,6 +55,17 @@ bool window_base_set = false;
 u64 prefix_generic_bytes = 16u << 10;
 // Unique blob bytes recorded before the window, per call kind and slot: the log at stop names the biggest.
 LONG64 volatile prefix_slot_bytes[kind_count][wide_slots];
+// X2W_REPLAY_CARRY_MAX_MIB (default 64, 0 = off): before the window, every command list's calls since its last Reset (or
+// creation) are kept in memory, and the first queue submit of the list inside the window writes them into the file. A
+// list closed before the window and submitted inside it (the title's static lists) is then complete in the recording.
+// Past the cap, lists are left out.
+struct ThreadBuffer;
+u64 carry_max_bytes = 64ull << 20;
+LONG64 volatile carry_total_bytes;
+SRWLOCK carry_lock = SRWLOCK_INIT;
+std::unordered_map<u64, ThreadBuffer*>& carry_lists() { static std::unordered_map<u64, ThreadBuffer*> m; return m; }  // carry_lock
+thread_local ThreadBuffer* carry_target;  // the buffer record_call writes to instead of the thread's own
+LONG64 volatile carry_over_cap;
 // The thunk checks active before doing any recorder work. Window and prefix
 // selection is published by present(); the prefix ends when the window opens.
 std::atomic<bool> window_open{false}, prefix_open{false};
@@ -88,6 +100,10 @@ constexpr LONG draw_log_presents = 600;
 struct ThreadBuffer {
     SRWLOCK lock = SRWLOCK_INIT;
     std::vector<unsigned char> bytes;
+    // A carried list's buffer (see carry_entry): its blobs are never deduplicated against the file, and the calls wait in
+    // memory until the window submits the list.
+    bool carry = false, overflow = false;
+    u64 calls = 0, accounted = 0;
 };
 std::vector<ThreadBuffer*>& thread_buffers() { static std::vector<ThreadBuffer*> v; return v; }
 std::unordered_set<u64>& stored_blobs() { static std::unordered_set<u64> s; return s; }  // blob_lock
@@ -149,6 +165,98 @@ bool in_window()
     if (present < first_present || present >= last_present) return false;
     const double t = seconds_now();
     return t >= start_s && t < end_s;
+}
+
+// The carry buffer of a command list; `restart` (Reset, or the last Release) forgets what it held.
+ThreadBuffer* carry_entry(u64 list, bool restart)
+{
+    thread_local u64 last_list;  // entries are never freed, so a thread's last list stays valid
+    thread_local ThreadBuffer* last_entry;
+    ThreadBuffer* entry = last_list == list ? last_entry : nullptr;
+    if (!entry) {
+        AcquireSRWLockExclusive(&carry_lock);
+        ThreadBuffer*& slot = carry_lists()[list];
+        if (!slot) {
+            slot = new ThreadBuffer;
+            slot->carry = true;
+        }
+        entry = slot;
+        ReleaseSRWLockExclusive(&carry_lock);
+        last_list = list;
+        last_entry = entry;
+    }
+    if (restart) {
+        AcquireSRWLockExclusive(&entry->lock);
+        InterlockedAdd64(&carry_total_bytes, -static_cast<LONG64>(entry->accounted));
+        entry->bytes.clear();
+        entry->bytes.shrink_to_fit();
+        entry->accounted = entry->calls = 0;
+        entry->overflow = false;
+        ReleaseSRWLockExclusive(&entry->lock);
+    }
+    return entry;
+}
+// After a carried call was recorded (entry->lock held): the cap counts every list's bytes together.
+void carry_account(ThreadBuffer& entry)
+{
+    const u64 now = entry.bytes.size();
+    InterlockedAdd64(&carry_total_bytes, static_cast<LONG64>(now) - static_cast<LONG64>(entry.accounted));
+    entry.accounted = now;
+    ++entry.calls;
+    if (static_cast<u64>(carry_total_bytes) > carry_max_bytes && !entry.overflow) {
+        InterlockedIncrement64(&carry_over_cap);
+        InterlockedAdd64(&carry_total_bytes, -static_cast<LONG64>(entry.accounted));
+        entry.bytes.clear();
+        entry.bytes.shrink_to_fit();
+        entry.accounted = entry.calls = 0;
+        entry.overflow = true;
+    }
+}
+// Lists carried into the file so far (log at stop).
+bool copy_readable(u64 address, void* destination, std::size_t bytes);
+LONG64 volatile carried_lists, carried_calls, carried_bytes;
+// A queue submit inside the window: the lists it names that still hold their calls from before the window go into the
+// file now (their CALL seqs sort them among the prefix calls, so the player runs them where they happened). A list the
+// title Resets first (carry_forget) is never needed, so the file only holds the lists the window submits as built.
+void carry_emit_submitted(u64 count, u64 array)
+{
+    for (u64 i = 0; i < count; ++i) {
+        u64 list;
+        if (!copy_readable(array + i * sizeof(u64), &list, sizeof(list))) return;
+        AcquireSRWLockExclusive(&carry_lock);
+        const auto found = carry_lists().find(list);
+        ThreadBuffer* entry = found == carry_lists().end() ? nullptr : found->second;
+        ReleaseSRWLockExclusive(&carry_lock);
+        if (!entry) continue;
+        AcquireSRWLockExclusive(&entry->lock);
+        if (!entry->bytes.empty()) {
+            AcquireSRWLockExclusive(&file_lock);
+            drain(*entry);
+            ReleaseSRWLockExclusive(&file_lock);
+            InterlockedIncrement64(&carried_lists);
+            InterlockedAdd64(&carried_calls, static_cast<LONG64>(entry->calls));
+            InterlockedAdd64(&carried_bytes, static_cast<LONG64>(entry->accounted));
+            InterlockedAdd64(&calls_written, static_cast<LONG64>(entry->calls));
+            InterlockedAdd64(&carry_total_bytes, -static_cast<LONG64>(entry->accounted));
+            entry->accounted = entry->calls = 0;
+        }
+        ReleaseSRWLockExclusive(&entry->lock);
+    }
+}
+// The title Resets a list inside the window: what it built before the window is not submitted again.
+void carry_forget(u64 list)
+{
+    AcquireSRWLockExclusive(&carry_lock);
+    const auto found = carry_lists().find(list);
+    ThreadBuffer* entry = found == carry_lists().end() ? nullptr : found->second;
+    ReleaseSRWLockExclusive(&carry_lock);
+    if (!entry) return;
+    AcquireSRWLockExclusive(&entry->lock);
+    InterlockedAdd64(&carry_total_bytes, -static_cast<LONG64>(entry->accounted));
+    entry->bytes.clear();
+    entry->bytes.shrink_to_fit();
+    entry->accounted = entry->calls = 0;
+    ReleaseSRWLockExclusive(&entry->lock);
 }
 void update_window(bool open)
 {
@@ -276,9 +384,12 @@ struct ArgumentCapture {
         const u64 hash = content_hash(copy.data(), copy.size());
         struct { u64 seq; std::uint32_t arg, depth; u64 address, bytes, hash; } header{call.seq, arg, depth, address, bytes, hash};
         append_chunk(buffer.bytes, "ARGM", &header, sizeof(header), nullptr, 0);
-        AcquireSRWLockExclusive(&blob_lock);
-        const bool fresh = stored_blobs().insert(hash).second;
-        ReleaseSRWLockExclusive(&blob_lock);
+        bool fresh = true;  // a carried list may be forgotten before the window, so its blobs stay out of the shared set
+        if (!buffer.carry) {
+            AcquireSRWLockExclusive(&blob_lock);
+            fresh = stored_blobs().insert(hash).second;
+            ReleaseSRWLockExclusive(&blob_lock);
+        }
         if (fresh) {
             struct { u64 hash, bytes; } blob{hash, bytes};
             append_chunk(buffer.bytes, "BLOB", &blob, sizeof(blob), copy.data(), copy.size());
@@ -622,8 +733,10 @@ thread_local HeapPlacement* active_placement = nullptr;
 void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy, const HeapPlacement& placement)
 {
     const u64 view_id = take_view_id();
-    ThreadBuffer& b = my_buffer();
-    AcquireSRWLockExclusive(&b.lock);
+    ThreadBuffer* chosen = carry_target;
+    if (!chosen) chosen = &my_buffer();
+    AcquireSRWLockExclusive(&chosen->lock);
+    ThreadBuffer& b = *chosen;
     if (!active.load(std::memory_order_relaxed)) {
         ReleaseSRWLockExclusive(&b.lock);
         return;
@@ -666,6 +779,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     } else {
         record_arguments(capture);
     }
+    if (b.carry) {
+        carry_account(b);
+        ReleaseSRWLockExclusive(&b.lock);
+        return;
+    }
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
@@ -693,9 +811,24 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     // the home area; a slot reads only what it declares). All eleven are recorded.
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
+    // A list's calls (past the QueryInterface/AddRef/Release slots and its private-data and type getters) are carried in
+    // memory while the prefix runs: see carry_entry.
+    constexpr bool carried = K == list_kind && N >= 9;
+    const bool carrying = carried && carry_max_bytes && prefix_open.load(std::memory_order_relaxed) &&
+                          !window_open.load(std::memory_order_relaxed);
     if (!active.load(std::memory_order_relaxed) ||
-        (!window_open.load(std::memory_order_relaxed) && !(prefix_slot(K, N) && prefix_open.load(std::memory_order_relaxed))))
+        (!window_open.load(std::memory_order_relaxed) && !(prefix_slot(K, N) && prefix_open.load(std::memory_order_relaxed)) && !carrying))
         return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    ThreadBuffer* carry = nullptr;
+    if constexpr (carried) {
+        if (carrying) {
+            carry = carry_entry(rcx, N == 139);  // Reset (the console list's slot 139) starts a new sequence
+            AcquireSRWLockShared(&carry->lock);
+            const bool skip = carry->overflow;
+            ReleaseSRWLockShared(&carry->lock);
+            if (skip) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+        }
+    }
     // CopyDescriptors takes no float arguments, so its counted arrays are read from the call's own registers.
     constexpr bool descriptor_copy = K == device_kind && N == 23;
     // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
@@ -728,11 +861,22 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     take_view_id();
     const u64 previous_seq = call_seq;
     call_seq = K == list_kind && window_open.load(std::memory_order_relaxed) ? seq : 0;
+    if (carry_max_bytes && static_cast<LONG64>(carry_total_bytes) > 0 && window_open.load(std::memory_order_relaxed)) {
+        if constexpr (K == queue_kind) {
+            if (execute_shaped(rdx, r8)) carry_emit_submitted(rdx, r8);
+        } else if constexpr (K == list_kind && N == 139) {
+            carry_forget(rcx);
+        }
+    }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     call_seq = previous_seq;
     if constexpr (K == device_kind && N == 133) active_placement = previous;
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
+    if constexpr (K == list_kind && N == 2)  // the last Release: whatever sits at this address next starts fresh
+        if (static_cast<std::uint32_t>(ret) == 0 && carry_max_bytes && prefix_open.load(std::memory_order_relaxed)) carry_entry(rcx, true);
+    carry_target = carry;
     record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
+    carry_target = nullptr;
     if constexpr (K == descriptor_heap_kind && N == 9)
         if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false, true);  // after the window's last present: that Present call is in the file
@@ -930,6 +1074,10 @@ void finish_file(bool at_exit)
                 top[2].kind, top[2].slot, top[2].bytes >> 10, top[3].kind, top[3].slot, top[3].bytes >> 10,
                 top[4].kind, top[4].slot, top[4].bytes >> 10);
     }
+    if (carry_max_bytes)
+        log("x2w-replay record: static lists carried into the window %lld (%lld KiB, %lld calls); %lld left out over the %llu MiB cap",
+            static_cast<long long>(carried_lists), static_cast<long long>(carried_bytes >> 10), static_cast<long long>(carried_calls),
+            static_cast<long long>(carry_over_cap), static_cast<unsigned long long>(carry_max_bytes >> 20));
     if (!at_exit)
         log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls,
             static_cast<unsigned long long>(blobs_stored), end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
@@ -1161,6 +1309,9 @@ void install()
     char prefix_cap[24]{};
     const DWORD pc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_MAX_MIB", prefix_cap, sizeof(prefix_cap));
     if (pc && pc < sizeof(prefix_cap)) prefix_max_bytes = std::strtoull(prefix_cap, nullptr, 10) << 20;
+    char carry_mib[24]{};
+    const DWORD cc = GetEnvironmentVariableA("X2W_REPLAY_CARRY_MAX_MIB", carry_mib, sizeof(carry_mib));
+    if (cc && cc < sizeof(carry_mib)) carry_max_bytes = std::strtoull(carry_mib, nullptr, 10) << 20;
     char generic_kib[24]{};
     const DWORD gc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_GENERIC_KIB", generic_kib, sizeof(generic_kib));
     if (gc && gc < sizeof(generic_kib)) prefix_generic_bytes = std::strtoull(generic_kib, nullptr, 10) << 10;
