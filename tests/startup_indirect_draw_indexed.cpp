@@ -1151,6 +1151,23 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             const UINT values[]{0, index};
             slot<Constants>(wrapped, 40)(wrapped, 2, 2, values, 0);
         }
+        if (GetEnvironmentVariableW(L"X2W_TEST_MESH57_ROOT_SRV", nullptr, 0)) {
+            // A root SRV buffer in title memory, larger than the 64 KiB window the other stages read, plus its one root constant.
+            wchar_t root_path[MAX_PATH]{};
+            if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_ROOT_SRV", root_path, MAX_PATH)) return false;
+            std::ifstream root_file(std::filesystem::path(root_path), std::ios::binary);
+            std::vector<char> root_data(std::istreambuf_iterator<char>(root_file), {});
+            if (root_data.empty() || root_data.size() % 4) return false;
+            using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+            void* root_allocation = slot<Allocate>(wrapped, 148)(wrapped, root_data.size(), 256);
+            if (!root_allocation) return false;
+            std::memcpy(root_allocation, root_data.data(), root_data.size());
+            using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
+            slot<RootSrv>(wrapped, 44)(wrapped, 3, reinterpret_cast<UINT64>(root_allocation));
+            using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+            const UINT zero = 0;
+            slot<Constants>(wrapped, 40)(wrapped, 2, 1, &zero, 0);
+        }
         if (!GetEnvironmentVariableA("X2W_TEST_MESH57_NO_CONSTANTS", nullptr, 0)) {
             using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
             const UINT values[]{2, 12};
@@ -3268,7 +3285,7 @@ int main(int argc, char** argv) try
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
         const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER params[3]{};
+        D3D12_ROOT_PARAMETER params[4]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -3276,7 +3293,14 @@ int main(int argc, char** argv) try
         const bool heap_fixture = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[2].Constants = {1, 0, 2};
-        const D3D12_ROOT_SIGNATURE_DESC source_root{heap_fixture ? 3u : 2u, params, 0, nullptr,
+        // X2W_TEST_MESH57_ROOT_SRV: parameter 2 is one root constant (s19) and parameter 3 a root SRV (s[20:21]).
+        const bool root_srv_fixture = GetEnvironmentVariableW(L"X2W_TEST_MESH57_ROOT_SRV", nullptr, 0) != 0;
+        if (root_srv_fixture) {
+            params[2].Constants = {1, 0, 1};
+            params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            params[3].Descriptor = {0, 0};
+        }
+        const D3D12_ROOT_SIGNATURE_DESC source_root{root_srv_fixture ? 4u : heap_fixture ? 3u : 2u, params, 0, nullptr,
             static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(heap_fixture ? 0x400 : 0)};
         const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;

@@ -4847,6 +4847,32 @@ void report_placeholder_draws(Emit emit)
     }
 }
 
+// The byte span a slot 57 mesh root SRV may read, from the allocation that holds its address: the rest of the list's upload
+// allocation, the rest of the placed buffer, or the committed run of plain title memory, capped at the 16 MiB draw copy.
+// A root address names no size, and the 64 KiB probe the other stages use would silently cut a larger input, so the mesh entry
+// takes the real extent and returns 0 (refuse) when it cannot find one.
+static std::size_t mesh_root_srv_span(Wrapper* self, u64 address)
+{
+    constexpr u64 limit = 16u << 20;
+    if (!address || address % 4) return 0;
+    u64 span = 0;
+    if (const auto allocation = list_upload_tail(self, address); allocation.resource) {
+        span = allocation.bytes;
+    } else if (const auto placed = placed_buffer_range(self->own().list_device, address, 4); placed.reject) {
+        return 0;
+    } else if (placed.owner) {
+        const auto* info = resource_info(placed.owner);
+        const u64 base = reinterpret_cast<u64>(placed.owner->own().title_memory);
+        span = info && base && address >= base && address - base < info->bytes ? info->bytes - (address - base) : 0;
+    } else {
+        bool ok = false;
+        span = x2w_local::committed_extent(reinterpret_cast<const void*>(address), static_cast<std::size_t>(limit), &ok);
+        if (!ok) span = 0;
+    }
+    span = (std::min)(span, limit) & ~u64{3};
+    return span < 4 ? 0 : static_cast<std::size_t>(span);
+}
+
 // Called after releasing draw_lock, including for the late indexed refusal.
 static bool not_drawn(const Pass& pass, ID3D12GraphicsCommandList* list, u64 key, int site)
 {
@@ -5092,7 +5118,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const bool mesh_entry = mesh && std::all_of(tr->uds.begin(), tr->uds.end(), [](const Translation::Ud& ud) {
             // Every translated stage has the rectangle-list switch; a mesh dispatch fills it with 0 (no rectangle lists).
             return ud.kind != Translation::base_vertex && ud.kind != Translation::start_instance;
-        }) && std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) { return srv.source == 0; });
+        }) && std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) {
+            return srv.source == 0 || (srv.source == 2 && srv.a >= 0 && srv.a < 16);  // a table, or a root SRV
+        });
         if ((!mesh && !*entry) || (mesh && !mesh_entry) || tr->samplers.heap) {
             indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
                                   indirect_refusal_code::unsupported_resource_or_entry);
@@ -5297,7 +5325,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         } else if (srv.source == 2 && srv.a < 16) {
             address = pass.root_address[srv.a];
-            bytes = readable_window(address, 0x10000);
+            if (mesh) {
+                // The mesh entry binds the whole buffer the address lies in, never a truncated window.
+                bytes = mesh_root_srv_span(self, address);
+                if (!bytes) {
+                    static LONG unresolved;
+                    if (first_calls(unresolved, 8))
+                        log("x2w-draw slot57 mesh %016llx srv %u: root SRV %d at 0x%llx has no resolvable size; draw refused", tr->key, i,
+                            srv.a, address);
+                    indirect->set_refusal("slot57 mesh root SRV has no resolvable buffer extent",
+                                          indirect_refusal_code::incomplete_table_buffer);
+                    draw_lock_release_exclusive();
+                    return not_drawn(pass, list, not_drawn_key, 11);
+                }
+            } else {
+                bytes = readable_window(address, 0x10000);
+            }
         }
         const auto& formatted = formatted_buffers[i];
         const u64 entry = formatted.entry ? formatted.entry :
