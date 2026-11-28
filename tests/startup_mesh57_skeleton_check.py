@@ -2584,7 +2584,8 @@ def runtime(dxc, renderer, adapter, publisher):
                    X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
                    X2W_TEST_MESH57_HEAP=str(heap), X2W_TRAP_LOG=str(log))
         env.pop('X2W_TEST_MESH57_NO_CONSTANTS', None)
-        for index in (1, 0, 2):
+        # Heap slot 0 holds the data table view (the guest binds one heap); 1 and 2 the typed records; 3 is empty.
+        for index, want in ((1, images[1]), (3, images[0]), (2, images[2])):
             pixels.unlink(missing_ok=True)
             log.unlink(missing_ok=True)
             result = subprocess.run([publisher, adapter, 'mesh'], env=dict(env, X2W_TEST_MESH57_HEAP_INDEX=str(index)),
@@ -2594,9 +2595,9 @@ def runtime(dxc, renderer, adapter, publisher):
             if result.returncode:
                 raise AssertionError(result.stdout + result.stderr)
             actual = pixels.read_bytes()
-            if actual != images[index]:
+            if actual != want:
                 raise AssertionError(f'formatted heap record {index}: image differs\n' +
-                                     runtime_mismatch_report(actual, images[index], images[1], images[2], clear, log))
+                                     runtime_mismatch_report(actual, want, images[1], images[2], clear, log))
     return 0
 
 

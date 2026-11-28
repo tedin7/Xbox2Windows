@@ -1099,17 +1099,17 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT64 address = reinterpret_cast<UINT64>(allocation);
         const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
             static_cast<std::uint32_t>(address >> 32) | (4u << 16), static_cast<UINT>(data.size() / 4), 0};
-        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu + 3 * 32 : mesh_table->cpu), view.data(), sizeof(view));
+        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu : mesh_table->cpu), view.data(), sizeof(view));
         using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
         using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
         ID3D12DescriptorHeap* heaps[]{mesh_table->heap.Get()};
         if (!mesh57_heap) slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
-        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu + 3 * 32 : mesh_table->gpu);
+        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu : mesh_table->gpu);
         if (mesh57_heap) {
             char selected[8]{};
             if (!GetEnvironmentVariableA("X2W_TEST_MESH57_HEAP_INDEX", selected, sizeof(selected))) return false;
             const UINT index = static_cast<UINT>(std::strtoul(selected, nullptr, 10));
-            if (index > 2) return false;
+            if (index > 3) return false;  // 0 = the data table view, 1-2 = typed records, 3 = an empty record
             using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
             const UINT values[]{0, index};
             slot<Constants>(wrapped, 40)(wrapped, 2, 2, values, 0);
