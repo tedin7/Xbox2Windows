@@ -412,9 +412,32 @@ def check_fallback_mode():
     assert status.startswith('unsupported: ') and 'wave loop: internal lookup KeyError' in status, status
 
 
+def check_stage_retry():
+    """A stage retry runs translate() again; it must read the guest program again, not the pseudo program of the
+    first attempt (whose single block has no predecessor entry for the blocks of the first CFG)."""
+    base = G.Stage.translate
+    calls = []
+
+    def refuse_once(self):
+        calls.append(self.kind)
+        if len(calls) == 1:
+            raise G.Unsupported('numeric use of s7 holding joined at a branch target')
+        return base(self)
+
+    for mesh, pixel in ((SERIAL_MESH, ()), (DATA_DEP, PIXEL)):
+        status, plain = run(mesh, 'fallback', pixel, artifacts=True)
+        assert status == 'ok', status
+        calls.clear()
+        with patch.object(G.Stage, 'translate', refuse_once):
+            status, retried = run(mesh, 'fallback', pixel, artifacts=True)
+        assert len(calls) >= 2 and status == 'ok', (calls, status)
+        assert retried['ms57.hlsl'] == plain['ms57.hlsl']
+
+
 def offline(dxc=None):
     check_oracle_sibling()
     check_fallback_mode()
+    check_stage_retry()
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
     translated, output = run(SERIAL_MESH, '1', artifacts=True)
