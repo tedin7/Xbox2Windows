@@ -1531,8 +1531,8 @@ def check_execz_mask_subset():
         's_mov_b32 exec_lo, s21',
     )
     for near_miss in (narrowed_saveexec, narrowed_cmpx, overwritten_before, overwritten_inside, join_one_arm):
-        refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
-                lambda code=near_miss: translate('A', code=code).hlsl_cs())
+        refused_per_lane('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
+                       lambda code=near_miss: translate('A', code=code).hlsl_cs())
 
     # Unit checks for 64-bit moves and non-narrowing/invalidating steps in subset_after().
     assert G.subset_after('s_mov_b64', 's_mov_b64 exec, s[22:23]', {'exec', 'exec_hi', 'scc'}, G.EXEC_SUBSET) == (

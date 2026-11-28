@@ -41,7 +41,7 @@ from startup_compute_request_check import DATA, prepare  # noqa: E402
 from startup_compute_translate_check import state_a  # noqa: E402
 import startup_gfx2hlsl_compute_check as C  # noqa: E402
 import startup_gfx2hlsl_heap_record_check as H  # noqa: E402
-from startup_gfx2hlsl_compute_check import G, assemble, refused  # noqa: E402
+from startup_gfx2hlsl_compute_check import G, assemble, refused_per_lane as refused  # noqa: E402
 
 GROUP = (4, 1, 1)
 NO_DATA = bytes(C.WORDS * 4)
