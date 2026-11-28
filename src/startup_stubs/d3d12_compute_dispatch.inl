@@ -965,7 +965,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output buffer range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer has no unordered access";
-        { static LONG diag; if (first_calls(diag, 8)) log("x2w-draw compute %016llx output %zu: words %08x %08x %08x %08x bytes %llu sized %d placed owner %d alias %d reject %d reason %s", key, i, words[0], words[1], words[2], words[3], static_cast<unsigned long long>(bytes), int(sized), int(placed.owner != nullptr), int(placed.alias != nullptr), int(placed.reject), reason ? reason : "none"); }
         static LONG size_logged;
         if (reason && !sized && first_calls(size_logged, 16))
             log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
