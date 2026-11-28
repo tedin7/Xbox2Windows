@@ -1021,7 +1021,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (!reason && half_bytes) {
             const auto format = x2w::native_half_buffer_format(half_bytes);
             D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-            constexpr UINT required = D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            const UINT required = D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
             if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
                 (support.Support1 & required) != required ||
                 !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
