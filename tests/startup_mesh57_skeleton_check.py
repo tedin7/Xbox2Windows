@@ -11,6 +11,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py group <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py heap <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py convert <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -32,6 +33,8 @@ early-exit null export (entered by s_cbranch_execz, and in the demote form by s_
 and compares both with the CPU rasteriser without the killed triangles; the same mesh with the pixel stage that
 does not kill must differ at exactly the killed pixels.
 The heap mode compares a root-selected raw heap buffer with the CPU image and a slot-zero shader mutant.
+The convert mode draws the fixture with its table descriptor converted to a raw view in place (stride cleared, NUM_RECORDS
+scaled by max(stride, 1), OOB_SELECT 3) before the loads, and compares the read-back target with the CPU image.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import inspect
@@ -164,6 +167,20 @@ FORMAT_LOAD = 'buffer_load_format_x v20, v4, s[8:11], 0 offen offset:192'
 AFTER_COLOUR_LOAD = MESH.index('e03810c0') + 2
 FORMATTED_MESH = MESH[:AFTER_COLOUR_LOAD] + ['e00010c0', '80021404'] + MESH[AFTER_COLOUR_LOAD:]
 REWRITTEN_FORMAT = FORMATTED_MESH[:AFTER_COLOUR_LOAD] + ['be8b0380'] + FORMATTED_MESH[AFTER_COLOUR_LOAD:]  # s_mov_b32 s11, 0
+
+
+# gfx10 structured-to-raw conversion of s[8:11] (V# layout: stride DW1[29:16], NUM_RECORDS DW2, OOB_SELECT DW3[29:28]),
+# inserted before the first buffer load; s60 holds the extracted stride:
+CONVERT_WORDS = [
+    '93bcff09', '000e0010',  # s_bfe_u32 s60, s9, 0xe0010
+    '84bc813c',              # s_max_u32 s60, s60, 1
+    '930a3c0a',              # s_mul_i32 s10, s10, s60
+    '8709ff09', 'c000ffff',  # s_and_b32 s9, s9, 0xc000ffff
+    '870bff0b', 'cfffffff',  # s_and_b32 s11, s11, 0xcfffffff
+    '880bff0b', '30000000',  # s_or_b32 s11, s11, 0x30000000
+]
+_convert_at = MESH.index('e0381000')
+CONVERT_MESH = MESH[:_convert_at] + CONVERT_WORDS + MESH[_convert_at:]
 
 
 def code(words):
@@ -1619,6 +1636,7 @@ def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
     group_reference_controls()
+    convert_controls()
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, HEAP_MESH, root_blob=heap_root())
         expect('heap branch translates', result, 'ok')
@@ -3326,6 +3344,58 @@ def draw_heap(dxc, renderer, adapter):
     return 0
 
 
+def draw_convert(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, CONVERT_MESH)
+        expect('the converted descriptor translates and compiles', result, 'ok')
+        if result != 'ok':
+            return 0
+        name = str(Path(tmp) / ('%016x' % key))
+        uds = G.MeshPipeline(code(CONVERT_MESH), code(PIXEL), root()).uds
+        constants = bytearray(1024)
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), len(indices))
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 1)), len(points))
+        image = rasterise(points, colours, indices, len(points), len(indices))
+        head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+        path = Path(tmp) / 'convert.bin'
+        args = [renderer, adapter, '--mesh-indexed', name + '.ms57.cso', name + '.ps57.cso', str(path)]
+        wrong = list(image)
+        at = next(i for i, pixel in enumerate(image) if pixel != (0, 0, 0, 255))
+        wrong[at] = (0, 0, 0, 255)
+        for label, reference, mismatches in (('correct reference', image, 0), ('one wrong pixel', wrong, 1)):
+            path.write_bytes(head + b''.join(bytes(pixel) for pixel in reference))
+            run = subprocess.run(args, capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            expect('converted descriptor draw, ' + label,
+                   (run.returncode, 'pixels=1024 mismatches=%d' % mismatches in run.stdout), (int(bool(mismatches)), True))
+            print('%s: %s' % (label, run.stdout.strip().splitlines()[-1:]))
+    return 0
+
+
+def convert_controls():
+    """The structured-to-raw conversion is accepted only as the exact words; a changed mask or a missing step stays refused."""
+    refused = 'unsupported: buffer load through a modified descriptor'
+    variants = (
+        ('stride mask changed', ('8709ff09', 'c000ffff'), ('8709ff09', 'c000fffe')),
+        ('NUM_RECORDS not scaled', ('930a3c0a',), ('be8a030a',)),
+        ('OOB_SELECT mask changed', ('870bff0b', 'cfffffff'), ('870bff0b', 'dfffffff')),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        expect('converted descriptor translates', request(tmp, CONVERT_MESH)[1], 'ok')
+        for label, old, new in variants:
+            words = ' '.join(CONVERT_WORDS)
+            changed = words.replace(' '.join(old), ' '.join(new)).split()
+            expect(label + ' changes the words', changed != CONVERT_WORDS, True)
+            mutated = MESH[:_convert_at] + changed + MESH[_convert_at:]
+            expect('converted descriptor refused: ' + label, request(tmp, mutated)[1], refused)
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
@@ -3344,6 +3414,8 @@ def main(argv):
         status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['heap'] and len(argv) == 5:
         status = draw_heap(*argv[2:])
+    elif argv[1:2] == ['convert'] and len(argv) == 5:
+        status = draw_convert(*argv[2:])
     elif argv[1:2] == ['group'] and len(argv) == 5:
         status = draw_group(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:
