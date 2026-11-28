@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <memory>
 #include <new>
+#include <type_traits>
 
 namespace x2w_local {
 
@@ -52,6 +53,16 @@ inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
         seen = previous;
     }
     return false;
+}
+
+// Seconds since this process was created: one time base for lines from different stand-in DLLs.
+inline double process_seconds() noexcept
+{
+    FILETIME created{}, exited{}, kernel{}, user{}, now{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime; };
+    return ticks(now) > ticks(created) ? static_cast<double>(ticks(now) - ticks(created)) / 1e7 : 0.0;
 }
 
 // First-chance exceptions stop the whole process while a debugger is attached, so a probe or a copy that is
@@ -220,9 +231,25 @@ inline void forget_mapped_spans() noexcept
     }
 }
 
+// The pre-check is a debugging aid: it only pays off while a debugger would stop on every first-chance fault.
+// X2W_PROBE_PRECHECK decides when it is set (0 off, anything else on); unset, the pre-check runs when a debugger is
+// attached. Read once, cached. Title runs always start under debug_launch.py, where a VirtualQuery per probe can
+// cost far more than the faults it avoids, so X2W_PROBE_PRECHECK=0 turns it off there. Off, probes and copies keep
+// the plain touch / __try path at no extra cost.
+inline bool precheck_enabled() noexcept
+{
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD n = GetEnvironmentVariableA("X2W_PROBE_PRECHECK", value, sizeof(value));
+        if (n != 0 && n < sizeof(value)) return value[0] != '0';
+        return IsDebuggerPresent() != FALSE;
+    }();
+    return enabled;
+}
+
 inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexcept
 {
-    if (bytes == 0 || start + bytes < start) return bytes;
+    if (bytes == 0 || start + bytes < start || !precheck_enabled()) return bytes;
     const std::uintptr_t end = start + bytes;
     std::uintptr_t at = start;
     if (auto* tables = mapped_span_tables()) {
@@ -364,6 +391,27 @@ inline void commit_lazy_block(const void* pointer) noexcept
     if (commit_block) commit_block(pointer);
 }
 
+// Runs f() outside xmem's run breaks (x2w_xmem_stable_call, X2W_XMEM_SHARED_VIEWS): inside a break the pages of
+// the run being taken apart read as reserved to a VirtualQuery and make ReadProcessMemory fail, although a touch of
+// them would be retried. f must be a query, or a copy into the caller's memory, that can run again; it may run
+// twice. Without xmem.dll, or with one that lacks the export, f runs once, directly.
+using StableCall = BOOL(WINAPI*)(void (*)(void*), void*);
+inline StableCall stable_call_export() noexcept
+{
+    static const StableCall stable_call = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<StableCall>(GetProcAddress(xmem, "x2w_xmem_stable_call")) : nullptr;
+    }();
+    return stable_call;
+}
+template <typename F>
+inline void outside_run_breaks(F&& f) noexcept
+{
+    const StableCall stable_call = stable_call_export();
+    using Call = std::remove_reference_t<F>;
+    if (!stable_call || !stable_call([](void* context) { (*static_cast<Call*>(context))(); }, &f)) f();
+}
+
 // Readability by probing (see probe_readable); writability by one VirtualQuery (rare callers).
 inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexcept
 {
@@ -372,7 +420,9 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
     if (!write) return probe_readable(start, bytes) == bytes;
     commit_lazy(pointer, bytes);
     MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    SIZE_T queried = 0;
+    outside_run_breaks([&] { queried = VirtualQuery(pointer, &info, sizeof(info)); });
+    if (!queried || info.State != MEM_COMMIT) return false;
     const DWORD protect = info.Protect & 0xFF;
     if ((info.Protect & PAGE_GUARD) || protect == PAGE_NOACCESS || protect == 0) return false;
     const bool writable = protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE || protect == PAGE_WRITECOPY ||
@@ -385,5 +435,31 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
 }
 inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }
 inline bool writable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, true); }
+
+// True when every byte of [pointer, pointer + bytes) is committed and writable, with no guard or no-access page
+// in between. Walks the regions one VirtualQuery at a time, so a range that spans regions of different
+// protection is judged page by page. Nothing is written, touched or committed (see commit_lazy), so it is safe
+// under xmem's mapping lock. An empty range is writable; a null or wrapping one is not.
+inline bool committed_writable(const void* pointer, std::size_t bytes) noexcept
+{
+    if (bytes == 0) return true;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(pointer);
+    if (!pointer || bytes > ~std::uintptr_t{0} - cursor) return false;
+    const std::uintptr_t end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
+    return true;
+}
 
 }  // namespace x2w_local

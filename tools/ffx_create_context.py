@@ -1,6 +1,8 @@
 """Statically bind the inspected loader's create path to a host-owned provider table."""
 import argparse
+import os
 from pathlib import Path
+import tempfile
 
 import pefile
 
@@ -67,18 +69,59 @@ def generate(path):
                           "r8 = reinterpret_cast<word>(allocator);"])
 
 
-def main(argv=None):
+def _validate_paths(loader: Path, output: Path, parser: argparse.ArgumentParser) -> None:
+    if loader.is_dir():
+        raise IsADirectoryError(f"loader path is a directory: {loader}")
+    if not loader.is_file():
+        raise FileNotFoundError(f"loader file not found: {loader}")
+    if output.suffix.lower() != ".cpp":
+        parser.error("choose a separate .cpp output")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {output}")
+    if output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    if output.resolve() == loader.resolve() or (output.exists() and loader.samefile(output)):
+        parser.error("choose a separate .cpp output")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write ASCII content to a sibling temp file and atomically replace path, leaving 0 temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("loader", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.loader.resolve():
-            parser.error("choose a separate .cpp output")
-        args.output.write_text(generate(args.loader), encoding="ascii")
+        _validate_paths(args.loader, args.output, parser)
+        _write_atomic(args.output, generate(args.loader))
     except (OSError, ValueError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -212,8 +212,8 @@ def main():
               '%s %s' % (result, fail_reason(name)))
 
         # 8. The cache revision moved, so a translation from before the store lowering is never loaded.
-        check('cache key uses revision 28', G.pipeline_key(b'a', b'b', ROOT) ==
-              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.shader_cache_seed(b'x2w-startup-shader-28')))))
+        check('cache key uses revision 29', G.pipeline_key(b'a', b'b', ROOT) ==
+              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.shader_cache_seed(b'x2w-startup-shader-29')))))
 
     from startup_pixel_store_format_xyzw_check import controls
     controls()

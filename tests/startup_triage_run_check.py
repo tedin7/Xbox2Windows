@@ -59,6 +59,11 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
         # A device slot 67 compute request with the same reason is counted in its own class.
         (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
         (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
+        # A compute runtime manifest reason is a fixed category; text outside its allowlist is not copied.
+        for key, line in ((5, "unsupported startup runtime manifest bindings: UAV kind texture_uav cube"),
+                          (6, "unsupported startup runtime manifest bindings: SRV kind /home/alice/x")):
+            (cache_dir / f"{key:016x}.fail").write_text(line + "\n", encoding="utf-8")
+            (cache_dir / f"req_{key:016x}.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -77,6 +82,8 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
             "| 1 | `compute: image_load_mip tfe` |",
+            "| 1 | `compute: runtime manifest: UAV kind texture_uav cube` |",
+            f"| 1 | `compute: {triage_run.OTHER}` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
@@ -122,6 +129,8 @@ PRIVATE_SHADER_FAILS = [
     "undecodable word at +0x10: AcmeTitle shader text",
     "image_load_mip tfe AcmeTitle",
     "image_load_mip tfe",
+    "native compute +0x1a: unsupported instruction v_acme_widget_7f3a 0xdeadbeefu",
+    "native compute +0x1c: AcmeTitle secret reason",
 ]
 PRIVATE_NEEDLES = [
     "Acme", "acme", "ACME", "Private", "secret", "leak", "widget", "7f3a", "exploded",
@@ -159,6 +168,10 @@ def check_private_text_never_echoed(failures: list[str]) -> None:
         ]:
             if want not in report:
                 failures.append(f"missing grouped allowlist row: {want!r}")
+        if "| 4 | `other (text omitted)` |" not in report:
+            failures.append("unknown shader .fail lines were not grouped as other (text omitted)")
+        if "| 1 | `v_* instruction` |" not in report:
+            failures.append("native unsupported instruction .fail line was not grouped under its mnemonic family")
         if "| 1 | other (text omitted) | ? | ? | ? | ? | ? | ? |" not in report:
             failures.append("unknown slot70 reason/values were not grouped as other/?")
 
@@ -494,6 +507,22 @@ def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
     # text changed, folds a known cause into "other" without failing anything else. The samples are
     # matched back to the table so a new entry without a sample fails here.
     samples = (
+        ("native compute +0x14: unsupported instruction v_add3_u32 0xd76d0002u", "v_* instruction"),
+        ("native compute +0x8: unsupported opcode 0xdeadbeefu", "unsupported opcode"),
+        ("native compute +0x10: unsupported pixel entry VGPR 2", "unsupported pixel entry VGPR"),
+        ("unsupported startup runtime manifest bindings: SRV kind texture_srv 2d array",
+         "runtime manifest: SRV kind texture_srv 2d array"),
+        ("unsupported startup runtime manifest bindings: more than 8 UAVs", "runtime manifest: more than 8 UAVs"),
+        ("native compute +0x1c: unproven resource descriptor s12", "unproven resource descriptor"),
+        ("native compute +0x20: unbound numeric SGPR s0", "unbound numeric SGPR"),
+        ("unknown gfx1013 instruction format at byte 24", "undecodable word"),
+        ("graphics request key mismatch or missing root", "graphics request key mismatch"),
+        ("compute request key mismatch", "compute request key mismatch"),
+        ("stale pixel input description: graphics request key mismatch", "stale pixel input description"),
+        ("pixel input description names another pipeline", "pixel input description names another pipeline"),
+        ("contradictory pixel input enable/address masks", "contradictory pixel input enable/address masks"),
+        ("pixel input enable mask missing from the stream description", "invalid pixel input description"),
+        ("invalid pixel input description", "invalid pixel input description"),
         ("image_load_mip tfe", "image_load_mip tfe"),
         ("image_load_mip a16", "image_load_mip a16"),
         ("buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL", "buffer_* instruction"),

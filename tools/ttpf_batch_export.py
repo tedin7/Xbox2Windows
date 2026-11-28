@@ -285,6 +285,9 @@ def batch_export(pool_path: Path, out_dir: Path,
         raise ValueError(f"--manifest path collides with --out: {resolved_manifest}")
     if resolved_manifest.resolve() in out_dir.resolve().parents:
         raise ValueError(f"--manifest path cannot be an ancestor of --out: {resolved_manifest}")
+    for option, source_path in (("history", history_path), ("calibration", calibration_path)):
+        if source_path is not None and _same_path(resolved_manifest, source_path):
+            raise ValueError(f"--manifest path collides with --{option}: {resolved_manifest}")
 
     if calibration_path is not None and (allow_provisional or history_path is not None):
         raise ValueError("--calibration cannot be combined with --allow-provisional or --history")
@@ -349,7 +352,6 @@ def batch_export(pool_path: Path, out_dir: Path,
     finally:
         pool.close()
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = resolved_manifest
 
     if indices is None:
@@ -358,6 +360,13 @@ def batch_export(pool_path: Path, out_dir: Path,
         target_indices = list(range(start_idx, end_idx))
     else:
         target_indices = [i for i in indices if 0 <= i < total_textures]
+
+    # The manifest is published after the workers finish. Its path must not name
+    # a requested DDS, including one preserved after a failed or skipped export.
+    for index in target_indices:
+        if _same_path(manifest_path, out_dir / f"tex_{index:05d}.dds"):
+            raise ValueError(f"--manifest path collides with DDS output: {manifest_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entries: list[dict] = []
     stats = {"strict": 0, "provisional": 0, "failed": 0, "skipped": 0}

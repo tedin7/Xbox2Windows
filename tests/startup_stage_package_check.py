@@ -1,4 +1,5 @@
 """Exercise safe startup staging using synthetic files; no game package is needed."""
+import ctypes
 import os
 from pathlib import Path
 import subprocess
@@ -93,6 +94,73 @@ def main():
             assert not (location / "new-run").exists()
         finally:
             junction.rmdir()
+
+        # The package can be named through an alias while the destination uses its real path.
+        # Both spellings must refer to the same tree for the separation check.
+        alias = root / "package-alias"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias), str(package)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            nested = package / "new" / "run"
+            result = call(powershell, alias, exe.name, nested)
+            assert result.returncode != 0 and "separate from PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not nested.exists()
+            safe = root / "alias-safe-run"
+            result = call(powershell, alias, exe.name, safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / exe.name).read_bytes() == original[exe.name]
+        finally:
+            alias.rmdir()
+
+        # A path spelled inside the package can also lead outside through a junction.
+        outside_dir = root / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "outside.exe").write_bytes(b"outside executable")
+        escape = package / "escape"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(escape), str(outside_dir)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            refused = root / "escape-run"
+            result = call(powershell, package, "escape/outside.exe", refused)
+            assert result.returncode != 0 and "inside PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not refused.exists()
+        finally:
+            escape.rmdir()
+
+        # A junction whose target stays inside the package remains usable.
+        inside = package / "inside"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(inside), str(bin_dir)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            safe = root / "inside-run"
+            result = call(powershell, package, "inside/child.exe", safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / "child.exe").read_bytes() == b"child"
+            assert (safe / "side.DLL").read_bytes() == b"beside child"
+        finally:
+            inside.rmdir()
+
+        # Volume GUID paths are returned as provider-qualified paths by PowerShell.
+        # Staging to a sibling must work, while the underlying package is still protected.
+        volume = ctypes.create_unicode_buffer(1024)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetVolumeNameForVolumeMountPointW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel.GetVolumeNameForVolumeMountPointW.restype = ctypes.c_int
+        if kernel.GetVolumeNameForVolumeMountPointW(package.anchor, volume, len(volume)):
+            volume_package = volume.value + str(package)[len(package.anchor):]
+            nested = package / "volume-nested"
+            result = call(powershell, volume_package, exe.name, nested)
+            assert result.returncode != 0 and "separate from PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not nested.exists()
+            safe = root / "volume-safe"
+            result = call(powershell, volume_package, exe.name, safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / exe.name).read_bytes() == original[exe.name]
+        else:
+            print("volume GUID control skipped: temporary volume has no GUID path")
     print("safe startup staging: isolated executable/DLL copy, package preservation and overwrite/path guards passed")
 
 

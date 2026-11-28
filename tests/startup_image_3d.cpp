@@ -26,21 +26,21 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
-// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
-constexpr UINT mip_base = 4;
 constexpr UINT max_levels = 3;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
 // alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
-void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, UINT base, float out[4])
 {
     if (levels == 1) {
         const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
         std::memcpy(out, one, sizeof(one));
         return;
     }
-    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    const UINT area = base * base;
+    const float red = float(1 + x + base * y + area * (s + 2 * m)) / float(8 * area);
+    const float many[4] = {red, float(x), float(y), float(s + 2 * m)};
     std::memcpy(out, many, sizeof(many));
 }
 
@@ -64,22 +64,39 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 
 // array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
 // view of a two-slice texture is a Texture2DArray over both. Multi-mip fixtures use a 4x4 base.
-// A nonzero view_levels selects an explicit 2D SRV starting at first_mip. When sampler_line is a
+// A nonzero view_levels selects an explicit 2D or 2D-array SRV starting at first_mip. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float* colors, const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels, bool cube, UINT width, UINT height)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, bool cube, UINT width, UINT height,
+                            UINT mip_base)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional && !cube))
         throw std::runtime_error("Unsupported image mip level count");
-    if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
+    if (view_levels && ((!two_dimensional && !array) || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
-        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    const char* newline = std::strchr(sampler_line, '\n');
+    if (!newline) {
+        if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+            throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    } else {
+        const std::string first(sampler_line, newline);
+        const char* second = newline + 1;
+        int first_index = -1, second_index = -1;
+        if (!two_dimensional || !view_levels || std::strchr(second, '\n') ||
+            (std::sscanf(first.c_str(), "smp %d", &first_index) != 1 &&
+             std::sscanf(first.c_str(), "smpl %d", &first_index) != 1) ||
+            (std::sscanf(second, "smp %d", &second_index) != 1 &&
+             std::sscanf(second, "smpl %d", &second_index) != 1) ||
+            first_index != 0 || second_index != 1 ||
+            !samplers.read_manifest_line(first.c_str()) || !samplers.read_manifest_line(second) ||
+            samplers.statics.size() != 2 || samplers.heap || samplers.comparison[0] || samplers.comparison[1])
+            throw std::runtime_error("Expected two ordered noncomparison inline samplers in the 2D view draw");
+    }
     const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
     const auto root = create_root(device, samplers);
 
@@ -137,7 +154,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                         texel[2] = float(ty);
                         texel[3] = 1.0f + level;
                     } else {
-                        texel_value(tx, ty, tz, level, levels, texel);
+                        texel_value(tx, ty, tz, level, levels, base, texel);
                     }
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = sliced ? start + place.Offset : start + place.Offset + tz * slice_pitch;
@@ -169,10 +186,16 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     if (view_levels) {
         view.Format = td.Format;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.ViewDimension = array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Texture2D.MostDetailedMip = first_mip;
-        view.Texture2D.MipLevels = view_levels;
+        if (array) {
+            view.Texture2DArray.MostDetailedMip = first_mip;
+            view.Texture2DArray.MipLevels = view_levels;
+            view.Texture2DArray.ArraySize = td.DepthOrArraySize;
+        } else {
+            view.Texture2D.MostDetailedMip = first_mip;
+            view.Texture2D.MipLevels = view_levels;
+        }
     }
     if (cube) {
         view.Format = td.Format;

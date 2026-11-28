@@ -55,6 +55,56 @@ def round_exact(x):
     return neg | (n if e == -14 and n < 0x400 else ((e + 15) << 10) | (n & 0x3ff))
 
 
+def half_unary_value(op, x):
+    """Evaluate binary16 unary operations in float64, including special values."""
+    if op == 'rcp':
+        return math.copysign(math.inf, x) if x == 0 else 1.0 / x
+    if op == 'sqrt':
+        return math.nan if x < 0 else math.sqrt(x)
+    if op == 'rsq':
+        if x == 0:
+            return math.copysign(math.inf, x)
+        return math.nan if x < 0 else 1.0 / math.sqrt(x)
+    assert op == 'exp'
+    return math.inf if x >= 128 else math.exp2(x)
+
+
+def rsq_rounding(bits):
+    """Return the exact RNE result and any alternate allowed by the f32 midpoint window."""
+    if not 0 < bits < 0x7c00:
+        value = half_unary_value('rsq', h2f(bits))
+        result = 0x7e00 if math.isnan(value) else struct.unpack('<H', struct.pack('<e', value))[0]
+        return result, None
+
+    source = Fraction(h2f(bits))
+
+    def below_rsq(value):
+        return source * value * value < 1
+
+    # The reciprocal square root of every positive finite half is a normal half
+    # or falls between two normal half encodings. 0x6c00 is the largest result.
+    lo, hi = 0x0400, 0x6c01
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if below_rsq(Fraction(h2f(mid))):
+            lo = mid
+        else:
+            hi = mid
+    lower, upper = Fraction(h2f(lo)), Fraction(h2f(hi))
+    if source * upper * upper == 1:
+        return hi, None
+    midpoint = (lower + upper) / 2
+    if source * midpoint * midpoint == 1:
+        rounded = lo if lo % 2 == 0 else hi
+    else:
+        rounded = hi if below_rsq(midpoint) else lo
+    # The result and midpoint share the lower encoding's binade. Compare
+    # the exact reciprocal square root to each endpoint by squaring.
+    radius = Fraction(2) ** ((lo >> 10) - 15 - 20)
+    near = below_rsq(midpoint - radius) and source * (midpoint + radius) ** 2 > 1
+    return rounded, (lo if rounded == hi else hi) if near else None
+
+
 def minmax(op, a, b):
     """v_pk_min_f16 / v_pk_max_f16 lane: IEEE minNum / maxNum on binary16 words. A quiet NaN operand yields the other operand, two NaNs
     a quiet NaN, and the zeros are ordered (-0 below +0). Signalling NaN operands are not modelled (the callers leave them out)."""
@@ -70,10 +120,22 @@ def minmax(op, a, b):
     return a if (x < y) == (op == 'min') else b
 
 
-def half_op(op, a, b, c=0):
-    """One binary16 lane: op is 'mul', 'add', 'fma' (a * b + c), 'min' or 'max'."""
+def half_op(op, a, b=0, c=0):
+    """Round one binary16 operation: mul, add, fma, min, max and unary rcp, sqrt, rsq and exp2."""
     if op in ('min', 'max'):
         return minmax(op, a, b)
+    if op == 'rsq':
+        return rsq_rounding(a)[0]
+    if op in ('rcp', 'sqrt', 'exp'):
+        x = h2f(a)
+        if op == 'rcp' and math.isfinite(x) and x != 0:
+            return round_exact(1 / Fraction(x))
+        value = half_unary_value(op, x)
+        if math.isnan(value):
+            return 0x7e00
+        if value == 0 or math.isinf(value):
+            return struct.unpack('<H', struct.pack('<e', value))[0]
+        return round_exact(Fraction(value))
     words = (a, b, c) if op == 'fma' else (a, b)
     if any(is_nan(w) for w in words):
         return 0x7e00

@@ -1,0 +1,2 @@
+# Patch manifest schema, loader and hash gate (tools/patch_manifest.py).
+tests/patch_manifest_check.py

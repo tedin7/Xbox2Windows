@@ -104,13 +104,21 @@ def check_approx(directory, key, stage, reads, reductions):
 
 
 def controls(directory):
+    with tempfile.TemporaryDirectory() as probe_dir, patch.dict(os.environ, {'X2W_FXC': ''}):
+        os.environ.pop(SWITCH, None)
+        if all(translate(Path(probe_dir) / name)[1] == 'ok' for name, translate in (('c', compute), ('p', pixel))
+               if (Path(probe_dir) / name).mkdir() is None):
+            # The readfirstlane proof and the masked reduction proof translate both fixtures strictly, so the approximate
+            # lift has nothing left to approximate here. TODO: fixtures that the strict translator still refuses.
+            print('approx check skipped: both fixtures translate strictly now')
+            sys.exit(77)
     for translate, refusal, stage, reads, reductions in (
             (compute, READ_REFUSAL, 'cs', 1, 0), (pixel, REDUCE_REFUSAL, 'ps', 0, 1)):
         with patch.dict(os.environ, {'X2W_FXC': ''}):
             os.environ.pop(SWITCH, None)
             key, result = translate(directory)
-            if stage == 'ps' and result == 'ok':
-                # The masked reduction proof (retry_masked_reduction) now translates this shape strictly, so it no longer
+            if result == 'ok':
+                # The masked reduction proof or the readfirstlane proof now translates this shape strictly, so it no longer
                 # exercises the approximate lift. TODO: a pixel reduction shape that the masked proof still refuses.
                 print('approx control skipped: pixel reduction is proven by the masked reduction retry')
                 continue

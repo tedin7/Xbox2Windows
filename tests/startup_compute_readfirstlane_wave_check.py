@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import startup_compute_waterfall as waterfall
 from compute_load_format_check import check_references
@@ -88,9 +89,11 @@ def controls(llvm_mc):
                 assert 'WaveReadLaneFirst(v5)' in hlsl and 'WaveActiveMin((exec & 1u)' in hlsl, hlsl
             else:
                 assert 's22 = v10;' in hlsl and 'WaveReadLaneFirst' not in hlsl, hlsl
-    refused(REFUSAL, lambda: translate(uniform_body(phi=(*PHI[:-1], VARYING)), None, llvm_mc))
-    for width in (32, 64):
-        refused(REFUSAL, lambda: translate(active_body(width), width, llvm_mc, group=8))
+    # The fixture's offsets are for the small group. Test the uniform-source and host-wave proofs in isolation.
+    with patch.object(waterfall.G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+        refused(REFUSAL, lambda: translate(uniform_body(phi=(*PHI[:-1], VARYING)), None, llvm_mc))
+        for width in (32, 64):
+            refused(REFUSAL, lambda: translate(active_body(width), width, llvm_mc, group=8))
     print('uniform phi and scalar load, first-active wave32/wave64 and refusal controls passed')
 
 

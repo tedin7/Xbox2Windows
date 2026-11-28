@@ -26,6 +26,14 @@ either is not that reduction for some mask or is a conservative refusal (said so
 order that matters in the interleaved form: with vT shared by the two chains, the min's readlane moved after the max
 fill reads the max.
 
+A uniform branch may sit before the chain, after it, or both. The branch here is s_cmp_eq_u32 of a constant with
+itself (SCC proven uniform) and s_cbranch_scc0, which is not taken, over one s_nop; the other edge lands on the
+chain too, so every lane runs the chain. The chain stays straight: no branch instruction and no branch target
+inside it, and EXEC is saved and restored as in the shapes above. A branch target inside the chain, a non-uniform
+branch that changes EXEC inside the chain (s_and_saveexec_b32 and s_cbranch_execz before the fill), a divergent
+branch outside the chain, and wave64 stay refused. Restoring the straight-line refusal (the test wraps the matcher)
+refuses the uniform-branch programs and still lowers the straight-line ones.
+
 The desktop contract: the console packs pixels into waves in its own way, so a correct program cannot depend on which
 pixels share a wave; the lowering is one WaveActive* over the active lanes of the desktop wave. The draw cannot know
 the desktop packing in advance, so the test appends one observation to the translated pixel stage: the fourth channel
@@ -33,7 +41,8 @@ is replaced by the lane index, the lane count (WaveGetLaneCount) and the pixel i
 the wave. The readback (offscreen_check --startup-pixel-dump) is grouped by that id and every covered pixel's results
 are compared with OP over the inputs of the covered pixels of its group. The triangle leaves quads partly covered:
 their helper lanes run the stage, are not in the console EXEC (no s_wqm), and must not change the result. Planted
-errors in the translated text (another operation, signed for unsigned, the lane's own value, the first lane's value;
+errors in the translated text (another operation, the lane's own value, the first lane's value; signed for
+unsigned only where that rewrite changes the program, which is min and max, since v_or_b32 has no signed form;
 for the interleaved pair the min's readlane lowered after the max, min and max swapped, the v_cndmask_b32_sdwa
 dropped) must fail.
 """
@@ -111,7 +120,13 @@ def sopp(op, simm=0):
     return struct.pack('<I', 0xbf800000 | (op << 16) | (simm & 0xffff))
 
 
-S_MOV_B32, S_WQM_B32, S_AND_SAVEEXEC_B32, S_OR_SAVEEXEC_B32, S_OR_SAVEEXEC_B64 = 0x03, 0x09, 0x3c, 0x3d, 0x25
+def sopc(op, ssrc0, ssrc1):
+    return struct.pack('<I', 0xbf000000 | (op << 16) | (ssrc1 << 8) | ssrc0)
+
+
+S_MOV_B32, S_WQM_B32, S_OR_SAVEEXEC_B32, S_OR_SAVEEXEC_B64 = 0x03, 0x09, 0x3d, 0x25
+S_AND_SAVEEXEC_B32, S_CMP_EQ_U32 = 0x3c, 0x06
+S_CBRANCH_SCC0, INLINE_1 = 0x04, 129
 EXEC_LO, INLINE_M1 = 126, 0xc1
 V_PERMLANEX16_B32, V_READLANE_B32, V_CNDMASK_B32_E64, V_LSHLREV_B32_E64 = 0x378, 0x360, 0x101, 0x11a
 V_CNDMASK_B32, V_CMP_GT_U32 = 0x01, 0xc4
@@ -423,6 +438,63 @@ def paired_controls():
               bool(mutant and mutant != text and 'WaveActiveMin(' in mutant), str(reason))
 
 
+def uniform_scc_block(at, skip=1):
+    """s_mov_b32 s2, 1 / s_cmp_eq_u32 s2, 1 / s_cbranch_scc0 over `skip` s_nop instructions, starting at byte `at`.
+
+    The compare is true, so s_cbranch_scc0 is not taken and every lane falls through the nop into the next
+    instruction. The taken edge lands on that same instruction, so the chain runs on every lane either way.
+    s2 is not a register the chain uses."""
+    mov = ('s_mov_b32 s2, 1', sop1(S_MOV_B32, 2, INLINE_1))
+    cmp = ('s_cmp_eq_u32 s2, 1', sopc(S_CMP_EQ_U32, 2, INLINE_1))
+    branch_at = at + 8
+    target = branch_at + 4 + skip * 4
+    branch = ('s_cbranch_scc0 label_0x%x' % target, sopp(S_CBRANCH_SCC0, (target - (branch_at + 4)) // 4))
+    return [mov, cmp, branch] + [('s_nop 0', sopp(0))] * skip
+
+
+def uniform_around(op, where):
+    """The op's straight-line program with a uniform branch before the chain, after it, or both."""
+    head = start(op) + chain(op)
+    if where == 'before':
+        return program(uniform_scc_block(0), head, RESULT, END)
+    if where == 'after':
+        return program(head, uniform_scc_block(sum(len(w) for _t, w in head)), RESULT, END)
+    if where == 'both':
+        prefix = uniform_scc_block(0)
+        at = sum(len(w) for part in (prefix, head) for _t, w in part)
+        return program(prefix, head, uniform_scc_block(at), RESULT, END)
+    raise AssertionError(where)
+
+
+def wave64_with_uniform_branch(op):
+    """wave64 chain after a uniform branch: the wave64 refusal comes before the branch allowance."""
+    prefix = uniform_scc_block(0)
+    return program(prefix, start(op), chain(op, wave='b64'), RESULT, END)
+
+
+def exec_inside(op):
+    """s_and_saveexec_b32 and s_cbranch_execz between the chain's saveexec and its fill."""
+    opening = [saveexec(0)]
+    rest = chain(op)[1:]
+    inserted = opening + [
+        ('s_and_saveexec_b32 s6, s7', sop1(S_AND_SAVEEXEC_B32, 6, 7)),
+    ]
+    at = sum(len(w) for _t, w in inserted)
+    # The branch instruction is inside the chain; its target is the export, past the chain.
+    before_end = rest + RESULT
+    target = at + 4 + sum(len(w) for _t, w in before_end)
+    branch = [('s_cbranch_execz label_0x%x' % target, sopp(0x08, (target - (at + 4)) // 4))]
+    return program(inserted, branch, before_end, END)
+
+
+def nonuniform_after(op):
+    """s_cbranch_execz after the chain, targeting the next instruction. EXEC is still the entry mask."""
+    head = start(op) + chain(op)
+    at = sum(len(w) for _t, w in head)
+    branch = [('s_cbranch_execz label_0x%x' % (at + 4), sopp(0x08, 0))]
+    return program(head, branch, RESULT, END)
+
+
 def cmpx_program():
     body = chain('v_max_u32')
     skip = sum(len(data) for _, data in body) // 4
@@ -562,6 +634,27 @@ def translate(words):
         return None, str(reason)
 
 
+def straight_line_refusal(words):
+    """Translate with the pre-allowance guard put back: any branch refuses the chain.
+
+    The wrapper runs the real matcher, then refuses once it has accepted an instruction of a chain in a program
+    that has branches. A straight-line chain never takes that path."""
+    original = G.Stage.wave_reduction
+
+    def reverted(self, base, ops):
+        branched = bool(getattr(self, 'has_branches', False) or getattr(self, 'blocks', False))
+        allowed = original(self, base, ops)
+        if allowed and branched:
+            raise G.Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
+        return allowed
+
+    G.Stage.wave_reduction = reverted
+    try:
+        return translate(words)
+    finally:
+        G.Stage.wave_reduction = original
+
+
 # ---- 32-lane model of the source chain (the ISA, not the lowering) --------------------------------------------------
 def apply(op, a, b):
     if op == 'v_or_b32':
@@ -672,6 +765,12 @@ def run_model(source, inputs, exec_mask, rng):
             v[int(ops[0][1:])] = [apply(base, a[i], b[i]) if exec_lo >> i & 1 else dst[i] for i in range(32)]
         elif base == 'v_readlane_b32':
             s[int(ops[0][1:])] = reg(ops[1])[int(ops[2], 0)]
+        elif base == 's_mov_b32' and ops[0].startswith('s'):
+            continue   # the uniform-branch fixture's constant; it is not an input of the reduction
+        elif base in ('s_nop', 's_cmp_eq_u32', 's_cbranch_scc0', 's_cbranch_scc1', 's_branch'):
+            # The accepted branch is not taken (s_cbranch_scc0 on a true compare) and its other edge lands on the
+            # chain, so executing every line still runs the chain on every lane.
+            continue
         else:
             raise AssertionError(line)
     return s
@@ -746,6 +845,8 @@ def refusals():
     yield ('branch target inside the chain', branch_program(op, True), 'branch target', None)
     yield ('branch target on the later readlane of the v_min_u32 chain', branch_into_later_readlane(),
            'branch target', None)
+    yield ('a non-uniform branch that changes EXEC inside the chain', exec_inside(op), 'non-uniform branch', None)
+    yield ('wave64 with a uniform branch before the chain', wave64_with_uniform_branch(op), 'wave64', None)
     yield ('after s_wqm exec_lo, exec_lo', program(WQM, START_MUL, chain(op), RESULT, END), 'helper lanes', None)
     yield ('the permlane VGPR read after the chain', program(START_MUL, chain(op), RESULT, END_READS_VP),
            'read after the chain', None)
@@ -931,6 +1032,70 @@ def controls():
         check('refuses %s, by name' % label, text is None and reason is not None and 'wave reduction' in reason
               and fragment in reason, str(reason))
         model_run(label, source, model, [(1, 'v_max_u32')])
+    # A uniform branch before the chain, after it, or both. The chain is the same shape; the branch does not
+    # enter it. The 32-lane model runs every line (the branch is not taken) and the readlane is still the reduction.
+    for where in ('before', 'after', 'both'):
+        for op in OPS:
+            if where != 'before' and op != 'v_max_u32':
+                continue   # one operation carries the after and both placements; before covers all three
+            source, words = uniform_around(op, where)
+            label = 'uniform branch %s the %s chain' % (where, op)
+            decoded = [text for _o, _s, _n, text in G.decode(words)]
+            check('%s fixture decodes to its source' % label, decoded == source.splitlines(), str(decoded))
+            check('%s is the reduction on the 32-lane model' % label, model_says_reduction(source, [(1, op)]))
+            text, reason = translate(words)
+            check('%s translates' % label, text is not None, str(reason))
+            if text is None:
+                continue
+            body = body_of(text)
+            check('%s lowers to one %s' % (label, INTRINSIC[op]),
+                  body.count('Wave') == 1 and 'v2 = %s;' % INTRINSIC[op] in body and 's1 = v2;' in body
+                  and 'QuadRead' not in body, body)
+    # Reverted pass: the allowance is the branch guard. With the straight-line refusal put back, the same
+    # uniform-branch program is refused and the straight-line chain still lowers. A mutant that drops the
+    # intrinsic is not the lowering the fixture asks for.
+    source, words = uniform_around('v_max_u32', 'before')
+    text, reason = translate(words)
+    if text is not None:
+        mutant = text.replace(INTRINSIC['v_max_u32'], 'v1')
+        check('mutant replaces the wave reduction and is not the accepted lowering',
+              mutant != text and INTRINSIC['v_max_u32'] not in mutant and 'v2 = v1;' in mutant)
+    text, reason = straight_line_refusal(words)
+    check('reverted straight-line guard refuses a uniform branch before the chain',
+          text is None and reason is not None and 'program with branches' in reason, str(reason))
+    text, reason = straight_line_refusal(uniform_around('v_max_u32', 'after')[1])
+    check('reverted straight-line guard refuses a uniform branch after the chain',
+          text is None and reason is not None and 'program with branches' in reason, str(reason))
+    text, reason = straight_line_refusal(fixture('v_max_u32')[1])
+    check('reverted straight-line guard still lowers the straight-line chain',
+          text is not None and 'v2 = %s;' % INTRINSIC['v_max_u32'] in text, str(reason))
+    # Each draw plant must change the translated program, except signed-for-unsigned on v_or_b32, which has no
+    # signed form. That includes the uniform-branch-after or draw, not only the straight-line or draw.
+    for label, words, input_op, channels in DRAWS:
+        text, reason = translate(words)
+        check('%s draw translates for the planted errors' % label, text is not None, str(reason))
+        if text is None:
+            continue
+        single_op = channels[0] == ('reduce', input_op) and all(kind != 'lane' for kind, _arg in channels)
+        tagged = label == WAVE64
+        if label == WAVE64:
+            hows = [('lane-local input', lambda t: t.replace('WaveActiveSum(v1)', 'v1'))]
+        elif label == BRANCH_PAIR_LABEL:
+            hows = [('min/max swapped', PAIR_MUTATIONS['min and max swapped'])]
+        elif label in BRANCHED:
+            op, _ = BRANCHED[label]
+            hows = [('lane-local instead of a wave value', lambda t, op=op: t.replace(INTRINSIC[op], 'v1')),
+                    ('reversed wave vote', lambda t: t.replace('WaveActiveAnyTrue((vcc & 1u) != 0u)',
+                                                              '!WaveActiveAnyTrue((vcc & 1u) != 0u)'))]
+        elif single_op:
+            hows = [(how, (lambda t, f=f, op=input_op: f(t, op))) for how, f in MUTATIONS.items()]
+        else:
+            hows = list(PAIR_MUTATIONS.items())
+        for how, mutate in hows:
+            changed = observed(mutate(text), tagged) != observed(text, tagged)
+            expect = not (input_op not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32')
+                          and how == 'signed for unsigned')
+            check('%s %s %s the program' % (label, how, 'changes' if expect else 'leaves'), changed is expect)
     # Not a chain: s_or_saveexec_b32 with -1 and no mirror or permlane after it keeps its own handler.
     _source, words = program(START_MUL, [saveexec(0)], export('v1', 'v1', 'v1'))
     text, reason = translate(words)
@@ -1024,7 +1189,10 @@ def pair_sdwa(x, y):
 
 DRAWS = [(op, fixture(op)[1]) + single(op) for op in OPS] + [
     ('min then max, interleaved', PAIR[1], 'v_min_u32',
-     (('reduce', 'v_min_u32'), ('lane', pair_sdwa), ('reduce', 'v_max_u32')))]
+     (('reduce', 'v_min_u32'), ('lane', pair_sdwa), ('reduce', 'v_max_u32'))),
+    ('uniform branch before',) + (uniform_around('v_max_u32', 'before')[1],) + single('v_max_u32'),
+    ('uniform branch after',) + (uniform_around('v_or_b32', 'after')[1],) + single('v_or_b32'),
+]
 
 # The recognition simulates the steps, so another order of the same four steps is drawn too (label -> operation).
 REORDERED = {'v_max_u32, half mirror first': ('v_max_u32', (STEPS[2], STEPS[0], STEPS[1], STEPS[3])),
@@ -1170,6 +1338,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if text is None:
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
+            single_op = channels[0] == ('reduce', input_op) and all(kind != 'lane' for kind, _arg in channels)
             branched = label in BRANCHED or label == BRANCH_PAIR_LABEL
             tagged = label == WAVE64
             if label == WAVE64:
@@ -1181,16 +1350,15 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 hows = [('lane-local instead of a wave value', lambda t: t.replace(INTRINSIC[op], 'v1')),
                         ('reversed wave vote', lambda t: t.replace('WaveActiveAnyTrue((vcc & 1u) != 0u)',
                                                                   '!WaveActiveAnyTrue((vcc & 1u) != 0u)'))]
-            elif label in OPS or label in REORDERED:
-                label_op = REORDERED[label][0] if label in REORDERED else label
-                hows = [(how, (lambda t, f=f: f(t, label_op))) for how, f in MUTATIONS.items()]
+            elif single_op:
+                hows = [(how, (lambda t, f=f, op=input_op: f(t, op))) for how, f in MUTATIONS.items()]
             else:
                 hows = list(PAIR_MUTATIONS.items())
             for how, mutate in [(None, None)] + hows:
                 source = observed(text if how is None else mutate(text), tagged)
                 if how is not None and source == observed(text, tagged):
-                    if label not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32') and how == 'signed for unsigned':
-                        continue   # only min and max have a signedness
+                    if input_op not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32') and how == 'signed for unsigned':
+                        continue   # only min and max have a signedness; the plant does not change the program
                     check('%s %s %s: the planted error applies' % (adapter, label, how), False)
                     continue
                 tag = re.sub(r'\W+', '_', label + ('' if how is None else '_' + how))
@@ -1239,6 +1407,9 @@ def check_binary(llvm_mc):
     programs = [('%s fixture' % op, fixture(op)) for op in OPS]
     programs += [('min then max, interleaved, vT shared', PAIR), ('min then max, interleaved, vT apart', PAIR_SPLIT),
                  ('min then max, each read at once', PAIR_AT_ONCE), ('or, then min and max interleaved', SET)]
+    programs += [('uniform branch %s %s' % (where, op), uniform_around(op, where))
+                 for where in ('before', 'after', 'both') for op in OPS
+                 if where == 'before' or op == 'v_max_u32']
     programs += [(label, prog) for label, prog, _f, _m in refusals()]
     programs += [('bound_ctrl variant', program(START_MUL, chain('v_max_u32', bound_ctrl=True), RESULT, END)),
                  ('no fi variant', program(START_MUL, chain('v_max_u32', fi=False), RESULT, END)),
@@ -1252,13 +1423,13 @@ def check_binary(llvm_mc):
     for label, (source, words) in programs:
         if 'label_' not in source:
             built = assemble(llvm_mc, source)
-        else:  # a branch: llvm-mc needs the label defined, at the word the fixture names
-            targets = {int(label, 16) for label in re.findall(r'label_([0-9A-F]{4})', source)}
+        else:  # a branch: llvm-mc needs every label defined, at the word the fixture names
+            targets = {int(m, 16) for m in re.findall(r'label_((?:0x)?[0-9A-Fa-f]+)', source)}
             out, offset = [], 0
             for text, size in zip(source.splitlines(), [n for _o, n, _name, _t in G.decode(words)]):
                 if offset in targets:
                     out.append('L%04X:' % offset)
-                out.append(text.replace('label_', 'L'))
+                out.append(re.sub(r'label_((?:0x)?[0-9A-Fa-f]+)', lambda m: 'L%04X' % int(m.group(1), 16), text))
                 offset += size
             built = assemble_object(llvm_mc, '\n'.join(out) + '\n')
         check('llvm-mc assembles the program "%s" to the same words' % label, built == words,

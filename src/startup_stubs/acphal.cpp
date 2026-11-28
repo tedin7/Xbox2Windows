@@ -6,6 +6,8 @@
 #include "startup_stubs/local_log.h"
 
 #include <array>
+#include <cstring>
+#include <new>
 #include <utility>
 
 X2W_TRAP_EXPORT(2, AcpHalReleaseShapeContexts)
@@ -152,6 +154,149 @@ bool heap_give(const void* virtual_address)
     return done;
 }
 
+// Activity counter (#1145), off unless X2W_AUDIO_ACTIVITY=1. It watches the XMA context array that
+// AcpHalAllocateShapeContexts hands out and counts how its 64-byte contexts change, without reading any field
+// in them: a context that goes from all zero to nonzero is filled, one that changes while nonzero is changed,
+// one that returns to all zero is cleared. HAL slot2 submits are counted by their type argument. There is no thread:
+// the array is compared with a copy inside the calls that count (a HAL submit, AcpHalAllocateShapeContexts, every
+// ApuFree once counting started, x2w_acphal_xma_activity), at most once per 10 ms except where a call below says it
+// samples now. A context written across a sample counts twice, and one filled and cleared between two samples not at
+// all. Such a call at least a second after the previous line (or the first counted event) writes the next line, with
+// the counts since that line, if a count moved; until then the counts wait for a later call.
+// Nothing here runs outside a call into this DLL, so a caller that unloads it leaves no code of it running. Off,
+// nothing here runs: no read of caller memory, no line.
+bool activity_on() noexcept { return x2w_local::env_on("X2W_AUDIO_ACTIVITY"); }
+
+constexpr std::size_t context_words = 64 / sizeof(u64);
+constexpr unsigned submit_types = 8;  // types 0..7 one by one, then all other types together
+struct Activity {
+    u64 filled, changed, cleared;
+    u64 submits[submit_types + 1];
+};
+SRWLOCK activity_lock = SRWLOCK_INIT;  // guards the eight below
+const volatile u64* watched;           // the XMA contexts, or null
+u64* shadow;                           // their words at the last sample
+std::uint32_t watched_count, live;
+Activity activity, reported;           // the counts now and at the last line
+ULONGLONG last_sample, last_line;      // GetTickCount64 of the last sample and of the last line written
+                                       // (or of the first counted event)
+volatile LONG activity_started;  // set with the first counted event, never cleared
+
+// Compares the watched contexts with the copy and counts the ones that moved. Hold activity_lock.
+void sample_locked() noexcept
+{
+    live = 0;
+    for (std::uint32_t c = 0; watched && c < watched_count; ++c) {
+        bool was = false, now = false, moved = false;
+        for (std::size_t w = 0; w < context_words; ++w) {
+            const u64 value = watched[c * context_words + w];  // one aligned 8-byte load, never torn
+            u64& old = shadow[c * context_words + w];
+            was = was || old;
+            now = now || value;
+            moved = moved || value != old;
+            old = value;
+        }
+        live += now;
+        if (moved) ++(!was ? activity.filled : now ? activity.changed : activity.cleared);
+    }
+}
+
+// Samples the contexts (always when now is set, else at most once per 10 ms); if the last line is at least a second old
+// and a count moved, writes the next line into text and returns true. Hold activity_lock; log the text after
+// releasing it.
+bool poll_locked(bool now, char (&text)[512]) noexcept
+{
+    const ULONGLONG tick = GetTickCount64();
+    if (now || tick - last_sample >= 10) {
+        sample_locked();
+        last_sample = tick;
+    }
+    if (tick - last_line < 1000 || !std::memcmp(&activity, &reported, sizeof(activity))) return false;
+    last_line = tick;
+    char types[256] = "";
+    std::size_t used = 0;
+    u64 submits = 0;
+    for (unsigned t = 0; t <= submit_types; ++t) {
+        const u64 n = activity.submits[t] - reported.submits[t];
+        submits += n;
+        if (!n || used >= sizeof(types)) continue;
+        used += static_cast<std::size_t>(t < submit_types ? std::snprintf(types + used, sizeof(types) - used, " %u=%llu", t, n)
+                                                           : std::snprintf(types + used, sizeof(types) - used, " other=%llu", n));
+    }
+    std::snprintf(text, sizeof(text),
+                  "x2w-audio xma-activity t=%.1f s: contexts filled=%llu changed=%llu cleared=%llu live=%u/%u; "
+                  "hal submits=%llu by type%s",
+                  x2w_local::process_seconds(), activity.filled - reported.filled, activity.changed - reported.changed,
+                  activity.cleared - reported.cleared, live, watched_count, submits, types);
+    reported = activity;
+    return true;
+}
+
+// The first counted event starts the one-second line interval. Hold activity_lock.
+void start_locked() noexcept
+{
+    if (activity_started) return;
+    activity_started = 1;
+    last_line = GetTickCount64();
+}
+
+// Watches a newly allocated XMA array; its content now is the baseline. The caller's last error is kept.
+void watch(unsigned char* contexts, std::uint32_t count) noexcept
+{
+    const DWORD error = GetLastError();
+    auto* copy = new (std::nothrow) u64[std::size_t{count} * context_words];
+    char text[512];
+    AcquireSRWLockExclusive(&activity_lock);
+    const bool line = poll_locked(true, text);  // samples now: an earlier array's last changes still count
+    delete[] shadow;
+    shadow = copy;
+    watched = copy ? reinterpret_cast<const volatile u64*>(contexts) : nullptr;
+    watched_count = copy ? count : 0;
+    if (copy) std::memcpy(copy, contexts, std::size_t{count} * 64);
+    start_locked();
+    ReleaseSRWLockExclusive(&activity_lock);
+    if (line) x2w_local::logf("%s", text);
+    x2w_local::logf(copy ? "x2w-audio xma-activity: watching %u contexts" : "x2w-audio xma-activity: no memory to watch %u contexts",
+                    count);
+    SetLastError(error);
+}
+
+// Every ApuFree once counting started: samples (now, if the block is the watched array) and may write the line. ApuFree
+// of the watched array: its last changes count, then watching stops before the block can be reused.
+void unwatch(const void* block) noexcept
+{
+    if (!activity_started) return;
+    const DWORD error = GetLastError();
+    char text[512];
+    AcquireSRWLockExclusive(&activity_lock);
+    const bool hit = watched && static_cast<const volatile void*>(watched) == block;
+    const bool line = poll_locked(hit, text);  // samples now if the watched array is freed
+    if (hit) {
+        watched = nullptr;
+        watched_count = live = 0;
+        delete[] shadow;
+        shadow = nullptr;
+    }
+    ReleaseSRWLockExclusive(&activity_lock);
+    if (line) x2w_local::logf("%s", text);
+    if (hit) x2w_local::logf("x2w-audio xma-activity: contexts freed, no longer watched");
+    SetLastError(error);
+}
+
+void count_submit(unsigned type) noexcept
+{
+    if (!activity_on()) return;
+    const DWORD error = GetLastError();
+    char text[512];
+    AcquireSRWLockExclusive(&activity_lock);
+    ++activity.submits[type < submit_types ? type : submit_types];
+    start_locked();
+    const bool line = poll_locked(false, text);
+    ReleaseSRWLockExclusive(&activity_lock);
+    if (line) x2w_local::logf("%s", text);
+    SetLastError(error);
+}
+
 // AcpHal object (not COM: slot 0 is the first method). Seen: slot 0 (0x1000, 0x1000) -> HRESULT, a
 // connect with two queue lengths; slot 2 (type, id, frame, &value, 0) -> HRESULT, a command submit.
 // Both succeed and are logged; every other slot traps and names itself.
@@ -169,6 +314,7 @@ long __stdcall hal_connect(void*, unsigned commands, unsigned messages)
 }
 long __stdcall hal_submit(void*, unsigned type, u64 id, unsigned frame, const unsigned* input, u64 extra)
 {
+    count_submit(type);
     static LONG calls;
     if (x2w_local::first_calls(calls, 16))
         x2w_local::logf("x2w-audio AcpHal::slot2(submit) type=%u id=0x%llx frame=0x%x input=%p [0x%x] extra=0x%llx -> S_OK", type,
@@ -271,6 +417,7 @@ extern "C" __declspec(noinline) long AcpHalAllocateShapeContexts(u64 rcx, u64 rd
         x2w_local::logf("x2w-audio   XMA contexts: %u x 64 bytes at %p (apu 0x%x)", counts[i], static_cast<void*>(memory),
                         apu[i]);
     }
+    if (allocated[4] && activity_on()) watch(arrays[4], counts[4]);
     return 0;
 }
 
@@ -350,6 +497,7 @@ extern "C" __declspec(noinline) long ApuFree(void* virtual_address)
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "ApuFree", 5, reinterpret_cast<u64>(virtual_address), 0, 0, 0,
                        _ReturnAddress());
     if (!virtual_address) return 0;
+    unwatch(virtual_address);
     const long hr = heap_give(virtual_address) ? 0 : static_cast<long>(0x80070057);
     static LONG calls;
     if (FAILED(hr) || x2w_local::first_calls(calls, 4))
@@ -395,4 +543,38 @@ extern "C" __declspec(noinline) std::uint32_t ApuMapVirtualAddress(void* virtual
     static LONG calls;
     if (x2w_local::first_calls(calls, 4)) x2w_local::logf("x2w-audio ApuMapVirtualAddress %p -> 0x%x", virtual_address, result);
     return result;
+}
+
+// Experimental export for the source-built check (tests/startup_acphal_xma_activity.cpp): samples now, writes the line
+// if one is due, as a counted call does, and writes the totals since start to out[0..14]: contexts watched, contexts
+// live, filled, changed, cleared, HAL submits, then submits of types 0..7 and of all other types. With
+// X2W_AUDIO_ACTIVITY off it writes zeros and returns FALSE.
+extern "C" BOOL WINAPI x2w_acphal_xma_activity(ULONGLONG* out)
+{
+    if (!out) return FALSE;
+    const bool on = activity_on();
+    Activity now{};
+    std::uint32_t count = 0, live_now = 0;
+    char text[512];
+    bool line = false;
+    if (on) {
+        AcquireSRWLockExclusive(&activity_lock);
+        line = poll_locked(true, text);
+        now = activity;
+        count = watched_count;
+        live_now = live;
+        ReleaseSRWLockExclusive(&activity_lock);
+    }
+    if (line) x2w_local::logf("%s", text);
+    out[0] = count;
+    out[1] = live_now;
+    out[2] = now.filled;
+    out[3] = now.changed;
+    out[4] = now.cleared;
+    out[5] = 0;
+    for (unsigned t = 0; t <= submit_types; ++t) {
+        out[5] += now.submits[t];
+        out[6 + t] = now.submits[t];
+    }
+    return on;
 }

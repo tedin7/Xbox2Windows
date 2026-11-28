@@ -19,6 +19,7 @@ The words are encoded from the SOP1 / SOP2 / SOPC / SOPP, SMEM and MUBUF field l
 `tools/disasm_rdna2.py` decodes. The first test below checks them against the decoded text.
 """
 import hashlib
+import hlsl_pin  # noqa: E402
 import re
 import struct
 import subprocess
@@ -305,9 +306,9 @@ def embedded_scalar_control():
     assert reason and 'shader load address' in reason, reason
 
     old = vector_table_pipeline(vector_table_vertex())
-    assert [hashlib.sha256(x.encode()).hexdigest() for x in (old.hlsl_vs(), old.hlsl_ps(), old.manifest())] == [
-        'c316062e876cfa7970566e2f472296f04290961ae518555fee43b8b760ec8a0a',
-        '6ae9d0b469c599e2cbbe58a2bac0c74cf9d9536ce9a105228dc8792c21fcdd52',
+    assert [hlsl_pin.digest(x, sep="") for x in (old.hlsl_vs(), old.hlsl_ps(), old.manifest())] == [
+        '9fb302e699c2ef79e91f24b888ed14d3a1e791648e70a6453908cd4fb5519bb8',
+        'e328ba5224af9571406f8e24996b720c0f976ac01c5ea421055ffdec74c08e87',
         '9a6837358af0301f1dc4f3c4b36cdf8cfbf81be2f4f11c269c8027b4efd50839',
     ]
     return cmp_pipe, cmp_vs, cmp_ps
@@ -505,9 +506,9 @@ def vertex_image_loop_control():
             raise AssertionError('the loop with an unproved edge translated')
     old, old_vs, old_ps = translate(LOOP_VS)
     assert old.vs.loop_uniform is None
-    assert [hashlib.sha256(x.encode()).hexdigest() for x in (old_vs, old_ps, old.manifest())] == [
-        'b6729f75ee319bec8177de1d2f3e68496bfc3b9548bbc483dcef8c684e4297cd',
-        '834e3ce1d54b3ffbaae9da19647ae684f64a31b20e2fff7a12c4634664fc16f9',
+    assert [hlsl_pin.digest(x, sep="") for x in (old_vs, old_ps, old.manifest())] == [
+        '801b07191197fc338a0821ce01e5c40750617176e0f010836a47dfa614ff5938',
+        '282f53839b422a70e3a2df20995a88ea7334c9f5a2ce20161b6e265b5735c2f0',
         'b9eb3cb0811ceb855942b96467c0dea4a9b5c6e040da2fdc2d2de49a738d7b25',
     ]
     return pipe, vs, ps

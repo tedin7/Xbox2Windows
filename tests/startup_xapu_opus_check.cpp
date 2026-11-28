@@ -184,6 +184,63 @@ void expect_refused(const char* label, long want, const std::array<unsigned char
     check(untouched(out), label);
 }
 
+void check_activated_stereo(std::uint32_t options)
+{
+    const std::array<std::uint32_t, 6> connection{1, 2, 2, 0x10000, 0, options};
+    std::array<void*, 2> shared{};
+    void* device = nullptr;
+    if (connect(connection.data(), shared.data(), &device) != hr_ok) {
+        check(false, "connect typed Opus stream");
+        return;
+    }
+    std::array<unsigned char, 0x58> result{};
+    auto open = plain_cmd(1, 0);
+    put(open, 24, 2u);
+    check(enqueue(device, open.data(), 0, 0) == hr_ok && dequeue(device, result.data()) == hr_ok, "activate stereo");
+    auto packets = tone_packets(48000, 2, 960, 1);
+    int err = OPUS_OK;
+    OpusDecoder* reference = opus_decoder_create(48000, 2, &err);
+    if (packets.size() == 1 && reference) {
+        const auto& p = packets.front();
+        float want[1920]{};
+        check(opus_decode_float(reference, p.data(), static_cast<opus_int32>(p.size()), want, 960, 0) == 960,
+              "decode complete reference packet");
+        auto out = filled(2 * 649);
+        const auto capacity = 2u * 648 * sizeof(float);
+        // The decoder must consume all 960 frames before trimming the 312-frame prefix.
+        auto cmd = decode_cmd(0, 1.0f, 960, p.data(), static_cast<std::uint32_t>(p.size()),
+                              out.data(), static_cast<std::uint32_t>(capacity));
+        put(cmd, 8, 37u);
+        put(cmd, 16, std::uint64_t{0x123456789abcdef0});
+        put(cmd, 32, 312u);
+        result.fill(0xCD);
+        check(enqueue(device, cmd.data(), 0, 0) == hr_ok && dequeue(device, result.data()) == hr_ok, "decode trimmed packet");
+        std::uint32_t frames{}, bytes{};
+        std::memcpy(&frames, result.data() + 0x30, 4);
+        std::memcpy(&bytes, result.data() + 0x34, 4);
+        check(frames == 648 && bytes == capacity && std::memcmp(cmd.data(), result.data(), 24) == 0,
+              "completed frames, length and command identity");
+        check(std::memcmp(result.data() + 0x38, cmd.data() + 0x38, 8) == 0 &&
+              std::memcmp(result.data() + 0x44, cmd.data() + 0x28, 12) == 0, "completed packet and output spans");
+        check(result[0x50] == 0xCD && result.back() == 0xCD, "next packed result is untouched");
+        bool matches = true;
+        for (unsigned i = 0; i < 648; ++i) {
+            for (unsigned c = 0; c < 2; ++c) {
+                const auto dest = (options & 4) ? c * 648 + i : 2 * i + c;
+                matches &= out[dest] == want[2 * (312 + i) + c];
+            }
+        }
+        check(matches && untouched(out, 1296), "trim and channel order match reference, tail preserved");
+        auto close = plain_cmd(2, 0);
+        check(enqueue(device, close.data(), 0, 0) == hr_ok && dequeue(device, result.data()) == hr_ok, "close stereo");
+        check(enqueue(device, cmd.data(), 0, 0) == hr_invalid_arg && get_count(device, 0) == 0,
+              "a closed stream cannot decode another packet");
+    } else {
+        check(false, "construct stereo reference");
+    }
+    if (reference) opus_decoder_destroy(reference);
+    disconnect(device);
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -199,6 +256,8 @@ int main(int argc, char** argv)
     enqueue = reinterpret_cast<EnqueueCommandFn>(GetProcAddress(module, "XApuEnqueueCommand"));
     disconnect = reinterpret_cast<DisconnectFn>(GetProcAddress(module, "XApuDisconnect"));
     if (!connect || !get_count || !dequeue || !enqueue || !disconnect) return std::printf("FAIL: missing export\n"), 2;
+    check_activated_stereo(1);
+    check_activated_stereo(5);
 
     std::array<unsigned char, 0x18> input{};
     const std::uint32_t buffer_bytes = 0x104000;

@@ -19,7 +19,9 @@ param(
     [string]$BuildDir = "out/build/release",
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
+    [int]$AssertSites = 0,                     # distinct main-image int3 sites whose every hit is stepped over
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
+    [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
@@ -28,6 +30,7 @@ param(
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
     [switch]$FreshShaderCache,                 # with -Render: move a shader cache that is not empty aside first
+    [string]$NativeShaders = "",               # with -Render: the directory of dxcompiler.dll and dxil.dll; compute requests are translated in the stand-in (X2W_NATIVE_SHADERS)
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
     [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
     [switch]$NoNullIdentity,                   # with -Render: do not set X2W_DRAW_NULL_IDENTITY (an empty buffer slot then keeps its real address in the log)
@@ -50,8 +53,8 @@ foreach ($dll in "xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs
 $env:X2W_AUDIO_PERMISSIVE = "1"; $env:X2W_D3D12_DEVICE_NOOP = "1"; $env:X2W_D3D12_LIST_NOOP = "1"
 $env:X2W_D3D12_PERMISSIVE = "1"; $env:X2W_XMEM_PERMISSIVE = "1"; $env:X2W_RUNTIME_PROXY = "1"
 $config = Join-Path $DataDir "MicrosoftGame.config"
-if (Test-Path $config) {
-    $text = Get-Content $config -Raw
+if (Test-Path -LiteralPath $config) {
+    $text = Get-Content -LiteralPath $config -Raw
     if ($text -match "<TitleId>([^<]*)") { $env:X2W_TITLE_ID = $Matches[1] }
     if ($text -match "<SizeMB>([^<]*)") { $env:X2W_STORAGE_MB = $Matches[1] }
 }
@@ -82,7 +85,9 @@ if ($Render) {
     $env:X2W_D3D12_RENDER = "1"
     if ($NoNullIdentity) { Remove-Item Env:X2W_DRAW_NULL_IDENTITY -ErrorAction SilentlyContinue } else { $env:X2W_DRAW_NULL_IDENTITY = "1" }
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path
+    if ($NativeShaders) { $env:X2W_NATIVE_SHADERS = (Resolve-Path $NativeShaders).Path }
 }
+if ($NativeShaders -and -not $Render) { Write-Warning "-NativeShaders needs -Render (no shader requests without it); ignored" }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 # Requests keyed by another revision are all refused, and the translator's log does not say why: warn once,
 # before the watcher starts (revision.txt of an earlier run) or after the run (the one this run's stand-ins wrote).
@@ -95,8 +100,9 @@ $checkRevision = {
 }
 $revisionWarned = $false
 $translator = $null
+$watchShaders = $Translate -and $Render
 if ($Translate -and -not $Render) { Write-Warning "-Translate needs -Render (no shader cache without it); ignored" }
-if ($Translate -and $Render) {
+if ($watchShaders) {
     $revisionWarned = & $checkRevision
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
@@ -129,6 +135,8 @@ if ($Translate -and $Render) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$mapArgs = @()
+if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 if ($CaptureEvery -ne 0 -and $CaptureMenuEvery -ne 0) { $captureArgs += @("--capture-menu-every", "$CaptureMenuEvery") }
@@ -140,7 +148,7 @@ try {
     & {
         $ErrorActionPreference = "Continue"
         & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-            --trace-files $TraceFiles --continue-asserts $ContinueAsserts @traceArgs @captureArgs
+            --trace-files $TraceFiles --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs
         $script:debuggerExit = $LASTEXITCODE
     } *> "$LogDir.out"
 } finally {
@@ -161,6 +169,6 @@ try {
         }
     }
 }
-if ($Translate -and $Render -and -not $revisionWarned) { $null = & $checkRevision }
+if ($watchShaders -and -not $revisionWarned) { $null = & $checkRevision }
 Get-Content "$LogDir.out" -TotalCount 5
 exit $debuggerExit

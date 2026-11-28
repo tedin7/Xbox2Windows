@@ -175,6 +175,8 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
                      : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
                                                                          : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
     if (!(storage.Support1 & req)) return blocked("format_dimension_support");
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE && !(storage.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE))
+        return blocked("format_cube_support");
     if (r.MipLevels != 1 && !(storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP)) return blocked("format_mip_support");
     return true;
 }
@@ -186,8 +188,9 @@ bool memory_srv_destination(u64 handle)
     for (const auto& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.increment) continue;
         const u64 base = heap.title_cpu ? heap.title_cpu : heap.desktop_cpu;
-        if (handle >= base && (handle - base) % heap.increment == 0 &&
-            (handle - base) / heap.increment < heap.count) {
+        const UINT stride = heap.title_cpu ? heap.title_increment : heap.increment;
+        if (handle >= base && (handle - base) % stride == 0 &&
+            (handle - base) / stride < heap.count) {
             valid = true;
             break;
         }
@@ -247,7 +250,8 @@ bool address_resource_overlap(u64 address, u64 span, x2w_startup::BufferRefusalD
     bool found = false;
     note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+        if (wrapper->own().tiled_address_srv || wrapper->own().unplaced_srv_backing ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
@@ -434,7 +438,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes, bool& f
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||
-            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            wrapper->own().exact_copy || info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
@@ -504,9 +508,12 @@ Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOUR
     };
     constexpr u64 max_view_bytes = 1ull << 20;
     constexpr u64 budget = 128ull << 20;
-    if (view.Format != DXGI_FORMAT_UNKNOWN || view.Buffer.FirstElement != 0 ||
-        view.Buffer.NumElements != 1 || view.Buffer.StructureByteStride != requested.Width ||
-        !bytes || bytes > UINT64_MAX - address)
+    // Any valid buffer view shape (structured, typed or raw; one or several elements, from any first element) that ends inside the
+    // requested resource: the snapshot holds the bytes from the resource start to the end of the view, and the shadow buffer
+    // has the requested size, so the same view describes the same elements.
+    const u64 element_bytes = x2w_startup::buffer_srv_element_bytes(view);
+    if (!element_bytes || !bytes || bytes > UINT64_MAX - address || bytes > requested.Width ||
+        bytes != (u64{view.Buffer.FirstElement} + view.Buffer.NumElements) * element_bytes)
         return failed(counts.view_does_not_fit);
     if (bytes > max_view_bytes) return failed(counts.over_limit);
     const auto placed = placed_buffer_range(device, address, bytes);
@@ -609,7 +616,7 @@ void clear_unplaced_buffers(Wrapper* device)
 // allocation the buffer does not fit (fully_committed), or by one page that is not committed (witness_page).
 // A nullptr from a later step carries no proof (proven stays false).
 Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
-                                u64 elem_bytes, x2w_startup::SrvRefusalProof& refusal)
+                                u64 elem_bytes, bool raw, x2w_startup::SrvRefusalProof& refusal)
 {
     using Reason = x2w_startup::BufferRefusalReason;
     const auto prove = [&](x2w_startup::SrvRefusalKind kind, u64 witness = 0, u64 base = 0) {
@@ -651,7 +658,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
     // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
     // starts at the address itself (checked above to lie inside memory the title owns).
-    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes, raw);
     if (exact) {
         page_start = address;
         page_span = span_bytes;
@@ -783,6 +790,8 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+    w->own().unplaced_srv_backing = true;
+    w->own().exact_copy = exact;
     using Backing = x2w_startup::BufferSrvBacking;
     const auto backing = exact ? Backing::exact_copy : is_upload ? Backing::page_copy : Backing::page_alias;
     note_resource(w, &rdesc, page_span, nullptr, 0, backing);
@@ -879,13 +888,15 @@ u64 address_texture_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 //   copy records a tiled write; the 0x109 BC chains, which XG writes in their layout, keep their own
 //   path and never come through here);
 // - the layout runs past the size the XG stand-in reports for the description (the desktop copyable
-//   footprints of a slice rounded up to 64 KiB, times the slices), which the title may not own.
+//   footprints of a slice rounded up to 64 KiB, times the slices), which the title may not own. A volume
+//   has one slice: its footprints already span every depth layer.
 const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     if (latest_texture_write_is_rows(address)) return "console_layout_xg_rows";
     const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels);
     if (plan.size == UINT64_MAX || !plan.size) return "console_layout_without_footprints";
-    const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * desc.DepthOrArraySize;
+    const u64 slices = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+    const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * slices;
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
 
@@ -929,17 +940,13 @@ bool texture_range_readable(u64 address, u64 bytes)
     return false;
 }
 
-// Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the three causes the census
-// keeps apart. `published` is true when a publication was attempted (BC, console layout, single element), false when
-// only a live resource with this base and description could have served the view.
-constexpr u64 max_published_texture_bytes = 64ull << 20;  // the transient upload ring's single-copy limit
+// Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the causes the census keeps apart
+// (x2w_startup::texture_unavailable_cause). `published` is true when a publication was attempted (BC, console layout,
+// single element), false when only a live resource with this base and description could have served the view.
 const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc, bool published)
 {
-    if (!published) return "texture_no_resource";
-    const auto bytes = address_texture_bytes(device, desc);
-    if (bytes > max_published_texture_bytes) return "texture_over_64mib";
-    if (!texture_range_readable(address, bytes)) return "texture_unreadable";
-    return "texture_unavailable";  // publication failed for another reason (no wrapper)
+    const u64 bytes = published ? address_texture_bytes(device, desc) : 0;
+    return x2w_startup::texture_unavailable_cause(published, bytes, [&] { return texture_range_readable(address, bytes); });
 }
 
 // Publish a plain CPU footprint, distinct from the tiled address sources below.
@@ -996,7 +1003,7 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     const u64 stride = (plan.size + 0xFFFF) & ~u64{0xFFFF};
     const u64 bytes = stride * (desc.DepthOrArraySize - 1) + plan.size;
     refusal = "texture_over_64mib";
-    if (bytes > max_published_texture_bytes) return nullptr;
+    if (bytes > x2w_startup::max_published_texture_bytes) return nullptr;
     refusal = "overlapping_resource";
     if (address_resource_overlap(address, bytes)) return nullptr;
     refusal = "texture_unreadable";
@@ -1041,7 +1048,7 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     // block's padding mapped.
     const auto read_bytes = console_layout_srv(desc) ? x2w_startup::gfx10::Layout(desc).used_bytes() : bytes;
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > max_published_texture_bytes || !texture_range_readable(address, read_bytes)) return nullptr;
+    if (bytes > x2w_startup::max_published_texture_bytes || !texture_range_readable(address, read_bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {
@@ -1088,7 +1095,8 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
-    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        (placed_1d_texture_enabled() || !console_layout_srv(sampled.desc)))
         return static_cast<ID3D12Resource*>(resource->own().real);
     // An already-published token can outlive a write in a different layout.
     if ((partial_tiled_bc(sampled.desc) || console_layout_srv(sampled.desc)) &&
@@ -1365,10 +1373,22 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted, &refusal_proof.detail);
         Wrapper* buffer = nullptr;
         bool from_placement = false;
+        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        const auto resolve = [&](Wrapper* candidate) {
+            const auto* candidate_info = candidate ? resource_info(candidate) : nullptr;
+            return candidate_info && x2w_startup::resolve_buffer_srv_desc(
+                reinterpret_cast<u64>(candidate->own().title_memory), candidate_info->console.Width,
+                input->address, input->view, adjusted);
+        };
+        bool resolved = false;
         if (!cached_refusal) {
             buffer = existing_memory_buffer(self, input->address, span_bytes, from_placement);
-            if (!buffer)
-                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, refusal_proof);
+            resolved = resolve(buffer);
+            if (!buffer || (!resolved && buffer->own().unplaced_srv_backing)) {
+                buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes,
+                                                input->view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW, refusal_proof);
+                resolved = resolve(buffer);
+            }
         }
         static const bool shadow_enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_BUFFER");
         // The cached proof covers the regular buffer lookup, not the smaller snapshot range.
@@ -1389,11 +1409,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                               destination);
             return;
         }
-        const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
-        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        if (!buffer || !info ||
-            !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
-                                                  info->console.Width, input->address, input->view, adjusted)) {
+        if (!resolved) {
+            const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
             // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
             if (buffer) {
                 refusal_proof = {x2w_startup::SrvRefusalKind::independent, 0, 0, true};
@@ -1431,7 +1448,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
-    if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled()) {
+    if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled()) {  // opt-in: the placed 1D path also takes a 1D linear console layout
         auto view = input->view;
         const char* refusal = nullptr;
         const char* detail = nullptr;
@@ -1457,7 +1474,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         } else {
             const auto bytes = address_texture_bytes(self, *resource);
             if (!bytes) held = "texture_unavailable";
-            else if (bytes > max_published_texture_bytes) held = "texture_over_64mib";
+            else if (bytes > x2w_startup::max_published_texture_bytes) held = "texture_over_64mib";
             else if (!texture && address_resource_overlap(input->address, bytes)) held = "overlapping_resource";
             if (held) {
                 texture = nullptr;

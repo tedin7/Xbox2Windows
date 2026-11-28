@@ -5,6 +5,8 @@
 #include "heap_indexed_root.h"
 #include "sampler_desc_check.h"
 
+#include "startup_stubs/local_log.h"
+
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -21,6 +23,8 @@ constexpr UINT translated_sampler_count = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_
 constexpr UINT translated_sampler_space = 1;
 constexpr UINT translated_sampler_fallback = translated_sampler_count - 1;
 constexpr UINT title_sampler_stride = sizeof(SamplerWords);
+constexpr UINT translated_resheap_space = 2;
+constexpr UINT max_translated_resheap = 1024;
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
@@ -142,23 +146,28 @@ inline bool supports_sampler_min_max(ID3D12Device* device)
            options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2;
 }
 
-// Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
+// Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.., then bounded resheap SRVs (space 2).
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
                                       const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0,
-                                      bool dynamic_heap = false)
+                                      bool dynamic_heap = false, UINT heap_srvs = 0)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = constants;
-    // A compute program's outputs (u0..) follow its resources in the same table.
-    const D3D12_DESCRIPTOR_RANGE view_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0},
-                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs}};
+    // A compute program's outputs (u0..) follow its resources in the same table; bounded heap SRVs follow in space 2.
+    D3D12_DESCRIPTOR_RANGE view_ranges[3]{};
+    UINT range_count = 0;
+    if (srvs) view_ranges[range_count++] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0};
+    if (uavs) view_ranges[range_count++] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs};
+    if (heap_srvs) {
+        view_ranges[range_count++] = {
+            D3D12_DESCRIPTOR_RANGE_TYPE_SRV, heap_srvs, 0, translated_resheap_space, srvs + uavs};
+    }
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    // A range of no descriptors does not serialize: a program without resources starts the table at its outputs.
-    parameters[1].DescriptorTable = {(srvs ? 1u : 0u) + (uavs ? 1u : 0u), srvs ? view_ranges : view_ranges + 1};
+    parameters[1].DescriptorTable = {range_count, view_ranges};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
-    UINT count = sampler_root_parameter(srvs + uavs);
+    UINT count = sampler_root_parameter(srvs + uavs + heap_srvs);
     if (samplers.heap) {
         parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[count].DescriptorTable = {1, &sampler_range};
@@ -209,10 +218,15 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
         const UINT room = static_cast<UINT>((page_size - address % page_size) / title_sampler_stride);
         const UINT available = snapshot.count - i;
         const UINT run = room ? (room < available ? room : available) : 1;
-        SIZE_T copied = 0;
         const SIZE_T bytes = SIZE_T{run} * title_sampler_stride;
-        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes, &copied) &&
-            copied == bytes) {
+        // Outside xmem's run breaks, where a mapped page of the title's heap would read as missing.
+        bool whole = false;
+        x2w_local::outside_run_breaks([&] {
+            SIZE_T copied = 0;
+            whole = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes,
+                                      &copied) && copied == bytes;
+        });
+        if (whole) {
             for (UINT j = i; j < i + run; ++j) snapshot.readable.set(j);
         } else {
             // ReadProcessMemory can copy part of a record on failure.

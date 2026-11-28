@@ -41,6 +41,11 @@ def read_needs_arguments(path=NEEDS_ARGUMENTS_FILE):
     return frozenset(line.strip() for line in lines if line.strip() and not line.startswith("#"))
 
 
+def _command_key(command):
+    """Return a comparison key with the script path resolved to collapse spelling variants."""
+    return (str(Path(command[0]).resolve()), *command[1:])
+
+
 def _validate_script_path(raw_path: str) -> str:
     if not raw_path or not raw_path.strip():
         raise ValueError("script path must not be empty")
@@ -121,7 +126,7 @@ def read_check_files(directory):
                 _validate_script_path(command[0])
             except (ValueError, OSError) as exc:
                 raise type(exc)(f"{where}: {exc}") from exc
-            key = tuple(command)
+            key = _command_key(command)
             if key in seen:
                 raise ValueError(f"{where}: duplicate of {seen[key]}: {line}")
             seen[key] = where
@@ -136,9 +141,9 @@ def merge_checks(inline, directory):
     list to a file without running twice. The listed commands keep their sorted file order.
     """
     inline = list(inline)
-    known = {tuple(command) for command, _ in inline}
+    known = {_command_key(command) for command, _ in inline}
     return inline + [(command, {}) for command in read_check_files(directory)
-                     if tuple(command) not in known]
+                     if _command_key(command) not in known]
 
 
 def run_one(check):
@@ -200,9 +205,12 @@ def main(argv=None) -> int:
         parser.error("the following arguments are required: scripts (or --from-dir)")
     try:
         scripts = [_validate_script_path(script) for script in args.scripts]
-        for number, script in enumerate(scripts):
-            if script in scripts[:number]:
+        seen_scripts = set()
+        for script in scripts:
+            key = _command_key([script])
+            if key in seen_scripts:
                 raise ValueError(f"duplicate command-line script: {script}")
+            seen_scripts.add(key)
         checks = [([script], None) for script in scripts]
         if args.from_dir:
             checks = merge_checks(checks, args.from_dir)

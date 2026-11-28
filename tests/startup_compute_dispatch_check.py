@@ -6,20 +6,26 @@ The consumer creates case A of startup_gfx2hlsl_compute_check.py as a device slo
 stand-in list, the descriptor heap, the pipeline, its root signature, two root constants (word 0 by slot 37, word 1
 by slot 39, with a slot 40 call of other words in between), one table of two
 hardware buffer descriptors and Dispatch(3, 2, 2). Input and output are placed buffers that alias the consumer's
-memory; the output words are read from that memory after the queue's fence. Four runs share one cache:
+memory; the output words are read from that memory after the queue's fence. The runs share one cache:
 
 1. before translation: the request is published, the Dispatch is refused with "no translation" and every output
    word keeps the sentinel (the check fails when nothing translated is dispatched);
 2. after gfx2hlsl.py --pending with DXC: all 320 words equal the case's expectation;
 3. dispatch-none (no Dispatch recorded): every word keeps the sentinel;
 4. dispatch-swapped (the two descriptors exchanged, so the output names the buffer without unordered access):
-   refused with one logged reason, every word keeps the sentinel and the input is unchanged;
+   refused with "an output buffer has no unordered access", every word keeps the sentinel and the input is
+   unchanged;
 5. dispatch-same-root (the same compute root set again after the constants): all 320 words still match;
 6. five more refusals, each with its one logged reason and an untouched output: dispatch-missing-word (no slot 37
    call), dispatch-root-changed (another compute root and back after the constants), dispatch-reset (list closed
    and reset after the constants), dispatch-wrong-root (recorded under a root the pipeline was not created with)
    and dispatch-same-buffer (the output buffer is also the input).
-Exit 77 when the adapter is not available.
+7. slot 35 selects the correct table at descriptor index 2 instead of the swapped pair at the heap start;
+   setting the same heap again preserves the table, but changing the compute root or view heap after binding
+   must refuse at the table lookup, not an earlier check.
+8. published output compatibility: the same bytecode is refused with either stale native manifest
+   and runs with the current native marker or with the Python sidecar.
+Exit 77 only if the initial probe cannot use the adapter or required heaps.
 """
 import os
 from pathlib import Path
@@ -34,16 +40,19 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 
-def dispatch(directory, consumer, env, mode):
+def dispatch(directory, consumer, env, mode, *, probe=False):
     out = directory / 'out.bin'
     out.unlink(missing_ok=True)
     args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
             directory / 'program', directory / 'data', directory / 'state', mode]
     result = subprocess.run(args, env=dict(env, X2W_TEST_DISPATCH_OUT=str(out)), capture_output=True, text=True)
-    if result.returncode == 77:
+    if 'device removed' in result.stderr.lower():
+        raise RuntimeError(f'{mode}: device removed\n{result.stderr[-3000:]}')
+    if result.returncode == 77 and probe:
         print(result.stdout, end='')
         sys.exit(77)
-    assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
+    if result.returncode:
+        raise RuntimeError(f'{mode}: consumer exit {result.returncode}\n{result.stdout[-1000:]}\n{result.stderr[-3000:]}')
     return list(struct.unpack('<%dI' % C.WORDS, out.read_bytes())), result
 
 
@@ -72,10 +81,11 @@ def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare_case(directory, adapter)
+        env.pop('X2W_NATIVE_SHADERS', None)  # Exercise published translations.
         untouched, expected = [C.SENTINEL] * C.WORDS, C.expected('A')
         assert expected != untouched
 
-        got, result = dispatch(directory, consumer, env, 'dispatch')
+        got, result = dispatch(directory, consumer, env, 'dispatch', probe=True)
         print(result.stdout, end='')
         assert got == untouched, 'a Dispatch without a translation wrote the output'
         assert len(lines(result, 'Dispatch(3, 2, 2) refused: no translation')) == 1, result.stderr[-3000:]
@@ -91,6 +101,28 @@ def main(consumer, dxc, adapter):
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
         assert f'{key:016x}: ok' in out, out
+
+        manifest = cache / f'{key:016x}.txt'
+        hlsl = cache / f'{key:016x}.cs.hlsl'
+        python_manifest = manifest.read_bytes()
+        python_hlsl = hlsl.read_bytes()
+        assert not any(line.startswith(b'native ') for line in python_manifest.splitlines())
+        hlsl.unlink()
+        for marker, reason in (
+            (b'', 'native translation without a revision; rebuild it'),
+            (b'native 0\n', 'native translation from another compiler revision; rebuild it'),
+        ):
+            manifest.write_bytes(python_manifest + marker)
+            got, result = dispatch(directory, consumer, env, 'dispatch')
+            assert got == untouched, 'a stale native output wrote the output buffer'
+            assert len(lines(result, 'Dispatch(3, 2, 2) refused: ' + reason)) == 1, result.stderr[-3000:]
+
+        # Reuse working bytecode to isolate the manifest gate from native adapter requirements.
+        manifest.write_bytes(python_manifest + b'native 1\n')
+        got, result = dispatch(directory, consumer, env, 'dispatch')
+        assert got == expected and not lines(result, 'refused:'), result.stderr[-3000:]
+        hlsl.write_bytes(python_hlsl)
+        manifest.write_bytes(python_manifest)
 
         got, result = dispatch(directory, consumer, env, 'dispatch')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
@@ -114,9 +146,9 @@ def main(consumer, dxc, adapter):
         refused = lines(result, 'refused: ')
         census = lines(result, 'x2w-render compute census')
         assert len(census) == 3 and census[1].endswith(
-            'reason "an output buffer was created without unordered access": 1 keys, 1 dispatches') \
+            'reason "an output buffer has no unordered access": 1 keys, 1 dispatches') \
             and '[00000000 00000000 ' not in census[2], census
-        assert len(refused) == 1 and 'an output buffer was created without unordered access' in refused[0], \
+        assert len(refused) == 1 and 'an output buffer has no unordered access' in refused[0], \
             result.stderr[-3000:]
         got, result = dispatch(directory, consumer, env, 'dispatch-same-root')
         assert got == expected and not lines(result, 'refused'), 'setting the same compute root again lost the constants'
@@ -129,8 +161,28 @@ def main(consumer, dxc, adapter):
             assert got == untouched, f'{mode}: a refused Dispatch wrote the output'
             refused = lines(result, 'refused: ')
             assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), f'{mode}: {refused}\n{result.stderr[-3000:]}'
-        print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation and with the '
-              'same root set again; untouched before translation, without a Dispatch and for 6 refusals)')
+        debug_enabled = bool(layer and '0x00000000' in layer[0])
+        for mode in ('dispatch-table-root-changed', 'dispatch-table-heap-changed', 'dispatch-table-offset'):
+            got, result = dispatch(directory, consumer, env, mode)
+            if debug_enabled:
+                initialized = lines(result, 'x2w-d3d12 debug layer: ')
+                assert len(initialized) == 1 and '0x00000000' in initialized[0], f'{mode}: debug layer not initialized'
+            refused = lines(result, 'refused: ')
+            translated = lines(result, 'Dispatch(3, 2, 2) translated')
+            if mode == 'dispatch-table-offset':
+                wrong = sum(a != b for a, b in zip(got, expected))
+                assert not wrong, f'{mode}: {wrong} words differ from the CPU reference\n{result.stderr[-3000:]}'
+                assert len(translated) == 1 and not refused, result.stderr[-3000:]
+                print(f'{mode}: all {C.WORDS} words match the CPU reference')
+            else:
+                written = sum(word != C.SENTINEL for word in got)
+                assert not written, f'{mode}: {written} output words changed after table invalidation\n{result.stderr[-3000:]}'
+                assert not translated and len(refused) == 1 and refused[0].endswith(
+                    'Dispatch(3, 2, 2) refused: a table descriptor is not bound'), result.stderr[-3000:]
+                print(f'{mode}: exact table refusal, all {C.WORDS} sentinel words unchanged')
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
+        print(f'startup_compute_dispatch: PASS on {adapter}')
 
 
 if __name__ == '__main__':

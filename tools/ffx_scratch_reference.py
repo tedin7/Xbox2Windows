@@ -4,6 +4,7 @@ The oracle uses row/column tensor addressing and Python signed-byte arithmetic.
 It evaluates only the integer network and its quantizers. No generated HLSL is
 parsed or executed. The four final logits suffice for spatially constant colors.
 """
+from collections.abc import Mapping
 import re
 import struct
 
@@ -21,6 +22,8 @@ def signed(x):
 
 
 def simm16(token):
+    if not isinstance(token, str):
+        raise ValueError(f"Invalid 16-bit signed immediate: {token!r}")
     value = int(token, 0)
     if -0x8000 <= value < 0:
         return value & 0xffffffff
@@ -34,6 +37,8 @@ def seed(x, y, c):
 
 
 def network(program, taps, initializer, stage):
+    if isinstance(stage, bool) or not isinstance(stage, int) or stage not in (24, 26):
+        raise ValueError(f"Expected network stage 24 or 26, got {stage!r}")
     regs = {"s16": 0}  # group z
     logits = []
     tap = 0
@@ -50,8 +55,15 @@ def network(program, taps, initializer, stage):
             tap += 1
             continue
         if mn == "s_buffer_load_dwordx16":
+            if not src:
+                raise ValueError("Missing constant-buffer offset for s_buffer_load_dwordx16")
             first = int(dst.split(":")[0][2:])
-            for i, val in enumerate(struct.unpack_from("<16I", initializer, int(src[-1], 0))):
+            offset = int(src[-1], 0)
+            if offset < 0 or offset % 4 != 0 or offset + 64 > len(initializer):
+                raise ValueError(
+                    f"Constant-buffer offset {offset} out of bounds for {len(initializer)}-byte initializer"
+                )
+            for i, val in enumerate(struct.unpack_from("<16I", initializer, offset)):
                 regs[f"s{first+i}"] = val
             continue
         if stage == 24 and mn == "buffer_store_dwordx4":
@@ -111,6 +123,8 @@ def network(program, taps, initializer, stage):
 
 
 def make_reference(programs, initializer):
+    if not isinstance(programs, Mapping) or "pass24" not in programs or "producer" not in programs:
+        raise ValueError("Expected programs mapping with 'pass24' and 'producer'")
     rows, gates = [], []
     for mode in range(3):
         # The 6x4 union includes a pass-24 overdispatch column at x=5.

@@ -27,6 +27,8 @@ def check_refusal_lines(log):
         + r"view\{dim=11 fmt=0 map=0x1688 raw=(00000000,){5}00000000 "
         + r"\(acceleration structure view\)\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
+        buffer_unavailable.replace("FIRST", "0"),  # unplaced raw view at page + 1
+        buffer_unavailable.replace("FIRST", "0"),  # unplaced raw view before stride-16 publication
     ]
     lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
     if len(lines) != len(expected):
@@ -54,7 +56,7 @@ def check(directory, consumer, backend):
     )
     if actual is None:
         return 77
-    values = (17, 63, 141, 141, 99, 17, 201, 77)
+    values = (17, 63, 141, 141, 99, 17, 201, 201, 55, 77, 55, 201, 201, 173, 173)
     row = b"".join(bytes((v, 0, 0, 255)) for v in values)
     expected = row * 4
     if actual != expected:

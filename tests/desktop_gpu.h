@@ -29,16 +29,19 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             float* colors, const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false,
                             UINT first_mip = 0, UINT view_levels = 0, bool cube = false, UINT width = 1,
-                            UINT height = 1);
+                            UINT height = 1, UINT mip_base = 4);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64], bool array, bool sampled,
                                   bool half_float = false, bool red_only = false,
                                   const std::uint32_t* descriptor_entry = nullptr, UINT descriptor_count = 0,
                                   bool descriptor_bound = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4]);
+                              const std::uint32_t expected[4], unsigned coverage = 1);
 int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const char* fixture_path, bool signed_view);
+// Queries colour formats and returns "typed_uav_load_refused" when one has no typed UAV load, before any draw.
+// Returns nullptr only when the refusal helper itself accepts a cleared UAV_TYPED_LOAD bit.
+const char* check_startup_image_store_typed_load(ID3D12Device* device);
 int check_startup_pixel_formatted_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                         const char* sampler_line, const char* fixture_path);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
@@ -60,6 +63,7 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
                         bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
+int check_compute_waterfall_oracle(ID3D12Device* device, const char* shader_path);
 struct ComputeReadbackProgram {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
@@ -80,7 +84,7 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
 // multi_primitive: one native color draw whose export trace size comes from the fixture.
-enum class MeshDrawMode { color, textured, mesh_texture_load, depth_pair, multi_primitive };
+enum class MeshDrawMode { heap, color, textured, mesh_texture_load, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;
@@ -90,7 +94,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr,
-                           const char* amplification = nullptr);
+                           const char* amplification = nullptr, unsigned groups = 1);
 bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
                                const char* pixel, const char* fixture);
 bool check_mesh_shader_pipeline(ID3D12Device* device, bool force_fallback);

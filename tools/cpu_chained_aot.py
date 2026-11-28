@@ -1,8 +1,11 @@
 """Lift acyclic pointer checks and early returns across AMD64 chained unwind ranges."""
 
 import argparse
+import os
 from pathlib import Path
 import re
+import sys
+import tempfile
 
 import pefile
 from iced_x86 import Code, Decoder, OpKind, Register as R, RegisterExt
@@ -16,9 +19,15 @@ GPRS = set(SAVED) | {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 
 
 def translate(image, name, partial=False, callback_offset=None, ffx_destroy=False):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("export name must be non-empty")
     if ffx_destroy and (partial or callback_offset is not None):
         raise ValueError("the destroy contract requires a complete translation and its own typed bindings")
-    if callback_offset is not None and (not 0 <= callback_offset <= 0x7fffffff or callback_offset % 8):
+    if callback_offset is not None and (
+        type(callback_offset) is not int
+        or not 0 <= callback_offset <= 0x7fffffff
+        or callback_offset % 8
+    ):
         raise ValueError("callback slot must be a nonnegative aligned table offset")
     with pefile.PE(str(image), fast_load=True) as pe:
         entry = export_rva(pe, name)
@@ -224,7 +233,53 @@ extern "C" __declspec(dllexport) word try_lifted_callback(word first, word secon
     return source + "\n".join(lines) + "\n}\n", ranges, returns, stops
 
 
-if __name__ == "__main__":
+def _validate_cli_inputs(image: Path, export: str, output: Path) -> None:
+    if not image.is_file():
+        raise ValueError(f"input image is not an existing file: {image}")
+    if not export.strip():
+        raise ValueError("export name must not be empty")
+    if output.suffix.lower() != ".cpp":
+        raise ValueError(f"output path must have a .cpp suffix: {output}")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symbolic link: {output}")
+    if output.is_dir():
+        raise ValueError(f"output path is a directory: {output}")
+    if output.parent.is_file() or (output.parent.exists() and not output.parent.is_dir()):
+        raise ValueError(f"output parent is not a directory: {output.parent}")
+    try:
+        same = output.resolve() == image.resolve()
+    except OSError:
+        same = False
+    if not same and output.exists():
+        same = output.samefile(image)
+    if same:
+        raise ValueError(f"output path must not collide with input image: {output}")
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    fd_open = True
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd_open = False
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if fd_open:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("export")
@@ -233,10 +288,19 @@ if __name__ == "__main__":
     parser.add_argument("--ffx-destroy", action="store_true", help="use the verified FidelityFX destroy and cleanup ABI")
     parser.add_argument("--callback-offset", type=lambda s: int(s, 0),
                         help="bind a table slot with a known Windows x64 word(word, word) callback ABI")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        source, ranges, returns, stops = translate(args.image, args.export, args.partial, args.callback_offset, args.ffx_destroy)
-        args.output.write_text(source, encoding="utf-8")
+        _validate_cli_inputs(args.image, args.export, args.output)
+        source, ranges, returns, stops = translate(
+            args.image, args.export, args.partial, args.callback_offset, args.ffx_destroy
+        )
+        _write_atomic(args.output, source)
         print(f"{len(ranges)} owned ranges, {len(returns)} return paths, indirect stops: {sorted(stops)}")
+        return 0
     except (ValueError, OSError, pefile.PEFormatError) as error:
-        parser.exit(1, f"{error}\n")
+        print(f"{error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

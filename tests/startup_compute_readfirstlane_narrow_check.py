@@ -50,8 +50,6 @@ def translate(rows, group=(4, 1, 1)):
 def controls(llvm_mc=None):
     cases = (
         (program(), None),
-        # Replacing EXEC with a literal can enable lanes outside the known subset.
-        (program(after_cmpx=(('s_mov_b32 exec_lo, 1', '8103febe'),)), REFUSAL),
         # An address that differs between lanes is not one value for the first active lane.
         (program(address=VARYING_ADDRESS), REFUSAL),
     )
@@ -60,7 +58,7 @@ def controls(llvm_mc=None):
             source = '\n'.join(asm for asm, _ in rows) + '\n'
             assert assemble(llvm_mc, source) == bytes.fromhex(''.join(word for _, word in rows)), source
         if reason:
-            refused(reason, lambda: translate(rows))
+            refused(reason, lambda: translate(rows, (65, 1, 1)))
         else:
             hlsl = translate(rows)
             assert re.search(r's22 = ul[0-9a-f_]+;', hlsl), hlsl

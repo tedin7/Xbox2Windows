@@ -28,7 +28,8 @@ inline HRESULT create_desktop_device(IUnknown* adapter, REFIID iid, void** devic
 }
 
 inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmatched,
-                                                          CreateDeviceFn create = create_desktop_device)
+                                                          CreateDeviceFn create = create_desktop_device,
+                                                          std::FILE* diagnostics = stdout)
 {
     unmatched = false;
     Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
@@ -44,7 +45,7 @@ inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmat
     wchar_t wanted[128]{};
     const DWORD filter = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
     if (filter >= 128) {
-        std::puts("XBOX2WINDOWS_ADAPTER is longer than 127 characters");
+        std::fputs("XBOX2WINDOWS_ADAPTER is longer than 127 characters\n", diagnostics);
         unmatched = true;
         return nullptr;
     }
@@ -59,12 +60,12 @@ inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmat
             if (!match) continue;
         }
         if (SUCCEEDED(create(adapter.Get(), IID_PPV_ARGS(&device)))) {
-            std::printf("device adapter %04x:%04x %ls\n", desc.VendorId, desc.DeviceId, desc.Description);
+            std::fprintf(diagnostics, "device adapter %04x:%04x %ls\n", desc.VendorId, desc.DeviceId, desc.Description);
             return device;
         }
     }
     if (filter) {
-        std::printf("No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
+        std::fprintf(diagnostics, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
         unmatched = true;
     }
     return nullptr;

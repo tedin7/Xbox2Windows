@@ -1,8 +1,11 @@
 """Recompile a bounded Windows x64 caller with direct calls or one ordinary import call."""
 
 import argparse
+import os
 from pathlib import Path
 import struct
+import sys
+import tempfile
 
 import pefile
 
@@ -160,6 +163,9 @@ def lift_body(start, code, *, caller, bind_import=None, name=None,
 
 
 def resolve_import(pe, slot, provider, symbol, link_name=None):
+    provider = Path(provider)
+    if link_name is not None and (not isinstance(link_name, str) or not link_name.strip()):
+        raise ValueError("link name must not be empty")
     pe.parse_data_directories(directories=[1])  # ordinary import directory
     matches = [(desc.dll, imp) for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
                for imp in desc.imports if imp.address - pe.OPTIONAL_HEADER.ImageBase == slot]
@@ -194,8 +200,20 @@ def resolve_import(pe, slot, provider, symbol, link_name=None):
 
 
 def translate(image, entry, binding=None, link_name=None):
-    if link_name is not None and not binding:
-        raise ValueError("link name requires a provider binding")
+    if link_name is not None:
+        if not binding:
+            raise ValueError("link name requires a provider binding")
+        if not isinstance(link_name, str) or not link_name.strip():
+            raise ValueError("link name must not be empty")
+    if binding:
+        if len(binding) != 2:
+            raise ValueError("expected provider path and symbol for --bind")
+        provider_raw, bind_symbol = binding
+        if not str(provider_raw).strip() or not isinstance(bind_symbol, str) or not bind_symbol.strip():
+            raise ValueError("provider path and symbol must not be empty")
+        provider_path = Path(provider_raw)
+        if not provider_path.is_file():
+            raise ValueError(f"missing provider for {provider_path.name}!{bind_symbol}")
     with pefile.PE(str(image), fast_load=True) as pe:
         start = export_rva(pe, entry)
         code = bounded_code(pe, start)
@@ -225,7 +243,76 @@ def translate(image, entry, binding=None, link_name=None):
     return f"#include <cstdint>\nusing word = std::uint64_t;\n{body}\n"
 
 
-if __name__ == "__main__":
+def _validate_paths(
+    image: Path,
+    export: str,
+    output: Path,
+    bind: list[str] | None = None,
+    link_name: str | None = None,
+) -> None:
+    if image.is_dir():
+        raise IsADirectoryError(f"image path is a directory: {image}")
+    if not image.is_file():
+        raise FileNotFoundError(f"image file not found: {image}")
+    if not isinstance(export, str) or not export.strip():
+        raise ValueError("export name must not be empty")
+    if output.suffix.lower() != ".cpp":
+        raise ValueError(f"output path must have .cpp suffix: {output}")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {output}")
+    if output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    if link_name is not None:
+        if not bind:
+            raise ValueError("link name requires a provider binding")
+        if not isinstance(link_name, str) or not link_name.strip():
+            raise ValueError("link name must not be empty")
+    if bind:
+        if len(bind) != 2:
+            raise ValueError("expected provider path and symbol for --bind")
+        provider_raw, bind_symbol = bind
+        if not str(provider_raw).strip() or not isinstance(bind_symbol, str) or not bind_symbol.strip():
+            raise ValueError("provider path and symbol must not be empty")
+        provider = Path(provider_raw)
+        if not provider.is_file():
+            raise ValueError(f"missing provider for {provider.name}!{bind_symbol}")
+        inputs = (image, provider)
+    else:
+        inputs = (image,)
+    out_resolved = output.resolve()
+    for input_path in inputs:
+        if out_resolved == input_path.resolve() or (output.exists() and input_path.samefile(output)):
+            raise ValueError(f"output path must not match input path: {output}")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write UTF-8 text to a sibling temp file and atomically replace path, unlinking temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("export")
@@ -233,8 +320,15 @@ if __name__ == "__main__":
     parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
                         help="export name or #ordinal with the fixture's two-word and output-pointer ABI")
     parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        args.output.write_text(translate(args.image, args.export, args.bind, args.link_name), encoding="utf-8")
+        _validate_paths(args.image, args.export, args.output, args.bind, args.link_name)
+        _write_atomic(args.output, translate(args.image, args.export, args.bind, args.link_name))
     except (OSError, ValueError, pefile.PEFormatError) as error:
-        parser.exit(1, f"{error}\n")
+        sys.stderr.write(f"{error}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

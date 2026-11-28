@@ -669,11 +669,11 @@ def check_controls():
             refused('4-byte aligned immediate offset', lambda r=raw: G.ComputePipeline(
                 single_ds_code(r), root_blob(), USER7 | (1 << 15), (32, 1, 1)))
 
-    # 12. Branched shader + s_barrier refused (while branched shader WITHOUT s_barrier translates!).
+    # 12. A branched shader with a barrier refuses its unproven SCC; the legacy no-barrier path still translates.
     branch_no_bar = single_ds_code(ds_single(0x00, 1, 2, offset=4), with_branch=True, with_barrier=False)
     assert 'InterlockedAdd(' in G.ComputePipeline(branch_no_bar, root_blob(), USER7 | (1 << 15), (32, 1, 1)).hlsl_cs()
     branch_with_bar = single_ds_code(ds_single(0x00, 1, 2, offset=4), with_branch=True, with_barrier=True)
-    refused('straight-line', lambda: G.ComputePipeline(branch_with_bar, root_blob(), USER7 | (1 << 15), (32, 1, 1)))
+    refused('LDS scalar branch needs proven uniform SCC', lambda: G.ComputePipeline(branch_with_bar, root_blob(), USER7 | (1 << 15), (32, 1, 1)))
     # Nonzero reserved immediate on s_barrier in a dual/atomic shader is refused.
     bad_bar = patch(WORDS_A, '00008abf', '01008abf') if WORDS_A.count(bytes.fromhex('00008abf')) == 1 else (
         WORDS_A.replace(bytes.fromhex('00008abf'), bytes.fromhex('01008abf'), 1))

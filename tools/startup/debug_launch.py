@@ -1,11 +1,16 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
 usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--capture-menu-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
+                      [--continue-asserts N] [--assert-sites N]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
 Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
 A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
+--continue-asserts N steps over the first N main-image int3 hits in total. --assert-sites N instead
+steps over every hit at up to N distinct main-image int3 sites, so a site that repeats does not use
+the budget up however long the run lasts; the first hit at one more site stops the run. A hit is
+stepped over when either budget allows it.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
 """
@@ -28,6 +33,8 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
+from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
 
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
@@ -136,8 +143,10 @@ def main():
         timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
         memory_gib = float(opts.get("--memory-gib", 16))
         skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+        assert_sites = int(opts.get("--assert-sites", "0"))  # distinct sites whose every hit is continued
     except ValueError:
-        print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
+        print("expected numeric --timeout and --memory-gib values and integer --continue-asserts and "
+              "--assert-sites values")
         return 2
     stop_first = opts.get("--stop-first-chance") == "1"
     try:
@@ -168,12 +177,20 @@ def main():
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
+    if assert_sites < 0:
+        print("expected an --assert-sites value of 0 or greater")
+        return 2
     # The job always sets JOB_MEMORY (0x200), so a limit of 0 would deny the process any commit.
     if not 1 <= memory_gib * 2**30 < 2**(8 * ctypes.sizeof(ctypes.c_size_t)):
         print("expected a finite --memory-gib that is at least one byte and fits the Windows size_t limit")
         return 2
     memory = int(memory_gib * 2**30)
     asserts_seen = {}
+    # The two assert budgets keep their own books, so a hit one of them covers never uses up the other:
+    # assert_sites_admitted holds the sites --assert-sites covers (the first assert_sites distinct ones),
+    # asserts_counted the hits --continue-asserts stepped over.
+    assert_sites_admitted = set()
+    asserts_counted = 0
     # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
     # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is
     # unchanged, but a long mapping that traps once per chunk then runs at native speed.
@@ -391,6 +408,97 @@ def main():
         text = ustr(name) if name else ""
         return (f"[root {root:#x}]" if root else "") + text
 
+    def oa_string(addr):  # the UNICODE_STRING* inside OBJECT_ATTRIBUTES, for rewriting it
+        raw = read(addr, 24)
+        return struct.unpack_from("<Q", raw, 16)[0] if len(raw) >= 24 else 0
+
+    # --map-drive G=C:\folder[;S=D:\folder]: a console executable opens its package at a fixed drive
+    # letter, so a package that sits on another volume never mounts. The file hooks rewrite the path
+    # of an open on a mapped letter to the real folder, in the caller's own UNICODE_STRING.
+    drive_map = {}
+    # Rewritten names live in buffers borrowed for the duration of one hooked call, so two calls that
+    # overlap on different threads cannot overwrite or free each other's name. A buffer goes back to
+    # the pool when that call's name is restored, so a serial run reuses one buffer instead of
+    # allocating per open and the allocation count does not follow the number of opens.
+    name_pool = {"free": [], "allocations": 0}
+    for item in filter(None, opts.get("--map-drive", "").split(";")):
+        letter, _, folder = item.partition("=")
+        letter = letter.strip().rstrip(":").upper()
+        # Letters are ASCII A-Z: isalpha() alone also accepts non-ASCII letters, which no NT path has.
+        if len(letter) == 1 and letter.isascii() and letter.isalpha() and folder.strip():
+            # NT paths take backslashes; the option may arrive with either separator.
+            drive_map[letter] = folder.strip().rstrip("\\/").replace("/", "\\")
+
+    def map_drive(text, string_address):
+        """Makes the call's name temporary: returns (new text, restore) or (None, None).
+
+        The caller's UNICODE_STRING is changed only for the duration of the hooked call; restore()
+        puts back its length, buffer pointer and contents when the call returns."""
+        if not drive_map or not string_address:
+            return None, None
+        body = text
+        # oa_name() marks a root-relative name with a "[root 0x...]" tag for the log. That tag is not
+        # part of the name, so it is dropped here and never written into the caller's UNICODE_STRING.
+        if body.startswith("[root ") and "]" in body:
+            body = body[body.index("]") + 1:]
+        prefix = ""
+        for candidate in ("\\??\\", "\\\\.\\", "\\\\?\\"):
+            if body.upper().startswith(candidate):
+                prefix, body = body[:len(candidate)], body[len(candidate):]
+                break
+        if len(body) < 2 or body[1] != ":" or body[0].upper() not in drive_map:
+            return None, None
+        replacement = prefix + drive_map[body[0].upper()] + body[2:]
+        raw = read(string_address, 16)
+        if len(raw) < 16:
+            return None, None
+        _, maximum, buffer = struct.unpack_from("<HH4xQ", raw)
+        encoded = replacement.encode("utf-16-le")
+        # A UNICODE_STRING length is a USHORT, so a longer name cannot be expressed at all.
+        if not 0 < len(encoded) <= 0xFFFF:
+            return None, None
+        if len(encoded) <= maximum:
+            original = read(buffer, len(encoded))
+            if len(original) != len(encoded) or not write(buffer, encoded):
+                return None, None
+            if not write(string_address, struct.pack("<H", len(encoded))):
+                write(buffer, original)
+                return None, None
+            return replacement, lambda: (write(buffer, original), write(string_address, raw))
+        # The replacement is longer than the caller's buffer, which is the common case: a folder path
+        # against a single letter. Borrow a buffer from the pool for this call only; it is returned
+        # when the name is restored, so serial opens reuse one buffer but overlapping calls get their
+        # own.
+        address, capacity = 0, 0
+        for index, (candidate, room) in enumerate(name_pool["free"]):
+            if room >= len(encoded):
+                address, capacity = name_pool["free"].pop(index)
+                break
+        if not address:
+            k32.VirtualAllocEx.restype = ctypes.c_void_p
+            k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+            fresh = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), None, len(encoded), 0x3000, 0x04)
+            if not fresh:
+                return None, None
+            address, capacity = fresh, len(encoded)
+            name_pool["allocations"] += 1
+            if file_log:
+                file_log.write(f"{time.time() - start:7.3f} NAMEBUF alloc {len(encoded)} bytes at {fresh:#x} "
+                               f"(live {name_pool['allocations']})\n")
+                file_log.flush()
+        if not write(address, encoded):
+            name_pool["free"].append((address, capacity))
+            return None, None
+        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), address)):
+            name_pool["free"].append((address, capacity))
+            return None, None
+
+        def restore():
+            write(string_address, raw)
+            name_pool["free"].append((address, capacity))
+
+        return replacement, restore
+
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
     # files.txt lists every file open (one flushed line each, a hit and a held-thread step per open: slow on a hard disk)
     # only with --trace-files 1; without it the hooks stay for offline mode and files.txt keeps what is rare (DENIED,
@@ -430,6 +538,9 @@ def main():
     redirects = {}
     # Offline by default (--offline 0 turns it off): no sockets, NetBIOS name devices or DNS resolver.
     offline = opts.get("--offline", "1") == "1"
+    # Keep the same offline entry checks. An allowed file operation only
+    # needs a return breakpoint when collecting its completion status.
+    offline_entry_only = offline and os.environ.get("X2W_OFFLINE_ENTRY_ONLY") == "1"
     OFFLINE_DENY = ("\\device\\afd", "\\device\\netbt", "dnsresolver", "\\device\\tcp", "\\device\\udp",
                     "\\device\\rawip", "\\device\\ws2ifsl")
     denied = {}
@@ -582,7 +693,11 @@ def main():
         if addr in hooks:
             hook_entries[0] += 1
             name, arg = hooks[addr]
-            ret = read_qword(read, rsp) or 0
+            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
+            # Every kind of trace reaches the common "if desc:" below, so the restore callback is
+            # initialised here: leaving it to the file-name branch would let a non-name trace see an
+            # unbound name or carry over the previous call's callback.
+            restore = None
             if arg == "valloc":
                 # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
                 # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
@@ -630,10 +745,29 @@ def main():
                 desc = bink_call(name, regs, ret)
             else:
                 if arg.startswith("ustr:"):
-                    target = ustr(regs[arg[5:].capitalize()])
+                    string_address = regs[arg[5:].capitalize()]
+                    target = ustr(string_address)
                 else:
-                    target = oa_name(regs[arg.capitalize()] if arg != 'r8' else regs['R8'])
-                desc = f"{name} {target} from {where(ret)}"
+                    oa_address = regs['R8'] if arg == 'r8' else regs[arg.capitalize()]
+                    target = oa_name(oa_address)
+                    string_address = oa_string(oa_address)
+                if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
+                    # Offline mode: the call never runs, so the caller's name is left untouched.
+                    denied[target] = denied.get(target, 0) + 1
+                    file_log.write(f"{time.time() - start:7.3f} DENIED (offline) {name} {target} "
+                                   f"from {where(ret)}\n")
+                    file_log.flush()
+                    struct.pack_into("<Q", ctx, 0x78, 0xC0000022)   # rax
+                    struct.pack_into("<Q", ctx, 0x98, rsp + 8)      # rsp: pop the return address
+                    struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
+                    set_ctx(thread)
+                    return True
+                mapped, restore = map_drive(target, string_address)
+                desc = f"{name} {mapped or target} from {where(ret)}"
+                if mapped:
+                    desc += " (mapped from " + target + ")"
+                    file_log.write(f"{time.time() - start:7.3f} MAP {target} -> {mapped}\n")
+                    file_log.flush()
                 if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
                     # Offline mode: the call never runs. Return STATUS_ACCESS_DENIED to the caller.
                     denied[target] = denied.get(target, 0) + 1
@@ -646,6 +780,8 @@ def main():
                     return True
                 if not log_files:
                     desc = None   # a plain open: nothing to log, and no return breakpoint to arm
+                if offline_entry_only:
+                    desc = None
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -653,13 +789,13 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.add(ret, tid, rsp + 8, desc, addr)
+                # The name is temporary: take() puts the caller's own UNICODE_STRING back (restore) when the
+                # call returns, before anything else runs, so a failure or a retry sees the name it built.
+                returns.add(ret, tid, rsp + 8, desc, addr, restore)
                 arm(ret)
         for description in returns.take(addr, tid, rsp):
             file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
             file_log.flush()
-        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
-        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
@@ -669,7 +805,9 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
-        # Step over the original instruction, then re-arm.
+        # Step over the original instruction, then re-arm. Everyone else is held until the step is done (a retired
+        # breakpoint above is not stepped over, so it opens no window).
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
@@ -1088,8 +1226,13 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites
+                       or skip_asserts == -1 or asserts_counted < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
+                if ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites:
+                    assert_sites_admitted.add(ex_addr)
+                else:
+                    asserts_counted += 1
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 patched = False
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):

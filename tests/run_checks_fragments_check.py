@@ -71,13 +71,22 @@ with tempfile.TemporaryDirectory(prefix="x2w frag ") as tmp:
         refused = run("--from-dir", bad_list)
         assert refused.returncode == 1 and needle in refused.stdout, (name, refused.stdout)
         assert "echo ran" not in refused.stdout, (name, refused.stdout)
-    # The same command in two files is a duplicate too.
+    # The same command in two files is a duplicate too, even with different path spellings.
     two = os.path.join(tmp, "case_two")
     os.mkdir(two)
     write(os.path.join(two, "a.txt"), f"{q(echo)}\n")
     write(os.path.join(two, "b.txt"), f"{q(echo)}\n")
     twice = run("--from-dir", two)
     assert twice.returncode == 1 and "b.txt:1" in twice.stdout and "duplicate" in twice.stdout, twice.stdout
+    dot_two = os.path.join(tmp, "case_dot_two")
+    os.mkdir(dot_two)
+    dot_echo = os.path.join(tmp, ".", os.path.basename(echo))
+    write(os.path.join(dot_two, "a.txt"), f"{q(echo)}\n")
+    write(os.path.join(dot_two, "b.txt"), f"{q(dot_echo)}\n")
+    dot_twice = run("--from-dir", dot_two)
+    assert dot_twice.returncode == 1 and "b.txt:1" in dot_twice.stdout and "duplicate" in dot_twice.stdout, dot_twice.stdout
+    dedup = run("--from-dir", lists, dot_echo)
+    assert dedup.returncode == 0 and "all 3 checks passed" in dedup.stdout, dedup.stdout
     assert run().returncode == 2
 
     # A listing saved with a UTF-8 byte-order mark (Notepad, Windows PowerShell 5.1 Set-Content

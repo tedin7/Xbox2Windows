@@ -240,11 +240,11 @@ def evaluate(vs, ps, channels=None, regs=None):
                               for r, sh, zero in args]
     state = {}
     for line in ps.splitlines():
-        stmt = re.fullmatch(r' +(v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.(param0|hparam0_lo|hparam0_hi)\.([xyzw])\);',
+        stmt = re.fullmatch(r' +(v\d+) = \((v\d+) & 0xffff0000u\) \| f16rn\(i\.(param0|hparam0_lo|hparam0_hi)\.([xyzw])\);',
                             line)
         if stmt:
             assert stmt.group(1) == stmt.group(2), line
-            # f32tof16 of the interpolated value; a constant triangle makes it the exported value
+            # f16rn of the interpolated value; a constant triangle makes it the exported value
             source = channels if stmt.group(3) == 'param0' else halves[stmt.group(3)[-2:]]
             f32 = source['xyzw'.index(stmt.group(4))]
             state[stmt.group(1)] = f16_bits(struct.unpack('<f', struct.pack('<I', f32))[0])
@@ -290,7 +290,7 @@ def controls():
     print('translated: %s' % ','.join('%08x' % w for w in got))
 
     # The p2 lowering keeps the upper half of the destination with this mask; dropping it must fail the check.
-    assert ps.count('& 0xffff0000u) | f32tof16(') == 4, ps
+    assert ps.count('& 0xffff0000u) | f16rn(') == 4, ps
     # The whole-program scan runs once per translated program, not once per p1ll / p2 statement.
     calls = []
     scan = G.Stage.interp_f16_scan
@@ -557,14 +557,19 @@ def flow_controls():
         refused('unsupported rounding immediate %#x' % immediate, M0 + words(0xbfa40000 | immediate) + END,
                 'binary32 rounding' if immediate == 3 else 'directed binary16/binary64 rounding')
     for name, op in (
-            ('v_cvt_f16_f32', words(0x7e000000 | 10 << 17 | 0x0a << 9 | 242)),
             ('v_add_f16', words(0x32 << 25 | 12 << 17 | 11 << 9 | 266)),
-            ('v_interp_p2_f16', p1 + p2)):
+            ):
         refused(name + ' in RTZ', M0 + ROUND_ZERO + op + END, name + ' with binary16/binary64 rounding toward zero')
+    cvt = words(0x7e000000 | 10 << 17 | 0x0a << 9 | 242)
+    for name, op in (('conversion', cvt), ('interpolation', p1 + p2)):
+        shader = translate(M0 + ROUND_ZERO + op + END).hlsl_ps()
+        assert 'f16rz(' in shader and 'uint f16rz(float value)' in shader, name
+        mixed_op = M0 + branch(8, ROUND_ZERO) + ROUND_ZERO + op + END
+        refused('mixed modes at ' + name, mixed_op, 'mixed binary16/binary64 rounding modes')
     mixed = M0 + branch(8, ROUND_ZERO) + ROUND_ZERO + mix_words(16, 17, opcode=0x21) + END
     refused('mixed modes at a binary16 producer', mixed, 'mixed binary16/binary64 rounding modes')
     reset = translate(M0 + ROUND_ZERO + words(0xbfa40000) + mix_words(16, 17, opcode=0x21) + END).hlsl_ps()
-    assert 'f16rn(mix32(' in reset and 'f16rz' not in reset, reset
+    assert re.search(r'precise float mf[0-9a-f]+ = mad\(', reset) and 'f16rz' not in reset, reset
 
 
 def save_exec(dst, source=128):
@@ -1232,7 +1237,7 @@ def loop_controls(expected):
     are the reference words); a p1ll result or an unconverted p2 result carried along the back edge stays refused."""
     pipe = translate(LOOP_WORDS['loop'])
     ps = pipe.hlsl_ps()
-    assert 'pc = (scc) ? 1 : 2;' in ps and ps.count('f32tof16(i.param0.') == 4, ps
+    assert 'pc = (scc) ? 1 : 2;' in ps and ps.count('f16rn(i.param0.') == 4, ps
     got = evaluate(pipe.hlsl_vs(), ps)
     assert got == expected, ('loop translated words', [hex(w) for w in got], [hex(w) for w in expected])
     print('translated loop: %s' % ','.join('%08x' % w for w in got))
@@ -1359,14 +1364,16 @@ def check_draw(dxc, renderer, adapter):
             print('plain export, other half: fails as expected', flush=True)
 
 
-def varying_vertex_words(right_x=3.0, bottom_y=-3.0):
-    # Only vertex 1 has x = right_x and attr0.x's high half = 3.
-    # The other two vertices have x = -1 and attr0.x's high half = 1.
+def varying_vertex_words(right_x=3.0, bottom_y=-3.0, near=False):
+    # Default: only vertex 1 has x = right_x and attr0.x's high half = 3; the others have x = -1 and high half 1.
+    # With the fullscreen triangle (-1,1), (3,1), (-1,-3) at pixel column x of an 8-wide target the weight of vertex 1
+    # is (x + 0.5) / 16. attr0.x high is 1.0 at vertices 0 and 2; near: 1 + 2^-9 at vertex 1, so the interpolant is
+    # 1 + (x + 0.5) / 8 binary16 ULPs of 1.0, i.e. 1/16 .. 15/16 ULP.
     def select(dst, original, replacement):
         return words(0x02000000 | dst << 17 | replacement << 9 | (256 + original))  # v_cndmask_b32
 
     return (mov(6, f32_bits(right_x)) + mov(7, f32_bits(bottom_y)) + mov(8, 0xbf800000) + mov(9, 0x3f800000)
-            + mov(15, 0x3c004000) + mov(16, 0x42004000) + mov(17, 0x42003800)
+            + mov(15, 0x3c004000) + mov(16, 0x3c024000 if near else 0x42004000) + mov(17, 0x42003800)
             + words(0x7d840081) + select(2, 8, 6) + select(15, 15, 16)  # v_cmp_eq_u32 1, v0
             + words(0x7d840082) + select(3, 9, 7)                       # v_cmp_eq_u32 2, v0
             + mov(4, 0) + mov(5, 0x3f800000)
@@ -1379,22 +1386,24 @@ def helper_triangle_words():
     return varying_vertex_words(right_x=1.0, bottom_y=-0.75)
 
 
-def flow_reference(width, height):
-    """ISA reference at pixel centers. All interpolated values are exact binary16."""
+def flow_reference(width, height, near_input=False):
+    """ISA reference at pixel centers; interpolants are exact binary32 values."""
     expected = []
     # 1 + 3*2^-12 is three quarters of a half ULP above 1.
     near = 1 + 3 * 2**-12
     truncation = 0x3c00
     assert f16_bits(near) == truncation + 1
+    assert f16_bits(1 + (4.5 / 8) * 2**-10) == 0x3c01
+    assert 1 + (4.5 / 8) * 2**-10 > 1 + 2**-11
     for _ in range(height):
         for x in range(width):
-            interp = 1 + (x + 0.5) / width
+            interp = 1 + ((x + 0.5) / width) * (2**-10 if near_input else 1)
             half = f16_bits(interp)
             if interp > 1.5:
                 first = 0x3f800000 | half
                 overwritten = 1.0
             else:
-                first = G.fbits(interp)
+                first = f16_to_f32_bits(half)
                 overwritten = 2.0
             high_p2 = f16_bits(3.0) << 16 | f16_bits(1.0)
             mix = (0x8000 | truncation) << 16 | truncation
@@ -1409,8 +1418,8 @@ def check_flow_draw(dxc, renderer, adapter):
     ps = pipe.hlsl_ps()
     cases = {
         'flow': ps,
-        'clear_high': ps.replace('(v20 & 0xffff0000u) | f32tof16(i.param0.y)', 'f32tof16(i.param0.y)'),
-        'clear_low': ps.replace('(v22 & 0xffffu) | (f32tof16(i.param0.w) << 16)', '(f32tof16(i.param0.w) << 16)'),
+        'clear_high': ps.replace('(v20 & 0xffff0000u) | f16rn(i.param0.y)', 'f16rn(i.param0.y)'),
+        'clear_low': ps.replace('(v22 & 0xffffu) | (f16rn(i.param0.w) << 16)', '(f16rn(i.param0.w) << 16)'),
         'round_nearest': ps.replace('f16rz(mix32(', 'f16rn(mix32('),
     }
     assert all(mutant != ps for name, mutant in cases.items() if name != 'flow')
@@ -1432,6 +1441,19 @@ def check_flow_draw(dxc, renderer, adapter):
             else:
                 assert run.returncode == 1 and 'pixel mismatch' in diagnostic, (name, diagnostic)
             print(name, diagnostic, flush=True)
+        near_pipe = translate(flow_fixture(), varying_vertex_words(near=True))
+        near_reference = directory / 'near.bin'
+        near_reference.write_bytes(words(*flow_reference(width, height, near_input=True)))
+        near_vs = compile_hlsl(dxc, 'dxc', near_pipe.hlsl_vs(), 'near_vs', 'vs_6_0', directory)
+        near_ps = compile_hlsl(dxc, 'dxc', near_pipe.hlsl_ps(), 'near_ps', 'ps_6_0', directory)
+        run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-words', near_vs, near_ps,
+                                                       width, height, near_reference])
+        diagnostic = run.stdout + run.stderr
+        if run.returncode == 77:
+            print(diagnostic, flush=True)
+            raise SystemExit(77)
+        assert run.returncode == 0 and 'all 32 pixels matched' in diagnostic, diagnostic
+        print('near-half', diagnostic, flush=True)
 
 
 def check_extended_flow_draw(dxc, renderer, adapter):
@@ -1590,6 +1612,7 @@ def main():
     elif mode == 'draw':
         controls()
         check_draw(*args)
+        check_flow_draw(*args)
     elif mode == 'draw_flow':
         check_flow_draw(*args)
     elif mode == 'draw_exec_halves':

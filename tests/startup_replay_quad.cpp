@@ -19,6 +19,7 @@
 #include "startup_stream_setup.h"
 
 extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_calls();
+extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_carried_bytes();
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_record_stop(int at_exit);
 
 using Word = StreamWord;
@@ -29,18 +30,26 @@ namespace {
 constexpr UINT width = 64, height = 32;
 constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
 constexpr UINT indirect_argument_offset = 4096, indirect_count_offset = 8192;
-// X2W_TEST_REPLAY_TITLE_RANGE=ring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
+// X2W_TEST_REPLAY_TITLE_RANGE=ring or plainring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
 // recorder's 64 KiB root window, so each binding's capture is needed on its own), and clears both before its Present.
 constexpr UINT ring_slice_bytes = 0x20000, ring_vb_offset = 0x10000;
-enum class TitleRange { none, root, generated, supplied, ring, table };
+enum class TitleRange { none, root, generated, supplied, ring, plainring, table };
 
 struct Scene {
     void* target = nullptr;
+    void* offscreen = nullptr;
+    void* history = nullptr;
+    void* window_copy = nullptr;
+    void* snapshot_buffer = nullptr;
+    void* snapshot_upload = nullptr;
+    UINT64 snapshot_bytes = 0;
     void* title_buffer = nullptr;
     void* rtv_heap = nullptr;
     void* queue = nullptr;
     void* allocator = nullptr;
     void* list = nullptr;
+    void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
+    bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: Released in the window without a submit
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
     TitleRange title_range = TitleRange::none;
@@ -56,6 +65,7 @@ struct Scene {
     void* indirect_count = nullptr;
     D3D12_DRAW_ARGUMENTS* late_arguments = nullptr;
     UINT* late_count = nullptr;
+    void* gpu_source = nullptr;  // X2W_TEST_REPLAY_INDIRECT=gpu: upload words the list copies into both buffers
     void* upload = nullptr;  // X2W_TEST_REPLAY_PREFIX_LIVE
 };
 
@@ -119,6 +129,17 @@ bool record_memory_cases(void* device)
     if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
     std::printf("replay quad: recorder access exceptions %ld\n", access_exceptions);
     return ok;
+}
+
+bool create_copy_texture(void* device, void*& texture)
+{
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+                                   DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                   D3D12_RESOURCE_FLAG_NONE};
+    return SUCCEEDED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+                                                 D3D12_RESOURCE_STATE_COMMON, 0,
+                                                 arg(&__uuidof(ID3D12Resource)), arg(&texture)))) && texture;
 }
 
 int create_scene(void* device, Scene& s)
@@ -240,6 +261,16 @@ int create_scene(void* device, Scene& s)
         }
         invoke(device, 20, arg(s.target), arg(&view), s.rtv);
     }
+    // The GPU state fixture uses the RTV for an offscreen target written only before the window.
+    char gpu_state[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_GPU_STATE", gpu_state, sizeof(gpu_state)) == 1 && gpu_state[0] == '1') {
+        if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+                                               D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                                               arg(&s.offscreen)))) || !s.offscreen)
+            return 28;
+        invoke(device, 20, arg(s.offscreen), arg(&view), s.rtv);
+        if (!create_copy_texture(device, s.history)) return 28;
+    }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&s.queue)))) ||
@@ -249,7 +280,41 @@ int create_scene(void* device, Scene& s)
                                            arg(&s.list)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&s.fence)))))
         return 23;
+    // A list built and closed before the recorder's window, submitted again every frame: a magenta corner over the frame.
+    char static_list[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_LIST", static_list, sizeof(static_list)) == 1 && static_list[0] == '1') {
+        void* allocator = nullptr;
+        const float magenta[] = {1.0f, 0.0f, 1.0f, 1.0f};
+        const D3D12_RECT corner{0, 0, 12, 10};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
+                                               arg(&allocator)))) ||
+            FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(allocator), 0,
+                                               arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&s.static_list)))))
+            return 23;
+        // The stand-in's lists record only after a Reset (slot 139), as the title's do.
+        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 139, arg(allocator))))) return 30;
+        invoke(s.static_list, 52, s.rtv, arg(magenta), 1, arg(&corner));
+        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+        s.release_static = GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_RELEASE", nullptr, 0) != 0;
+    }
     return 0;
+}
+
+bool create_gpu_source(void* device, Scene& s)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&upload_heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+            D3D12_RESOURCE_STATE_GENERIC_READ, 0, arg(&__uuidof(ID3D12Resource)), arg(&s.gpu_source)))) || !s.gpu_source)
+        return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{0, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(s.gpu_source, 8, 0, arg(&no_reads), arg(&mapped)))) || !mapped) return false;
+    const UINT words[10]{3, 1, 0, 0, 0, 1, 0, 0, 1, 0};
+    std::memcpy(mapped, words, sizeof(words));
+    invoke(s.gpu_source, 9, 0, 0);
+    return true;
 }
 
 int create_indirect_arguments(void* device, Scene& s, bool late)
@@ -289,17 +354,21 @@ int create_indirect_arguments(void* device, Scene& s, bool late)
 int create_title_range(void* device, Scene& s)
 {
     if (s.title_range == TitleRange::none) return 0;
-    if (s.title_range == TitleRange::ring) {
+    if (s.title_range == TitleRange::ring || s.title_range == TitleRange::plainring) {
         constexpr SIZE_T bytes = 1u << 20;
+        const bool plain = s.title_range == TitleRange::plainring;
+        const Word address = plain ? 0x10000000ull : 0x21200000000ull;
         s.ring = static_cast<unsigned char*>(
-            VirtualAlloc(reinterpret_cast<void*>(0x21200000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            VirtualAlloc(reinterpret_cast<void*>(address), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!s.ring) return 46;
-        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-                                         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
-        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.ring), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
-                                               arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
-            !s.title_buffer)
-            return 46;
+        if (!plain) {
+            const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.ring), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                                   arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
+                !s.title_buffer)
+                return 46;
+        }
         std::printf("title ranges: %llx 0\n", arg(s.ring));
         return 0;
     }
@@ -371,8 +440,38 @@ int wait_for_frame(const Scene& s, UINT frame)
     return 0;
 }
 
+bool create_snapshot_buffer(void* device, Scene& s)
+{
+    char value[32]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_TEST_REPLAY_GPU_STATE_BIG", value, sizeof(value));
+    if (!length) return true;
+    char* end = nullptr;
+    const auto mib = std::strtoull(value, &end, 10);
+    if (length >= sizeof(value) || value[0] < '0' || value[0] > '9' || *end || !mib || mib > (UINT64_MAX >> 20))
+        return false;
+    s.snapshot_bytes = mib << 20;
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, s.snapshot_bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    const D3D12_HEAP_PROPERTIES target_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const auto create = [&](const D3D12_HEAP_PROPERTIES& heap, D3D12_RESOURCE_STATES state, void*& resource) {
+        return SUCCEEDED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+            state, 0, arg(&__uuidof(ID3D12Resource)), arg(&resource)))) && resource;
+    };
+    if (!create(target_heap, D3D12_RESOURCE_STATE_COMMON, s.snapshot_buffer)) return false;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (!create(upload_heap, D3D12_RESOURCE_STATE_GENERIC_READ, s.snapshot_upload)) return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{0, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(s.snapshot_upload, 8, 0, arg(&no_reads), arg(&mapped)))) || !mapped)
+        return false;
+    std::memset(mapped, 0, static_cast<std::size_t>(s.snapshot_bytes));
+    invoke(s.snapshot_upload, 9, 0, 0);
+    return true;
+}
+
 int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool slot_layouts)
 {
+    if (s.history && frame == 2 && !create_copy_texture(device, s.window_copy)) return 28;
     unsigned char* slice = nullptr;
     if (s.ring) {
         if (frame >= 8) return 47;
@@ -426,8 +525,19 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         const float fallback[] = {1.0f, 1.0f, 0.0f, 1.0f};
         invoke(s.list, 52, s.fallback_rtv, arg(fallback));
     }
-    if (!s.signature || s.late_arguments || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
-    if (!s.signature || s.late_arguments || frame == 1) {
+    if (frame == 0 && s.snapshot_buffer)
+        invoke(s.list, 15, arg(s.snapshot_buffer), 0, arg(s.snapshot_upload), 0, s.snapshot_bytes);
+    if (s.offscreen) {
+        constexpr float history[]{1.0f, 0.0f, 1.0f, 1.0f};
+        if (frame < 2) {
+            invoke(s.list, 52, s.rtv, arg(history));
+            invoke(s.list, 17, arg(s.history), arg(s.offscreen));
+        } else {
+            invoke(s.list, 17, arg(s.window_copy), arg(s.history));
+            invoke(s.list, 17, arg(s.target), arg(s.window_copy));
+        }
+    } else if (!s.signature || s.late_arguments || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
+    if (!s.offscreen && (!s.signature || s.late_arguments || frame == 1)) {
         invoke(s.list, 50, 1, arg(&s.rtv));
         invoke(s.list, 21, 1, arg(&viewport));
         invoke(s.list, 22, 1, arg(&scissor));
@@ -436,8 +546,17 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         if (s.late_arguments) {
             invoke(s.list, 34, arg(stream_root_signature()));
             // Block one frame with the count word and another with the draw arguments.
-            *s.late_arguments = {frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
-            *s.late_count = frame % 4 == 1 ? 0u : 1u;
+            if (s.gpu_source) {
+                // The copy runs on the GPU timeline: title memory keeps its old words, so only the copy writes them.
+                // Source words: +0 arguments of three vertices, +16 arguments of none, +32 count one, +36 count zero.
+                invoke(s.list, 15, arg(s.arguments), indirect_argument_offset, arg(s.gpu_source),
+                       frame % 4 == 3 ? 16 : 0, sizeof(D3D12_DRAW_ARGUMENTS));
+                invoke(s.list, 15, arg(s.indirect_count), indirect_count_offset, arg(s.gpu_source),
+                       frame % 4 == 1 ? 36 : 32, sizeof(UINT));
+            } else {
+                *s.late_arguments = {frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
+                *s.late_count = frame % 4 == 1 ? 0u : 1u;
+            }
             invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), indirect_argument_offset,
                    arg(s.indirect_count), indirect_count_offset);
         } else if (s.signature) {
@@ -462,7 +581,23 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
-    invoke(s.queue, 10, 1, arg(&s.list));
+    if (s.release_static && frame == 6) {
+        // Inside the window: the carried list is Released without a submit. Whatever address its memory gets next must
+        // not inherit its calls, so the recorder has to let go of them now (the bytes it still holds are printed).
+        const auto before = x2w_d3d12_replay_record_carried_bytes();
+        invoke(s.static_list, 2);
+        s.static_list = nullptr;
+        std::fprintf(stderr, "replay quad: carried bytes %llu before the release, %llu after\n",
+                     static_cast<unsigned long long>(before),
+                     static_cast<unsigned long long>(x2w_d3d12_replay_record_carried_bytes()));
+    }
+    // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
+    static const UINT execute_slot = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("X2W_TEST_REPLAY_EXEC_SLOT", value, sizeof(value)) ? static_cast<UINT>(std::atoi(value)) : 10u;
+    }();
+    invoke(s.queue, execute_slot, 1, arg(&s.list));
+    if (s.static_list) invoke(s.queue, execute_slot, 1, arg(&s.static_list));
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
@@ -503,13 +638,15 @@ int main(int argc, char** argv)
     Scene scene;
     char indirect_mode[16]{};
     const DWORD indirect_size = GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", indirect_mode, sizeof(indirect_mode));
-    const bool late = indirect_size == 4 && std::strcmp(indirect_mode, "late") == 0;
+    const bool gpu = indirect_size == 3 && std::strcmp(indirect_mode, "gpu") == 0;
+    const bool late = gpu || (indirect_size == 4 && std::strcmp(indirect_mode, "late") == 0);
     char mode[16]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_TITLE_RANGE", mode, sizeof(mode))) {
         if (!std::strcmp(mode, "root")) scene.title_range = TitleRange::root;
         else if (!std::strcmp(mode, "generated")) scene.title_range = TitleRange::generated;
         else if (!std::strcmp(mode, "supplied")) scene.title_range = TitleRange::supplied;
         else if (!std::strcmp(mode, "ring")) scene.title_range = TitleRange::ring;
+        else if (!std::strcmp(mode, "plainring")) scene.title_range = TitleRange::plainring;
         else if (!std::strcmp(mode, "table")) scene.title_range = TitleRange::table;
         else return 2;
     }
@@ -519,10 +656,12 @@ int main(int argc, char** argv)
                                                device, pso, late))
         return rc;
     if (const int rc = create_scene(device, scene)) return rc;
+    if (!create_snapshot_buffer(device, scene)) return 28;
     if (const int rc = create_title_range(device, scene)) return rc;
     if (indirect_size) {
         if (!late && frames != 3) return 2;
         if (const int rc = create_indirect_arguments(device, scene, late)) return rc;
+        if (gpu && !create_gpu_source(device, scene)) return 29;
     }
     char recorder_case[16]{};
     GetEnvironmentVariableA("X2W_TEST_REPLAY_RECORDER", recorder_case, sizeof(recorder_case));
@@ -556,6 +695,7 @@ int main(int argc, char** argv)
         Word token = 0;
         if (paced && (invoke(device, 80, 0, 0xFFFFFFFFu, 0, 0, arg(&token)) != S_OK || !token)) return 38;
         if (const int rc = draw_frame(scene, device, pso, frame, frames, slot_layouts)) return rc;
+        if (frame == 0 && scene.snapshot_upload) invoke(scene.snapshot_upload, 2);
     }
     if (std::strcmp(recorder_case, "cap") == 0)
         std::printf("replay quad: recorder calls after scene %llu\n",

@@ -450,7 +450,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     char placeholder_mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_PLACEHOLDER_DRAW", placeholder_mode, sizeof(placeholder_mode));
     const bool placeholder_fixture = placeholder_mode[0] != 0;
-    const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT width = mapped_spans ? 64 : identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0) ? 15 : 8;
     const bool pixel_uav_rw = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
     const UINT height = placeholder_fixture ? 8 : mapped_spans ? 1 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : pixel_uav_rw ? 8 : 4;
     ComPtr<ID3D12Device> desktop;
@@ -549,6 +549,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_SRV_DRAW", nullptr, 0)) {
+        extern int draw_root_srv(void*);
+        if (const int result = draw_root_srv(list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_control(ID3D12Device*);
         extern int draw_root_cbv(void*, void*);
@@ -587,6 +590,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
         extern int draw_formatted_view(void*, void*);
         if (const int result = draw_formatted_view(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_TABLE_ALIAS_WRITE", nullptr, 0)) {
+        extern int draw_table_alias_writes(ID3D12Device*, void*, void*);
+        if (const int result = draw_table_alias_writes(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV", nullptr, 0)) {
         extern int draw_copied_vertex_buffer_srv(void*, void*);
         if (const int result = draw_copied_vertex_buffer_srv(guest, list)) return result;
@@ -650,6 +656,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_RECT_GAP", nullptr, 0)) {
+        extern int draw_rect_gap(void*, void*);
+        if (const int result = draw_rect_gap(guest, list)) return result;
     } else if (frame_copy) {
         extern int draw_frame_copies(ID3D12Device*, void*, StreamTarget&, void*, UINT, UINT, const char*, const char*);
         const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, frame_copy_mode);
@@ -688,6 +697,46 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             invoke(list, 25, arg(pso));
             return true;
         };
+        // X2W_TEST_CONSOLE_KEEP (with the shared ring): a second list A records 32 payloads (32 x 16 MiB = 512 MiB),
+        // is submitted and waited for, and is never Reset. The fixture's own list then draws payload 32 over the right
+        // half. A is then submitted again, still closed and not Reset, and the target is read back.
+        if (GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_KEEP", nullptr, 0)) {
+            constexpr unsigned kept = 32;
+            void *allocator_a = nullptr, *list_a = nullptr;
+            const unsigned list_a_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+            if (FAILED(static_cast<HRESULT>(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator_a)))) ||
+                FAILED(static_cast<HRESULT>(invoke(guest, 73, arg(list_a_desc), arg(allocator_a), 0,
+                                                   arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list_a)))) ||
+                FAILED(static_cast<HRESULT>(invoke(allocator_a, 8))) ||
+                FAILED(static_cast<HRESULT>(invoke(list_a, 139, arg(allocator_a))))) return 23;  // created closed
+            const D3D12_VIEWPORT whole{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+            invoke(list_a, 50, 1, arg(&rtv));
+            invoke(list_a, 21, 1, arg(&whole));
+            invoke(list_a, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            invoke(list_a, 25, arg(pso));
+            for (unsigned payload = 0; payload < kept; ++payload)
+                if (const int result = draw_gated_console_payload(guest, list_a, payload, payload == 0)) return result;
+            const auto submit_and_wait = [&](void* recorded, UINT64 value) {
+                invoke(queue, 10, 1, arg(&recorded));
+                if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), value)))) return false;
+                const auto deadline = GetTickCount64() + 60000;
+                while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+                return invoke(fence, 8) == value;
+            };
+            invoke(list, 9);  // the fixture's own recording so far (its clear) runs first
+            if (!submit_and_wait(list, 1)) return 25;
+            invoke(list_a, 9);
+            if (!submit_and_wait(list_a, 2)) return 25;
+            if (!next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, kept, false)) return result;
+            invoke(list, 9);
+            if (!submit_and_wait(list, 3)) return 25;
+            // A again: closed, never Reset. The target is read back after it, so a stale A that ran (its last
+            // payload, 31, over the right half) shows in the pixels.
+            if (!submit_and_wait(list_a, 4)) return 25;
+            return read_stream_target(desktop.Get(), frame, pixels);
+        }
         // Retrying the same bytes after abandoning a recording still needs an upload. The shared-ring
         // control skips it so every upload behind the gate comes from the ring, whose 256 MiB cap is
         // then exhausted: the later reservations are refused and those draws bind the null view.
@@ -790,6 +839,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_report();
         if (const int rc = root_heap_report()) return rc;
+    }
+    if (GetEnvironmentVariableW(L"X2W_TEST_TABLE_ALIAS_WRITE", nullptr, 0)) {
+        extern void table_alias_debug_report();
+        table_alias_debug_report();
     }
 
     if (placeholder_fixture) {

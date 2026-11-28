@@ -163,15 +163,15 @@ check('the bits form is narrower than the float form above 1.0, which frac canno
 
 # 4. The shader cache revision: both literals are the same word, and the old seed cannot produce the new key.
 gfx_source = Path(G.__file__).read_text(encoding='utf-8')
-seed = re.search(r"(?:fnv|shader_cache_seed)\(b'(x2w-startup-shader-\d+)'\)", gfx_source)
+seed = re.search(r"(?:(?:fnv|shader_cache_seed)\(b'|PIPELINE_KEY_REVISION = b')(x2w-startup-shader-\d+)'", gfx_source)
 stub_source = (root / 'src' / 'startup_stubs' / 'd3d12_draw.inl').read_text(encoding='utf-8')
 literal = re.search(r'constexpr char revision\[\] = "(x2w-startup-shader-\d+)";', stub_source)
 check('both files spell a x2w-startup-shader revision', seed is not None and literal is not None,
       repr((seed and seed.group(1), literal and literal.group(1))))
 check('the two literals are identical', seed and literal and seed.group(1) == literal.group(1),
       repr((seed and seed.group(1), literal and literal.group(1))))
-check('the revision is x2w-startup-shader-28, after the precise v_fma_mix lowering',
-      bool(seed and seed.group(1) == 'x2w-startup-shader-28'), repr(seed and seed.group(1)))
+check('the revision is x2w-startup-shader-29, after the vcc_hi may-write of the mad64 carry-out',
+      bool(seed and seed.group(1) == 'x2w-startup-shader-29'), repr(seed and seed.group(1)))
 
 
 def key_from_seed(word):

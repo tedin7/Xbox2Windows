@@ -57,13 +57,13 @@ def program(kind, *, mutant=False, join_op=LATE, tail_ops=()):
         yield asm, encoded
 
 
-def translate(rows, llvm_mc=None):
+def translate(rows, llvm_mc=None, group=(4, 1, 1)):
     rows = tuple(rows)
     binary = bytes.fromhex(''.join(code for _, code in rows))
     if llvm_mc:
         source = '\n'.join(asm for asm, _ in rows) + '\n'
         assert assemble(llvm_mc, source) == binary, source
-    return G.ComputePipeline(binary, root_blob(), USER7, (4, 1, 1)).hlsl_cs()
+    return G.ComputePipeline(binary, root_blob(), USER7, group).hlsl_cs()
 
 
 KINDS = ('join', 'shared', 'split')
@@ -74,13 +74,14 @@ def controls(llvm_mc):
         good = translate(program(kind), llvm_mc)
         bad = translate(program(kind, mutant=True), llvm_mc)
         assert good != bad, kind
-    refused('exec write', lambda: translate(program('shared', join_op=RESTORE), llvm_mc))
-    refused('branch out of the block', lambda: translate(program('shared', join_op=END), llvm_mc))
+    multi_wave = (65, 1, 1)
+    refused('exec write', lambda: translate(program('shared', join_op=RESTORE), llvm_mc, multi_wave))
+    refused('branch out of the block', lambda: translate(program('shared', join_op=END), llvm_mc, multi_wave))
     refused('branch out of the block',
-            lambda: translate(program('shared', join_op=('s_branch', '@late')), llvm_mc))
+            lambda: translate(program('shared', join_op=('s_branch', '@late')), llvm_mc, multi_wave))
     refused('definition of s27', lambda: translate(program(
         'shared', join_op=('s_mov_b32 s27, 1', '81039bbe'),
-        tail_ops=(('v_mov_b32_e32 v7, s27', '1b020e7e'),)), llvm_mc))
+        tail_ops=(('v_mov_b32_e32 v7, s27', '1b020e7e'),)), llvm_mc, multi_wave))
     print('EXECZ exit translations and unsafe-path refusals passed')
 
 

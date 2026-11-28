@@ -189,6 +189,25 @@ def controls():
                 'v_mad_u64_u32 v[12:13], vcc_lo, v18, v19, v20'):
         check('refused: %s' % asm, refused(asm))
 
+    # Discarded carry destinations have no VCC effect, even on forms the translator refuses.
+    for name, asm, may in (
+            ('v_mad_u64_u32', 'v_mad_u64_u32 v[12:13], vcc_lo, v18, v19, v[20:21]', {'vcc', 'vcc_hi'}),
+            ('v_mad_u64_u32', 'v_mad_u64_u32 v[12:13], null, v18, v19, v[20:21]', set()),
+            ('v_mad_i64_i32', 'v_mad_i64_i32 v[12:13], null, v18, v19, v[20:21]', set()),
+            ('v_add_co_u32', 'v_add_co_u32 v4, vcc_lo, v5, v6', {'vcc', 'vcc_hi'}),
+            ('v_cmp_gt_u32_e64', 'v_cmp_gt_u32_e64 vcc_lo, v1, v2', {'vcc', 'vcc_hi'})):
+        _, writes, may_write = G.scalar_effects(name, asm)
+        check('%s may-writes %s' % (asm, ' and '.join(sorted(may)) or 'no VCC half'),
+              (writes | may_write) & G.VCC_KEYS == may and 'vcc_hi' not in writes)
+    # A skipped-block join must not retain a stale high-half clear fact.
+    start = {('exec', 0), ('exec_hi', 1), ('vcc_hi', 0)}
+    mad = 'v_mad_u64_u32 v[12:13], vcc_lo, v18, v19, v[20:21]'
+    after = G.clear_after('v_mad_u64_u32', mad, G.scalar_effects('v_mad_u64_u32', mad)[2], start)
+    check('a clear vcc_hi fact does not survive the unsigned mad', after == start - {('vcc_hi', 0)})
+    null_mad = 'v_mad_u64_u32 v[12:13], null, v18, v19, v[20:21]'
+    after_null = G.clear_after('v_mad_u64_u32', null_mad, G.scalar_effects('v_mad_u64_u32', null_mad)[2], start)
+    check('a discarded null carry keeps the vcc_hi fact', after_null == start)
+
 
 def pack_draw(a, b, c):
     return [(a, 0, 0), (b, 0, 0), (c & MASK, 0, 0), (c >> 32, 0, 0)]

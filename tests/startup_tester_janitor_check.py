@@ -69,6 +69,11 @@ class Janitor(unittest.TestCase):
                           "gfx2hlsl.py", "--watch", str(self.cache))
 
     def test_an_interrupted_run_is_ended_and_packed(self):
+        linker_map = self.root / "XCRDAPI.map"
+        linker_map.write_text("00001020 t queue_worker\n")
+        job = json.loads(self.job.read_text())
+        job["map_xcrdapi"] = str(linker_map)
+        self.job.write_text(json.dumps(job))
         title = self.start("import signal,sys,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);"
                            "open(sys.argv[1]+'/title.pid','w').write(str(__import__('os').getpid()));time.sleep(300)", str(self.logdir))
         debugger = self.start("import signal,subprocess,sys,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);"
@@ -93,6 +98,8 @@ class Janitor(unittest.TestCase):
         self.assertTrue(self.zip.exists(), "the report was not packed")
         with zipfile.ZipFile(self.zip) as z:
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+            self.assertEqual(z.read(T.XCRDAPI_SYMBOLS_NAME), b"1020 queue_worker\n")
+        self.assertEqual(manifest["symbols_xcrdapi"], 1)
         self.assertIs(manifest["interrupted"], True)
         self.assertTrue(manifest["end_cause"].startswith("interrupted by the tester (Ctrl-C or the window was closed); "), manifest["end_cause"])
         self.assertIn("last present #90 at 30 s", manifest["end_cause"])

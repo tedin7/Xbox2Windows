@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch as mock_patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
@@ -1106,6 +1107,9 @@ def expected(name):
         for i in range(16):
             out[i] = input_word(i // 8)
         return out
+    if name == 'O-loop-subset':
+        out[:8] = [9, 1, 2, 9, 9, 9, 9, 9]
+        return out
     if name == 'O-dword':
         for group in range(4):
             out[2 + group] = KEY ^ group
@@ -1255,6 +1259,12 @@ def refused(fragment, build):
     raise AssertionError('accepted, expected a refusal naming %r' % fragment)
 
 
+def refused_per_lane(fragment, build):
+    # Keep the fixtures' group shapes while testing their per-lane control-flow proofs.
+    with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+        refused(fragment, build)
+
+
 def patch(words, old, new):
     old, new = bytes.fromhex(old), bytes.fromhex(new)
     assert words.count(old) == 1, old.hex()
@@ -1269,6 +1279,8 @@ for field, offset_bytes in (('offset0', '1f00'), ('offset1', '001f')):
     words = patch(WORDS_G, '100034d804050000', '000034d804050000')
     words = patch(words, '0524dcd806000006', offset_bytes + 'dcd806000006')
     CASES[f'G-{field}-only'] = (source, words, *CASES['G'][2:])
+CASES['O-loop-subset'] = (LOOP_BREAK_SOURCE.replace('s_cbranch_scc0 6\n', 's_nop 0\n', 1),
+                          patch(LOOP_BREAK_WORDS, '060084bf', '000080bf'), USER7 | TGID_X | tidig(1), (8, 1, 1), (1, 1, 1))
 
 
 MBCNT_REFUSALS = (
@@ -1308,14 +1320,16 @@ def check_execz_loop_break():
     store = '001070e004050480'
     with_counter = patch(LOOP_BREAK_WORDS, store, '18020a7e' + store)
     reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
-    for program in (LOOP_BREAK_WORDS, with_counter):
-        refused(reason, lambda: translate('O', code=program).hlsl_cs())
     # Removing only the guard accepts the program. Removing only the latch still leaves two different
     # remasks and scalar counter work on the staying path, outside the straight T3 proof.
     translate('O', code=patch(LOOP_BREAK_WORDS, '060088bf', '000080bf')).hlsl_cs()
     latch_nop = patch(LOOP_BREAK_WORDS, 'f4ff84bf', '000080bf')
-    refused('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block',
-            lambda: translate('O', code=latch_nop).hlsl_cs())
+    # Keep the eight-lane execution traced above while checking the per-lane loop and exit proofs.
+    with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+        for program in (LOOP_BREAK_WORDS, with_counter):
+            refused(reason, lambda: translate('O', code=program).hlsl_cs())
+        refused('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block',
+                lambda: translate('O', code=latch_nop).hlsl_cs())
 
 
 def check_execz_exit_run():
@@ -1372,6 +1386,11 @@ def check_execz_exit_run():
     # Workgroups above 32 threads are outside this single-wave32 proof.
     for big in ((33, 1, 1), (64, 1, 1)):
         refused(reason, lambda group=big: translate('O', code=EXIT_RUN_WORDS, group=group).hlsl_cs())
+    def legacy_exit(code, *, frag=reason):
+        # Keep the eight lanes that exercise both arms of the per-lane proof.
+        with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+            refused(frag, lambda: translate('O', code=code).hlsl_cs())
+
     for at, new in ((28, '800395be'),   # s_mov_b32 s21, 0: restore mask was never saved from EXEC
                     (36, '800380be'),   # s_mov_b32 s0, 0: ANDN2 source mask was never saved from EXEC
                     (52, '007e168a'),   # s_andn2_b32 s22, s0, exec_lo: destination differs from source
@@ -1388,18 +1407,143 @@ def check_execz_exit_run():
                     (88, '000080bf'),   # s_nop in place of the restore
                     (56, '050084bf'),   # branch into the second word of s_load_dwordx8
                     (56, 'ff7f84bf')):  # branch past the end of the program
-        refused(reason, lambda code=swap(at, new): translate('O', code=code).hlsl_cs())
-    refused(reason.replace('scc0', 'scc1'), lambda: translate('O', code=swap(56, '020085bf')).hlsl_cs())
+        legacy_exit(swap(at, new))
+    legacy_exit(swap(56, '020085bf'), frag=reason.replace('scc0', 'scc1'))
     # On the staying path s25 is overwritten. The run reads it into s26 and the first vector op after
     # the restore stores that value, exposing the 1 versus 9 traced above for lane 0.
     code = swap(68, '19039abe', swap(64, '810399be'))  # s_mov_b32 s25, 1; s_mov_b32 s26, s25
     code = bytes.fromhex('890399be') + code[:92] + bytes.fromhex('1a020a7e') + code[92:]
-    refused(reason, lambda: translate('O', code=code).hlsl_cs())
+    legacy_exit(code)
     # SCC after the scalar run still has the stay-mask test's wave/singleton difference.
     code = EXIT_RUN_WORDS[:92] + bytes.fromhex('fd0399be19020a7e') + EXIT_RUN_WORDS[92:]
     refusals = []
-    G.ComputePipeline(code, root_blob(), CASES['O'][2], (8, 1, 1), refusals=refusals)
+    with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+        G.ComputePipeline(code, root_blob(), CASES['O'][2], (8, 1, 1), refusals=refusals)
     assert any(reason in text for text, _ in refusals), refusals
+
+
+def check_execz_mask_subset():
+    """Pre-branch EXEC subset tracking (#2645 T1): sM <= EXEC carried into an execz block lets remasks preserve skipped bits."""
+    # With the early exit branch replaced by s_nop, the counted loop still exercises s_mov_b32 exec_lo, s22 before
+    # s_cbranch_execz and s_andn2_b32 + s_mov_b32 exec_lo, s22 inside the skipped block.
+    def trace_loop(lanes, narrow_before=False):
+        outer = {lane for lane in lanes}
+        if narrow_before:
+            # Saving s22 before narrowing EXEC makes s22 a superset of EXEC at s_cbranch_execz, not a subset.
+            saved = set(outer)
+            exec_mask = {lane for lane in outer if lane < 1}
+        else:
+            saved = {lane for lane in outer if lane < 3}
+            exec_mask = set(saved)
+        values = dict.fromkeys(lanes, 9)
+        for counter in range(1, 4):
+            if exec_mask:
+                breaking = {lane for lane in exec_mask if counter > lane}
+                saved -= breaking
+                exec_mask = set(saved)  # s_mov_b32 exec_lo, saved
+                values.update(dict.fromkeys(exec_mask, counter))
+            exec_mask = set(saved)
+        return values
+
+    lanes = range(8)
+    wave = trace_loop(lanes)
+    singles = [trace_loop([lane]) for lane in lanes]
+    assert list(wave.values()) == [s[lane] for lane, s in enumerate(singles)] == [9, 1, 2, 9, 9, 9, 9, 9]
+    # Near-miss wave-vs-singleton disagreement when the saved mask holds skipped lanes: lane 1 skips the block in the
+    # singleton model (9) while the wave enters via lane 0 and re-enables lane 1 through the stale saved mask (1).
+    bad_wave = trace_loop(lanes, narrow_before=True)
+    bad_singles = [trace_loop([lane], narrow_before=True) for lane in lanes]
+    assert bad_wave[1] == 1 and bad_singles[1][1] == 9
+
+    hlsl = translate('O-loop-subset').hlsl_cs()
+    assert 'exec = (s22) & 1;\n        if (exec & 1) v5 = s24;' in hlsl, hlsl
+    # LOOP_BREAK_WORDS drops the T1 exec write refusal while keeping T2 (loop exit crosses a backward s_cbranch_scc0).
+    st = object.__new__(G.Stage)
+    st.kind = 'cs'
+    st.ins = G.decode(LOOP_BREAK_WORDS)
+    st.calculated_pc = {}
+    assert st.execz_refusals() == {
+        0x30: 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
+    }
+
+    # Build straight-line execz checks from llvm-mc-15 verified instructions in SPLICE / LOOP_BREAK_WORDS.
+    W = dict(SPLICE)
+    W.update({
+        's_nop 0': '000080bf',
+        's_and_b32 s22, exec_lo, vcc_lo': '7e6a1687',
+        's_mov_b32 s23, s22': '160397be',
+        's_mov_b32 s24, 1': '810398be',
+        'v_cmpx_gt_u32 s24, v0': '1800a87d',
+        's_andn2_b32 s22, s22, exec_lo': '167e168a',
+        's_andn2_b32 s23, s23, exec_lo': '177e178a',
+        's_mov_b32 exec_lo, s22': '1603febe',
+        's_mov_b32 exec_lo, s23': '1703febe',
+        'v_mov_b32 v5, s24': '18020a7e',
+        's_and_b32 exec_lo, exec_lo, vcc_lo': '7e6a7e87',
+        's_mov_b32 s23, 0': '800397be',
+        's_mov_b32 vcc_lo, -1': 'c103eabe',
+    })
+    end = bytes.fromhex('000081bf')
+    def seq(*lines):
+        return WORDS_A[:STORE_A] + b''.join(bytes.fromhex(W[line]) for line in lines) + end
+
+    # Accepted pre-branch subset setup without re-assigning EXEC directly before s_cbranch_execz.
+    pre_and_copy = seq(
+        's_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 3, v0',
+        's_and_b32 s22, exec_lo, vcc_lo', 's_mov_b32 s23, s22', 's_mov_b32 s24, 1',
+        's_cbranch_execz 4', 'v_cmpx_gt_u32 s24, v0', 's_andn2_b32 s23, s23, exec_lo',
+        's_mov_b32 exec_lo, s23', 'v_mov_b32 v5, s24', 's_mov_b32 exec_lo, s21',
+        'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    assert 'exec = (s23) & 1;' in translate('A', code=pre_and_copy).hlsl_cs()
+    pre_mov = seq(
+        's_mov_b32 s21, exec_lo', 's_cbranch_execz 3', 's_mov_b32 exec_lo, s21',
+        'v_mov_b32 v5, s24', 's_nop 0', 's_mov_b32 exec_lo, s21',
+        'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    assert 'exec = (s21) & 1;' in translate('A', code=pre_mov).hlsl_cs()
+
+    # Near-miss controls: each violates subset provenance and must stay refused as an exec write.
+    narrowed_saveexec = seq(
+        's_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_saveexec_b32 s0, vcc_lo',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, s21', 'v_mov_b32 v5, s24', 's_nop 0',
+        's_or_b32 exec_lo, exec_lo, s0', 'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    narrowed_cmpx = seq(
+        's_mov_b32 s24, 1', 's_mov_b32 s21, exec_lo', 'v_cmpx_gt_u32 s24, v0',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, s21', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    overwritten_before = seq(
+        's_mov_b32 s21, exec_lo', 's_mov_b32 exec_lo, vcc_lo', 's_mov_b32 vcc_lo, -1',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    overwritten_inside = seq(
+        's_mov_b32 s21, exec_lo', 's_mov_b32 exec_lo, vcc_lo',
+        's_cbranch_execz 3', 's_mov_b32 vcc_lo, -1', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    join_one_arm = seq(
+        's_mov_b32 s21, exec_lo', 's_cbranch_scc1 2', 's_mov_b32 exec_lo, vcc_lo', 's_branch 2',
+        's_mov_b32 vcc_lo, -1', 's_nop 0',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    for near_miss in (narrowed_saveexec, narrowed_cmpx, overwritten_before, overwritten_inside, join_one_arm):
+        refused_per_lane('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
+                       lambda code=near_miss: translate('A', code=code).hlsl_cs())
+
+    # Unit checks for 64-bit moves and non-narrowing/invalidating steps in subset_after().
+    assert G.subset_after('s_mov_b64', 's_mov_b64 exec, s[22:23]', {'exec', 'exec_hi', 'scc'}, G.EXEC_SUBSET) == (
+        G.EXEC_SUBSET | {('s22', 0), ('s23', 1)})
+    both = G.subset_after('s_mov_b64', 's_mov_b64 s[22:23], exec', {'s22', 's23', 'scc'}, G.EXEC_SUBSET)
+    assert both == (G.EXEC_SUBSET | {('s22', 0), ('s23', 1)}), both
+    assert G.subset_after('v_cmpx_gt_u32_e32', 'v_cmpx_gt_u32_e32 s24, v0', G.EXEC_KEYS, both) == G.EXEC_SUBSET
+    assert G.subset_after('s_movreld_b32', 's_movreld_b32 s0, s1', {'m0'}, both) == G.EXEC_SUBSET
+    assert G.subset_after('s_or_saveexec_b32', 's_or_saveexec_b32 s21, vcc_lo',
+                          {'s21', 'exec', 'exec_hi', 'scc'}, {('exec', 0), ('exec_hi', 1), ('s22', 0)}) == (
+        {('exec', 0), ('exec_hi', 1), ('s21', 0), ('s22', 0)})
 
 
 def check_mbcnt():
@@ -1679,6 +1823,15 @@ def check_descriptor_scc():
     assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, SCC_LANE_SELECT).hlsl_cs()
 
 
+def legacy_lds_check(name, rsrc2=None, code=None, group=None):
+    # Keep the legacy proof's refusal controls separate from the general retry.
+    _, words, default_rsrc2, local, _ = CASES[name]
+    resource = default_rsrc2 if rsrc2 is None else rsrc2
+    G.check_lds_exchange(G.decode(G.strip_header(code or words)), group or local,
+                         ((resource >> 15) & 0x1ff) * 128)
+    return translate(name, rsrc2=rsrc2, code=code, group=group)
+
+
 def check_lds():
     # Actual instruction substitutions in the LLVM-assembled exchange. Keep the prefix, except where the
     # local-ID proof itself is under test; a different first refusal would hide the regression.
@@ -1711,11 +1864,11 @@ def check_lds():
         (store, '8003febe' + store, 'entry EXEC'),
         (store, '020084bf' + store, 'straight-line'),
     ):
-        refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
+        refused(reason, lambda: legacy_lds_check('F', code=patch(WORDS_F, old, new)))
     base = USER7 | TGID_X
     for units in (0, 65):
-        refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
-    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+        refused('allocation', lambda: legacy_lds_check('F', rsrc2=base | units << 15))
+    refused('1D group', lambda: legacy_lds_check('F', group=(32, 2, 1)))
     # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
     at_end = patch(WORDS_F, store, '000134d804050000')
     at_end = patch(at_end, peer, '0001d8d808000006')
@@ -1741,7 +1894,7 @@ def check_lds():
         (second, second + '800234d804040000', 'two'),                 # third fill
         (second, nop + second, 'bounded'),                            # address proof no longer adjacent
     ):
-        refused(reason, lambda: translate('F-two-fills', code=patch(WORDS_F2, old, new)))
+        refused(reason, lambda: legacy_lds_check('F-two-fills', code=patch(WORDS_F2, old, new)))
 
     pair = '0524dcd806000006'
     # The first result overwrites v6. Both loads must use the address saved before that write.
@@ -1756,7 +1909,7 @@ def check_lds():
         ('0505dcd806000006', 'distinct offsets'),
         ('0000dcd806000006', 'distinct offsets'),
     ):
-        refused(reason, lambda: translate('G', code=patch(WORDS_G, pair, other)))
+        refused(reason, lambda: legacy_lds_check('G', code=patch(WORDS_G, pair, other)))
     # The binary decoder only emits unsigned 8-bit offsets and consecutive pairs. Exercise
     # the proof's operand checks directly for inputs the instruction cannot encode.
     decoded = list(G.decode(WORDS_G))
@@ -1792,6 +1945,10 @@ def check_formatted_loads():
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end).hlsl_cs()
     # A word rewritten after that load, with the target between, is not the loaded descriptor any more.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe000082bf') + LOAD_L + end))
+    # An instruction writes a derived descriptor word to a separate SGPR (s21), leaving operand s[12:15] intact.
+    # The indexed formatted load is refused because the descriptor is modified.
+    refused('indexed load through a modified descriptor',
+            lambda: translate('L-uint', code=prefix + bytes.fromhex('0dff1587ffff00c0') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
     check_formatted_pointer_copy()
@@ -1896,7 +2053,7 @@ def check_off_stores():
     hlsl = lines('v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
                  'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
     assert 'if (exec & 1) u0.Store(a, v5);' in [line.strip() for line in hlsl], hlsl
-    refused('exec write', lambda: lines(
+    refused('buffer store off with data not proven wave-uniform', lambda: lines(
         'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 4', 's_waitcnt lgkmcnt(0)', 's_mov_b32 exec_lo, s21',
         'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0'))
     # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
@@ -1954,11 +2111,14 @@ def check_pair_phi_controls():
     for name, edit, refused_word in (
             ('phi64-vcc', '6b020a7e', 'vcc_hi'),
             ('phi64-vcc', '000086bf', 'vcc'),
-            ('phi64-sgpr', '19020c7e', 's24')):
+            ('phi64-sgpr', '19020c7e', 's25')):
         program = CASES[name][1].replace(bytes.fromhex('c104febe'), bytes.fromhex('c104febe' + edit), 1)
         if refused_word == 'vcc_hi':
             program = program.replace(bytes.fromhex('050001d58300aa01'), b'', 1)
-        refused('definition of ' + refused_word, lambda: translate(name, code=program))
+        if refused_word == 'vcc':
+            refused('definition of vcc', lambda: translate(name, code=program, group=(128, 1, 1)))
+        else:
+            refused(f'v_mov_b32 data operand {refused_word} is a lane mask', lambda: translate(name, code=program))
         decoded = G.decode(program)
         pair = 'vcc' if name == 'phi64-vcc' else 's[24:25]'
         if edit != '000086bf':  # VCC votes are mask operands but cannot follow a per-lane join.
@@ -1969,9 +2129,10 @@ def check_pair_phi_controls():
     high_only = CASES[name][1].replace(bytes.fromhex('050001d583006200'), bytes.fromhex('19020a7e'), 1)
     refused('reads lane mask s25 as numeric data', lambda: translate(name, code=high_only))
 
-    for name, old, wrong in (('phi64-vcc', '8004eabe', 'c104eabe'), ('phi64-ones', 'c10498be', '800498be')):
-        program = CASES[name][1].replace(bytes.fromhex(old), bytes.fromhex(wrong), 1)
-        refused('live where the block joins', lambda: translate(name, code=program))
+    wrong_vcc = CASES['phi64-vcc'][1].replace(bytes.fromhex('8004eabe'), bytes.fromhex('c104eabe'), 1)
+    refused('live where the block joins', lambda: translate('phi64-vcc', code=wrong_vcc, group=(128, 1, 1)))
+    wrong_pair = CASES['phi64-ones'][1].replace(bytes.fromhex('c10498be'), bytes.fromhex('800498be'), 1)
+    refused('incompatible lane mask definitions for s24', lambda: translate('phi64-ones', code=wrong_pair))
 
 
 def check_controls():
@@ -1989,7 +2150,9 @@ def check_controls():
     # Shift by one to retain masked bit 1, or enable extracted bit 3 in a larger group.
     masked = patch(CASES['masked-tid'][1], '8204022c', '8104022c')
     refused('requires a proven uniform source', lambda: translate('masked-tid', code=masked))
-    refused('requires a proven uniform source', lambda: translate('extracted-tid', group=(16, 1, 1)))
+    # Sixteen lanes isolate the entry proof's bit-3 boundary.
+    with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+        refused('requires a proven uniform source', lambda: translate('extracted-tid', group=(16, 1, 1)))
     carry = translate('address-carry').hlsl_cs()
     assert 's21 = (scc ? 1u : 0u);' in carry
     lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
@@ -2024,6 +2187,7 @@ def check_controls():
     check_mbcnt()
     check_execz_exit_run()
     check_execz_loop_break()
+    check_execz_mask_subset()
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
@@ -2187,17 +2351,17 @@ def check_controls():
     for lines in (enter + ['s_cbranch_execz 1', 's_add_u32 s20, s7, 1'] + leave + ['v_mov_b32 v5, s20'],
                   ['v_cmp_gt_u32 vcc_lo, 1, v0', 's_and_saveexec_b32 s0, vcc_lo', 's_cbranch_execz 1',
                    's_add_u32 s20, s7, 1', 's_or_b32 exec_lo, exec_lo, s0', 'v_mov_b32 v5, s20']):
-        refused('s_add_u32 inside a block s_cbranch_execz skips per lane: definition of s20',
+        refused_per_lane('s_add_u32 inside a block s_cbranch_execz skips per lane: definition of s20',
                 lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
     # Dead after the join (s23 and SCC are not read again): accepted, and case J runs such a block on the GPU.
     translate('A', code=splice(*enter, 's_cbranch_execz 1', 's_add_u32 s23, s7, 1', *leave)).hlsl_cs()
     translate('J').hlsl_cs()
     # SCC set in the block and consumed after the join by s_cselect: refused.
-    refused('definition of scc', lambda: translate('A', code=splice(
+    refused_per_lane('definition of scc', lambda: translate('A', code=splice(
         *enter, 's_cbranch_execz 1', 's_add_u32 s23, s7, 1', *leave, 's_cselect_b32 s23, 1, 0')).hlsl_cs())
     # Exec writes inside the block. For a lane whose exec bit is clear on entry, the wave's writes must keep it clear,
     # so its exec at the join is what the model has. Exec set from a compare alone can set it: refused.
-    refused('exec write', lambda: translate('A', code=splice(
+    refused_per_lane('exec write', lambda: translate('A', code=splice(
         *enter, 's_cbranch_execz 3', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 exec_lo, vcc_lo', 's_cbranch_execz 0',
         *leave)).hlsl_cs())
     # A nested if (s_and_saveexec, restored with s_or of the mask saved in the block) keeps it clear: accepted, and
@@ -2205,11 +2369,11 @@ def check_controls():
     translate('A', code=splice(*enter, 's_cbranch_execz 3', 'v_cmp_gt_u32 vcc_lo, 3, v0',
                                's_and_saveexec_b32 s0, vcc_lo', 's_or_b32 exec_lo, exec_lo, s0', *leave)).hlsl_cs()
     translate('H').hlsl_cs()
-    refused('exec write', lambda: translate('A', code=splice(
+    refused_per_lane('exec write', lambda: translate('A', code=splice(
         *enter, 's_cbranch_execz 3', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_saveexec_b32 s0, vcc_lo',
         's_or_b32 exec_lo, exec_lo, s21', *leave)).hlsl_cs())
     # A backward s_cbranch_execz: refused.
-    refused('s_cbranch_execz to a block before it', lambda: translate('A', code=splice(
+    refused_per_lane('s_cbranch_execz to a block before it', lambda: translate('A', code=splice(
         's_add_u32 s23, s7, 1', 's_cbranch_execz 65534')).hlsl_cs())
     # The same live-out block without the branch translates: the scalar write then runs for every lane.
     translate('A', code=splice(*enter, 's_add_u32 s20, s7, 1', *leave, 'v_mov_b32 v5, s20')).hlsl_cs()
@@ -2219,41 +2383,42 @@ def check_controls():
     for cmpx in ('1700a87d', '0000d4d417000200'):  # v_cmpx_gt_u32 s23, v0 in the e32 and e64 forms
         program = bytes.fromhex(prologue + '800397be' '7e0395be' '8300887d' '6a03febe' '010088bf' '07811780' '1503febe'
                                 + cmpx + '82000834' '001070e004000380' '000081bf')
-        refused('s_add_u32 inside a block s_cbranch_execz skips per lane: definition of s23',
+        refused_per_lane('s_add_u32 inside a block s_cbranch_execz skips per lane: definition of s23',
                 lambda program=program: translate('A', code=program).hlsl_cs())
     # A branch inside the block: on the path that skips `s_mov_b32 s21, exec_lo` the restore reads the mask saved
     # before the block, which can set inactive lanes. Exec writes are accepted in straight-line blocks only: refused.
     program = bytes.fromhex(prologue + '82000834' '7e0395be' '8300887d' '6a03febe' '040088bf' '048007bf' '010085bf'
                             '7e0395be' '1503febe' '001070e004000380' '000081bf')
-    refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
+    refused_per_lane('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
             lambda: translate('A', code=program).hlsl_cs())
     # saved tracks register names, not which exec half was copied: two 32-bit copies restored through a 64-bit move
     # would set exec_hi from exec_lo. Refused; the 32-bit restore above stays accepted.
     SPLICE.update({'s_mov_b32 s22, exec_lo': '7e0396be', 's_mov_b32 s23, exec_lo': '7e0397be',
                    's_mov_b64 exec, s[22:23]': '1604febe'})
-    refused('s_mov_b64 inside a block s_cbranch_execz skips per lane: exec write', lambda: translate('A', code=splice(
+    refused('unproven lane mask operand s[22:23]', lambda: translate('A', code=splice(
         *enter, 's_cbranch_execz 3', 's_mov_b32 s22, exec_lo', 's_mov_b32 s23, exec_lo', 's_mov_b64 exec, s[22:23]',
         *leave)).hlsl_cs())
     # Refusals of the block scan with short programs: a branch leaving the block, a vcc definition that a vcc branch
     # reads after the join, and a proven s_setpc_b64 (GETPC, ADD, ADDC, SETPC) inside the block.
     SPLICE['s_branch 2'] = '020082bf'
-    refused('s_branch inside a block s_cbranch_execz skips per lane: branch out of the block', lambda: translate(
+    unproven_flow = 'unproven control flow for scalar lane masks'
+    refused(unproven_flow, lambda: translate(
         'A', code=splice(*enter, 's_cbranch_execz 1', 's_branch 2', *leave)).hlsl_cs())
-    refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc', lambda: translate(
+    refused_per_lane('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc', lambda: translate(
         'A', code=splice(*enter, 's_cbranch_execz 1', 'v_cmp_gt_u32 vcc_lo, 1, v0', *leave,
                          's_cbranch_vccz 1', 'v_mov_b32 v5, s20')).hlsl_cs())
     SPLICE.update({'s_cbranch_execz 4': '040088bf', 's_getpc_b64 s[22:23]': '001f96be', 's_add_u32 s22, s22, 12': '168c1680',
                    's_addc_u32 s23, s23, 0': '17801782', 's_setpc_b64 s[22:23]': '162080be'})
-    refused('s_setpc_b64 inside a block s_cbranch_execz skips per lane: effect outside scalar registers', lambda: translate(
+    refused(unproven_flow, lambda: translate(
         'A', code=splice(*enter, 's_cbranch_execz 4', 's_getpc_b64 s[22:23]', 's_add_u32 s22, s22, 12',
                          's_addc_u32 s23, s23, 0', 's_setpc_b64 s[22:23]', *leave)).hlsl_cs())
     # A proven calculated jump into the block bypasses the copy like a direct branch does: the restore at the target
     # reads a mask the block did not save. GETPC / ADD 20 / ADDC / SETPC lands on the restore; both are refused.
     SPLICE.update({'s_add_u32 s22, s22, 20': '16941680', 's_cbranch_execz 2': '020088bf'})
     block = ['s_cbranch_execz 2', 's_mov_b32 s21, exec_lo', *leave]
-    refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write', lambda: translate(
+    refused('incompatible lane mask definitions for s21', lambda: translate(
         'A', code=splice('s_branch 2', *block)).hlsl_cs())
-    refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write', lambda: translate(
+    refused(unproven_flow, lambda: translate(
         'A', code=splice('s_getpc_b64 s[22:23]', 's_add_u32 s22, s22, 20', 's_addc_u32 s23, s23, 0',
                          's_setpc_b64 s[22:23]', *block)).hlsl_cs())
     # Exec writes in a block with branches. The proof follows, over every path from the branch, which masks keep
@@ -2275,8 +2440,10 @@ def check_controls():
     def block(*lines):
         refusals = []
         SPLICE['s_cbranch_execz %d' % len(lines)] = '%02x0088bf' % len(lines)
-        G.ComputePipeline(splice(*enter, 's_cbranch_execz %d' % len(lines), *lines, *leave), root_blob(), CASES['A'][2],
-                          (2, 3, 4), refusals=refusals)
+        # This census deliberately exercises the per-lane block proof.
+        with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+            G.ComputePipeline(splice(*enter, 's_cbranch_execz %d' % len(lines), *lines, *leave), root_blob(), CASES['A'][2],
+                              (2, 3, 4), refusals=refusals)
         return [reason for reason, _ in refusals]
 
     exec_write = '%s inside a block s_cbranch_execz skips per lane: exec write'
@@ -2404,20 +2571,20 @@ def check_controls():
             ([], ['s_and_b32 s23, vcc_lo, exec_lo'], 's_and_b32', 'exec is written between the join and the read'),
             (['s_mov_b32 s23, vcc_lo'], [], 's_mov_b32', 'lane-mask operation mov'),
             (['s_orn2_b32 s23, exec_lo, vcc_lo'], [], 's_orn2_b32', 'the word is not paired with the exec word'),
-            (['s_and_b32 s23, vcc_lo, exec_hi'], [], 's_and_b32', 'the word is not paired with the exec word'),
             (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'], 's_cbranch_vccz',
              'a data read or a copy'),
             (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32', 'another path enters the join')):
-        refused('%s: read by %s after the join (cause: %s' % (live, name, cause), lambda before=before, after=after: translate(
+        refused_per_lane('%s: read by %s after the join (cause: %s' % (live, name, cause), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
+    refused('unproven lane mask operand exec_hi', lambda: translate(
+        'A', code=splice(*enter, *compare, 's_and_b32 s23, vcc_lo, exec_hi', *leave)).hlsl_cs())
     # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
     # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted. The caller's
     # statement that the program is wave64 keeps that refusal; a program whose exec writes are all 32-bit forms is wave32
     # (G.wave32_exec_proof), vcc_hi is then an ordinary scalar register and the read is accepted.
     wave64_read = lambda size: G.ComputePipeline(  # noqa: E731
         splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo'), root_blob(), CASES['A'][2], CASES['A'][3], wave_size=size)
-    refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
-            'joins: read by s_and_b32 after the join', lambda: wave64_read(64).hlsl_cs())
+    refused('unproven lane mask operand vcc_hi', lambda: wave64_read(64).hlsl_cs())
     assert 'vcc_hi' not in wave64_read(None).hlsl_cs() and 'vcc_hi' not in wave64_read(32).hlsl_cs()
     assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
@@ -2463,13 +2630,16 @@ def check_controls():
            'after the join'
     for prefix, body, join, inner, name in (
             ([], ['s_andn2_b32 s0, s0, s21'], [], 's_andn2_b32', 's_mov_b32'),
-            ([], ['s_mov_b32 s0, 4'], [], 's_mov_b32', 's_mov_b32'),
-            ([], ['s_andn2_b32 s0, s0, exec_lo', 's_mov_b32 s0, 4'], [], 's_andn2_b32', 's_mov_b32'),
             ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_mov_b32 s1, s0'], 's_andn2_b32', 's_mov_b32'),
-            ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_add_u32 s23, s0, 1'], 's_andn2_b32', 's_add_u32'),
             (['s_cbranch_scc1 1'], ['s_andn2_b32 s0, s0, exec_lo'], [], 's_andn2_b32', 's_mov_b32')):
-        refused(inner + kept % name, lambda prefix=prefix, body=body, join=join: translate('A', code=splice(
+        refused_per_lane(inner + kept % name, lambda prefix=prefix, body=body, join=join: translate('A', code=splice(
             *save, *prefix, 's_cbranch_execz %d' % len(body), *body, *join, 's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
+    for body in (['s_mov_b32 s0, 4'], ['s_andn2_b32 s0, s0, exec_lo', 's_mov_b32 s0, 4']):
+        refused('incompatible lane mask definitions for s0', lambda: translate('A', code=splice(
+            *save, 's_cbranch_execz %d' % len(body), *body, 's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
+    refused('s_add_u32 reads lane mask s0 as numeric data', lambda: translate('A', code=splice(
+        *save, 's_cbranch_execz 1', 's_andn2_b32 s0, s0, exec_lo', 's_add_u32 s23, s0, 1',
+        's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
     # The rule's steps on their own: the halves a write keeps, and the reads that keep the lane's bit.
     for line, word, clear, halves in (('s_andn2_b32 s0, s0, exec_lo', 's0', start, {0}),
                                       ('s_andn2_b64 s[0:1], s[0:1], exec', 's1', start, {1}),
@@ -2512,48 +2682,50 @@ def check_controls():
         # the lane select reads the mask's lane bit, which the block set from exec (the model runs the block for
         # every lane it models, and skips it only where exec is clear, leaving the zeroing)
         assert '& 1) ? ' in text and ('vcc = (exec) & 1;' in text or 's20 = ' in text), text
-    # an s_and of exec with data (a group id) is not a lane mask: its lane bit is at bit `lane` in the wave
-    for write in (['s_and_b32 vcc_lo, s7, exec_lo'], ['s_and_b32 s20, s7, exec_lo']):
-        refused('definition of ' + ('vcc' if 'vcc_lo, s7' in write[0] else 's20') + ', live where the block joins',
-                lambda write=write: phi_text(phi(['s_mov_b32 %s, 0' % ('vcc_lo' if 'vcc_lo, s7' in write[0] else 's20')],
-                                                 write, cnd_vcc if 'vcc_lo, s7' in write[0] else cnd_s)))
+    # A group-ID source is a whole word. Group vote projects it before combining it with EXEC.
+    z20 = ['s_mov_b32 s20, 0']
+    mixed = 'incompatible lane mask definitions for s20'
+    refused_per_lane('definition of vcc, live where the block joins', lambda: phi_text(phi(
+        ['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, exec_lo'], cnd_vcc)))
+    refused(mixed, lambda: phi_text(phi(z20, ['s_and_b32 s20, s7, exec_lo'], cnd_s)))
     # s_and with exec reads the lane bit only (the result is a lane mask): accepted
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_b32 s20, vcc_lo, exec_lo'] + cnd_vcc))
     # so does s_and_saveexec with the mask as its source (exec &= the lane bit); with the mask as its destination
     # the saved exec overwrites it, a whole-mask value, and the later lane select is refused
     SPLICE.update({'s_and_saveexec_b32 s22, vcc_lo': '6a3c96be', 's_and_saveexec_b32 vcc_lo, vcc_lo': '6a3ceabe'})
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 s22, vcc_lo'] + cnd_vcc))
-    refused('definition of vcc, live where the block joins', lambda: phi_text(phi(
+    refused('saveexec destination vcc_lo', lambda: phi_text(phi(
         ['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 vcc_lo, vcc_lo'] + cnd_vcc)))
     # Negative controls: each condition removed keeps the refusal of the live definition.
-    live = lambda name: 'definition of %s, live where the block joins' % name
+    live_vcc = 'definition of vcc, live where the block joins'
     wr, rd = ['s_mov_b32 vcc_lo, exec_lo'], cnd_vcc
     for zero in (['s_mov_b32 vcc_lo, -1'], [], ['s_mov_b32 vcc_lo, s7']):  # zeroing with all ones, absent, not zero
-        refused(live('vcc'), lambda zero=zero: phi_text(phi(zero, wr, rd)))
+        refused_per_lane(live_vcc, lambda zero=zero: phi_text(phi(zero, wr, rd)))
     # a branch target between the zeroing and the branch: the path through the label did not run the zeroing
     SPLICE['s_cbranch_execz 6'] = '060088bf'
-    refused(live('vcc'), lambda: phi_text(splice(*enter, 's_cbranch_scc1 1', 's_mov_b32 vcc_lo, 0', 's_cbranch_execz 1',
+    refused_per_lane(live_vcc, lambda: phi_text(splice(*enter, 's_cbranch_scc1 1', 's_mov_b32 vcc_lo, 0', 's_cbranch_execz 1',
                                                  *wr, *leave, *rd)))
-    refused(live('vcc'), lambda: phi_text(splice(*enter, 's_mov_b32 vcc_lo, 0', 's_cbranch_scc1 0', 's_cbranch_execz 1',
+    refused_per_lane(live_vcc, lambda: phi_text(splice(*enter, 's_mov_b32 vcc_lo, 0', 's_cbranch_scc1 0', 's_cbranch_execz 1',
                                                  *wr, *leave, *rd)))
     # no zeroing of s20 at all; a block write that is an s_and without exec; the mask read as a data word
-    refused(live('s20'), lambda: phi_text(phi([], ['s_mov_b32 s20, exec_lo'], cnd_s)))
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, s7'], rd)))
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, ['v_cndmask_b32 v5, vcc_lo, v6, vcc_lo'])))
+    refused(mixed, lambda: phi_text(phi([], ['s_mov_b32 s20, exec_lo'], cnd_s)))
+    refused_per_lane(live_vcc, lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, s7'], rd)))
+    refused('v_cndmask_b32 data operand vcc_lo is a lane mask', lambda: phi_text(
+        phi(['s_mov_b32 vcc_lo, 0'], wr, ['v_cndmask_b32 v5, vcc_lo, v6, vcc_lo'])))
     # a branch between the zeroing and the branch, even one to the join; and a branch inside the block (not straight)
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, between=['s_cbranch_scc1 2'])))
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=['s_cbranch_scc1 0'])))
+    refused_per_lane(live_vcc, lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, between=['s_cbranch_scc1 2'])))
+    refused_per_lane(live_vcc, lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=['s_cbranch_scc1 0'])))
     # a write in the block that is not from exec, or a second write, or a 64-bit write
     for inside in (['s_mov_b32 vcc_lo, -1'], ['s_mov_b32 vcc_lo, s7']):
-        refused(live('vcc'), lambda inside=inside: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=inside)))
+        refused_per_lane(live_vcc, lambda inside=inside: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=inside)))
     # (a vcc_hi write does not translate at all, so the 64-bit move is the wide control)
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b64 vcc, exec'], rd)))
+    refused_per_lane(live_vcc, lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b64 vcc, exec'], rd)))
     # whole-mask reads after the join see the other lanes' bits, which the one-lane model lacks: refused
     for read in (['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'] + cnd_vcc, ['s_mov_b32 s20, vcc_lo'] + cnd_vcc):
-        refused(live('vcc'), lambda read=read: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, read)))
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
-                                              ['s_cmp_eq_u32 s20, 0'] + cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
+        refused_per_lane(live_vcc, lambda read=read: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, read)))
+    refused('s_cmp_eq_u32 reads lane mask s20 as numeric data', lambda: phi_text(
+        phi(z20, ['s_mov_b32 s20, exec_lo'], ['s_cmp_eq_u32 s20, 0'] + cnd_s)))
+    refused(mixed, lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
                                               ['s_mov_b32 s7, s20'] + cnd_s)))
     # A block that leaves the mask bit of a lane it skips unchanged is exact whatever M held before the branch:
     # `s_andn2 M, M, exec_lo` and `s_or M, M, T` with T exec-masked in the block (the compiler's i1 phi with a
@@ -2570,43 +2742,45 @@ def check_controls():
     SPLICE.update({'s_and_b32 s22, vcc_lo, exec_lo': '6a7e1687', 's_mov_b32 s20, 16': '9003 94be'.replace(' ', ''),
                    's_orn2_b32 s20, vcc_lo, exec_lo': '6a7e148b'})
     blend = ['s_andn2_b32 s20, s20, exec_lo', *cmp_t, 's_or_b32 s20, s20, s22']
-    z20, zv = ['s_mov_b32 s20, 0'], ['s_mov_b32 vcc_lo, 0']
+    zv = ['s_mov_b32 vcc_lo, 0']
     for zero, write, read in ((z20, blend, cnd_s), (z20, blend[:1], cnd_s),
                               (zv, ['s_andn2_b32 vcc_lo, vcc_lo, exec_lo', 's_and_b32 s22, vcc_lo, exec_lo',
                                     's_or_b32 vcc_lo, vcc_lo, s22'], cnd_vcc)):
         phi_text(phi(zero, write, read))
     # ANDing a numeric word with EXEC does not turn it into this lane's projected bit.
-    refused(live('s20'), lambda: phi_text(phi(['s_and_b32 s20, s7, exec_lo'], blend[:1], cnd_s)))
+    refused_per_lane('definition of s20, live where the block joins', lambda: phi_text(
+        phi(['s_and_b32 s20, s7, exec_lo'], blend[:1], cnd_s)))
     phi_text(phi(['s_and_b32 s20, vcc_lo, exec_lo'], blend[:1], cnd_s))
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc))       # compare into a zeroed M
     phi_text(phi(['s_mov_b32 s20, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_orn2_b32 s20, vcc_lo, exec_lo'], cnd_s))  # orn2
     # controls: the same writes without their set-up, an unmasked term, M not the first source, mixed classes,
     # M or an operand that is not a lane mask, and a whole-mask read after a preserving block
-    refused(live('vcc'), lambda: phi_text(phi([], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
-    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
+    refused_per_lane(live_vcc, lambda: phi_text(phi([], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
+    refused_per_lane(live_vcc, lambda: phi_text(phi(['s_mov_b32 vcc_lo, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
     for zero in ([], z20):
-        refused(live('s20'), lambda zero=zero: phi_text(phi(zero, ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_mov_b32 s20, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(z20, ['s_mov_b32 s20, exec_lo', 's_orn2_b32 s20, s7, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], *cmp_t, 's_or_b32 s20, s20, s7'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, exec_lo', blend[3]], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, s7', blend[3]], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(z20, ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
+        refused(mixed, lambda zero=zero: phi_text(phi(zero, ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_mov_b32 s20, exec_lo'], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, ['s_mov_b32 s20, exec_lo', 's_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, [blend[0], *cmp_t, 's_or_b32 s20, s20, s7'], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, exec_lo', blend[3]], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, s7', blend[3]], cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
     # A compare-derived operand does not make the classes mixable: a zero write (s_mov M, exec_lo) and a ones write
     # (s_orn2 with exec) in one block are refused after either setting. `s_andn2 M, M, X` keeps M's skipped bits only for
     # X == exec_lo; with a compare mask it clears bits of lanes the model skips.
     SPLICE.update({'s_andn2_b32 s20, s20, vcc_lo': '146a148a'})
     mixed_cmp = ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 s20, exec_lo', 's_orn2_b32 s20, vcc_lo, exec_lo']
     for setting in (z20, ['s_mov_b32 s20, -1']):
-        refused(live('s20'), lambda setting=setting: phi_text(phi(setting, mixed_cmp, cnd_s)))
+        refused(mixed, lambda setting=setting: phi_text(phi(setting, mixed_cmp, cnd_s)))
     for setting in (z20, [], ['s_mov_b32 s20, -1']):
-        refused(live('s20'), lambda setting=setting: phi_text(
+        refused(mixed, lambda setting=setting: phi_text(
             phi(setting, ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_andn2_b32 s20, s20, vcc_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi([], blend, cnd_s)))                       # M unknown before the block
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 16'], blend, cnd_s)))    # M holds data, not lane bits
-    for read in (['s_cmp_eq_u32 s20, 0'] + cnd_s, ['s_mov_b32 s7, s20'] + cnd_s):
-        refused(live('s20'), lambda read=read: phi_text(phi(z20, blend, read)))
+    refused(mixed, lambda: phi_text(phi([], blend, cnd_s)))                       # M unknown before the block
+    refused(mixed, lambda: phi_text(phi(['s_mov_b32 s20, 16'], blend, cnd_s)))    # M holds data, not lane bits
+    refused('s_cmp_eq_u32 reads lane mask s20 as numeric data',
+            lambda: phi_text(phi(z20, blend, ['s_cmp_eq_u32 s20, 0'] + cnd_s)))
+    refused(mixed, lambda: phi_text(phi(z20, blend, ['s_mov_b32 s7, s20'] + cnd_s)))
     # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
@@ -2619,7 +2793,8 @@ def check_controls():
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
     # A readfirstlane of a buffer load at a uniform address translates; at a per-lane address it is refused.
     assert 's20 = v1;' in translate('N').hlsl_cs()
-    refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
+    refused_per_lane('v_readfirstlane_b32 requires a proven uniform source',
+                     lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
     print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 
@@ -2677,6 +2852,8 @@ CONTROLS = {
     'm-else-unswitched': ('M', 'exec = (s0 & ~exec) & 1;', 'exec = (s0) & 1;'),  # the then lanes run the else arm
     'n-unmasked': ('NM', 's23 = (vcc & exec) & 1;', 's23 = (vcc) & 1;'),  # lanes 6 and 7 store with their stale vcc
     'o-mask-kept': ('O', 's0 = (s0 & ~exec) & 1;', 's0 = (s0) & 1;'),  # lanes 0-2 keep their bit and store
+    'o-subset-remask-dropped': ('O-loop-subset', 'exec = (s22) & 1;\n        if (exec & 1) v5 = s24;',
+                                'exec = 1u;\n        if (exec & 1) v5 = s24;'),  # broken lanes overwrite v5
     'k-block-entered': ('K', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipped waves run it
     'p-dropped-andn2': ('P', 's23 = (s23 & ~exec) & 1;', 's23 = (s23) & 1;'),  # an entering lane keeps its old bit
     'p-dropped-or': ('P', 's23 = (s23 | s22) & 1;', 's23 = (s23) & 1;'),  # an entering lane loses its compare bit

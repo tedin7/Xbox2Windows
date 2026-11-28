@@ -53,7 +53,7 @@ int main()
         {50, "OMSetRenderTargets"},
         {52, "ClearRenderTargetView"},
         {61, "ExecuteIndirect"},
-        {139, "Reset"},
+        {139, "Reset (console)"},
     };
     for (const auto& entry : handled) expect(is(entry.first, entry.second), "slot " + std::to_string(entry.first) + " is " + entry.second);
 
@@ -61,12 +61,16 @@ int main()
     const std::vector<std::pair<int, const char*>> between = {
         {0, "QueryInterface"}, {1, "AddRef"}, {2, "Release"}, {3, "GetPrivateData"}, {4, "SetPrivateData"},
         {5, "SetPrivateDataInterface"}, {6, "SetName"}, {8, "GetType"},
+        {10, "Reset"}, {11, "ClearState"},
         {14, "Dispatch"}, {15, "CopyBufferRegion"}, {16, "CopyTextureRegion"}, {17, "CopyResource"}, {18, "CopyTiles"},
         {19, "ResolveSubresource"}, {24, "OMSetStencilRef"},
+        {27, "ExecuteBundle"},
+        {28, "BeginQuery"}, {29, "EndQuery"}, {30, "ResolveQueryData"}, {31, "SetPredication"},
+        {56, "SetMarker"}, {57, "BeginEvent"}, {58, "EndEvent"},
     };
     for (const auto& entry : between) expect(is(entry.first, entry.second), "slot " + std::to_string(entry.first) + " is " + entry.second);
 
-    // From SetDescriptorHeaps on the console slot is the desktop slot plus four: 28 desktop methods in a row.
+    // From SetDescriptorHeaps through DiscardResource the console slot is the desktop slot plus four.
     const std::vector<const char*> shifted = {
         "SetDescriptorHeaps", "SetComputeRootSignature", "SetGraphicsRootSignature", "SetComputeRootDescriptorTable",
         "SetGraphicsRootDescriptorTable", "SetComputeRoot32BitConstant", "SetGraphicsRoot32BitConstant",
@@ -74,19 +78,21 @@ int main()
         "SetGraphicsRootConstantBufferView", "SetComputeRootShaderResourceView", "SetGraphicsRootShaderResourceView",
         "SetComputeRootUnorderedAccessView", "SetGraphicsRootUnorderedAccessView", "IASetIndexBuffer", "IASetVertexBuffers",
         "SOSetTargets", "OMSetRenderTargets", "ClearDepthStencilView", "ClearRenderTargetView",
-        "ClearUnorderedAccessViewUint", "ClearUnorderedAccessViewFloat", "DiscardResource", "BeginQuery", "EndQuery",
-        "ResolveQueryData", "SetPredication"};
-    expect(shifted.size() == 28, "the shifted run has 28 methods");
+        "ClearUnorderedAccessViewUint", "ClearUnorderedAccessViewFloat", "DiscardResource"};
+    expect(shifted.size() == 24, "the shifted run has 24 methods");
     for (std::size_t i = 0; i < shifted.size(); ++i)
         expect(is(32 + static_cast<int>(i), shifted[i]), "slot " + std::to_string(32 + i) + " is " + shifted[i]);
-    // The run ends at 59 with the desktop slot 55; the desktop methods after it (56 to 59, plus four) are not named.
-    expect(is(59, "SetPredication"), "slot 59 is the desktop slot 55 plus four");
+    // The run ends at 55 with DiscardResource; 56 to 58 keep the desktop marker names.
+    expect(is(55, "DiscardResource"), "slot 55 is the desktop slot 51 plus four");
+    expect(is(56, "SetMarker"), "slot 56 is SetMarker");
+    expect(is(57, "BeginEvent"), "slot 57 is BeginEvent");
+    expect(is(58, "EndEvent"), "slot 58 is EndEvent");
 
     // Slots that are not known stay unnamed: a name there would be a guess.
-    // 10 and 11: this console list resets through 139. 27 to 31: the remaining unconfirmed methods before the shift.
-    // Other slots from 60 up have unconfirmed meanings. -1 and 4096: outside the table.
-    std::vector<int> unknown = {10, 11, 27, 28, 29, 30, 31, 60, 62, 63, 64, 66, 68, 70, 71, 72, 74, 75, 100, 126,
-                                131, 132, 138, 140, 142, 146, 255, 256, 999, 4096, -1, -100};
+    // 59 and 60 are console-only markers; 62 and up are console-only methods not named in this table.
+    // 148 is the console allocation method and stays unnamed. -1 and 4096: outside the table.
+    std::vector<int> unknown = {59, 60, 62, 63, 64, 66, 68, 70, 71, 72, 74, 75, 100, 126,
+                                131, 132, 138, 140, 142, 146, 147, 148, 149, 255, 256, 999, 4096, -1, -100};
     for (const int slot : unknown) expect(x2w_list_slots::name(slot) == nullptr, "slot " + std::to_string(slot) + " has no name");
 
     // Names are unique within the table and never empty, so a log line says which method it was.
@@ -98,7 +104,7 @@ int main()
         for (const std::string& earlier : seen) expect(earlier != got, std::string("the name ") + got + " is used once");
         seen.push_back(got);
     }
-    expect(seen.size() == 10 + 15 + 28 + 2, "the named slots are 0 to 9, 12 to 26, 32 to 59, 61 and 139");
+    expect(seen.size() == 61, "the named slots are 0 to 58, 61 and 139");
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

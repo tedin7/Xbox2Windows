@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/resident_pages.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
@@ -24,6 +25,10 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <typeinfo>
+#ifdef X2W_XCRDAPI_TEST_CONTROLS
+#include <stdexcept>
+#endif
 #include <unordered_map>
 #include <vector>
 
@@ -179,55 +184,53 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
-// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
-// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
-// destination's size, not the region's. Reads attributes only; no page is touched.
-static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
-{
-    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
-    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
-    while (page < end) {
-        DWORD count = 0;
-        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
-        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
-        for (DWORD i = 0; i < count; ++i) {
-            const auto& page_info = pages[i].VirtualAttributes;
-            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
-            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
-                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
-                return false;
-        }
-    }
-    return true;
-}
-
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
 // no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
 // their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
-// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
-// large regions: each query scans to the end of the region (#2684).
+// destination to the region walk (x2w_local::committed_writable), which judges it region by region. That walk
+// is slow on the title's large regions: each query scans to the end of the region (#2684). Lazily mapped
+// physical pages (X2W_XMEM_LAZY_COMMIT) are committed first.
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
-    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    const std::uintptr_t end = cursor + bytes;
-    if (resident_read_write(cursor, end)) return true;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return false;
-        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= cursor) return false;
-        cursor = region_end;
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - start) return false;
+    x2w_local::commit_lazy(destination, bytes);
+    if (x2w_local::resident_read_write(start, start + bytes)) return true;
+    return x2w_local::committed_writable(destination, bytes);
+}
+
+// Copies bytes of data into a plain-memory destination whose whole declared capacity must be writable. With
+// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy, under XMem's mapping mutex when
+// either range overlaps one of its runs, so an XMem run break (the pages of a shared view unmapped and mapped again)
+// can neither make a mapped destination look reserved nor take it away during the copy. Without xmem.dll the check
+// and the copy run here.
+// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); ERROR_INVALID_ADDRESS when
+// the copy faulted (part of the destination may be written); ERROR_INVALID_PARAMETER for an invalid request.
+static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)
+{
+    using CopyToDestination = BOOL(WINAPI*)(void*, SIZE_T, const void*, SIZE_T);
+    static const CopyToDestination copy = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<CopyToDestination>(GetProcAddress(xmem, "x2w_xmem_copy_to_destination")) : nullptr;
+    }();
+    if (copy) return copy(destination, capacity, data, bytes) ? ERROR_SUCCESS : GetLastError();
+    if (!destination_writable(destination, capacity)) return ERROR_NOACCESS;
+    std::memcpy(destination, data, bytes);
+    return ERROR_SUCCESS;
+}
+
+// The outcome logged for a copy that copy_to_destination did not complete, by its error. text holds the last case.
+static const char* copy_outcome(DWORD error, char (&text)[40])
+{
+    switch (error) {
+    case ERROR_NOACCESS: return "destination not writable";
+    case ERROR_INVALID_ADDRESS: return "copy faulted (part of the destination may be written)";
+    case ERROR_INVALID_PARAMETER: return "invalid copy request";
+    default:
+        std::snprintf(text, sizeof(text), "copy failed (error %lu)", static_cast<unsigned long>(error));
+        return text;
     }
-    return true;
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
@@ -999,6 +1002,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    char copy_failure[40];  // copy_outcome's text for an error it does not name
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
@@ -1129,27 +1133,18 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (input) {
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
-                std::vector<unsigned char> decoded(destination_size);
-                std::size_t produced = 0;
-                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
-                    output = std::move(decoded);
-                    data = output.data();
-                    decode_length = produced;
-                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
-                    bcpack_decoded = true;
-                } else {
-                    outcome = "bcpack failed";
-                    failure = StorageFailure::bcpack;
-                    data = nullptr;
-                }
-            } else {
-                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
-                // title's loading continues. Counted as bcpack_blank.
-                output.assign(destination_size, 0);
+            std::vector<unsigned char> decoded(destination_size);
+            std::size_t produced = 0;
+            if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                output = std::move(decoded);
                 data = output.data();
-                decode_length = destination_size;
-                outcome = "BCPack not decoded: zero-filled";
+                decode_length = produced;
+                outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                bcpack_decoded = true;
+            } else {
+                outcome = "bcpack failed";
+                failure = StorageFailure::bcpack;
+                data = nullptr;
             }
         }
         if (data) {
@@ -1198,11 +1193,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // The title's destination can be smaller in memory than its declared capacity (#870:
                 // a write fault inside this copy). Judge the whole declared capacity before the first
                 // byte is written, so a refusal leaves every page untouched.
-                if (destination_writable(destination, destination_capacity)) {
-                    std::memcpy(destination, data, decode_length);
-                } else {
-                    outcome = "destination not writable";
-                    failure = StorageFailure::destination_not_writable;
+                const DWORD copied = copy_to_destination(destination, destination_capacity, data, decode_length);
+                if (copied != ERROR_SUCCESS) {
+                    outcome = copy_outcome(copied, copy_failure);
+                    failure = copied == ERROR_NOACCESS ? StorageFailure::destination_not_writable : StorageFailure::other;
                     data = nullptr;
                     written = false;
                 }
@@ -1308,11 +1302,28 @@ bool deferred_pending(const QueueWork& work);
 
 void discard_entries(QueueWork* work) noexcept;
 
-DWORD WINAPI queue_worker(void* parameter)
+void log_worker_exception(volatile LONG& reported, const char* role, const std::exception* error) noexcept
+{
+    if (InterlockedCompareExchange(&reported, 1, 0) != 0) return;
+    char message[401]{};
+    const char* what = error ? error->what() : "";
+    for (std::size_t i = 0; i < sizeof(message) - 1 && what[i]; ++i)
+        message[i] = what[i] == '\r' || what[i] == '\n' ? ' ' : what[i];
+    x2w_local::logf("x2w-xcrdapi worker exception: role=%s type=%.400s what=\"%s\"",
+                    role, error ? typeid(*error).name() : "unknown", message);
+}
+
+volatile LONG queue_exception_reported;
+volatile LONG heartbeat_exception_reported;
+
+DWORD WINAPI queue_worker(void* parameter) try
 {
     on_queue_worker = true;
     auto* const self = static_cast<Object*>(parameter);
     QueueWork& work = *self->work;
+#ifdef X2W_XCRDAPI_TEST_CONTROLS
+    static volatile LONG injected;
+#endif
     for (;;) {
         Entry entry;
         {
@@ -1325,6 +1336,11 @@ DWORD WINAPI queue_worker(void* parameter)
             work.submitted.pop_front();
             if (hdd_mode()) hdd_look_ahead(work);
         }
+#ifdef X2W_XCRDAPI_TEST_CONTROLS
+        if (entry.type == Entry::request && x2w_local::env_on("X2W_TEST_XCRDAPI_THROW") &&
+            InterlockedCompareExchange(&injected, 1, 0) == 0)
+            throw std::runtime_error("x2w test worker throw");
+#endif
         // Buffers are sized from request fields; a failed allocation fails that request instead of
         // ending the process (an exception leaving a thread calls terminate). The handlers only note
         // the reason in a fixed buffer: the request's buffers are already freed when a handler runs,
@@ -1373,6 +1389,12 @@ DWORD WINAPI queue_worker(void* parameter)
     }
     InterlockedDecrement(&live_workers);
     return 0;
+} catch (const std::exception& e) {
+    log_worker_exception(queue_exception_reported, "queue", &e);
+    throw;
+} catch (...) {
+    log_worker_exception(queue_exception_reported, "queue", nullptr);
+    throw;
 }
 
 // Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
@@ -2005,6 +2027,91 @@ extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_workers()
     return static_cast<unsigned long>(live_workers);
 }
 
+DWORD WINAPI heartbeat_worker(void*) try
+{
+    LONG last = -1;
+    LONG64 last_read = 0, last_inflated = 0;
+    DiskStats last_disk;
+    MemorySample last_memory;
+    const DWORD interval_ms = heartbeat_interval_ms();
+    for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
+        const int second = static_cast<int>(elapsed_ms / 1000);
+        Sleep(interval_ms);
+        // Sample the counters once for every line of this report, even while the worker is reporting
+        // new failures.
+        StorageFailureCounts failure_counts;
+        const LONG failed = sample_failure_counts(failure_counts);
+        PageEndCounts page_ends;
+        sample_page_end_counts(page_ends);
+        const LONG total = requests_done + requests_compressed + failed;
+        const LONG total2 = total + requests_bcpack_blank;
+        {
+            // Every report, changed or not: "loading slow" (pending shrinks, MB/s above 0) against "loading stuck"
+            // (pending flat, oldest age growing, 0 MB/s).
+            const LONG64 read_now = bytes_read_total, inflated_now = bytes_inflated_total;
+            char progress[256];
+            format_progress(progress, sizeof progress, second, requests_enqueued, total2 - failed, failed, read_now - last_read,
+                            inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
+            log("%s", progress);
+            const DiskStats disk_now = disk_snapshot();
+            const LONG64 frequency = disk_frequency();
+            char disk_line[512];
+            format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
+                        frequency > 0 ? static_cast<double>(frequency) : 1.0);
+            log("%s", disk_line);
+            if (hdd_mode()) {
+                const x2w_startup::ReadCache::Counters c = hdd_cache().counters();
+                log("x2w-dstorage hdd %d s: cache hits %ld misses %ld (waited for a read in progress %ld); prefetch groups %ld, disk reads saved by "
+                    "merging %ld, prefetched %lld KiB, unused entries dropped %ld, failed group reads %ld", second, c.hits, c.misses,
+                    c.waited, c.groups, c.reads_saved, static_cast<long long>(c.prefetched_bytes >> 10), c.evicted_unused, c.failed);
+            }
+            last_disk = disk_now;
+            last_read = read_now;
+            last_inflated = inflated_now;
+        }
+        const MemorySample sample = memory_sample();
+        const ULONGLONG peak_mib = sample.peak_commit >> 20;
+        const ULONGLONG current_mib = sample.commit >> 20;
+        if (total2 != last || peak_mib != (last_memory.peak_commit >> 20) ||
+            current_mib != (last_memory.commit >> 20) || sample.sections != last_memory.sections ||
+            sample.commit_known != last_memory.commit_known || sample.sections_known != last_memory.sections_known) {
+            char memory[96];
+            if (sample.commit_known)
+                std::snprintf(memory, sizeof(memory), "commit peak=%llu MiB current=%llu MiB",
+                              static_cast<unsigned long long>(peak_mib),
+                              static_cast<unsigned long long>(current_mib));
+            else
+                std::snprintf(memory, sizeof(memory), "commit unknown");
+            char section_text[24];
+            if (sample.sections_known)
+                std::snprintf(section_text, sizeof(section_text), "%llu",
+                              static_cast<unsigned long long>(sample.sections));
+            else
+                std::snprintf(section_text, sizeof(section_text), "unknown");
+            // The counts keep "inflated=%ld failed=%ld" for tools/startup/live_view.py (format_request_counts);
+            // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
+            char counts[128];
+            format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, failed,
+                                  requests_bcpack_blank);
+            log("x2w-dstorage heartbeat %d s: requests %s; page tokens 0 at enqueue=%ld, "
+                "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, counts,
+                zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory, section_text);
+            char causes[384];
+            if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
+            char ends[384];
+            if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
+            last = total2;
+            last_memory = sample;
+        }
+    }
+} catch (const std::exception& e) {
+    log_worker_exception(heartbeat_exception_reported, "heartbeat", &e);
+    throw;
+} catch (...) {
+    log_worker_exception(heartbeat_exception_reported, "heartbeat", nullptr);
+    throw;
+}
+
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
 {
     char id[48];
@@ -2021,83 +2128,7 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
     // what the run spends (#1199), including while requests are stalled. A second line splits the
     // failed requests by cause, a third the page-destination requests by end (#1198).
-    static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
-        LONG last = -1;
-        LONG64 last_read = 0, last_inflated = 0;
-        DiskStats last_disk;
-        MemorySample last_memory;
-        const DWORD interval_ms = heartbeat_interval_ms();
-        for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
-            const int second = static_cast<int>(elapsed_ms / 1000);
-            Sleep(interval_ms);
-            // Sample the counters once for every line of this report, even while the worker is reporting
-            // new failures.
-            StorageFailureCounts failure_counts;
-            const LONG failed = sample_failure_counts(failure_counts);
-            PageEndCounts page_ends;
-            sample_page_end_counts(page_ends);
-            const LONG total = requests_done + requests_compressed + failed;
-            const LONG total2 = total + requests_bcpack_blank;
-            {
-                // Every report, changed or not: "loading slow" (pending shrinks, MB/s above 0) against "loading stuck"
-                // (pending flat, oldest age growing, 0 MB/s).
-                const LONG64 read_now = bytes_read_total, inflated_now = bytes_inflated_total;
-                char progress[256];
-                format_progress(progress, sizeof progress, second, requests_enqueued, total2 - failed, failed, read_now - last_read,
-                                inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
-                log("%s", progress);
-                const DiskStats disk_now = disk_snapshot();
-                const LONG64 frequency = disk_frequency();
-                char disk_line[512];
-                format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
-                            frequency > 0 ? static_cast<double>(frequency) : 1.0);
-                log("%s", disk_line);
-                if (hdd_mode()) {
-                    const x2w_startup::ReadCache::Counters c = hdd_cache().counters();
-                    log("x2w-dstorage hdd %d s: cache hits %ld misses %ld (waited for a read in progress %ld); prefetch groups %ld, disk reads saved by "
-                        "merging %ld, prefetched %lld KiB, unused entries dropped %ld, failed group reads %ld", second, c.hits, c.misses,
-                        c.waited, c.groups, c.reads_saved, static_cast<long long>(c.prefetched_bytes >> 10), c.evicted_unused, c.failed);
-                }
-                last_disk = disk_now;
-                last_read = read_now;
-                last_inflated = inflated_now;
-            }
-            const MemorySample sample = memory_sample();
-            const ULONGLONG peak_mib = sample.peak_commit >> 20;
-            const ULONGLONG current_mib = sample.commit >> 20;
-            if (total2 != last || peak_mib != (last_memory.peak_commit >> 20) ||
-                current_mib != (last_memory.commit >> 20) || sample.sections != last_memory.sections ||
-                sample.commit_known != last_memory.commit_known || sample.sections_known != last_memory.sections_known) {
-                char memory[96];
-                if (sample.commit_known)
-                    std::snprintf(memory, sizeof(memory), "commit peak=%llu MiB current=%llu MiB",
-                                  static_cast<unsigned long long>(peak_mib),
-                                  static_cast<unsigned long long>(current_mib));
-                else
-                    std::snprintf(memory, sizeof(memory), "commit unknown");
-                char section_text[24];
-                if (sample.sections_known)
-                    std::snprintf(section_text, sizeof(section_text), "%llu",
-                                  static_cast<unsigned long long>(sample.sections));
-                else
-                    std::snprintf(section_text, sizeof(section_text), "unknown");
-                // The counts keep "inflated=%ld failed=%ld" for tools/startup/live_view.py (format_request_counts);
-                // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
-                char counts[128];
-                format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, failed,
-                                      requests_bcpack_blank);
-                log("x2w-dstorage heartbeat %d s: requests %s; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, counts,
-                    zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory, section_text);
-                char causes[384];
-                if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
-                char ends[384];
-                if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
-                last = total2;
-                last_memory = sample;
-            }
-        }
-    }, nullptr, 0, nullptr);
+    static HANDLE heartbeat = CreateThread(nullptr, 0, heartbeat_worker, nullptr, 0, nullptr);
     (void)heartbeat;
     static Object* instance = make(factory);
     InterlockedIncrement(&instance->refs);

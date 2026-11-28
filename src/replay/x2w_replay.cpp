@@ -10,7 +10,8 @@
 // The title's frame-event waits (device slot 80) are played without their timeout, so they do not sleep to the title's
 // frame interval (a loading prefix spends most of its time there); --pace on keeps the recorded timeout.
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
-// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
+// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), passes.jsonl
+// (X2W_PASS_STATS=1: the stand-in's pass thermometer, with the recorded call of each pass), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // recording could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
 // 77 no D3D12 adapter.
@@ -59,6 +60,9 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
     void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
+extern "C" __declspec(dllimport) long long x2w_d3d12_magenta_draws();
+extern "C" __declspec(dllimport) void x2w_d3d12_pass_stats_call(unsigned long long call);
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
 namespace x2w_replay {
@@ -92,6 +96,12 @@ struct Range {
 };
 
 struct Player {
+    // X2W_REPLAY_INFER_EXECUTE=1 (opt-in, for recordings made before the recorder captured the list array of the title's
+    // ExecuteCommandLists on queue slot 35): a queue submit call whose array the file does not hold submits the next
+    // closed command lists in Close order. A recorded array always wins; this is a reconstruction, not recorded data.
+    std::vector<u64> closed_lists;
+    std::vector<u64> exec_array;
+    std::vector<std::pair<long long, long long>> draw_series;  // cumulative translated draws drawn / not drawn at each present
     UINT recorded_increments[4] = {};
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
@@ -120,6 +130,7 @@ struct Player {
     // The prefix: the calls before the window's first present (Recording::window_seq), how many were played, how long.
     u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0, prefix_left_out = 0;
     double prefix_seconds = 0;
+    u64 gpu_restored = 0, gpu_failed = 0, gpu_untranslated = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
 
@@ -132,10 +143,10 @@ struct Player {
     u64 page_target(u64 address, u64& bytes) const
     {
         auto above = handles.upper_bound(address);
-        if (above == handles.begin()) return address;
+        if (above == handles.begin()) return 0;
         --above;
         const u64 offset = address - above->first;
-        if (offset >= above->second.span) return address;
+        if (offset >= above->second.span) return 0;
         if (bytes > above->second.span - offset) bytes = above->second.span - offset;
         ++page_translated;
         return above->second.to + offset;
@@ -229,7 +240,9 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
         // Descriptor writes rebuild the backing in place. Other arguments on the same allocation granule still need their blobs.
-        if (p.descriptor_backing(m.address) || span_contains(page_replay().map_spans, m.address)) {
+        const auto& pages = page_replay();
+        if (p.descriptor_backing(m.address) ||
+            (span_contains(pages.map_spans, m.address) && pages.reserved(m.address, m.bytes))) {
             copies[i] = reinterpret_cast<unsigned char*>(m.address);
             ++p.title_memory_args;
             continue;
@@ -481,6 +494,33 @@ int written_arg(const CallRecord& c)
     return x2w_replay_slots::output_arg(c.kind, c.slot);
 }
 
+// X2W_REPLAY_INFER_EXECUTE=1: see Player::closed_lists. Close (list slot 9) queues the list; a queue submit call (slot 10 or the
+// title's slot 35) with a count of 1 to 64 and no recorded array takes that many queued lists, oldest first.
+void infer_execute(Player& p, const CallRecord& c, Played& call)
+{
+    static const bool enabled = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_REPLAY_INFER_EXECUTE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    constexpr std::uint16_t list_object_kind = 4, close_slot = 9, execute_slot = 10, title_execute_slot = 35;
+    if (!enabled) return;
+    if (c.kind == list_object_kind && c.slot == close_slot) {
+        p.closed_lists.push_back(call.self);
+        return;
+    }
+    if (c.kind != queue_kind || (c.slot != execute_slot && c.slot != title_execute_slot) || call.top[1] ||
+        c.args[0] < 1 || c.args[0] > 64 || p.closed_lists.size() < c.args[0])
+        return;
+    const std::size_t n = static_cast<std::size_t>(c.args[0]);
+    p.exec_array.assign(p.closed_lists.begin(), p.closed_lists.begin() + n);
+    p.closed_lists.erase(p.closed_lists.begin(), p.closed_lists.begin() + n);
+    call.top[1] = reinterpret_cast<u64>(p.exec_array.data());
+    static LONG announced;
+    if (InterlockedIncrement(&announced) == 1)
+        say("replay: X2W_REPLAY_INFER_EXECUTE=1: queue slot %u call %llu has no recorded list array; submitting the next %zu closed list(s) in Close order",
+            static_cast<unsigned>(c.slot), static_cast<unsigned long long>(c.seq), n);
+}
+
 bool play(Player& p, const Recording& r, const Step& step)
 {
     current_step = &step;
@@ -513,6 +553,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     // Map's CPU address is an output too, but not a wrapper, so it has no OUTP: sample it for the mapped dump.
     if (c.kind == resource_kind && c.slot == resource_map)
         call.sampled[2] = call.read_output(2, call.before[2]);
+    infer_execute(p, c, call);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     // An argument the stand-in reads as memory (the recorder's declared captures) that the file does not hold: passing
@@ -668,7 +709,13 @@ bool play(Player& p, const Recording& r, const Step& step)
             call.ret = call_slot(call.self, rcx, c.slot, a);
         if (call.ret < c.ret) ++p.fence_timeouts;
     }
-    if (c.kind == queue_kind && c.slot == queue_present) ++p.presents;
+    if (c.kind == queue_kind && c.slot == queue_present) {
+        ++p.presents;
+        // Cumulative draw counters at each present: the summary lists the draws of every present.
+        long long drawn = 0, not_drawn = 0;
+        x2w_d3d12_draw_totals(&drawn, &not_drawn, nullptr, 0);
+        p.draw_series.push_back({drawn, not_drawn});
+    }
     learn_after(p, r, call);
     ++p.played;
     return true;
@@ -847,9 +894,10 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         std::fprintf(f, "\"view_tokens\": {\"rewritten\": %llu, \"unmapped\": %llu}, ",
                      pages.view_tokens_rewritten, pages.view_tokens_unmapped);
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
-                        "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
+                        "\"bad_maps\": %llu, \"unreserved_spans\": %llu, \"left_out\": %llu, "
+                        "\"title_memory_args\": %llu}, \"ranges\": [",
                      r.maps.size(), pages.maps_applied, pages.pages_written, pages.zero_pages, pages.missing_pages, pages.bad_maps,
-                     p.title_memory_args);
+                     pages.unreserved_spans, pages.left_out, p.title_memory_args);
         for (std::size_t i = 0; i < pages.spans.size(); ++i)
             std::fprintf(f, "%s{\"address\": \"0x%llx\", \"bytes\": %llu, \"hash\": \"%016llx\"}", i ? ", " : "", pages.spans[i].base,
                          pages.spans[i].end - pages.spans[i].base, span_hash(pages.spans[i]));
@@ -858,8 +906,25 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
                             "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
+        {
+            long long drawn = 0, not_drawn = 0;
+            char reasons[2048];
+            const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
+            std::fprintf(f, ", \"draws\": {\"drawn\": %lld, \"not_drawn\": %lld, \"magenta_draws\": %lld, \"not_drawn_by_reason\": %s, \"per_present\": [",
+                         drawn, not_drawn, x2w_d3d12_magenta_draws(), length ? reasons : "{}");
+            long long previous_drawn = 0, previous_refused = 0;
+            for (std::size_t i = 0; i < p.draw_series.size(); ++i) {
+                std::fprintf(f, "%s{\"drawn\": %lld, \"not_drawn\": %lld}", i ? ", " : "",
+                             p.draw_series[i].first - previous_drawn, p.draw_series[i].second - previous_refused);
+                previous_drawn = p.draw_series[i].first;
+                previous_refused = p.draw_series[i].second;
+            }
+            std::fprintf(f, "]}");
+        }
         std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"left_out\": %llu, \"wall_s\": %.3f}",
                      p.prefix_calls, p.prefix_played, p.prefix_left_out, p.prefix_seconds);
+        std::fprintf(f, ", \"gpu_state\": {\"restored\": %llu, \"failed\": %llu, \"untranslated\": %llu}",
+                     p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
         if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
@@ -868,6 +933,13 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
                 "wall_s %.3f fps %.2f%s\n",
                 p.presents, p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.fence_timeouts, wall, fps,
                 stopped ? " stopped_at_max_seconds" : "");
+    {
+        long long drawn = 0, not_drawn = 0;
+        char reasons[2048];
+        const unsigned length = x2w_d3d12_draw_totals(&drawn, &not_drawn, reasons, sizeof(reasons));
+        std::printf("x2w-replay draws drawn %lld not_drawn %lld by_reason %s magenta draws %lld\n", drawn, not_drawn,
+                    length ? reasons : "{}", x2w_d3d12_magenta_draws());
+    }
     std::fflush(stdout);
 }
 
@@ -978,7 +1050,7 @@ int run(const Options& o)
         return 2;
     }
     // Reserve title ranges before the stand-in can allocate at those addresses.
-    if (std::string problem; !reserve_page_ranges(r, problem)) {
+    if (std::string problem; !reserve_page_ranges(r, problem, say)) {
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
@@ -1004,6 +1076,10 @@ int run(const Options& o)
     // X2W_REPLAY_DUMP reaches the delay-loaded shim from the environment or the recording's XENV.
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
+    wchar_t pass_stats_switch[4]{};
+    const bool pass_stats = GetEnvironmentVariableW(L"X2W_PASS_STATS", pass_stats_switch, 4) == 1 && pass_stats_switch[0] == L'1';
+    if (pass_stats && !GetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", nullptr, 0))
+        SetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     phase = "seeding the shader cache";
@@ -1079,6 +1155,10 @@ int run(const Options& o)
     if (o.prefix_live) live = prefix_live_of(r, p.window_seq);
     p.pace = o.pace;
     bool in_prefix = true;
+    using RestoreSubresource = BOOL (*)(void*, UINT, const void*, const void*, UINT64);
+    const HMODULE shim = r.gpu_state.empty() ? nullptr : GetModuleHandleW(L"d3d12_xs.dll");
+    const auto restore = shim ? reinterpret_cast<RestoreSubresource>(GetProcAddress(shim, "x2w_d3d12_restore_subresource"))
+                              : nullptr;
     const auto end_prefix = [&](u64 calls) {
         in_prefix = false;
         p.prefix_calls = calls;
@@ -1087,12 +1167,28 @@ int run(const Options& o)
         say("x2w-replay: prefix: %llu of %llu calls played (%llu left out by --prefix-live), wall %.3f s",
             static_cast<unsigned long long>(p.prefix_played),
             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(p.prefix_left_out), p.prefix_seconds);
+        if (!r.gpu_state.empty() && p.window_seq != ~0ull)
+            apply_pages_before(r, p.window_seq + 1, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+        for (const auto& slice : r.gpu_state) {
+            const auto object = p.objects.find(slice.header.object);
+            if (object == p.objects.end() || !object->second) {
+                ++p.gpu_untranslated;
+            } else if (restore && restore(reinterpret_cast<void*>(object->second), slice.header.subresource,
+                                          &slice.header, slice.data, slice.header.bytes)) {
+                ++p.gpu_restored;
+            } else {
+                ++p.gpu_failed;
+            }
+        }
+        say("x2w-replay gpu state: %llu subresources restored, %llu failed, %llu untranslated",
+            p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
     };
     u64 index = 0;
     Step s;  // the call being played, loaded from the mapping
     const auto play_step = [&] {
         const bool learn_view_id = take_view_id && s.has_view_id;
         if (learn_view_id) take_view_id();  // discard any view stored by a previous step
+        if (pass_stats) x2w_d3d12_pass_stats_call(s.call.seq);  // the pass thermometer names passes by recorded call
         const bool played = play(p, r, s);
         if (learn_view_id && played)
             if (const u64 id = take_view_id())
@@ -1143,6 +1239,7 @@ int run(const Options& o)
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
     say("x2w-replay: view tokens: rewritten %llu, unmapped %llu", pages.view_tokens_rewritten, pages.view_tokens_unmapped);
+    say("x2w-replay: title ranges unreserved %llu, pages left out (unreserved) %llu", pages.unreserved_spans, pages.left_out);
     say("x2w-replay: frame waits not paced: %llu of %llu (%.3f s inside them)%s", static_cast<unsigned long long>(p.unpaced_waits),
         static_cast<unsigned long long>(p.event_waits), p.event_wait_seconds, p.pace ? ", --pace on" : "");
     say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",

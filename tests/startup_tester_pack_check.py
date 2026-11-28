@@ -869,7 +869,16 @@ def check_seed_cache():
         assert T.seed_line(result) == "pre-translate: 5 requests from 1 older cache(s) in %g s" % result["seconds"]
         assert sorted(os.listdir(old)) == old_names, "the old cache is only read"
         names = os.listdir(new)
-        # Requests only, under new names, and no result of the old revision.
+        # Requests only, under new names, and no result of the old revision. The re-keying tool stamps the new cache
+        # with the key seed it wrote the requests under (x2w_key_seed.txt).
+        import gfx2hlsl
+        assert (new / gfx2hlsl.KEY_SEED_NAME).read_text() == gfx2hlsl.key_seed_line() + "\n"
+        # revision.txt: the same file the stand-in writes, naming the translator's revisions (shader_cache_revision.py
+        # then finds no warning to give for this cache).
+        import shader_cache_revision as R
+        assert R.cache_revisions(str(new)) == R.translator_revisions(str(Path(T.__file__).with_name("gfx2hlsl.py"))), (new / R.REVISION_FILE).read_text()
+        assert R.cache_revisions(str(new)).get("graphics") and R.warning(str(new), str(Path(T.__file__).with_name("gfx2hlsl.py"))) is None
+        names = [n for n in names if n not in (gfx2hlsl.KEY_SEED_NAME, R.REVISION_FILE)]
         assert not [n for n in names if n.endswith((".txt", ".fail", ".cso", ".hlsl", ".tmp"))], names
         assert not [n for n in names if n.startswith(("req_00000000000000a", "req_00000000000000c0", "req_00000000000000e0"))], names
         assert T.request_count(str(new)) == 5, names
@@ -944,17 +953,32 @@ def check_symbols():
         run.mkdir()
         make_run(run, 1)
         (tmp / "d3d12_xs.map").write_text(MSVC_MAP)
+        (tmp / "XCRDAPI.map").write_text(
+            " Preferred load address is 0000000180000000\n"
+            " 0001:00001200 heartbeat_worker 0000000180001200 f xcrdapi.obj\n"
+            " Static symbols\n"
+            " 0001:00001020 queue_worker     0000000180001020 f xcrdapi.obj\n"
+        )
         (tmp / "m.json").write_text(json.dumps(MANIFEST))
         out = subprocess.run([sys.executable, "-B", T.__file__, "pack", str(run),
-                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map")],
+                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map"),
+                              "--map-xcrdapi", str(tmp / "XCRDAPI.map")],
                              capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
         with zipfile.ZipFile(tmp / "r.zip") as z:
             assert z.read(T.SYMBOLS_NAME).decode() == "1000 DllMain\n1400 ?Draw@Queue@@QEAAXXZ\n2000 ?Present@Queue@@QEAAXXZ\n"
-            assert json.loads(z.read("manifest.json"))["symbols"] == 3
+            assert z.read(T.XCRDAPI_SYMBOLS_NAME).decode() == "1020 queue_worker\n1200 heartbeat_worker\n"
+            manifest = json.loads(z.read("manifest.json"))
+            assert manifest["symbols"] == 3
+            assert manifest["symbols_xcrdapi"] == 2
         T.pack(str(run), MANIFEST, str(tmp / "plain.zip"))
         with zipfile.ZipFile(tmp / "plain.zip") as z:
-            assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
+            assert T.SYMBOLS_NAME not in z.namelist()
+            assert T.XCRDAPI_SYMBOLS_NAME not in z.namelist()
+        T.pack(str(run), MANIFEST, str(tmp / "storage.zip"), map_xcrdapi=tmp / "XCRDAPI.map")
+        with zipfile.ZipFile(tmp / "storage.zip") as z:
+            assert T.SYMBOLS_NAME not in z.namelist()
+            assert T.XCRDAPI_SYMBOLS_NAME in z.namelist()
 
 
 def check_null_inputs():

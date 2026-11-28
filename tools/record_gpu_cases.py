@@ -31,9 +31,76 @@ COMPILER = 'dxc'
 GROUP = 'gfx2hlsl_compute'
 
 
+def _samefile(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return Path(a).resolve(strict=False) == Path(b).resolve(strict=False)
+
+
+def _resolve_dxc(dxc):
+    if dxc is None or not str(dxc).strip():
+        raise ValueError("dxc path must be non-empty")
+    candidate = Path(dxc)
+    if candidate.is_file():
+        return candidate
+    if os.sep not in str(dxc) and "/" not in str(dxc) and "\\" not in str(dxc):
+        which = shutil.which(str(dxc))
+        if which and Path(which).is_file():
+            return Path(which)
+    raise ValueError(f"dxc must resolve to an existing regular file: {dxc}")
+
+
+def _validate_output_dir(output, dxc_path):
+    if output is None or not str(output).strip():
+        raise ValueError("output path must be non-empty")
+    out = Path(output)
+    if out.is_symlink():
+        raise ValueError(f"output path cannot be a symlink: {out}")
+    if out.is_file() or (out.exists() and not out.is_dir()):
+        raise ValueError(f"output path is not a directory: {out}")
+    if _samefile(out, dxc_path):
+        raise ValueError(f"output path matches dxc executable: {out}")
+    if out.parent.is_file():
+        raise ValueError(f"output parent is a file: {out.parent}")
+    for ancestor in (out.parent, *out.parent.parents):
+        if ancestor.exists():
+            if not ancestor.is_dir():
+                raise ValueError(f"output ancestor is not a directory: {ancestor}")
+            break
+    manifest = out / 'manifest.tsv'
+    if manifest.is_symlink() or manifest.is_dir():
+        raise ValueError(f"manifest target cannot be a symlink or directory: {manifest}")
+    return out
+
+
+def _write_manifest_atomic(path, rows):
+    text = ''.join('\t'.join(row) + '\n' for row in rows)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='ascii',
+            newline='\n',
+            dir=path.parent,
+            prefix='.%s.' % path.name,
+            suffix='.tmp',
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def record(dxc, output, cases=None, controls=None):
     """Write the cases and the manifest into `output`; return the manifest rows."""
-    output = Path(output)
+    dxc_path = _resolve_dxc(dxc)
+    output = _validate_output_dir(output, dxc_path)
     target = output / GROUP
     target.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -43,25 +110,27 @@ def record(dxc, output, cases=None, controls=None):
         ident = '%s/%s' % (GROUP, 'control-' + mutation if mutation else name)
         with tempfile.TemporaryDirectory() as tmp:
             # The runner is only started to be refused: python rejects the adapter word as a script name.
-            check.run_case(name, dxc, sys.executable, 'warp', Path(tmp), mutation)
+            check.run_case(name, str(dxc_path), sys.executable, 'warp', Path(tmp), mutation)
             for ext in ('cso', 'case'):
                 shutil.copyfile(Path(tmp) / ('%s.%s' % (name, ext)), output / ('%s.%s' % (ident, ext)))
         rows.append((ident, COMPILER, 'fail' if mutation else 'pass', check.CONTROL_MISMATCH.get(mutation, '') if mutation else ''))
-    with open(output / 'manifest.tsv', 'w', newline='\n', encoding='ascii') as manifest:
-        for row in rows:
-            manifest.write('\t'.join(row) + '\n')
+    _write_manifest_atomic(output / 'manifest.tsv', rows)
     return rows
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('dxc')
     parser.add_argument('output')
-    args = parser.parse_args()
-    rows = record(args.dxc, args.output)
+    args = parser.parse_args(argv)
+    try:
+        rows = record(args.dxc, args.output)
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.stderr.write(f'{error}\n')
+        return 1
     print('recorded %d cases (%d controls) into %s' % (len(rows), sum(r[2] == 'fail' for r in rows), args.output))
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())

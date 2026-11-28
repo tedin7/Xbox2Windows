@@ -76,7 +76,8 @@ Fields decode(std::uint64_t attributes) noexcept
         static_cast<std::uint32_t>((attributes >> 16) & 0xff),
         static_cast<std::uint32_t>((attributes >> 24) & 0x1f),
         static_cast<std::uint32_t>((attributes >> 29) & 0xf),
-        attributes >> 33,
+        static_cast<std::uint32_t>((attributes >> 33) & 1),
+        static_cast<std::uint32_t>((attributes >> 34) & 0x3fffffff),
     };
 }
 
@@ -85,6 +86,11 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
     const auto fields = decode(attributes);
     // Object type and allocator ID are tags. SlimEra's default heap ignores them.
     if (bytes == 0 || fields.reserved != 0 || fields.page_size == 3) {
+        return nullptr;
+    }
+    // The title asked for an address below 4 GiB. This allocator does not yet provide
+    // one, so refuse instead of returning an address above that boundary.
+    if (fields.address_below_4gib) {
         return nullptr;
     }
     const auto alignment = std::size_t{1} << std::max(4u, fields.alignment);
@@ -112,7 +118,7 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
         // SlimEra commits graphics memory as a separate virtual allocation. The desktop
         // places it on an allocation-granularity boundary (64 KiB on x64 Windows), which
         // covers 4 KB and 64 KB pages. Larger page sizes or alignments are not honored here.
-        constexpr std::size_t page_bytes[]{std::size_t{4} << 10, std::size_t{64} << 10, std::size_t{4} << 20};
+        constexpr std::size_t page_bytes[]{std::size_t{4} << 10, std::size_t{64} << 10, std::size_t{2} << 20};
         if (std::max(page_bytes[fields.page_size], alignment) > allocation_granularity()) {
             return nullptr;
         }

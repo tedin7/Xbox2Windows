@@ -982,6 +982,31 @@ OperationResult run_mesh_indexed(const OperationContext& ctx)
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
 }
 
+OperationResult run_mesh_indexed_heap(const OperationContext& ctx)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+        return {OutcomeKind::skip, "direct heap indexing requires resource binding tier 3"};
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true,
+                                              MeshConstantBinding::root, MeshDrawMode::heap));
+}
+
+bool validate_mesh_indexed_groups_args(int, char** argv)
+{
+    unsigned groups = 0;
+    const std::string_view text(argv[6]);
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), groups);
+    return error == std::errc{} && end == text.data() + text.size() && groups > 0 && groups <= 65535;
+}
+
+OperationResult run_mesh_indexed_groups(const OperationContext& ctx)
+{
+    const auto groups = static_cast<unsigned>(std::strtoul(ctx.argv[6], nullptr, 10));
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true,
+        MeshConstantBinding::root, MeshDrawMode::color, nullptr, nullptr, groups));
+}
+
 OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
 {
     check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
@@ -1053,6 +1078,12 @@ bool validate_mesh_shadow_args(int argc, char** argv)
 OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
 {
     check_bvh_root_roundtrip(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_waterfall_oracle(const OperationContext& ctx)
+{
+    check_compute_waterfall_oracle(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1363,7 +1394,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
 // third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
-// mip levels whose cells all differ (tests/startup_image_3d.cpp).
+// mip levels whose cells all differ (tests/startup_image_3d.cpp). --startup-image-cube binds six 4x4 faces as a
+// TextureCube whose 96 texels all differ (#2943); z is passed through as for the other modes.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
@@ -1400,16 +1432,32 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] [8] prints one RGBA32F pixel.
+// The optional selector is forwarded as the second root constant. The final 8 requests an 8x8 mip base.
+// --startup-image-2d-array-view uses the two-slice renderer with the default 4x4 base.
 OperationResult run_startup_image_2d_view(const OperationContext& ctx)
 {
     const std::string_view window = ctx.argv[6];
     if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
         window[2] < '1' || window[2] > '3')
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array-view") == 0;
+    float selector = 0.0f;
+    if (ctx.argc >= 8) {
+        if (std::strcmp(ctx.argv[7], "1") == 0)
+            selector = 1.0f;
+        else if (std::strcmp(ctx.argv[7], "0") != 0)
+            return {OutcomeKind::fail, "view selector must be 0 or 1"};
+    }
+    UINT mip_base = 4;
+    if (ctx.argc == 9) {
+        if (std::strcmp(ctx.argv[8], "8") != 0)
+            return {OutcomeKind::fail, "2D mip base must be 8"};
+        mip_base = 8;
+    }
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
-                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], selector, color, ctx.argv[5], array, 3, false, !array,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'), false, 1, 1, mip_base);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
@@ -1456,16 +1504,19 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
-// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits> [coverage]: the translated pixel
+// stage stores to u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and
+// every other texel -1.0. Coverage is 1 (one pixel) or 2 (two pixels in one draw).
 OperationResult run_startup_image_store(const OperationContext& ctx)
 {
-    unsigned x = 0, y = 0;
+    unsigned x = 0, y = 0, coverage = 1;
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
-    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+    if (ctx.argc == 8 && (std::sscanf(ctx.argv[7], "%u", &coverage) != 1 || (coverage != 1 && coverage != 2)))
+        return {OutcomeKind::fail, "coverage is not 1 or 2"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected, coverage))
         return {OutcomeKind::fail, "image store readback differs"};
     return {OutcomeKind::pass, nullptr};
 }
@@ -1479,6 +1530,14 @@ OperationResult run_startup_image_atomic(const OperationContext& ctx)
     if (check_startup_image_atomic(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], signed_view))
         return {OutcomeKind::fail, "image atomic readback differs"};
     return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-store-reject-load: a colour format without typed UAV load is refused before any draw.
+OperationResult run_startup_image_store_reject_load(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_image_store_typed_load(ctx.device))
+        return {OutcomeKind::fail, reason};
+    return {OutcomeKind::fail, "typed UAV load negative control found no refusal"};
 }
 
 OperationResult run_startup_pixel_formatted_store(const OperationContext& ctx)
@@ -1877,11 +1936,13 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-view", 7, 9, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-array-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store", 7, 8, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-atomic", 7, 7, nullptr, kNoGate, run_startup_image_atomic},
+    {"--startup-image-store-reject-load", 3, 3, nullptr, kNoGate, run_startup_image_store_reject_load},
     {"--startup-pixel-formatted-store", 7, 7, nullptr, kNoGate, run_startup_pixel_formatted_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
@@ -1961,6 +2022,8 @@ const OperationSpec kOperations[] = {
     {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
     {"--mesh-shader-pipeline-fallback", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline_fallback},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-indexed-heap", 6, 6, nullptr, kNoGate, run_mesh_indexed_heap},
+    {"--mesh-indexed-groups", 7, 7, validate_mesh_indexed_groups_args, kNoGate, run_mesh_indexed_groups},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
@@ -1975,6 +2038,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
+    {"--compute-waterfall-oracle", 4, 4, nullptr, kNoGate, run_compute_waterfall_oracle},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
     {"--bvh-hits", 3, 3, nullptr, kGateSm65, run_bvh_hits},
@@ -2306,6 +2370,9 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --mesh-amplified")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps", "fixture"},
                    CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-groups", "ms", "ps", "fixture", "0"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-indexed-groups")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-groups", "ms", "ps", "fixture", "2"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,

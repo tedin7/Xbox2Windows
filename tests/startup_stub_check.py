@@ -102,7 +102,7 @@ summary = re.search(r"x2w-dstorage BCPack summary: requests formats=([^;]*); zer
                     run.stderr)
 requests_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(1))} if summary else {}
 blank_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(2))} if summary else {}
-bcpack_ok = (requests_by_format.get(6) == 1 and blank_by_format.get(6) == 1
+bcpack_ok = (requests_by_format.get(6) == 1 and blank_by_format.get(6, 0) == 0
              and requests_by_format.get(1) == 2 and blank_by_format.get(1, 0) == 0
              and requests_by_format.get(3) == 3 and blank_by_format.get(3, 0) == 0
              and requests_by_format.get(4) == 4 and blank_by_format.get(4, 0) == 0

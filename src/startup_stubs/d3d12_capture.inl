@@ -25,6 +25,9 @@ struct PipelineInfo {
     std::vector<unsigned char> state_a, state_b;  // slot 57: the two state blocks, copied at creation (the title frees them)
 };
 struct ViewRecord {
+    // Capture the guest descriptor layout, independent of the desktop SDK.
+    static constexpr std::size_t srv_desc_bytes = 40;
+    static constexpr std::size_t uav_desc_bytes = 40;
     std::uint32_t id, slot;          // slot: 17 CBV, 18 SRV, 19 UAV, 20 RTV, 21 DSV, 22 sampler
     u64 resource, counter;           // title-side wrapper pointers (or 0)
     u64 dest_title, dest_desktop;
@@ -847,7 +850,7 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     std::vector<std::uint32_t> ids(entries * 2);  // [shadow ids + 1][token ids + 1]
     for (std::uint32_t i = 0; i < entries; ++i) ids[i] = heap.shadow ? heap.shadow[index + i] : 0;
     if (heap.title_cpu) {
-        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        const UINT stride = heap.title_increment;
         const u64 title_start = heap.title_cpu + index * stride;
         for (std::uint32_t i = 0; i < entries; ++i) {
             std::uint32_t token[2]{};

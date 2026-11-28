@@ -193,10 +193,10 @@ def controls(llvm_mc):
     refused(shader(dst=0xfe), 'four destination registers')
     refused(shader(dst=0xff), 'four destination registers')
     # The explicit-LOD and fixed-mip comparison gathers are lowered by their own tests; the implicit,
-    # biased and offset gathers stay refused here.
+    # biased and comparison-offset gathers stay refused here.
     refused(shader(opcode=0x40), 'image_gather4 requires the guest implicit mip level')
     refused(shader(opcode=0x45), 'image_gather4_b')
-    refused(shader(opcode=0x54), 'image_gather4_l_o')
+    assert 'gather_2d_lod_offset(' in pipeline(shader(opcode=0x54)).hlsl_ps()
     refused(shader(opcode=0x48), 'image_gather4_c')
     refused(shader(opcode=0x5f), 'image_gather4_c_lz_o')
     bad_wrap = PREFIX.replace(bytes.fromhex('920398be'), bytes.fromhex('930398be'))

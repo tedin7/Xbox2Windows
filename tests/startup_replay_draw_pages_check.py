@@ -1,4 +1,4 @@
-"""Replay a placed ring whose title bytes are cleared before Present."""
+"""Replay placed and plain rings whose title bytes are cleared before Present."""
 
 import os
 from pathlib import Path
@@ -19,20 +19,20 @@ float4 main() : SV_Target { return float4(asfloat(root_data.Load2(0)), asfloat(v
 """
 
 
-def prepare(folder, scene):
+def prepare(folder, scene, mode):
     vs, ps, root, cache = (folder / name for name in ("vs", "ps", "root", "cache"))
     cache.mkdir()
     vs.write_bytes(vertex())
     ps.write_bytes(pixel(False))
     env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_") or k == "X2W_FXC"}
     env.update(X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
-               X2W_SHADER_CACHE=str(cache), X2W_TEST_REPLAY_TITLE_RANGE="ring")
+               X2W_SHADER_CACHE=str(cache), X2W_TEST_REPLAY_TITLE_RANGE=mode)
     code, text = run([scene, vs, ps, root, "warp", 1], env)
     if code == 77:
         return None
     assert code == 0, text[-3000:]
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    manifest, = (p for p in cache.glob("*.txt") if p.name != "revision.txt")
+    manifest, = (p for p in cache.glob("*.txt") if p.name not in ("revision.txt", "x2w_key_seed.txt"))
     with manifest.open("a", encoding="ascii") as file:
         file.write("\nsrv 0 buf root 0\nsrv 1 buf vb 0\n")
     source = manifest.with_suffix(".ps.hlsl")
@@ -59,6 +59,7 @@ def maps_ring_start(path, ring):
 
 
 def check(folder, player, args, env):
+    mode = env["X2W_TEST_REPLAY_TITLE_RANGE"]
     colours = [bytes(rgba) for rgba in ((255, 0, 128, 255), (0, 255, 64, 255),
                                       (191, 64, 0, 255), (64, 191, 255, 255))]
     reference = None
@@ -74,6 +75,8 @@ def check(folder, player, args, env):
         match = re.search(r"title ranges: ([0-9a-f]+) 0\b", text)
         assert match, text[-3000:]
         ring = int(match[1], 16)
+        if mode == "plainring":
+            assert ring == 0x10000000
         recorded = pictures(original)
         assert len(recorded) == PRESENTS, recorded.keys()
         for frame, (_size, scanlines) in enumerate(recorded.values()):
@@ -84,23 +87,30 @@ def check(folder, player, args, env):
         assert played.keys() == recorded.keys()
         if enabled == "1":
             assert played == recorded, [name for name in recorded if played[name] != recorded[name]]
+            if mode == "plainring":
+                assert re.search(r"x2w-replay draw pages: .*plain memory spans [1-9]\d*", text), text[-3000:]
             reference = recorded
-            print(f"draw pages enabled: {PRESENTS} replayed presents match live pictures")
+            print(f"{mode}, draw pages enabled: {PRESENTS} replayed presents match live pictures")
         else:
             assert recorded == reference, "the switch changed the live draw"
-            assert maps_ring_start(recording, ring), "the scan missed the ring"
+            assert maps_ring_start(recording, ring) == (mode == "ring"), "unexpected ring coverage from the page scan"
             assert played != recorded, "the control replay matched without draw pages"
-            print("draw pages disabled: live pictures match the enabled case and the replay differs")
+            print(f"{mode}, draw pages disabled: live pictures match the enabled case and the replay differs")
     return 0
 
 
 def main(scene, player):
     with tempfile.TemporaryDirectory() as tmp:
-        folder = Path(tmp)
-        prepared = prepare(folder, scene)
-        if prepared is None:
-            return 77
-        return check(folder, player, *prepared)
+        for mode in ("ring", "plainring"):
+            folder = Path(tmp) / mode
+            folder.mkdir()
+            prepared = prepare(folder, scene, mode)
+            if prepared is None:
+                return 77
+            result = check(folder, player, *prepared)
+            if result:
+                return result
+    return 0
 
 
 if __name__ == "__main__":

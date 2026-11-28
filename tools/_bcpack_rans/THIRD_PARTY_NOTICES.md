@@ -34,12 +34,12 @@ SOFTWARE
 
 ## Ahmet Dedeler bcpack-rs
 
-`src/startup_stubs/bcpack_tables.h` and `src/startup_stubs/bcpack_tables_bcn.inl` contain BC1, BC3, BC4, BC5, and BC7
-codebook, rank, window, and dictionary tables (`BC7_CONTROL_TABLE`, `BC7_DICTIONARY`, `BC1_WINDOW`, `BC1_QUAD_MASKS`,
+`src/startup_stubs/bcpack_tables.h` and `src/startup_stubs/bcpack_tables_bcn.inl` contain BC3, BC4, BC5, and BC7
+codebook, rank, and dictionary tables (`BC7_CONTROL_TABLE`, `BC7_DICTIONARY`,
 `RANK_PAIR_BC4`, `BC4_DICTIONARY`, `RANK_PAIR_BC5`, `BC5_DICTIONARY`, `RANK_PAIR_BC3_ALPHA`, `RANK_QUAD_BC3_COLOUR`,
 `BC3_DICTIONARY`) adapted from https://github.com/Ahmet-Dedeler/bcpack-rs
 (pinned revision c55c5fad539644b8cf5a705051df214291763fc0).
-The BC1, BC3, BC4, BC5, and BC7 block reconstruction routines in `src/startup_stubs/bcpack_decoder.h` are adapted from
+The BC3, BC4, BC5, and BC7 block reconstruction routines in `src/startup_stubs/bcpack_decoder.h` are adapted from
 the same repository. Used under the MIT License:
 
 ```
@@ -64,4 +64,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+## Microsoft DirectXTex
+
+The `BC6_WIRE` descriptors in `src/startup_stubs/bcpack_tables_extra.inl` adapt
+the BC6H bit layout in `DirectXTex/BC6HBC7.cpp` at revision
+[`a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379`](https://github.com/microsoft/DirectXTex/tree/a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379).
+The BCPack-specific bit ordering is described in
+[the implementation notes](../../docs/experiments/bcpack-standalone.md).
+
+```text
+MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE
 ```

@@ -37,7 +37,7 @@ struct GamepadState {
 static_assert(sizeof(GamepadState) == 28, "GamepadState layout");
 
 struct IGameInputDevice {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     HRESULT QueryInterface(const GUID* iid, void** out)
     {
@@ -72,7 +72,7 @@ struct IGameInputDevice {
 };
 
 struct IGameInputReading {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     HRESULT QueryInterface(const GUID* iid, void** out)
     {
@@ -131,7 +131,7 @@ using DeviceCallback = void(__stdcall*)(std::uint64_t token, void* context, IGam
                                         std::uint32_t previousStatus);
 
 struct IGameInput {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     HRESULT QueryInterface(const GUID* iid, void** out)
     {

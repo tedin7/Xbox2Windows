@@ -20,7 +20,7 @@ def prepare_draw_cache(directory, consumer, hlsl, modes, binding, *, vertex_hlsl
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    manifest, = (path for path in cache.glob("*.txt") if path.name != "revision.txt")
+    manifest, = (path for path in cache.glob("*.txt") if path.name not in ("revision.txt", "x2w_key_seed.txt"))
     with manifest.open("a", encoding="ascii") as file:
         file.write(f"\n{binding}\n")
     source = manifest.with_suffix(".ps.hlsl")
@@ -118,7 +118,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
     if actual is None:
         raise AssertionError("linear WARP fixture unexpectedly skipped")
     # Literal UNORM8 reference for A and B, alternating mip 0 and mip 1.
-    samples = ((51, 102), (153, 204), (51, 102), (51, 102))
+    # Column 3 binds an address whose memory was never written: the layout path now reads it (zeros), as main does for linear 0x100.
+    samples = ((51, 102), (153, 204), (51, 102), (0, 0))
     expected = bytes(c for y in range(4) for x in range(8)
                      for c in (samples[x // 2][y % 2], 0, 0, 255))
     if actual != expected:
@@ -127,8 +128,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
              if "Device::slot70" in line and "layout=0x100" in line]
     if any("reason=unsupported_description" in line for line in lines):
         raise AssertionError(f"linear description refused: {lines}")
-    if sum("reason=texture_no_resource" in line for line in lines) != 1:
-        raise AssertionError(f"expected one missing-resource refusal: {lines}")
+    if any("reason=texture_no_resource" in line for line in lines):
+        raise AssertionError(f"a linear address without a live resource is read by the layout path, not refused: {lines}")
     print(f"{backend}: linear placed mip views; all 32 RGBA pixels exact")
 
 

@@ -1,0 +1,1 @@
+tests/startup_compile_lds_request_cli_check.py

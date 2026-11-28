@@ -31,6 +31,7 @@ footprint of two texels on the 4x4 base level, an implicit LOD of exactly 1. The
 """
 import contextlib
 import hashlib
+import hlsl_pin  # noqa: E402
 import io
 import math
 import re
@@ -130,13 +131,13 @@ def vcc_comparison_program():
 
 def vcc_sampler_controls():
     unchanged = stage('lz limits')
-    digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
-    assert digest == 'a98b36fe9b4cd302a35025630fc91ebb9088657c6bca923b63b07b75a93f8dbe', digest
+    digest = hlsl_pin.digest(unchanged.hlsl_ps(), unchanged.manifest())
+    assert digest == '509c3923cf77bb24143b118b6c9ae8b79024a956e5bfbfbddbb985ab89daae2a', digest
     setup = struct.pack('<III', 0xbeea04ff, 0x18500000, 0x7c000000 | 0xc2 << 17 | 256)
     compare_after = WORDS_2D[:24] + setup + WORDS_2D[24:]
     unchanged = G.Pipeline(VS_WORDS, compare_after, root_blob())
-    digest = hashlib.sha256((unchanged.hlsl_ps() + '\0' + unchanged.manifest()).encode()).hexdigest()
-    assert digest == '5a866b8f985d63b9b846632e1508c978b9bf8db3c9030936b33cf542a0a6bd2b', digest
+    digest = hlsl_pin.digest(unchanged.hlsl_ps(), unchanged.manifest())
+    assert digest == '14f5d252b45281f4575f5c8d0edccb8d29bc4f6d202055471e44527368ffdc35', digest
     for shape, first in (('a', 0x92), ('b', 0)):
         pipe = G.Pipeline(VS_WORDS, vcc_sampler_program(shape), root_blob())
         assert '.SampleLevel(' in pipe.hlsl_ps()

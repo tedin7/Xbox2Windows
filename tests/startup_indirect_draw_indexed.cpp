@@ -7,6 +7,7 @@
 #include "desktop_gpu.h"
 #include "xmem_section_lease.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/manifest_retry.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -18,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -349,7 +351,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
 
 std::uint64_t fixture_shader_key(D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps, ID3DBlob* root)
 {
-    static constexpr char revision[] = "x2w-startup-shader-28";
+    static constexpr char revision[] = "x2w-startup-shader-29";
     static constexpr char feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
     std::uint64_t key = 1469598103934665603ull;
     const auto add = [&key](const void* data, std::size_t bytes) {
@@ -858,6 +860,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
          const PlainIndexDraw* plain_index = nullptr, ShadowIndexDraw* shadow = nullptr)
 {
+    const bool mesh57_runtime = GetEnvironmentVariableA("X2W_TEST_MESH57_RUNTIME", nullptr, 0) != 0;
+    const UINT width = mesh57_runtime ? 32u : ::width, height = mesh57_runtime ? 32u : ::height;
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
@@ -880,6 +884,13 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const void* index_data = draw_right ? static_cast<const void*>(wide.data()) : narrow.data();
     Words initial_words = initial;
     if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
+    if (mesh57_runtime) {
+        wchar_t path[MAX_PATH]{};
+        if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_ARGS", path, MAX_PATH)) return false;
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        if (!file.read(reinterpret_cast<char*>(initial_words.data() + 1), sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)) ||
+            file.peek() != EOF) return false;
+    }
     const bool external_arguments = leased && leased->argument;
     std::optional<PlacedBuffer> arguments, index_buffer;
     if (!external_arguments)
@@ -1027,8 +1038,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Scissor = void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*);
     using Index = void (WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
-    const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
-    const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    const D3D12_RECT scissor{rect ? 1 : 0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     if (cached_depth_only) {
         slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
         list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -1051,6 +1062,43 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
         slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
     }
+    const bool mesh57_heap = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
+    ComPtr<ID3D12DescriptorHeap> indexed_heap;
+    UINT64 indexed_cpu = 0, indexed_gpu = 0;
+    alignas(8) std::array<unsigned char, 4 * 32> indexed_backing{};
+    if (mesh57_heap) {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 backing, bytes;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                    reinterpret_cast<UINT64>(indexed_backing.data()), indexed_backing.size()};
+        using CreateHeap = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+        check(slot<CreateHeap>(guest, 14)(guest, &heap_desc, __uuidof(ID3D12DescriptorHeap),
+            reinterpret_cast<void**>(indexed_heap.GetAddressOf())), "create mesh indexed heap");
+        using Handle = UINT64 (WINAPI*)(IUnknown*, void*);
+        indexed_cpu = slot<Handle>(indexed_heap.Get(), 9)(indexed_heap.Get(), nullptr);
+        indexed_gpu = slot<Handle>(indexed_heap.Get(), 10)(indexed_heap.Get(), nullptr);
+        if (!indexed_cpu || !indexed_gpu) return false;
+        std::memset(reinterpret_cast<void*>(indexed_cpu), 0, 4 * 32);
+        wchar_t path[MAX_PATH]{};
+        if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", path, MAX_PATH)) return false;
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        std::vector<char> data(std::istreambuf_iterator<char>(file), {});
+        if (data.size() != 1024) return false;
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        void* allocation = slot<Allocate>(wrapped, 148)(wrapped, data.size(), 16);
+        if (!allocation) return false;
+        std::memcpy(allocation, data.data(), data.size());
+        for (UINT i = 0; i < 2; ++i) {
+            const UINT64 address = reinterpret_cast<UINT64>(allocation) + i * 512;
+            const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
+                static_cast<std::uint32_t>(address >> 32) | (16u << 16), 32, 0x4dfac};
+            std::memcpy(reinterpret_cast<void*>(indexed_cpu + (i + 1) * 32), view.data(), sizeof(view));
+        }
+        using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+        ID3D12DescriptorHeap* heaps[]{indexed_heap.Get()};
+        slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+    }
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
     if (leased) {
@@ -1062,6 +1110,52 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         slot<Constants>(wrapped, 40)(wrapped, 0, 1, values, 0);
         if (refusal != Refusal::incomplete_mesh_constants)
             slot<Constants>(wrapped, 40)(wrapped, 0, 1, values + 1, 1);
+    }
+    std::unique_ptr<TranslatedDrawFixture> mesh_table;
+    if (mesh57_runtime) {
+        wchar_t path[MAX_PATH]{};
+        if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_DATA", path, MAX_PATH)) return false;
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        std::vector<char> data(std::istreambuf_iterator<char>(file), {});
+        if (data.empty() || data.size() % 4) return false;
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        void* allocation = slot<Allocate>(wrapped, 148)(wrapped, data.size(), 16);
+        if (!allocation) return false;
+        std::memcpy(allocation, data.data(), data.size());
+        mesh_table = std::make_unique<TranslatedDrawFixture>(guest, 0);
+        const UINT64 address = reinterpret_cast<UINT64>(allocation);
+        const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
+            static_cast<std::uint32_t>(address >> 32) | (4u << 16), static_cast<UINT>(data.size() / 4), 0};
+        // X2W_TEST_MESH57_TABLE_SLOT: the indexed-heap slot (0 or 3) that holds the data table view; slot 3 replaces the
+        // empty record. A title may place a table at any slot of the heap it indexes.
+        UINT table_slot = 0;
+        if (mesh57_heap) {
+            char slot_text[8]{};
+            if (GetEnvironmentVariableA("X2W_TEST_MESH57_TABLE_SLOT", slot_text, sizeof(slot_text)))
+                table_slot = static_cast<UINT>(std::strtoul(slot_text, nullptr, 10));
+            if (table_slot != 0 && table_slot != 3) return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu + table_slot * 32 : mesh_table->cpu), view.data(),
+                    sizeof(view));
+        using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+        using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
+        ID3D12DescriptorHeap* heaps[]{mesh_table->heap.Get()};
+        if (!mesh57_heap) slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu + table_slot * 32 : mesh_table->gpu);
+        if (mesh57_heap) {
+            char selected[8]{};
+            if (!GetEnvironmentVariableA("X2W_TEST_MESH57_HEAP_INDEX", selected, sizeof(selected))) return false;
+            const UINT index = static_cast<UINT>(std::strtoul(selected, nullptr, 10));
+            if (index > 3) return false;  // 0 = the data table view, 1-2 = typed records, 3 = an empty record
+            using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+            const UINT values[]{0, index};
+            slot<Constants>(wrapped, 40)(wrapped, 2, 2, values, 0);
+        }
+        if (!GetEnvironmentVariableA("X2W_TEST_MESH57_NO_CONSTANTS", nullptr, 0)) {
+            using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+            const UINT values[]{2, 12};
+            slot<Constants>(wrapped, 40)(wrapped, 0, 2, values, 0);
+        }
     }
     if (translated && refusal != Refusal::missing_texture) {
         ID3D12DescriptorHeap* heaps[]{translated->heap.Get()};
@@ -1095,7 +1189,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         std::memcpy(allocation, contents, vertex_bytes);
         const UINT bytes = vertex_bytes + (refusal == Refusal::indexed_vertex_range ? 4 : 0);
         const D3D12_VERTEX_BUFFER_VIEW vertex{reinterpret_cast<UINT64>(allocation), bytes,
-            rect ? sizeof(RectVertex) : sizeof(std::uint32_t)};
+            static_cast<UINT>(rect ? sizeof(RectVertex) : sizeof(std::uint32_t))};
         slot<VertexBuffer>(wrapped, 48)(wrapped, 0, 1, &vertex);
     }
     if (index_buffer) {
@@ -1179,6 +1273,11 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
                                external_arguments ? leased->argument_offset : offset, nullptr, 0);
+    if (mesh57_runtime) {
+        // Allow the asynchronous manifest prefetch to publish and the first manifest retry delay to pass.
+        Sleep(static_cast<DWORD>(x2w_startup::manifest_retry_first_ms + 300));
+        slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments->wrapped.Get(), offset, nullptr, 0);
+    }
     if (restore_compute) {
         // Leave the previously forwarded root + SRV alone. Only install the
         // consumer PSO and the output UAV that this fixture owns.
@@ -1297,6 +1396,16 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
 
         const D3D12_RANGE pixel_range{0, static_cast<SIZE_T>(bytes)};
         check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
+        if (mesh57_runtime) {
+            wchar_t path[MAX_PATH]{};
+            if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_PIXELS", path, MAX_PATH)) return false;
+            std::ofstream file(std::filesystem::path(path), std::ios::binary);
+            for (UINT y = 0; y < height; ++y)
+                file.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * 4);
+            pixel_readback->Unmap(0, &untouched);
+            if (!file) return false;
+            continue;
+        }
         UINT painted = 0;
         bool previous_frame_matches = true;
         bool pixels_match = true;
@@ -1519,11 +1628,13 @@ bool check_translated_refusal_census(const std::wstring& log_path)
 
 bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root,
                               ID3D12PipelineState* writer, ID3D12RootSignature* title_root, IUnknown* pso,
-                              ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding)
+                              ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding,
+                              const std::filesystem::path& delayed_manifest = {}, bool fallback_enabled = false)
 {
     const TranslatedDrawFixture alias_binding(guest, red, nullptr, false, false, false, true);
-    enum class Mode { mrt_two, color_and_dsv, depth_only, no_attachments, alias_rtv1 };
+    enum class Mode { mrt_two, color_and_dsv, depth_only, no_attachments, alias_rtv1, direct_missing, direct_ready };
     const auto run_mode = [&](Mode mode, const char* label) -> bool {
+        const bool direct = mode == Mode::direct_missing || mode == Mode::direct_ready;
         const auto& binding = mode == Mode::alias_rtv1 ? alias_binding : red_binding;
         PlacedBuffer arguments(device, guest, static_cast<UINT>(sizeof(initial)), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         Words initial_words = initial;
@@ -1601,7 +1712,7 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         if (mode == Mode::mrt_two) slot<Clear>(wrapped, 52)(wrapped, rtvs[1].ptr, clear, 0, nullptr);
         if (mode == Mode::mrt_two || mode == Mode::alias_rtv1)
             slot<Targets>(wrapped, 50)(wrapped, 2, rtvs, FALSE, nullptr);
-        else if (mode == Mode::color_and_dsv) {
+        else if (mode == Mode::color_and_dsv || direct) {
             slot<Targets>(wrapped, 50)(wrapped, 1, rtvs, FALSE, &guest_dsv);
             list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         } else if (mode == Mode::depth_only) {
@@ -1618,6 +1729,12 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create depth-only occlusion query heap");
             query_readback = make_buffer(device, sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         }
+        if (direct) {
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 1, 0};
+            check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create direct draw query heap");
+            query_readback = make_buffer(device, sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),
+                                         D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
 
         const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
         const D3D12_RECT scissor{0, 0, width, height};
@@ -1630,7 +1747,15 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
         slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
         if (mode == Mode::depth_only) list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
-        slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        if (direct) {
+            using Draw = void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT);
+            list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            slot<Draw>(wrapped, 12)(wrapped, 3, 1, 0, 0);
+            list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, query_readback.Get(), 0);
+        } else {
+            slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        }
         if (mode == Mode::depth_only) {
             list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
             list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback.Get(), 0);
@@ -1667,10 +1792,23 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             }
         }
 
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT64 bytes = 0;
-        device->GetCopyableFootprints(&color_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-        const auto read_pixels = [&](ID3D12Resource* target, std::uint32_t expected_colour, const char* which) -> bool {
+        if (direct) {
+            D3D12_QUERY_DATA_PIPELINE_STATISTICS stats{};
+            const D3D12_RANGE range{0, sizeof(stats)};
+            check(query_readback->Map(0, &range, &memory), "map direct draw query");
+            std::memcpy(&stats, memory, sizeof(stats));
+            query_readback->Unmap(0, &untouched);
+            const UINT64 expected = mode == Mode::direct_ready || fallback_enabled ? 3 : 0;
+            if (stats.IAVertices != expected) {
+                std::fprintf(stderr, "%s: IA vertices %llu, expected %llu\n", label, stats.IAVertices, expected);
+                return false;
+            }
+        }
+        const auto read_pixels = [&](ID3D12Resource* target, std::uint32_t expected_pixel, const char* which) -> bool {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            UINT64 bytes = 0;
+            const auto desc = target->GetDesc();
+            device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
             const auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
             transition(copy.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1685,22 +1823,38 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             for (UINT y = 0; y < height; ++y)
                 for (UINT x = 0; x < width; ++x) {
                     std::uint32_t actual = 0;
-                    std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual), sizeof(actual));
-                    if (actual != expected_colour) {
+                    const auto size = desc.Format == DXGI_FORMAT_D16_UNORM ? sizeof(std::uint16_t) : sizeof(actual);
+                    std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * size, size);
+                    if (actual != expected_pixel) {
                         std::fprintf(stderr, "%s (%s) pixel (%u,%u): got 0x%08x, expected 0x%08x\n",
-                                     label, which, x, y, actual, expected_colour);
+                                     label, which, x, y, actual, expected_pixel);
                         ok = false;
                     }
                 }
             readback->Unmap(0, &untouched);
             return ok;
         };
-        const bool expect_draw = mode == Mode::mrt_two || mode == Mode::color_and_dsv;
+        const bool expect_draw = mode == Mode::mrt_two || mode == Mode::color_and_dsv || mode == Mode::direct_ready;
         if (!read_pixels(color0.Get(), expect_draw ? red : black, "rtv0")) return false;
         if (mode == Mode::mrt_two && !read_pixels(color1.Get(), black, "rtv1")) return false;
+        if (mode == Mode::direct_missing && !read_pixels(depth.Get(), 0xffff, "dsv")) return false;
         std::printf("%s: OK\n", label);
         return true;
     };
+    if (!delayed_manifest.empty()) {
+        auto staged_manifest = delayed_manifest;
+        staged_manifest += ".staged";
+        std::filesystem::rename(delayed_manifest, staged_manifest);
+        if (!run_mode(Mode::direct_missing, "missing translation")) return false;
+        const auto request = delayed_manifest.parent_path() / ("req_" + delayed_manifest.stem().string() + ".a");
+        if (!std::filesystem::exists(request)) {
+            std::fprintf(stderr, "missing draw did not publish its shader request\n");
+            return false;
+        }
+        std::filesystem::rename(staged_manifest, delayed_manifest);
+        Sleep(1100);  // The runtime polls absent manifests at one-second intervals.
+        return run_mode(Mode::direct_ready, "published translation");
+    }
     const bool ok =
         run_mode(Mode::mrt_two, "translated indirect MRT (2 color targets)") &&
         run_mode(Mode::color_and_dsv, "translated indirect color + DSV") &&
@@ -2757,6 +2911,9 @@ int main(int argc, char** argv) try
     const bool starvation = starvation_control || starvation_mutant ||
                             (argc == 3 && std::strcmp(argv[2], "starved-target") == 0);
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
+    const bool fallback_enabled = argc == 3 && std::strcmp(argv[2], "missing-shader-fallback") == 0;
+    const bool fallback_fixture = fallback_enabled ||
+        (argc == 3 && std::strcmp(argv[2], "missing-shader-fallback-off") == 0);
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool root_fix_control = argc == 3 && std::strcmp(argv[2], "translated-root-control") == 0;
@@ -2785,7 +2942,8 @@ int main(int argc, char** argv) try
     const bool index_copy = index_copy_off || index_copy_late || index_copy_wide ||
         (argc == 3 && std::strcmp(argv[2], "index-copy") == 0);
     const bool translated_indexed = index_copy || alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets ||
+        fallback_fixture || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if (target_read_fixture || (translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -3097,12 +3255,16 @@ int main(int argc, char** argv) try
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
         const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER params[2]{};
+        D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {1, &srv};
-        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const bool heap_fixture = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[2].Constants = {1, 0, 2};
+        const D3D12_ROOT_SIGNATURE_DESC source_root{heap_fixture ? 3u : 2u, params, 0, nullptr,
+            static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(heap_fixture ? 0x400 : 0)};
         const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
         const auto root = create_root(guest.Get(), desc, &root_blob);
@@ -3146,6 +3308,8 @@ int main(int argc, char** argv) try
                        DrawKind::mesh, false, Refusal::none, label);
         };
         const auto pair = make_pso(true, false, false);
+        if (GetEnvironmentVariableA("X2W_TEST_MESH57_RUNTIME", nullptr, 0))
+            return dispatch(pair.Get(), root.Get(), "translated slot57 mesh") ? 0 : 1;
         const auto depth = make_pso(false, false, false);
         const auto aliased_vertex = make_pso(true, true, false);
         const auto incomplete = make_pso(true, false, true);
@@ -3339,6 +3503,21 @@ int main(int argc, char** argv) try
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
         }
         const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
+        if (fallback_fixture) {
+            check(SetEnvironmentVariableW(L"X2W_DRAW_MISSING_SHADER", fallback_enabled ? L"1" : L"0") ? S_OK : E_FAIL,
+                  "configure missing shader fallback");
+            std::filesystem::path manifest;
+            for (const auto& file : std::filesystem::directory_iterator(cache))
+                if (file.path().extension() == ".txt") manifest = file.path();
+            check(manifest.empty() ? E_FAIL : S_OK, "find fixture manifest");
+            const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
+            const TranslatedDrawFixture binding(guest.Get(), red);
+            const bool ok = check_translated_targets(device.Get(), guest.Get(), writer.Get(), producer.Get(),
+                                                     title_root.Get(), pso.Get(), nullptr, binding,
+                                                     manifest, fallback_enabled);
+            std::filesystem::remove_all(cache);
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
         const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");

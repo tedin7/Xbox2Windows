@@ -93,6 +93,7 @@ class ShaderCacheRekeyCliTests(unittest.TestCase):
                 f"req_{keys['c']:016x}.root",
                 f"req_{keys['c']:016x}.c67",
                 f"req_{keys['rtv']:016x}.rtv",
+                gfx2hlsl.KEY_SEED_NAME,
             ])
             self.assertEqual(sorted(p.name for p in dst_argv.iterdir()), expected_names)
 

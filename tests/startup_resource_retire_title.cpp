@@ -292,7 +292,9 @@ struct Context {
         upload->Unmap(0, nullptr);
         if (!require(own_allocator->Reset(), "own allocator") || !require(own_list->Reset(own_allocator.Get(), nullptr), "own list"))
             return false;
-        own_list->CopyTextureRegion(&footprint_tex(real.Get()), 0, 0, 0, &footprint(upload.Get()), nullptr);
+        D3D12_TEXTURE_COPY_LOCATION tex_dst = footprint_tex(real.Get());
+        D3D12_TEXTURE_COPY_LOCATION tex_src = footprint(upload.Get());
+        own_list->CopyTextureRegion(&tex_dst, 0, 0, 0, &tex_src, nullptr);
         D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
         b.Transition = {real.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_COMMON};
@@ -314,7 +316,9 @@ struct Context {
         b.Transition = {real.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_SOURCE};
         own_list->ResourceBarrier(1, &b);
-        own_list->CopyTextureRegion(&footprint(readback.Get(), fmt, width), 0, 0, 0, &footprint_tex(real.Get()), nullptr);
+        D3D12_TEXTURE_COPY_LOCATION tex_dst = footprint(readback.Get(), fmt, width);
+        D3D12_TEXTURE_COPY_LOCATION tex_src = footprint_tex(real.Get());
+        own_list->CopyTextureRegion(&tex_dst, 0, 0, 0, &tex_src, nullptr);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         own_list->ResourceBarrier(1, &b);
@@ -407,7 +411,7 @@ constexpr UINT draw_side = 4;      // 4x4 R8G8B8A8_UNORM target
 constexpr UINT draw_covered = 3;   // scissor leaves the last row and column untouched as the sentinel
 constexpr int draw_seed = 77;
 constexpr UINT draw_clear_pixel = 0xffff00ffu;  // ClearRenderTargetView({1, 0, 1, 1}) in R8G8B8A8_UNORM
-constexpr char draw_revision[] = "x2w-startup-shader-28";  // d3d12_draw.inl cached_translation
+constexpr char draw_revision[] = "x2w-startup-shader-29";  // d3d12_draw.inl cached_translation
 constexpr char draw_feature[] = "extended-buffer-formats1";  // d3d12_draw.inl shader_cache_seed, on by default
 
 constexpr char draw_vertex_shader[] = R"(

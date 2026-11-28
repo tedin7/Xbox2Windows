@@ -92,7 +92,7 @@ def indirect(directory, quad, player, adapter, env):
     return 0
 
 
-def late_indirect(directory, quad, player, env):
+def late_indirect(directory, quad, player, env, mode="late"):
     directory.mkdir()
     source = directory / "triangle.hlsl"
     source.write_text("""
@@ -107,7 +107,7 @@ float4 ps() : SV_Target { return float4(1, 0, 1, 1); }
                        env=env, check=True, timeout=30)
     frames = 4
     args = [quad, vs, ps, root, "warp", frames]
-    env = dict(env, X2W_TEST_REPLAY_INDIRECT="late", X2W_D3D12_LINEAR_BUFFERS="copy")
+    env = dict(env, X2W_TEST_REPLAY_INDIRECT=mode, X2W_D3D12_LINEAR_BUFFERS="copy")
     reference = None
     for enabled in ("1", "0"):
         recording = directory / f"late-{enabled}.x2wr"
@@ -130,7 +130,8 @@ float4 ps() : SV_Target { return float4(1, 0, 1, 1); }
             reference = live
         else:
             assert live == reference, "draw pages changed the live pictures"
-            assert mismatches == [0, 2], ("late indirect control mismatches", mismatches)
+            # CPU-written words need the capture. GPU-written words come back with the replayed copy.
+            assert mismatches == ([0, 2] if mode == "late" else []), ("indirect control mismatches", mismatches)
     print("Four late indirect replay pictures match with draw pages enabled. Frames 0 and 2 differ with pages disabled.")
 
 
@@ -175,6 +176,7 @@ def main(quad, consumer, player, dxc, adapter):
             return code
         if adapter == "warp":
             late_indirect(directory / "late", quad, player, env)
+            late_indirect(directory / "gpu", quad, player, env, "gpu")
     print("Replay dumps match for three indirect-scene and two compute-scene submissions. Only the mutated clear differs.")
     return 0
 

@@ -1,6 +1,9 @@
 """Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
+import ctypes
+from ctypes import wintypes
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,11 +37,13 @@ def pixel(green):
 def check(directory, consumer, backend):
     cache = directory / "cache"
     cache.mkdir()
+    recipes = directory / "recipes"
+    recipes.mkdir()
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
     vs.write_bytes(vertex())
     args = [consumer, vs, ps, root]
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
-               X2W_SHADER_CACHE=str(cache))
+               X2W_SHADER_CACHE=str(cache), X2W_PSO_RECIPE_DIR=str(recipes))
     env.setdefault("X2W_D3D12_DEBUG", "0")
     observations = []
     for green in (False, True):
@@ -63,9 +68,40 @@ def check(directory, consumer, backend):
         if pixels != expected:
             raise AssertionError(f"actual {pixels.hex()} expected {expected.hex()}")
         observations.append(pixels)
+        # The translated stream draw creates its desktop PSO through pipeline_for. A second
+        # process with the same recipe directory must replay it instead of reconstructing the
+        # state from scratch.
+        assert list(recipes.glob("pso_*.txt")), "the successful draw wrote no PSO recipe"
+        replay = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+        assert replay.returncode == 0, replay.stderr
+        assert "pso recipes" in replay.stderr and "precreated" in replay.stderr, replay.stderr
+        assert output.read_bytes() == pixels, "the recipe replay changed the drawn pixels"
+        # A second writer cannot enter while this process owns the recipe file exclusively. The
+        # draw must still render through the PSO it creates; only the cache append is skipped.
+        recipe_key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+        recipe_file = recipes / f"pso_{recipe_key:016x}.txt"
+        assert recipe_file.is_file(), f"missing recipe {recipe_file}"
+        size_before = recipe_file.stat().st_size
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateFileW(str(recipe_file), 0x80000000, 0, None, 3, 0, None)
+        assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
+        try:
+            locked = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+            assert locked.returncode == 0, locked.stderr
+            assert output.read_bytes() == pixels, "the locked recipe path changed the drawn pixels"
+            assert recipe_file.stat().st_size == size_before, "a contending draw appended to the locked recipe"
+        finally:
+            kernel32.CloseHandle(handle)
+        print(f"{backend}: exclusive recipe ownership keeps the draw on the fallback path")
     # Hold back the last-published marker while keeping the generated shader bytecode in place.
     key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
     manifest = cache / f"{key:016x}.txt"
+    green_recipe = recipes / f"pso_{key:016x}.txt"
+    assert green_recipe.is_file(), f"missing green recipe {green_recipe}"
     manifest.rename(str(manifest) + ".pending")
     run = subprocess.run(args + [backend, output], env=dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest)),
                          capture_output=True, text=True, timeout=30)
@@ -87,6 +123,49 @@ def check(directory, consumer, backend):
         if output.read_bytes() != expected:
             raise AssertionError(f"{mode}: got {output.read_bytes().hex()} expected {expected.hex()}")
         print(f"{backend} {mode} green={green}: 32 pixels exact, drawn byte {value}")
+
+    # Seed the file with valid records that belong to another translation key. They parse but
+    # never replay, so the next successful draw appends the matching record as number 64 and the
+    # process after it precreates that record. At 64 records the writer must refuse the 65th.
+    ps.write_bytes(pixel(True))
+    original = green_recipe.read_text(encoding="ascii")
+    records = original.split("x2w-pso-recipe 1\n")
+    assert len(records) >= 2, original
+    original = "x2w-pso-recipe 1\n" + records[1]
+    foreign = re.sub(r"(?m)^translation 0x[0-9a-f]{16}$", "translation 0xdeadbeefcafef00d", original)
+    assert foreign != original
+    green_recipe.write_text(foreign * 63, encoding="ascii")
+    run = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_bytes() == observations[1]
+    assert green_recipe.read_text(encoding="ascii").count("x2w-pso-recipe 1") == 64
+    replay = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert replay.returncode == 0, replay.stderr
+    assert "precreated 1" in replay.stderr, replay.stderr
+    assert output.read_bytes() == observations[1]
+
+    green_recipe.write_text(foreign * 64, encoding="ascii")
+    run = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_bytes() == observations[1]
+    assert green_recipe.read_text(encoding="ascii").count("x2w-pso-recipe 1") == 64, \
+        "a full recipe file accepted a 65th record"
+    print(f"{backend}: 63+1 records precreate; 64 records refuse the 65th")
+
+    # A record without its final LF still parses, but appending would join `end` and the next
+    # header on one line. The draw must render and leave the parseable file byte-for-byte intact.
+    no_final_lf = green_recipe.read_bytes()
+    assert no_final_lf.rstrip(b"\r\n").endswith(b"end"), no_final_lf[-40:]
+    green_recipe.write_bytes(no_final_lf[:-1])
+    before = green_recipe.read_bytes()
+    run = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_bytes() == observations[1]
+    assert green_recipe.read_bytes() == before, "a no-LF recipe file was modified by the refused append"
+    replay = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert replay.returncode == 0, replay.stderr
+    assert output.read_bytes() == observations[1]
+    print(f"{backend}: a recipe without a final LF stays readable and refuses the append")
     return 0
 
 

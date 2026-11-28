@@ -14,6 +14,20 @@
 #include <cstdint>
 
 namespace x2w_startup {
+constexpr unsigned title_view_stride = 32;
+
+inline unsigned view_heap_title_stride(D3D12_DESCRIPTOR_HEAP_TYPE type, unsigned count,
+                                       std::uint64_t backing, std::uint64_t bytes, unsigned desktop_stride)
+{
+    return type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && backing >= 0x10000 &&
+           bytes == std::uint64_t{count} * title_view_stride ? title_view_stride : desktop_stride;
+}
+
+inline std::uint64_t desktop_descriptor_offset(std::uint64_t offset, unsigned title_stride, unsigned desktop_stride)
+{
+    return (offset / title_stride) * desktop_stride + offset % title_stride;
+}
+
 inline bool heap_needs_title_memory(D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64_t desktop_cpu_start, bool strides_differ = false)
 {
     return strides_differ || type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || (desktop_cpu_start & (alignof(void*) - 1)) != 0;

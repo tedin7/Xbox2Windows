@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, cpp-migration]
   workflow_dispatch:
 
 concurrency:
@@ -147,6 +147,7 @@ jobs:
               (["tests/startup_compute_lds_b64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b128_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_calculated_target_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_far_early_out_check.py", "binary", "llvm-mc-15", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_join_symbols_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_joined_table_pointer_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
@@ -259,6 +260,7 @@ jobs:
             tests/startup_compute_image_store_check.py \
             tests/startup_compute_image_store_d16_check.py \
             tests/startup_compute_gather_l_check.py \
+            tests/startup_compute_gather_l_o_check.py \
             tests/startup_compute_buffer_atomics_check.py \
             tests/startup_compute_store_d16_x_check.py \
             tests/startup_compute_store_format_xyzw_check.py \
@@ -327,6 +329,7 @@ jobs:
             tests/startup_gfx2hlsl_heap_record_check.py \
             tests/startup_gfx2hlsl_heap_word_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
+            tests/startup_gfx2hlsl_far_early_out_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_msvc_throw_info_check.py \
             tests/startup_run_ps1_check.py \
@@ -503,6 +506,14 @@ jobs:
             ctest --preset dev --no-tests=error --parallel 4 -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
           }
           exit $LASTEXITCODE
+      - name: Check native DXIL generation on migration pull requests
+        if: github.base_ref == 'cpp-migration'
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          cmake --build --preset dev --target compile_dxil
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --preset dev --no-tests=error -R '^native_dxil_llvm_ident_controls$'
       - name: Require the SPIR-V bridge WARP tests
         if: ${{ !cancelled() }}
         shell: pwsh

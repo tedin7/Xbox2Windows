@@ -33,7 +33,14 @@ class _LogViewer:
 
     def __init__(self, package=None):
         # The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
-        roots = ["G:\\"] + ([os.path.join(os.path.abspath(package), "")] if package is not None else [])
+        roots = ["G:\\"]
+        if package is not None:
+            # Windows may spell the same root with an 8.3 alias or a different case; the log can
+            # carry the resolved form while run.ps1 passes the short one. Accept both spellings.
+            for candidate in (os.path.abspath(package), os.path.realpath(package)):
+                root = os.path.join(candidate, "")
+                if root not in roots:
+                    roots.append(root)
         self.game_file = re.compile(
             r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:"
             + "|".join(map(re.escape, roots))

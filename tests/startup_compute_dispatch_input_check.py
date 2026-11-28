@@ -198,6 +198,8 @@ void main() {
     subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', shader], check=True)
     (cache / f'{key}.txt').write_text(
         'x2w-manifest 2\nstage cs\nud 0\nsrv 0 tex2d table 1 64\nuav 0 table 1 0\n')
+    # An unmarked manifest is the Python translator's only with its <key>.cs.hlsl beside it.
+    (cache / f'{key}.cs.hlsl').write_text('// hand-written manifest fixture\n')
 
     def run(suffix='', *, enabled=True, refusal=None):
         settings = dict(env, X2W_COMPUTE_VIEW_TOKENS='1') if enabled else env
@@ -210,7 +212,7 @@ void main() {
             assert not refused and len(lines(log, 'Dispatch(1, 1, 1) translated')) == 1, log.stderr[-3000:]
         return readback
 
-    run(enabled=False, refusal='an output is a view token, not a buffer descriptor')
+    run(enabled=False, refusal='an output buffer descriptor is a view token')
     run('-wrong-kind', refusal='an output shader resource view token cannot supply unordered access')
     rgba = (17, 93, 201, 45)
     value = [rgba[0] + 257 * rgba[1], rgba[2] + 257 * rgba[3]]
@@ -283,7 +285,7 @@ def main(consumer, dxc, adapter):
         for variable in ('X2W_COMPUTE_VIEW_TOKENS', 'X2W_NULL_TOKEN_ZERO', 'X2W_COMPUTE_TITLE_INPUTS', 'X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY',
                          'X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT', 'X2W_TEST_UPLOAD_RING_MAX_KIB',
                          'X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS', 'X2W_TRANSLATED_INDIRECT_COPY_RANGES',
-                         'X2W_D3D12_LINEAR_BUFFERS', 'X2W_TEST_DISPATCH_HARDWARE'):
+                         'X2W_D3D12_LINEAR_BUFFERS', 'X2W_TEST_DISPATCH_HARDWARE', 'X2W_D3D12_RING_RELEASE_AT_SUBMIT'):
             env.pop(variable, None)
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
@@ -385,6 +387,22 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
+        # Long run: 48 frames of dispatches whose 8 MiB title-memory input is snapshotted each frame, the queue completed between
+        # frames: 384 MiB in all, three times the snapshot pool (128 MiB). The pool must be recycled: every frame translates,
+        # gives the first frame's words (the consumer exits 85 if one does not), the last frame matches the CPU reference
+        # and no reservation is refused. With release enabled, keep the submitted lists closed to exercise release without Reset.
+        for release, mode in ((False, 'dispatch-input-snapshot-long'), (True, 'dispatch-input-snapshot-long-keep')):
+            long_env = dict(snapshot_env)
+            if release:
+                long_env['X2W_D3D12_RING_RELEASE_AT_SUBMIT'] = '1'
+            got, result = dispatch(directory, consumer, long_env, mode)
+            assert got == expected and not lines(result, 'refused: '), result.stderr[-3000:]
+            assert not lines(result, 'reservation refused'), lines(result, 'reservation refused')
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) >= 1, result.stderr[-3000:]
+            # The input must really come from a snapshot (8 MiB), not be read in place: an empty long case would pass everything above.
+            assert len(lines(result, 'comes from a snapshot of title memory (8388608 bytes)')) == 1, result.stderr[-3000:]
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
         # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty
         # control above has a nonzero base and stays refused).
         got, result = dispatch(directory, consumer, env, 'dispatch-input-null')

@@ -4,6 +4,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import importlib
 import io
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -36,6 +37,16 @@ def _run_subprocess(*args: str | Path) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         timeout=30,
     )
+
+
+def _short_path(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+    return buffer.value if length else None
 
 
 class _ReconfigurableStringIO(io.StringIO):
@@ -159,6 +170,25 @@ class LiveViewCliPositiveTests(unittest.TestCase):
                 sorted(p.name for p in rundir.iterdir()),
                 ["events.txt", "files.txt", "finished.txt", "trap.log"],
             )
+
+    def test_short_path_alias_matches_resolved_package_file(self) -> None:
+        import live_view
+
+        with TemporaryDirectory() as tmp:
+            package = Path(tmp) / "pkg"
+            package.mkdir()
+            short = _short_path(package)
+            if not short or os.path.normcase(short) == os.path.normcase(os.path.abspath(package)):
+                self.skipTest("the temp volume has no distinct 8.3 alias")
+            viewer = live_view._LogViewer(short)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                viewer.on_file(
+                    "1.0 NtOpenFile "
+                    + str(package.resolve())
+                    + "\\data.bin from 0x1000 -> 0xc0000034"
+                )
+            self.assertIn("data.bin   (failed 0xc0000034)", out.getvalue())
 
 
 class LiveViewCliNegativeAndMutationTests(unittest.TestCase):

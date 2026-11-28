@@ -8,6 +8,7 @@
 #include <cstring>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <fstream>
@@ -20,6 +21,13 @@
 #include "startup_stream_draw.h"
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
+
+#ifdef OFFSCREEN_AGILITY_620
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
+__declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -195,9 +203,9 @@ static void* desktop_pipeline(void* device)
 //   data-pointer     valid, with the first data qword pointing at state block A
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
-//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-sampled-depth, dispatch-heap,
-//   dispatch-heap-outside, dispatch-heap-word*, dispatch-input-*: one creation, then dispatch_slot67 below
-//   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
+//   dispatch, dispatch-swapped, dispatch-none, dispatch-records32, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-sampled-depth, dispatch-heap,
+//   dispatch-heap-outside, dispatch-heap-word*, dispatch-input-*, dispatch-output-*: one creation, then dispatch_slot67 below
+//   texture-store and texture-array modes: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
@@ -222,6 +230,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // in one allocation, so both alias this process's memory and the result is read from that memory after the queue's
 // fence. dispatch-swapped exchanges the two descriptors (the output then names the buffer without unordered
 // access); dispatch-none records everything but the Dispatch. The 320 output words go to X2W_TEST_DISPATCH_OUT.
+// dispatch-records32 writes the table as 32-byte records, the layout the C++ compiler reads a table in
+// (startup_compute_dispatch_native_check.py): the output's descriptor at byte 32 and none at byte 16.
 // dispatch-sampled adds what the sampling variant of the case reads: a committed 1x1 RGBA8 texture filled by
 // CopyTextureRegion (list slot 16) and a shader resource view of it (device slot 18) whose token the stand-in
 // writes at table byte 64. dispatch-sampled-unbound creates no view, so that entry holds no token.
@@ -247,9 +257,19 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
+// Output descriptors the dispatch refuses, one reason each: dispatch-output-texture-token, -unplaced and -copied do
+// to the output what dispatch-input-token, -unplaced and -copied do to the input, dispatch-output-unaligned starts
+// the output 8 bytes into its buffer and dispatch-output-state places the output buffer in the unordered access state.
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// (The long case puts its input at 0x28000, not at a 64 KiB multiple like 0x20000: there the placed buffer would alias title memory
+// and the input would be read in place, never snapshotted, which is how an earlier version of this case passed without a snapshot.)
+// dispatch-input-snapshot-long: dispatch-input-snapshot with an 8 MiB input range (the descriptor declares 2M records; the program
+// reads the first 320 words) dispatched in 48 frames, 384 MiB of snapshots in all, with the queue completed between frames. The
+// snapshot pool holds 128 MiB, so every frame after the sixteenth reuses chunks the GPU is done with; a pool that is not recycled
+// refuses them. Every frame must translate and give the first frame's words.
+// Table controls bind away from the heap start or change the root/view heap after slot 35 without rebinding.
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -266,16 +286,29 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool range_fixture = raw_range || range_control;
     const UINT input_bytes = range_fixture ? 16u * 64u : large_input ? 40u << 20 : 12u << 10;
     const UINT record_offsets[] = {0, range_fixture ? 48u : input_bytes / 2, range_fixture ? 64u : input_bytes - 16};
+    const bool keep_closed = mode == "dispatch-input-snapshot-long-keep";
+    const bool long_run = keep_closed || mode == "dispatch-input-snapshot-long";
+    constexpr UINT long_records = 2u << 20, long_frames = 48;
+    const bool shared_uav = mode == "dispatch-read-write-uav";
+    const bool typed_output_offset = mode == "dispatch-records32-output-offset";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
-    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const bool heap_waterfall = mode.rfind("dispatch-heap-waterfall", 0) == 0;
+    const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
+    const bool write_zero = mode == "dispatch-indirect-pixel-zero";
+    const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
+    const UINT groups = mode == "dispatch-indirect-zero" || write_zero || mode == "dispatch-indirect-pixel-omit" ? 0u :
+                        mode == "dispatch-indirect-2" || mode == "dispatch-indirect-pixel-2" ? 2u : 5u;
+    const SIZE_T mem_bytes = heap_waterfall ? 0x60000 : long_run ? 0x28000 + long_records * sizeof(UINT) :
+                             (indirect || root_srv) ? 0x30000 : 0x20000;
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, mem_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
+    UINT* const buffer2 = memory + 0x20000 / sizeof(UINT);
     for (UINT i = 0; i < words; ++i) {
         buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
         buffers[1][i] = 0xc5c5c5c5u;
     }
-    UINT fields[2][3] = {{4, words, 0}, {4, words, 0}};
+    UINT fields[2][3] = {{4, long_run ? long_records : words, 0}, {4, words, 0}};
     const auto from_file = [](const char* variable, void* data, std::streamsize bytes) {
         char path[MAX_PATH];
         const DWORD n = GetEnvironmentVariableA(variable, path, MAX_PATH);
@@ -289,13 +322,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     UINT input[words];
     std::memcpy(input, buffers[0], sizeof(input));
+    if (shared_uav) std::memcpy(buffers[1], input, sizeof(input));
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     void* placed[2]{};
     UINT descriptors[2][4]{};
     for (int i = 0; i < 2; ++i) {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
-        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+        const auto state = i && mode == "dispatch-output-state" ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), state, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
         const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
@@ -354,13 +389,41 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (mode == "dispatch-input-title-add-tid") descriptors[0][3] |= 1u << 23;
         if (mode == "dispatch-input-title-cache-hint") descriptors[0][1] |= 1u << 30;
     }
-    const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
+    UINT record_descs[4][4]{};
+    if (heap_waterfall) {
+        for (UINT rec = 0; rec < 4; ++rec) {
+            UINT* const rec_buf = memory + (0x20000 + rec * 0x10000) / sizeof(UINT);
+            for (UINT i = 0; i < words; ++i) rec_buf[i] = 1000u * (rec + 1u) + 17u * i;
+            const D3D12_RESOURCE_DESC rdesc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            void* rec_res = nullptr;
+            if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(rec_buf), word(&rdesc), D3D12_RESOURCE_STATE_COMMON,
+                    0, word(&__uuidof(ID3D12Resource)), word(&rec_res))))) return 71;
+            const UINT64 address = reinterpret_cast<UINT64>(rec_buf);
+            const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), words, 0};
+            std::memcpy(record_descs[rec], view, sizeof(view));
+        }
+    }
+    const UINT64 between = reinterpret_cast<UINT64>(memory) + (long_run ? 0x28000 : 0x8000);
+    void* placed2 = nullptr;
+    if (root_srv) {
+        for (UINT i = 0; i < words; ++i) buffer2[i] = 0x3c6ef372u + i * 0x19660du;
+        for (UINT i = 0; i < 64; ++i) {
+            buffers[0][words + i] = 0xdeadbeefu + i;
+            buffer2[words + i] = 0xfeedfaceu + i;
+        }
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffer2), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                word(&__uuidof(ID3D12Resource)), word(&placed2))))) return 71;
+    }
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
     // exist only in title memory (the desktop copy of a buffer that does not alias holds zeros); dispatch-input-copied
     // leaves that memory zero.
-    if (mode == "dispatch-input-snapshot") std::memcpy(reinterpret_cast<void*>(between), input, sizeof(input));
-    if (mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot") {
-        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+    if (mode == "dispatch-input-snapshot" || long_run) std::memcpy(reinterpret_cast<void*>(between), input, sizeof(input));
+    if (mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot" || long_run || mode == "dispatch-root-srv-copied" ||
+        mode == "dispatch-output-copied") {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, long_run ? long_records * sizeof(UINT) : words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* copied = nullptr;
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(reinterpret_cast<void*>(between)), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
@@ -373,14 +436,26 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memset(descriptors[0], 0, sizeof(descriptors[0]));  // an unbound buffer: all four words zero
     } else if (mode == "dispatch-input-past") {
         descriptors[0][2] = words + 4;
-    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot") {
+    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot" || long_run) {
         descriptors[0][0] = static_cast<UINT>(between);
         descriptors[0][1] = static_cast<UINT>(between >> 32) | 4u << 16;
+    } else if (mode == "dispatch-output-unplaced" || mode == "dispatch-output-copied") {
+        descriptors[1][0] = static_cast<UINT>(between);
+        descriptors[1][1] = static_cast<UINT>(between >> 32) | 4u << 16;
+    } else if (mode == "dispatch-output-unaligned") {
+        descriptors[1][0] += 8;  // still inside the buffer: 318 records
+        descriptors[1][2] = words - 2;
+    } else if (typed_output_offset) {
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[1]) + 8;
+        descriptors[1][0] = static_cast<UINT>(address);
+        descriptors[1][1] = static_cast<UINT>(address >> 32) | fields[1][0] << 16;
     }
+    const bool heap_short = mode == "dispatch-heap-waterfall-short";
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, heap_waterfall ? (heap_short ? 3u : 5u) : 4u,
+                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     // dispatch-sampled-compute records the same calls on a compute list and queue.
     const D3D12_COMMAND_LIST_TYPE list_type = mode == "dispatch-sampled-compute" ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -398,8 +473,30 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 5, 0};
         std::memcpy(descriptors[1], alias, sizeof(alias));
     }
-    std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
-    const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
+    const bool change_table_root = mode == "dispatch-table-root-changed";
+    const bool change_table_heap = mode == "dispatch-table-heap-changed";
+    StreamWord table_gpu = gpu;
+    if (mode == "dispatch-table-offset") {
+        const UINT increment = static_cast<UINT>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        if (increment < sizeof(descriptors[0])) return 73;
+        const StreamWord offset = StreamWord{2} * increment;
+        // The heap starts with the wrong pair, but both records are well-formed. The correct pair starts at index 2.
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors[1], sizeof(descriptors[1]));
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[1])), descriptors[0], sizeof(descriptors[0]));
+        std::memcpy(reinterpret_cast<void*>(cpu + offset), descriptors, sizeof(descriptors));
+        table_gpu += offset;
+    } else {
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    }
+    if (mode == "dispatch-records32" || typed_output_offset || shared_uav) {  // output at byte 32, none at byte 16
+        std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
+        std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
+    }
+    void* other_heap = nullptr;
+    if (change_table_heap &&
+        (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)),
+                 word(&other_heap)))) || !other_heap || other_heap == heap)) return 72;
+    const bool heap_record = mode.rfind("dispatch-heap", 0) == 0 && !heap_waterfall;
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
@@ -436,9 +533,25 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         view.Buffer = {0, 32u / element, 0, D3D12_BUFFER_SRV_FLAG_NONE};
         invoke(device, 18, word(placed[0]), word(&view), cpu + 64);
     }
+    if (heap_waterfall) {
+        if (heap_short) {
+            std::memcpy(reinterpret_cast<void*>(cpu + 32), record_descs[1], sizeof(record_descs[1]));
+            std::memcpy(reinterpret_cast<void*>(cpu + 64), record_descs[2], sizeof(record_descs[2]));
+        } else {
+            for (UINT rec = 0; rec < 4; ++rec)
+                std::memcpy(reinterpret_cast<void*>(cpu + rec * 32u), record_descs[rec], sizeof(record_descs[rec]));
+            std::memcpy(reinterpret_cast<void*>(cpu + 128), descriptors, sizeof(descriptors));
+        }
+    }
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
     const bool dynamic_heap = mode.rfind("dispatch-heap-dynamic", 0) == 0;
-    const UINT constants[3] = {title_input ? record_offsets[1] : 0x01234567u,
+    UINT active_lanes = 4u;
+    if (heap_waterfall) {
+        char buf[32];
+        const DWORD len = GetEnvironmentVariableA("X2W_TEST_DISPATCH_ACTIVE", buf, sizeof(buf));
+        if (len && len < sizeof(buf)) active_lanes = static_cast<UINT>(std::strtoul(buf, nullptr, 10));
+    }
+    const UINT constants[3] = {heap_waterfall ? active_lanes : title_input ? record_offsets[1] : 0x01234567u,
         title_input ? record_offsets[2] : 0x9e3779b9u, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
@@ -447,17 +560,47 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    const auto submit = [&](UINT64 value) -> int {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), value)))) return 76;
+        // Render mode publishes the guest fence value after desktop queue completion.
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        for (;;) {
+            const auto completed = invoke(fence, 8);
+            const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
+            if (completed == ~UINT64{0} || FAILED(removed)) {
+                std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
+                return 78;
+            }
+            if (completed == value) break;
+            if (GetTickCount64() >= deadline) {
+                std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
+                return 78;
+            }
+            Sleep(1);
+        }
+        return 0;
+    };
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups, write_zero,
+                                 pixel ? queue : nullptr, pixel ? placed[1] : nullptr);
+    if (pixel) {
+        if (const int rc = submit(1)) return rc;
+        std::printf("guest queue=%p writer fence=1 completed\n", queue);
+        if (!record.check_record(groups, write_zero)) return 80;
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    }
     bind(list);
     if (mode.rfind("dispatch-texel-", 0) == 0) {
         const auto format = mode == "dispatch-texel-float" ? DXGI_FORMAT_R32_FLOAT :
                             mode == "dispatch-texel-sint" ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
         if (!bind_identifier_fixture(device, list, cpu + 64, format, identifier_fixture_dimension())) return 80;
     }
-    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || view_tokens || mode == "dispatch-indirect-texture") {
+    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || mode == "dispatch-output-texture-token" ||
+        view_tokens || mode == "dispatch-indirect-texture") {
         const bool depth = mode == "dispatch-sampled-depth";
-        const UINT width = view_tokens || depth || mode == "dispatch-sampled-2x1" ? 2 : 1;
+        const UINT width = depth || view_tokens || mode == "dispatch-sampled-2x1" ? 2 : 1;
         const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
         const UINT16 mips = view_tokens ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, format, {1, 0}};
@@ -491,6 +634,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             view.Texture2D.MostDetailedMip = 1;
         }
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
+        // Byte 16 is not a descriptor of the heap: the token's words are copied there, as a title copies descriptors.
+        if (mode == "dispatch-output-texture-token") std::memcpy(reinterpret_cast<void*>(cpu + 16), reinterpret_cast<const void*>(cpu + 64), 16);
     }
     if (view_tokens) {
         if (mode == "dispatch-input-view-tokens-wrong-kind") {
@@ -536,6 +681,65 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // The 32-byte token overlaps the following 16-byte table descriptor.
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
     }
+    if (mode.rfind("dispatch-texdim-", 0) == 0) {
+        // dispatch-texdim-<1d|2da|3d>[-mismatch|-undescribed|-clamped]: the sampled input is a described R32_FLOAT texture
+        // of that dimension in the SRV at table byte 64, texel (x + y * 4 + slice * 16) holding 0.25 * (index + 1):
+        // 1d is 8 texels wide, 2da is 4x4 with six slices (the view starts at slice 1 and spans four), 3d is 4x4x4.
+        // Each subresource is uploaded by its own copy. -mismatch views a plain 2D texture instead (a view dimension
+        // that is not the manifest's), -undescribed creates the view without a description, -clamped sets
+        // ResourceMinLODClamp 1.0 (a valid desktop view that is not a view of the texels as stored; a view outside the
+        // texture would remove the device when it is created).
+        const std::string rest = mode.substr(16);
+        const std::string kind = rest.substr(0, rest.find('-'));
+        const std::string control = rest.find('-') == std::string::npos ? "" : rest.substr(rest.find('-') + 1);
+        const bool one = kind == "1d", array = kind == "2da", volume = kind == "3d";
+        if (!one && !array && !volume) return 2;
+        const bool plain = control == "mismatch";
+        constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT;
+        const UINT width = one && !plain ? 8 : 4, height = one && !plain ? 1 : 4;
+        const UINT depth = plain || one ? 1 : array ? 6 : 4;
+        const D3D12_RESOURCE_DIMENSION dimension = plain || array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D :
+            one ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const D3D12_RESOURCE_DESC texture_desc{dimension, 0, width, height, static_cast<UINT16>(depth), 1, format, {1, 0}};
+        constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, slice_bytes = pitch * 4;
+        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 8192, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
+        void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* texel = nullptr;
+        if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&texel)))) || !texel) return 80;
+        std::memset(texel, 0, 8192);
+        for (UINT z = 0; z < depth; ++z)
+            for (UINT y = 0; y < height; ++y)
+                for (UINT x = 0; x < width; ++x) {
+                    const float value = 0.25f * static_cast<float>(x + y * 4 + z * 16 + 1);
+                    std::memcpy(static_cast<char*>(texel) + z * slice_bytes + y * pitch + x * 4, &value, sizeof(value));
+                }
+        invoke(upload, 9, 0, 0);
+        // A 3D texture is one subresource whose footprint spans its depth; a 2D one has a subresource per slice.
+        const UINT copies = volume ? 1 : depth;
+        for (UINT i = 0; i < copies; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            image.SubresourceIndex = i;
+            D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            source.PlacedFootprint = {UINT64{i} * slice_bytes, {format, width, height, volume ? depth : 1, pitch}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        const float clamp = control == "clamped" ? 1.0f : 0.0f;
+        if (plain) view.Texture2D.MipLevels = 1;
+        else if (one) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            view.Texture1D = {0, 1, clamp};
+        } else if (array) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 1, 1, 4, 0, clamp};
+        } else {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Texture3D = {0, 1, clamp};
+        }
+        invoke(device, 18, word(texture), control == "undescribed" ? 0 : word(&view), cpu + 64);
+    }
     if (mode == "dispatch-input-memory-view") {
         // The input is a buffer view (device slot 70) of memory no buffer is placed over, 16 bytes in; its token
         // replaces the input descriptor and the words are written after the view exists.
@@ -554,6 +758,40 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
     }
+    if (root_srv && mode != "dispatch-root-srv-unset") {
+        UINT64 addr0 = reinterpret_cast<UINT64>(buffers[0]);
+        UINT64 addr1 = reinterpret_cast<UINT64>(buffer2);
+        if (mode == "dispatch-root-srv-offset") {
+            addr0 += 16;
+            addr1 += 32;
+        } else if (mode == "dispatch-root-srv-upload") {
+            auto* const up = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, words * sizeof(UINT), 256)));
+            if (!up) return 81;
+            std::memcpy(up, buffers[0], words * sizeof(UINT));
+            addr0 = reinterpret_cast<UINT64>(up) + 16;
+        } else if (mode == "dispatch-root-srv-null") {
+            addr0 = 0;
+        } else if (mode == "dispatch-root-srv-unaligned") {
+            addr0 += 2;
+        } else if (mode == "dispatch-root-srv-unaligned-16") {
+            addr0 += 4;
+        } else if (mode == "dispatch-root-srv-unmapped" || mode == "dispatch-root-srv-copied") {
+            addr0 = between;
+        } else if (mode == "dispatch-root-srv-same-buffer") {
+            addr0 = reinterpret_cast<UINT64>(buffers[1]);
+        }
+        invoke(list, 43, 2, addr0);
+        if (mode != "dispatch-root-srv-unset-second") invoke(list, 43, 3, addr1);
+    }
+    if (mode == "dispatch-root-srv-root-changed") {
+        invoke(list, 33, word(slot67_other_root));
+        invoke(list, 33, word(slot67_root));
+    } else if (mode == "dispatch-root-srv-same-root") {
+        invoke(list, 33, word(slot67_root));
+    } else if (mode == "dispatch-root-srv-reset") {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+        bind(list);
+    }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
     invoke(list, 39, 0, 1, word(&constants[1]), 1);
@@ -563,7 +801,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind(list);
     }
-    if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (heap_record || root_srv || heap_waterfall) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     if (dynamic_heap) {
         auto* const index = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
         if (!index) return 81;
@@ -613,10 +851,22 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                               mode == "dispatch-heap-word-past" ? at : mode == "dispatch-heap-word-placed" ? words * 4 : bytes, 0};
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
-    invoke(list, 35, 1, gpu);
+    invoke(list, 35, 1, table_gpu + (heap_waterfall && !heap_short ? 128u : 0u));
+    if (change_table_root) {
+        invoke(list, 33, word(slot67_other_root));
+        invoke(list, 33, word(slot67_root));
+    }
+    if (change_table_heap) invoke(list, 32, 1, word(&other_heap));
+    if (change_table_root || change_table_heap) {
+        // Give Dispatch the expected entry values without rebinding slot 35.
+        invoke(list, 37, 0, constants[0], 0);
+        invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    }
+    if (pixel) record.capture_before_consumer(adapter, device, list);
     if (dynamic_heap) invoke(list, 14, 1, 1, 1);
     else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
+    else if (heap_waterfall) invoke(list, 14, 1, 1, 1);
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode == "dispatch-nolock-burst") {
@@ -734,18 +984,46 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 14, 1, 1, 1);
         if (!protected_input && !alias_input) std::memset(source, 0, 16);  // snapshot must have happened at record time
         invoke(list, 15, word(title_readback), 0, word(placed[1]), 0, sizeof(input));
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (mode != "dispatch-none" && mode != "dispatch-root-srv-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
-        Sleep(1);
+    if (const int rc = submit(pixel ? 2 : 1)) return rc;
+    if (pixel) {
+        std::printf("guest queue=%p consumer fence=2 completed\n", queue);
+        if (!record.check_record(groups, write_zero, true)) return 80;
+        const bool stale = mode == "dispatch-indirect-pixel-5-stale";
+        record.draw_pixels(adapter, device, queue, placed[stale ? 0 : 1], stale);
     }
-    if (indirect && !record.check_record(groups)) return 80;
+    if (indirect && !pixel && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
+    if (long_run) {
+        UINT first[words];
+        std::memcpy(first, buffers[1], sizeof(first));
+        for (UINT frame = 1; frame < long_frames; ++frame) {
+            std::fill_n(buffers[1], words, 0xc5c5c5c5u);
+            if (FAILED(static_cast<HRESULT>(invoke(allocator, 8)))) return 84;
+            // Keep each submitted list alive and closed so only fenced submit can drop its snapshot hold.
+            if (keep_closed && FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0,
+                    word(&__uuidof(ID3D12GraphicsCommandList)), word(&list))))) return 72;
+            if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+            bind(list);
+            invoke(list, 37, 0, constants[0], 0);
+            invoke(list, 40, 0, 2, word(graphics), 0);
+            invoke(list, 39, 0, 1, word(&constants[1]), 1);
+            invoke(list, 35, 1, gpu);
+            invoke(list, 14, 3, 2, 2);
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+            invoke(queue, 10, 1, word(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), frame + 1)))) return 76;
+            for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < frame + 1;) {
+                if (GetTickCount64() >= deadline) return 78;
+                Sleep(1);
+            }
+            if (std::memcmp(first, buffers[1], sizeof(first)) != 0) return 85;  // a frame gave other words than the first
+            for (UINT i = 0; i < words; ++i)
+                if (buffers[0][i] != input[i]) return 79;
+        }
+    }
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
@@ -913,20 +1191,53 @@ static int dispatch_descriptor_ring(IDXGIAdapter* adapter, void* device)
 // without unordered access, so the stand-in records its view as not created. texture-store-uint makes the texture
 // and its view RGBA16_UINT; texture-store-occupied then asks for a view of a texture without unordered access at the same
 // handle, which keeps the first view; texture-store-self also creates a shader resource view of the texture at table byte 0.
-static int texture_slot67(void* device, const std::string& mode)
+// texture-store-mips adds a second UAV of the same texture. The swapped mode reverses the two mip views.
+static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
-    constexpr UINT width = 32, height = 8;
+    constexpr UINT width = 32;
     const bool replay = mode == "texture-store-replay";
-    const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
-    const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
-    const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
+    const bool exact = mode.rfind("texture-exact-", 0) == 0;
+    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume";
+    const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
+    const UINT first_mip = volume || line ? 1 : 0;
+    const UINT height = line ? 1 : 8;
+    const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
+    const bool atomic_uint = mode == "texture-store-atomic";
+    const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ||
+                        mode == "texture-exact-array" ? 6 : 1;
+    const UINT subresources = volume ? 1 : layers;
+    const bool swapped = mode == "texture-store-mips-swapped";
+    const bool dual = swapped || mode == "texture-store-mips";
+    const UINT mips = dual ? 2 : 1;
+    const UINT pixel_bytes = exact ? (mode == "texture-exact-rg" ? 8 : 4) : atomic_uint ? 4 : fp32 ? 16 : 8;
+    const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
+    const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
+    const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+    const DXGI_FORMAT format = mode == "texture-exact-r" ? DXGI_FORMAT_R32_FLOAT :
+        mode == "texture-exact-rg" ? DXGI_FORMAT_R32G32_FLOAT :
+        mode == "texture-exact-rgba" ? DXGI_FORMAT_R8G8B8A8_UNORM :
+        exact ? DXGI_FORMAT_R11G11B10_FLOAT :
+        atomic_uint ? DXGI_FORMAT_R32_UINT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
+    if (exact) {
+        ComPtr<ID3D12Device> desktop;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop))) ||
+            FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) ||
+            (volume && !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE3D))) {
+            std::printf("exact-width image store format %u unavailable\n", static_cast<unsigned>(format));
+            return 77;
+        }
+    }
+    const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    D3D12_RESOURCE_DESC texture_desc{dimension, 0, width << first_mip, line ? 1 : height << first_mip,
+        static_cast<UINT16>(volume ? layers << first_mip : layers), static_cast<UINT16>(first_mip + mips), format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (replay)
@@ -939,10 +1250,32 @@ static int texture_slot67(void* device, const std::string& mode)
     void* memory = nullptr;
     if (!texture || !readback) return 71;
     if (!replay && (!upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory)) return 71;
-    if (fp32) {
+    if (exact) {
+        for (UINT layer = 0; layer < layers; ++layer)
+            for (UINT y = 0; y < height; ++y) {
+                auto* row = reinterpret_cast<UINT*>(static_cast<char*>(memory) + offset(layer, 0) + y * pitch);
+                const UINT row_words = width * pixel_bytes / sizeof(UINT);
+                for (UINT x = 0; x < row_words; ++x)
+                    row[x] = 0x30000000u + (layer * height + y) * row_words + x;
+            }
+    } else if (atomic_uint) {
+        auto* words = static_cast<UINT*>(memory);
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x)
+                words[y * pitch / sizeof(UINT) + x] = 0x10f00000u + y * width + x;
+    } else if (fp32) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;
+    } else if (dual) {
+        for (UINT mip = 0; mip < mips; ++mip) {
+            const UINT row_halves = (width >> mip) * (pixel_bytes / sizeof(UINT16));
+            auto* start = reinterpret_cast<UINT16*>(static_cast<char*>(memory) + offset(0, mip));
+            for (UINT y = 0; y < (height >> mip); ++y)
+                for (UINT x = 0; x < row_halves; ++x)
+                    start[y * pitch / sizeof(UINT16) + x] =
+                        static_cast<UINT16>(0x5000 + 0x400 * mip + y * row_halves + x);
+        }
     } else if (!replay) {
         for (UINT i = 0; i < bytes / 2; ++i) static_cast<UINT16*>(memory)[i] = static_cast<UINT16>(0x5000 + i);
     }
@@ -950,7 +1283,7 @@ static int texture_slot67(void* device, const std::string& mode)
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, dual ? 5u : 4u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -962,9 +1295,18 @@ static int texture_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    if (layers > 1) {
+    if (volume) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        // At mip 1 the depth is six. The bad count fits only if the binder uses the base mip's depth.
+        view.Texture3D = {first_mip, 1, mode == "texture-volume-bad-w" ? layers : ~0u};
+    } else if (line) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        view.Texture1D.MipSlice = mode == "texture-line-bad-mip" ? first_mip + 1 : first_mip;
+    } else if (layers > 1) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray = {0, 1, 4, 0}; // four selected slices, with untouched neighbors on both sides
+    } else {
+        view.Texture2D.MipSlice = swapped ? 1 : 0;
     }
     if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
     if (mode == "texture-store-copied") {
@@ -985,14 +1327,23 @@ static int texture_slot67(void* device, const std::string& mode)
         if (!other) return 79;
         invoke(device, 19, word(other), 0, word(&view), cpu + 64);
     }
+    if (dual) {
+        view.Texture2D.MipSlice = swapped ? 0 : 1;
+        invoke(device, 19, word(texture), 0, word(&view), cpu + 128);
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
-    D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
-    D3D12_TEXTURE_COPY_LOCATION result = source;
-    result.pResource = static_cast<ID3D12Resource*>(readback);
+    const auto transfer = [&](void* buffer, bool to_texture) {
+        for (UINT layer = 0; layer < subresources; ++layer)
+            for (UINT mip = 0; mip < mips; ++mip) {
+                D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                image.SubresourceIndex = layer * texture_desc.MipLevels + first_mip + mip;
+                D3D12_TEXTURE_COPY_LOCATION rows{static_cast<ID3D12Resource*>(buffer), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                rows.PlacedFootprint = {offset(layer, mip), {format, width >> mip, height >> mip, volume ? layers : 1, pitch}};
+                invoke(list, 16, word(to_texture ? &image : &rows), 0, 0, 0, word(to_texture ? &rows : &image), 0);
+            }
+    };
     const auto finish = [&](UINT64 value) {
         if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
         invoke(queue, 10, 1, word(&list));
@@ -1022,33 +1373,29 @@ static int texture_slot67(void* device, const std::string& mode)
             FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     }
     invoke(list, 32, 1, word(&heap));
-    if (!replay) {
-        for (UINT layer = 0; layer < layers; ++layer) {
-            image.SubresourceIndex = layer;
-            source.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
-            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
-        }
-    }
+    if (!replay) transfer(upload, true);
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));
     invoke(list, 39, 0, 3, word(constants), 0);
     invoke(list, 35, 1, gpu);
     if (mode != "texture-store-none") invoke(list, 14, 2, 1, 1);
-    for (UINT layer = 0; layer < layers; ++layer) {
-        image.SubresourceIndex = layer;
-        result.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
-        invoke(list, 16, word(&result), 0, 0, 0, word(&image), 0);
-    }
+    transfer(readback, false);
     if (const int rc = finish(replay ? 2 : 1)) return rc;
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     memory = nullptr;
     if (!n || n >= MAX_PATH || FAILED(static_cast<HRESULT>(invoke(readback, 8, 0, 0, word(&memory)))) || !memory) return 2;
-    std::ofstream(path, std::ios::binary).write(static_cast<const char*>(memory), bytes);
+    std::ofstream output(path, std::ios::binary);
+    for (UINT layer = 0; layer < layers; ++layer)
+        for (UINT mip = 0; mip < mips; ++mip)
+            for (UINT y = 0; y < (height >> mip); ++y)
+                output.write(static_cast<const char*>(memory) + offset(layer, mip) + y * pitch, (width >> mip) * pixel_bytes);
     invoke(readback, 9, 0, 0);
-    return 0;
+    return output ? 0 : 2;
 }
+
+#include "startup_pass_stats_scene.h"
 
 static bool create_slot67(void* device, const char* code_path, const char* data_path, const char* state_path, const char* mode)
 {
@@ -1407,8 +1754,10 @@ int main(int argc, char** argv)
         }
         return dispatch_slot67(adapter.Get(), device, argv[8]);
     }
+    if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "pass-stats", 10) == 0)
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? pass_stats_slot67(device, argv[8]) : 10;
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "texture", 7) == 0)
-        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(device, argv[8]) : 10;
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(adapter.Get(), device, argv[8]) : 10;
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (argc == 5 && std::strncmp(argv[4], "present-", 8) == 0) return present_gray(device, argv[4]);

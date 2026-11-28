@@ -1,12 +1,12 @@
 // Memory pages for replay (docs/startup-runtime.md#d3d12-replay-record): the title memory the recording captured as
-// PAGE/MAP chunks (src/startup_stubs/replay_pages.h) is reserved at its recorded addresses before anything else maps
-// there, and every MAP is written into it before the first call with a larger sequence number. Argument memory inside
-// those ranges is then passed as is: placed resources and mapped pointers name the replayed memory.
+// PAGE/MAP chunks (src/startup_stubs/replay_pages.h) is reserved at its recorded addresses where possible.
+// Each MAP is applied to reserved or translated memory before the first call with a larger sequence number.
 #pragma once
 
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -39,6 +39,7 @@ struct PageReplay {
     std::vector<ReservedSpan> map_spans;  // only ranges whose contents are restored by MAP
     std::size_t next_map = 0;
     u64 maps_applied = 0, pages_written = 0, zero_pages = 0, missing_pages = 0, bad_maps = 0;
+    u64 unreserved_spans = 0, left_out = 0;
     bool rewrite_view_tokens = false;
     std::unordered_map<std::uint32_t, std::uint32_t> view_ids;
     u64 view_tokens_rewritten = 0, view_tokens_unmapped = 0;
@@ -98,7 +99,7 @@ inline std::unordered_map<u64, u64> used_heap_ends(const Recording& r)
 }
 
 // Reserves and commits MAP and descriptor backing ranges at their recorded addresses.
-inline bool reserve_page_ranges(const Recording& r, std::string& problem)
+inline bool reserve_page_ranges(const Recording& r, std::string& problem, void (*log)(const char*, ...))
 {
     static constexpr u64 granule = 0x10000;
     const auto aligned = [](u64 address, u64 bytes) -> ReservedSpan {
@@ -108,11 +109,11 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     for (const PageMap& m : r.maps)
         if (m.bytes) state.map_spans.push_back(aligned(m.address, m.bytes));
     merge_spans(state.map_spans);
-    std::vector<ReservedSpan> wanted = state.map_spans;
+    std::vector<ReservedSpan> required;
     Step step;
     for (const StepRef& ref : r.backed_steps) {
         r.load(ref, step);
-        wanted.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
+        required.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
     }
     // Reserve whole recorded allocations, even when only interior pages were captured. A heap's allocation ends where
     // its placements end: OpenExistingHeapFromAddress takes the whole allocation, and on WARP every opened byte counts
@@ -123,7 +124,7 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     for (const auto& entry : r.placement_heaps) {
         const HeapPlacement& heap = entry.second;
         const u64 end = (heap.base + heap.bytes + granule - 1) & ~(granule - 1);
-        wanted.push_back({heap.base, end});
+        required.push_back({heap.base, end});
         boundaries.push_back(heap.base);
         boundaries.push_back(end);
         const auto used = used_ends.find(entry.first);
@@ -133,49 +134,67 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     }
     std::sort(boundaries.begin(), boundaries.end());
     boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    merge_spans(required);
+    std::vector<ReservedSpan> wanted = state.map_spans;
+    wanted.insert(wanted.end(), required.begin(), required.end());
     merge_spans(wanted);
     // Do not let adjacent page ranges merge two different recorded heaps into one allocation.
+    std::vector<ReservedSpan> reservations;
     state.spans.clear();
     for (const ReservedSpan& s : wanted) {
         u64 base = s.base;
         for (auto cut = std::upper_bound(boundaries.begin(), boundaries.end(), base);
              cut != boundaries.end() && *cut < s.end; ++cut) {
-            state.spans.push_back({base, *cut});
+            reservations.push_back({base, *cut});
             base = *cut;
         }
-        state.spans.push_back({base, s.end});
+        reservations.push_back({base, s.end});
     }
-    for (const ReservedSpan& s : state.spans) {
+    for (const ReservedSpan& s : reservations) {
         void* const at = VirtualAlloc(reinterpret_cast<void*>(s.base), static_cast<SIZE_T>(s.end - s.base), MEM_RESERVE | MEM_COMMIT,
                                       PAGE_READWRITE);
-        if (at != reinterpret_cast<void*>(s.base)) {
-            char text[160];
-            std::snprintf(text, sizeof(text), "title range 0x%llx-0x%llx could not be reserved at its address (error %lu)",
-                          s.base, s.end, GetLastError());
+        if (at && at == reinterpret_cast<void*>(s.base)) {
+            state.spans.push_back(s);
+            continue;
+        }
+        const DWORD error = at ? ERROR_INVALID_ADDRESS : GetLastError();
+        if (at) VirtualFree(at, 0, MEM_RELEASE);
+        char text[160];
+        std::snprintf(text, sizeof(text), "title range 0x%llx-0x%llx could not be reserved (error %lu)",
+                      s.base, s.end, error);
+        const auto backing = std::upper_bound(required.begin(), required.end(), s.base,
+                                              [](u64 base, const ReservedSpan& span) { return base < span.end; });
+        if (backing != required.end() && backing->base < s.end) {
             problem = text;
-            if (at) VirtualFree(at, 0, MEM_RELEASE);
             return false;
         }
+        if (++state.unreserved_spans <= 16)
+            log("x2w-replay: %s: its pages are left out", text);
     }
     return true;
 }
 
 // Writes one MAP's runs into the reserved memory.
 // Where a recorded page is on the replay: its address there, with `bytes` clipped to the translated range. The
-// recorded address itself when the page is not in a translated range.
+// result is zero when the page has no translation.
 using PageTarget = std::function<u64(u64 address, u64& bytes)>;
 
-inline void write_page(const PageTarget& target, u64 at, const unsigned char* data)
+inline bool write_page(const PageTarget& target, u64 at, const unsigned char* data)
 {
+    PageReplay& state = page_replay();
     u64 bytes = page_bytes;
-    auto* to = reinterpret_cast<unsigned char*>(target ? target(at, bytes) : at);
+    const u64 translated = target ? target(at, bytes) : 0;
+    if (!translated && !state.reserved(at, page_bytes)) {
+        ++state.left_out;
+        return false;
+    }
+    auto* to = reinterpret_cast<unsigned char*>(translated ? translated : at);
     if (!data) {
         std::memset(to, 0, static_cast<std::size_t>(bytes));
-        return;
+        return true;
     }
     std::memcpy(to, data, static_cast<std::size_t>(bytes));
-    PageReplay& state = page_replay();
-    if (!state.rewrite_view_tokens) return;
+    if (!state.rewrite_view_tokens) return true;
     constexpr std::uint32_t token_magic = 0x56573258;  // "X2WV"
     for (u64 offset = 0; offset + 32 <= bytes; offset += 32) {
         std::uint32_t words[2];
@@ -189,6 +208,7 @@ inline void write_page(const PageTarget& target, u64 at, const unsigned char* da
             ++state.view_tokens_rewritten;
         }
     }
+    return true;
 }
 
 inline void apply_map(const Recording& r, const PageMap& m, const PageTarget& target)
@@ -211,8 +231,7 @@ inline void apply_map(const Recording& r, const PageMap& m, const PageTarget& ta
         for (std::uint32_t i = 0; i < run.pages; ++i) {
             const u64 page = m.address + (u64{run.first} + i) * page_bytes;
             if (run.kind == 1) {
-                write_page(target, page, nullptr);
-                ++state.zero_pages;
+                if (write_page(target, page, nullptr)) ++state.zero_pages;
                 continue;
             }
             if (left < sizeof(PageKey)) {
@@ -227,8 +246,7 @@ inline void apply_map(const Recording& r, const PageMap& m, const PageTarget& ta
                 ++state.missing_pages;
                 continue;
             }
-            write_page(target, page, found->second);
-            ++state.pages_written;
+            if (write_page(target, page, found->second)) ++state.pages_written;
         }
     }
     ++state.maps_applied;

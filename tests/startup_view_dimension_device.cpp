@@ -113,6 +113,22 @@ float4 main() : SV_Target
 }
 )";
 
+// The same payload read through a typed buffer view of 16 elements of four words: element 0 and element 15 hold the words
+// the structured probe reads.
+constexpr char memory_buffer_typed_probe[] = R"(
+Buffer<uint4> source : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+}
+float4 main() : SV_Target
+{
+    const uint4 first = source[0];
+    const uint4 last = source[15];
+    return float4(first.x, first.y, last.z, last.w);
+}
+)";
+
 struct Context {
     IUnknown* guest;
     ID3D12Device* device;
@@ -286,7 +302,7 @@ bool check_snapshot_counts(const char* expected)
     return false;
 }
 
-int check_memory_buffer(Context& c, bool off, bool mutant, bool recover, bool cache_first)
+int check_memory_buffer(Context& c, bool off, bool mutant, bool recover, bool cache_first, bool typed)
 {
     using Payload = std::array<std::uint32_t, 64>;
     SYSTEM_INFO system{};
@@ -313,6 +329,11 @@ int check_memory_buffer(Context& c, bool off, bool mutant, bool recover, bool ca
     at.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     at.view.Buffer.NumElements = 1;
     at.view.Buffer.StructureByteStride = sizeof(Payload);
+    if (typed) {
+        at.view.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+        at.view.Buffer.NumElements = sizeof(Payload) / 16;
+        at.view.Buffer.StructureByteStride = 0;
+    }
     at.address = reinterpret_cast<UINT64>(data);
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = c.heap_real->GetCPUDescriptorHandleForHeapStart();
@@ -471,8 +492,9 @@ int main(int argc, char** argv)
     const bool memory_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-off") == 0;
     const bool memory_mutant = argc == 3 && std::strcmp(argv[2], "memory-buffer-stale") == 0;
     const bool cache_first = argc == 3 && std::strcmp(argv[2], "memory-buffer-cache-first") == 0;
+    const bool typed = argc == 3 && std::strcmp(argv[2], "memory-buffer-typed") == 0;
     const bool recover = cache_first || (argc == 3 && std::strcmp(argv[2], "memory-buffer-recover") == 0);
-    const bool memory_buffer = diagnostics || recover || memory_off || memory_mutant ||
+    const bool memory_buffer = diagnostics || recover || memory_off || memory_mutant || typed ||
         (argc == 3 && std::strcmp(argv[2], "memory-buffer") == 0);
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
         (argc == 3 && !memory_buffer && std::strcmp(argv[2], "off")))
@@ -537,7 +559,7 @@ int main(int argc, char** argv)
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     const D3D12_ROOT_SIGNATURE_DESC root_desc{memory_buffer ? 1u : 2u, root_parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    const char* shader = memory_buffer ? memory_buffer_probe : probe_shader;
+    const char* shader = typed ? memory_buffer_typed_probe : memory_buffer ? memory_buffer_probe : probe_shader;
     ComPtr<ID3DBlob> root_blob, errors, code;
     if (!require(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, root_blob.GetAddressOf(),
                                             errors.GetAddressOf()), "root serialize") ||
@@ -601,7 +623,7 @@ int main(int argc, char** argv)
             other_device.Get() == guest.Get()) return 4;
         return check_snapshot_diagnostics(c, other_device.Get(), diagnostics_off, snapshot_off);
     }
-    if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant, recover, cache_first);
+    if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant, recover, cache_first, typed);
 
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                            {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};

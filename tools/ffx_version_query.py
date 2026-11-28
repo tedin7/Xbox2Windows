@@ -599,6 +599,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS, M.MOVAPS,
         M.RCPPS, M.RCPSS, M.RSQRTPS, M.RSQRTSS,
         M.SHUFPD, M.UNPCKHPD, M.UNPCKLPD, M.MOVMSKPD, M.MOVUPD, M.MOVAPD, M.MOVDQA,
+        M.MOVNTPS, M.MOVNTPD, M.MOVNTDQ,
         M.VSHUFPS, M.VUNPCKHPS, M.VUNPCKLPS, M.VSHUFPD, M.VUNPCKHPD, M.VUNPCKLPD,
         M.VPSHUFD, M.VPSHUFHW, M.VPSHUFLW, M.VMOVHLPS, M.VMOVLHPS, M.VMOVMSKPS, M.VMOVMSKPD,
         M.VMOVAPS, M.VMOVAPD, M.VMOVDQA, M.VPMOVMSKB, M.VRCPPS, M.VRCPSS, M.VRSQRTPS, M.VRSQRTSS,
@@ -923,6 +924,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 stmt = f"{decrement} if ({count} != 0{condition}) goto block_{target:x};"
         elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
+        elif op == M.MOVNTI and i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER:
+            # A non-temporal store of a 32- or 64-bit register, with no alignment requirement and no flag change.
+            if MemorySizeExt.size(i.memory_size) == 8:
+                stmt = f"_mm_stream_si64(reinterpret_cast<long long*>({address()}), static_cast<long long>({operand(1)}));"
+            else:
+                stmt = f"_mm_stream_si32(reinterpret_cast<int*>({address()}), static_cast<int>({operand(1)}));"
         elif op == M.MOVSXD:
             stmt = write(f"int64_t(int32_t({operand(1)}))")
         elif op == M.MOVSX:
@@ -2564,6 +2571,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                         f"memcpy(reinterpret_cast<void*>(target), {wide_xmm[i.op1_register]}.data(), 16); }}")
             else:
                 raise ValueError(f"unsupported aligned SSE move form at {i.ip:#x}: {i}")
+        elif op in (M.MOVNTPS, M.MOVNTPD, M.MOVNTDQ) and i.encoding == EncodingKind.LEGACY and has_wide:
+            # Non-temporal stores of a whole XMM register. Like MOVAPS, a target that is not 16-byte aligned
+            # raises #GP(0) before anything is written. The streaming store keeps the non-temporal hint; its weak
+            # ordering is the guest's own (only an SFENCE, MFENCE or locked instruction orders it).
+            if i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ const word target = {address()}; if (target & 15u) raise_aligned_m128_fault(); "
+                        f"__m128i value; memcpy(&value, {wide_xmm[i.op1_register]}.data(), 16); "
+                        f"_mm_stream_si128(reinterpret_cast<__m128i*>(target), value); }}")
+            else:
+                raise ValueError(f"unsupported non-temporal SSE store form at {i.ip:#x}: {i}")
         elif op in (M.MOVUPS, M.MOVUPD) and has_wide:
             is_vex = i.encoding == EncodingKind.VEX
             if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:

@@ -5,3 +5,4 @@ EXPORTS
     XApuDisconnect
     XApuEnqueueCommand
     XApuGetResultCount
+    x2w_xapu_command_counts

@@ -4,6 +4,8 @@ The policy classifies import module names only. It does not resolve exports,
 prove a provider, or load the image.
 """
 
+from collections.abc import MutableMapping
+
 POLICY_VERSION = 2
 ROUTE_KIND = "candidate"
 RESOLUTION = "not_checked"
@@ -61,8 +63,17 @@ POLICY = {
 }
 
 
+def _validate_module(module):
+    """Reject non-str, empty, whitespace, or control-character module names."""
+    if not isinstance(module, str):
+        raise ValueError(f"module name must be a str, got {type(module).__name__}")
+    if not module or any(ch.isspace() or ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in module):
+        raise ValueError(f"invalid module name: {module!r}")
+
+
 def classify(module):
     """Return (route, reason) for a module name. No route is inferred."""
+    _validate_module(module)
     name = module.lower()
     if name in POLICY["hle"]:
         return "hle", POLICY["hle"][name]
@@ -82,6 +93,10 @@ def annotate(row, module_key="module"):
     The caller keeps its own caller and symbol fields. No provider or export
     resolution is recorded.
     """
+    if not isinstance(row, MutableMapping):
+        raise TypeError(f"row must be a MutableMapping, got {type(row).__name__}")
+    if module_key not in row:
+        raise KeyError(module_key)
     module = row[module_key]
     route, reason = classify(module)
     row.update({

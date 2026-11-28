@@ -227,6 +227,104 @@ int main(int argc, char** argv)
     const std::uint32_t bits_a = probe.texel(a.Get()), bits_b = probe.texel(b.Get());
     if (bits_a != 0xa1a1a1a1) { std::printf("A readback: %08x\n", bits_a); return 12; }
     if (bits_b != 0xb2b2b2b2) { std::printf("B readback: %08x\n", bits_b); return 13; }
+    // Depth stencil heap. The console's DSV descriptors are 8 bytes; a desktop device's are larger (32 on WARP and most
+    // hardware). A replay declares 8, and title handle k * 8 must reach descriptor k of the desktop heap. Without the
+    // declaration (its minimum was 32) handles k * 8 land inside one another's descriptors and the bind or clear reads garbage.
+    {
+        // The console's 8 where this device's depth stencil increment is larger (hardware: 32); on WARP, whose own is 8, 16
+        // stands in so that the title and desktop strides still differ.
+        const UINT dsv_desktop = probe.desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        const UINT dsv_title = dsv_desktop == 8 ? 16 : 8;
+        std::printf("DSV increments: desktop %u, title %u\n", dsv_desktop, dsv_title);
+        x2w_d3d12_replay_title_increment(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsv_title);
+        void* dsv_memory = VirtualAlloc(nullptr, 8 * dsv_title, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
+            dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, arg(dsv_memory), 8ull * dsv_title};
+        void* dsv_heap = nullptr;
+        if (!dsv_memory || !ok(invoke(device, 14, arg(&dsv_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&dsv_heap)))) {
+            std::printf("DSV heap creation failed\n"); return 18;
+        }
+        const Word dsv_start = invoke(dsv_heap, 9);
+        if (dsv_start != arg(dsv_memory)) { std::printf("DSV title heap start differs\n"); return 19; }
+        D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_RESOURCE_DESC depth_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 1, DXGI_FORMAT_D32_FLOAT,
+                                             {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+        ComPtr<ID3D12Resource> depth[2];
+        for (auto& resource : depth)
+            if (FAILED(probe.desktop->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)))) { std::printf("depth creation failed\n"); return 20; }
+        // Descriptors 1 and 5: with an 8-byte title step and 32-byte desktop descriptors, title offset 40 is not a descriptor boundary.
+        const unsigned slots[2] = {1, 5};
+        const float clears[2] = {0.75f, 0.25f};
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_D32_FLOAT;
+        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        for (unsigned i = 0; i < 2; ++i) invoke(device, 21, arg(depth[i].Get()), arg(&dsv), dsv_start + slots[i] * dsv_title);
+        unsigned binds_before = 0, unresolved_before = 0, binds_after = 0, unresolved_after = 0;
+        x2w_d3d12_render_target_stats(&binds_before, &unresolved_before);
+        if (!ok(invoke(list, 139, arg(allocator), 0))) { std::printf("list reset failed (DSV)\n"); return 21; }
+        using ClearDepth = void (WINAPI*)(void*, Word, UINT, float, UINT8, UINT, const void*);
+        const auto clear_depth = reinterpret_cast<ClearDepth>((*static_cast<void***>(list))[51]);
+        for (unsigned i = 0; i < 2; ++i) {
+            const Word handle = dsv_start + slots[i] * dsv_title;
+            invoke(list, 50, 0, 0, 0, arg(&handle));
+            clear_depth(list, handle, D3D12_CLEAR_FLAG_DEPTH, clears[i], 0, 0, nullptr);
+        }
+        invoke(list, 9);
+        if (!probe.submit(list)) { std::printf("DSV submit failed\n"); return 22; }
+        x2w_d3d12_render_target_stats(&binds_after, &unresolved_after);
+        if (binds_after < binds_before + 2 || unresolved_after != unresolved_before) {
+            std::printf("DSV binds %u -> %u, unresolved %u -> %u\n", binds_before, binds_after, unresolved_before, unresolved_after);
+            return 23;
+        }
+        // Read each depth texel back on a desktop queue: COMMON to COPY_SOURCE, one copy of the first texel.
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint{};
+        UINT64 depth_bytes = 0;
+        probe.desktop->GetCopyableFootprints(&depth_desc, 0, 1, 0, &depth_footprint, nullptr, nullptr, &depth_bytes);
+        D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+        const D3D12_RESOURCE_DESC depth_buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, depth_bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        for (unsigned i = 0; i < 2; ++i) {
+            ComPtr<ID3D12Resource> depth_readback;
+            D3D12_COMMAND_QUEUE_DESC desc{};
+            ComPtr<ID3D12CommandQueue> observer;
+            ComPtr<ID3D12CommandAllocator> observer_allocator;
+            ComPtr<ID3D12GraphicsCommandList> copy;
+            ComPtr<ID3D12Fence> done;
+            if (FAILED(probe.desktop->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &depth_buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&depth_readback))) ||
+                FAILED(probe.desktop->CreateCommandQueue(&desc, IID_PPV_ARGS(&observer))) ||
+                FAILED(probe.desktop->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&observer_allocator))) ||
+                FAILED(probe.desktop->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, observer_allocator.Get(), nullptr,
+                                                        IID_PPV_ARGS(&copy))) ||
+                FAILED(probe.desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)))) { std::printf("observer failed\n"); return 24; }
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = depth[i].Get();
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            copy->ResourceBarrier(1, &barrier);
+            D3D12_TEXTURE_COPY_LOCATION to{depth_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            to.PlacedFootprint = depth_footprint;
+            D3D12_TEXTURE_COPY_LOCATION from{depth[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            copy->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            if (FAILED(copy->Close())) return 24;
+            ID3D12CommandList* lists[] = {copy.Get()};
+            observer->ExecuteCommandLists(1, lists);
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const bool finished = event && SUCCEEDED(observer->Signal(done.Get(), 1)) &&
+                                  SUCCEEDED(done->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
+            if (event) CloseHandle(event);
+            void* memory = nullptr;
+            if (!finished || FAILED(depth_readback->Map(0, nullptr, &memory))) { std::printf("DSV readback failed\n"); return 25; }
+            float value = 0;
+            std::memcpy(&value, memory, sizeof(value));
+            depth_readback->Unmap(0, nullptr);
+            std::printf("DSV descriptor %u cleared to %.3f, read %.3f\n", slots[i], clears[i], value);
+            if (value != clears[i]) return 26;
+        }
+    }
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     const auto errors = debug_error_count.load();
     std::printf("desktop stride=%u title stride=%u A=%08x B=%08x removed=0x%08lx errors=%llu\n",

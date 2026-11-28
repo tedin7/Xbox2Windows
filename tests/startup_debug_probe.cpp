@@ -1,6 +1,7 @@
 // Input for the startup debugger's diagnostics check (tests/startup_debug_check.py). It reaches two
 // breakpoints in its own image, the way a retail image keeps soft asserts, and with
-// STARTUP_DEBUG_PROBE_ASSERTS=<n> n more at a third site (the repeated-assert case). It also
+// STARTUP_DEBUG_PROBE_ASSERTS=<n> n more at a third site (the repeated-assert case). With
+// STARTUP_DEBUG_PROBE_REVISIT=1 it reaches the first breakpoint once more after the second. It also
 // reserves one large range, reports whether the loader gave it the debug heap, stays alive for a
 // moment and exits 0.
 // With STARTUP_DEBUG_PROBE_DLL=<file> and STARTUP_DEBUG_PROBE_EXPORT=<name> it also loads that DLL
@@ -145,6 +146,9 @@ int main()
 {
     first_assert();
     second_assert();
+    if (const char* const revisit = std::getenv("STARTUP_DEBUG_PROBE_REVISIT"); revisit && *revisit == '1') {
+        first_assert();
+    }
     const char* const repeated = std::getenv("STARTUP_DEBUG_PROBE_ASSERTS");
     const int repeated_count = repeated ? std::atoi(repeated) : 0;
     repeated_assert(repeated_count);

@@ -24,11 +24,12 @@ int fail(const char* what, int code)
 
 void print_report(const char* name, const Report& r)
 {
-    std::printf("%s: first_block=%lld submitted_blocks=%zu submitted_frames=%llu consumed_frames=%llu clock_frames=%llu "
-                "unsupported=%u rejected_full=%u padding_errors=%u drained_ms=%.1f recovery_ms=%.1f glitches=%s\n",
-                name, static_cast<long long>(r.first_block), r.frames.size(), static_cast<unsigned long long>(r.submitted_frames),
-                static_cast<unsigned long long>(r.consumed_frames), static_cast<unsigned long long>(r.clock_frames),
-                r.unsupported, r.rejected_full, r.padding_errors, r.drained_ms, r.recovery_ms, r.glitches_available ? "reported" : "not available");
+    std::printf("%s: first_block=%lld submitted_blocks=%zu accepted=%llu submitted_frames=%llu consumed_frames=%llu clock_frames=%llu "
+                "unsupported=%u rejected_full=%u not_open=%u padding_errors=%u drained_ms=%.1f recovery_ms=%.1f glitches=%s\n",
+                name, static_cast<long long>(r.first_block), r.frames.size(), static_cast<unsigned long long>(r.accepted),
+                static_cast<unsigned long long>(r.submitted_frames), static_cast<unsigned long long>(r.consumed_frames),
+                static_cast<unsigned long long>(r.clock_frames), r.unsupported, r.rejected_full, r.not_open,
+                r.padding_errors, r.drained_ms, r.recovery_ms, r.glitches_available ? "reported" : "not available");
 }
 
 // Polls until done() holds or ms elapse; every wait in this fixture goes through here.
@@ -87,7 +88,7 @@ int run()
     wait_for(a, 300, [] { return false; });
     const Report ra = a.report();
     print_report("case a (no submission)", ra);
-    if (ra.first_block != -1 || !ra.frames.empty() || ra.submitted_frames != 0 || ra.consumed_frames != 0)
+    if (ra.first_block != -1 || !ra.frames.empty() || ra.accepted != 0 || ra.submitted_frames != 0 || ra.consumed_frames != 0)
         return fail("case a reported accepted or consumed frames without a submission", 1);
 
     // (b) Continuous stream of eight distinguishable 40 ms blocks; block 3 is all zeros.
@@ -104,7 +105,7 @@ int run()
     wait_for(b, 3000, [&] { return b.report().consumed_frames == 8ull * block; });
     const Report rb = b.report();
     print_report("case b (continuous with silence)", rb);
-    if (rb.first_block != 0 || rb.frames.size() != 8 || rb.submitted_frames != 8ull * block) return fail("case b submitted counts", 3);
+    if (rb.first_block != 0 || rb.frames.size() != 8 || rb.accepted != 8 || rb.submitted_frames != 8ull * block) return fail("case b submitted counts", 3);
     for (const uint32_t f : rb.frames) if (f != block) return fail("case b block frame count", 3);
     if (rb.consumed_frames != rb.submitted_frames) return fail("case b consumption incomplete", 4);
     if (rb.peaks[3] != 0.0f) return fail("case b silent block was not silent", 5);
@@ -128,6 +129,7 @@ int run()
     wait_for(c, 3000, [&] { return c.report().recovery_ms >= 0 && c.report().consumed_frames == 3ull * block; });
     const Report rc = c.report();
     print_report("case c (starvation)", rc);
+    if (rc.accepted != 3) return fail("case c accepted block count", 9);
     if (rc.drained_ms < 250) return fail("case c drained interval too short", 9);
     if (rc.recovery_ms < 0) return fail("case c consumption did not recover", 10);
     if (rc.consumed_frames != 3ull * block) return fail("case c consumption incomplete", 10);
@@ -148,7 +150,7 @@ int run()
         if (d.submit(ch6_44, 441, blk6.data()) != Submit::Accepted)
             return fail("case d 5.1 44.1 kHz block not accepted", 13);
         const Report rd = d.report();
-        if (rd.unsupported != 1 || rd.submitted_frames + 2 < resampled_frame_count(441, 44100, mix.rate) ||
+        if (rd.unsupported != 1 || rd.accepted != 1 || rd.submitted_frames + 2 < resampled_frame_count(441, 44100, mix.rate) ||
             rd.submitted_frames > resampled_frame_count(441, 44100, mix.rate))
             return fail("case d report counts mismatch", 14);
     }

@@ -6,7 +6,9 @@ usage: startup_gfx2hlsl_fma_mix_check.py [fxc <fxc> | dispatch <dxc> <offscreen_
 With `fxc`, every translated line is also compiled for ps_5_1 (the profile the startup tools use),
 so emitted text that is not valid HLSL fails here and not only in a later draw. With `dispatch`, every
 translated line runs in a DXC cs_6_0 shader on WARP or a hardware adapter, and each result word is
-compared with a CPU reference that decodes the VOP3P word itself. Exit code 77 is a capability skip.
+compared with a CPU reference that decodes the VOP3P word itself. FXC also compiles a translated
+pixel dispatcher with a counted back edge. Dispatch mode draws that same fixture with DXC and
+checks the packed result words. Exit code 77 is a capability skip.
 
 `v_fma_mix_f32` was refused outright (58 code pairs in the #1723 refusal snapshot). It now shares
 `Stage.mix()` with the two binary16-destination forms.
@@ -30,6 +32,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -171,18 +174,33 @@ expect('control: an unnegated literal on a binary32 source still translates',
        'v1 = U(mix32(F(0x3f800000u), F(v3), F(v4)));')
 
 # --- the binary16-destination forms keep their packing --------------------------------------------
+def inline_mix(args, *, high=False, clamp=False):
+    value = 'saturate(mf0)' if clamp else 'mf0'
+    rounded = ('(((mu0 >> 16) & 0x8000u) | (ma0 > 0x7f800000u ? 0x7e00u : '
+               '(ma0 >= 0x47800000u ? 0x7c00u : (ma0 < 0x38800000u ? '
+               'uint(round(asfloat(ma0) * 16777216.0)) : '
+               'min((ma0 + 0xfffu + ((ma0 >> 13) & 1u) - 0x38000000u) >> 13, 0x7c00u)))))')
+    packed = f'(v1 & 0xffffu) | ({rounded} << 16)' if high else f'(v1 & 0xffff0000u) | {rounded}'
+    return (f'{{ precise float mf0 = mad({args}); uint mu0 = asuint({value}); '
+            f'uint ma0 = mu0 & 0x7fffffffu; v1 = {packed}; }}')
+
+
 expect('mixlo writes the low half',
        encode(MIXLO_F16, 1, (v2, v3, v4), op_sel_hi=(1, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]',
-       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(f16tof32(v2), f16tof32(v3), F(v4)));')
+       inline_mix('f16tof32(v2), f16tof32(v3), F(v4)'))
 expect('mixlo with a negated inline 0 on a binary16 source',
        encode(MIXLO_F16, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1), neg=(0, 0, 1)),
        'v_fma_mixlo_f16 v1, v2, v3, -0 op_sel_hi:[1,1,1]',
-       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(f16tof32(v2), f16tof32(v3), (-0.0)));')
+       inline_mix('f16tof32(v2), f16tof32(v3), (-0.0)'))
 expect('mixhi writes the high half from a high-half source',
        encode(MIXHI_F16, 1, (v2, v3, v4), op_sel=(0, 0, 1), op_sel_hi=(0, 0, 1)),
        'v_fma_mixhi_f16 v1, v2, v3, v4 op_sel:[0,0,1] op_sel_hi:[0,0,1]',
-       'v1 = (v1 & 0xffffu) | (f16rn(mix32(F(v2), F(v3), f16tof32(v4 >> 16))) << 16);')
+       inline_mix('F(v2), F(v3), f16tof32(v4 >> 16)', high=True))
+expect('mixhi clamps before rounding',
+       encode(MIXHI_F16, 1, (v2, v3, v4), clamp=1),
+       'v_fma_mixhi_f16 v1, v2, v3, v4 clamp',
+       inline_mix('F(v2), F(v3), F(v4)', high=True, clamp=True))
 
 # A register whose upper 16 bits are undefined (odd-dmask D16 image_load) can feed a low-half read.
 expect('low half of a register with undefined upper bits',
@@ -197,12 +215,19 @@ expect_refused('high half of a register with undefined upper bits',
 expect_refused('binary32 use of a register with undefined upper bits',
                encode(MIX_F32, 1, (v2, v3, v4)),
                'v_fma_mix_f32 v1, v2, v3, v4', low16_only_v={2})
-expect_refused('op_sel on a binary32 negated inline 0',
-               encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 0, 1), neg=(0, 0, 1)),
-               'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,0,1]')
-expect_refused('op_sel without op_sel_hi (high half of a binary32 source)',
-               encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0)),
-               'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0]')
+expect('op_sel ignored on binary32 negated inline 0',
+       encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 0, 1), neg=(0, 0, 1)),
+       'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,0,1]',
+       'v1 = U(mix32(F(v2), F(v3), (-0.0)));')
+plain_mixed = expect('binary32 and binary16 sources',
+       encode(MIX_F32, 1, (v2, v3, v4), op_sel_hi=(0, 1, 1)),
+       'v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[0,1,1]',
+       'v1 = U(mix32(F(v2), f16tof32(v3), f16tof32(v4)));')
+ignored_mixed = expect('op_sel ignored on binary32 source',
+       encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(0, 1, 1)),
+       'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0] op_sel_hi:[0,1,1]',
+       'v1 = U(mix32(F(v2), f16tof32(v3), f16tof32(v4)));')
+check('ignored binary32 selector emits identical text', plain_mixed == ignored_mixed)
 for src, value in enumerate((0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0), 240):
     expect(f'low-half binary16 inline {value}',
            encode(MIX_F32, 1, (v2, src, v4), op_sel_hi=(0, 1, 0)),
@@ -211,7 +236,7 @@ for src, value in enumerate((0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0), 240):
 expect('low-half binary16 inline 1.0 in mixlo',
        encode(MIXLO_F16, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]',
-       'v1 = (v1 & 0xffff0000u) | f16rn(mix32(F(v2), 1.0, F(v4)));')
+       inline_mix('F(v2), 1.0, F(v4)'))
 expect_refused('high half of inline 1.0',
                encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0)),
                'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel:[0,1,0] op_sel_hi:[0,1,0]')
@@ -254,6 +279,33 @@ expect('inline half on a low binary16 source',
 expect_refused('unverified high half of inline constant',
                encode(MIX_F32, 1, (240, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(1, 0, 0)),
                'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]')
+
+
+def compile_dispatcher_shape(fxc):
+    """FXC 10.0 ps_5_1 failed with 'internal error: invalid access of unbound variable' on the nested helper form
+    f16rn(mix32(...)) inside the translator's [loop] pc dispatcher, in a guarded block followed by discard: the
+    smallest shape found by reducing two real pixel shaders. The binary16 mix line the translator emits for a -0.0
+    addend is placed in that shape and must compile."""
+    line = next(l for l in translated if '(-0.0)' in l and '0xffff0000u' in l)
+    regs = sorted({int(n) for n in re.findall(r'\bv(\d+)\b', line)})
+    destination = int(re.search(r'\bv(\d+) = ', line).group(1))
+    body = ['#define F asfloat', '#define U asuint', G.MIX32, G.F16RN,
+            'struct PSOut { float4 mrt0 : SV_Target0; };',
+            'PSOut main(nointerpolation uint4 p : TEXCOORD0) {', '    PSOut o = (PSOut)0;',
+            '    uint %s; uint exec = 1; uint pc = 0;' % ', '.join('v%d = 0' % r for r in regs),
+            '    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {']
+    body += ['    %sif (pc == %d) {\n    }' % ('else ' if k else '', k) for k in range(10)]
+    body += ['    else if (pc == 10) {', '        if (exec & 1) ' + line, '        if (!(exec & 1)) discard;',
+             '        pc = 0xffffu;', '    }', '    }',
+             '    o.mrt0 = float4(f16tof32(v%d), f16tof32(v%d >> 16), 0, 1);' % (destination, destination),
+             '    return o;', '}']
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'fma_mix_dispatcher.hlsl')
+        with open(src, 'w') as fh:
+            fh.write('\n'.join(body) + '\n')
+        run = subprocess.run([fxc, '/nologo', '/T', 'ps_5_1', '/E', 'main', '/Fo', os.path.join(d, 'shape.cso'), src],
+                             capture_output=True, text=True)
+    return run.returncode, (run.stdout + run.stderr).strip()
 
 
 def compile_translated(fxc):
@@ -324,6 +376,7 @@ def decode_mix(code):
     literal = struct.unpack_from('<I', code, 8)[0] if len(code) >= 12 else None
     return {
         'op': (w0 >> 16) & 0x7f, 'clamp': (w0 >> 15) & 1,
+        'dst': w0 & 0xff,
         'srcs': [w1 & 0x1ff, (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff],
         'op_sel': [(w0 >> (11 + i)) & 1 for i in range(3)],
         'op_sel_hi': [(w1 >> 27) & 1, (w1 >> 28) & 1, (w0 >> 14) & 1],
@@ -389,10 +442,59 @@ def reference(fields, words):
     if fields['op'] == MIX_F32:
         return f32_word(result)
     half = f16_word(result)
-    before = words['v1']
+    before = words['v%d' % fields['dst']]
     if fields['op'] == MIXLO_F16:
         return (before & 0xffff0000) | half
     return (before & 0xffff) | (half << 16)
+
+
+def loop_shaders():
+    from startup_gfx2hlsl_cndmask_abs_check import PRE_WORDS, root_blob_with_const, vs_words
+
+    trip_count = 1024
+    x, y = f32_word(-0.0), f32_word(1.0 / trip_count)
+    # s4 = 0; loop: ++s4; compare to 1024; branch back four dwords while unequal.
+    counter = struct.pack('<5I', 0xbe840380, 0x80048104, 0xbf06ff04, trip_count, 0xbf84fffc)
+    setup = struct.pack('<3I', 0x7e040c04, 0x7e180280, 0x7e1a0280)  # v2 = float(s4); v12 = v13 = 0
+    # Narrow EXEC with a runtime predicate (true for the draw), then restore it before the export.
+    narrow = struct.pack('<2I', 0x7d8a0280, 0xbe86246a)  # v_cmp_ne_u32 vcc_lo, 0, v1; s_and_saveexec_b64 s[6:7], vcc
+    restore = struct.pack('<I', 0x88fe7e06)  # s_or_b64 exec, exec, s[6:7]
+    mixes = [
+        encode(op, dst, (a, b, ZERO), neg=(0, 0, 1), clamp=clamp)
+        for op, dst, a, b, clamp in (
+            (MIXLO_F16, 12, V, V + 2, 0), (MIXHI_F16, 12, V + 1, V + 2, 0),
+            (MIXLO_F16, 13, V + 1, ONE_F, 0), (MIXHI_F16, 13, V + 2, ONE_F, 1),
+        )
+    ]
+    export = struct.pack('<3I', 0xf800180f, 0x02010d0c, 0xbf810000)  # mrt0 v12, v13, v1, v2
+    code = PRE_WORDS + counter + setup + narrow + b''.join(mixes) + restore + export
+    pipe = G.Pipeline(vs_words(x, y, 0), code, root_blob_with_const())
+    ps = pipe.hlsl_ps()
+    check('pixel fixture has a 1024-iteration dispatcher back edge',
+          'scc = s4 == 0x00000400u;' in ps and 'pc = (!scc) ? 1 : 2;' in ps)
+    mix_lines = [line for line in ps.splitlines() if '(-0.0)' in line]
+    temps = re.findall(r'if \(exec & 1\) \{ precise float (mf[0-9a-f]+) = mad\(', '\n'.join(mix_lines))
+    check('pixel fixture has four guarded inline mixes with fresh temporaries',
+          len(mix_lines) == len(set(temps)) == 4)
+
+    words = {'v0': x, 'v1': y, 'v2': f32_word(float(trip_count)), 'v12': 0, 'v13': 0}
+    for mix in mixes:
+        fields = decode_mix(mix)
+        dst = 'v%d' % fields['dst']
+        words[dst] = reference(fields, words)
+    expected = ','.join('%08x' % words[reg] for reg in ('v12', 'v13', 'v1', 'v2'))
+    return pipe.hlsl_vs(), ps, expected
+
+
+def draw_loop(dxc, runner, adapter, vs_source, ps_source, expected):
+    from startup_flat_param_check import compile_hlsl, draw
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', vs_source, 'mix_loop_vs', 'vs_6_0', directory)
+        ps = compile_hlsl(dxc, 'dxc', ps_source, 'mix_loop_ps', 'ps_6_0', directory)
+        run = draw(runner, adapter, vs, ps, expected)
+        check(f'{adapter}: loop pixel readback matches {expected}', run.returncode == 0, run.stderr)
 
 
 def raw_fill(index):
@@ -474,7 +576,7 @@ def check_dispatch(dxc, runner, adapter):
         # Negative control: drop the high-half shift, so the device reads the low half. The readback must
         # then match a reference with op_sel cleared, and differ from the correct result somewhere.
         # (A zero product, as in the -0 case, hides the half it reads.)
-        mutated = [line.replace(' >> 16)', ')') for line in lines]
+        mutated = [re.sub(r'f16tof32\(([sv]\d+) >> 16\)', r'f16tof32(\1)', line) for line in lines]
         changed = [i for i, (a, b) in enumerate(zip(lines, mutated)) if a != b]
         control = run_dispatch(dxc, runner, adapter, dispatch_source(rows, mutated), len(rows) * 6, directory,
                                'fma_mix_control')
@@ -516,11 +618,25 @@ def warp_heap(offscreen, dxc, pipe, vs_source, ps_source):
         draw(offscreen, vs, ps, 96, expected, len(pipe.uds), negative=True, heap_count=5)
 
 
+loop_vs, loop_ps, loop_expected = loop_shaders()
+
 if len(sys.argv) == 3 and sys.argv[1] == 'fxc':
     status, output = compile_translated(sys.argv[2])
     check(f'fxc ps_5_1 compiles all {len(translated)} translated lines', status == 0, output)
+    status, output = compile_dispatcher_shape(sys.argv[2])
+    check('fxc ps_5_1 compiles a binary16 mix in a guarded dispatcher block before discard', status == 0, output)
+    from startup_flat_param_check import compile_hlsl
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            compile_hlsl(sys.argv[2], 'fxc', loop_ps, 'mix_loop_ps', 'ps_5_1', Path(tmp))
+        except subprocess.CalledProcessError as error:
+            check('fxc ps_5_1 compiles counted-loop pixel shader', False, error.stdout + error.stderr)
+        else:
+            check('fxc ps_5_1 compiles counted-loop pixel shader', True)
 elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
     check_dispatch(*sys.argv[2:])
+    draw_loop(*sys.argv[2:], loop_vs, loop_ps, loop_expected)
 elif len(sys.argv) == 4 and sys.argv[1] == 'warp-heap':
     warp_heap(*sys.argv[2:], *heap_shaders())
 elif len(sys.argv) == 1:

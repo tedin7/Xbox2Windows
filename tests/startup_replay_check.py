@@ -142,11 +142,12 @@ def check_timing(summary, recording, progress):
     assert calls <= summary["played"] and presents <= summary["presents"], progress
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=()):
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=(), player_env=None):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     if timing:
         env["X2W_REPLAY_TIMING"] = "1"
+    env.update(player_env or {})
     code, text = run([player, recording, out, "--adapter", backend, *extra], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
@@ -157,6 +158,14 @@ def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False
     summary = json.loads((out / "replay_summary.json").read_text())
     assert summary["unknown_object"] == 0 and summary["missing_blob"] == 0, summary
     assert summary["presents"] == presents and summary["fence_timeouts"] == 0, summary
+    # The draw scoreboard counts every draw, not the capped log lines: one entry per present, adding up to the totals.
+    draws = summary["draws"]
+    assert len(draws["per_present"]) == presents, draws
+    assert sum(entry["drawn"] for entry in draws["per_present"]) <= draws["drawn"], draws
+    assert sum(draws["not_drawn_by_reason"].values()) <= draws["not_drawn"], draws
+    assert any(line.startswith("x2w-replay draws drawn %d not_drawn %d " % (draws["drawn"], draws["not_drawn"]))
+               for line in text.splitlines()), (draws, text[-500:])
+    assert draws["magenta_draws"] == 0 and " magenta draws 0" in text, draws  # the switch is off: no placeholder draw
     progress = [line for line in text.splitlines() if line.startswith("x2w-replay timing ")]
     if timing:
         check_timing(summary, recording, progress)
@@ -312,6 +321,163 @@ def check_paced(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_execute_slot35(scene, player, backend, env, directory, vs, ps, root):
+    """A title that submits its lists on queue slot 35 (not 10): the recording holds the list array, and the replay
+    submits the lists and draws the recorded pictures."""
+    recorded_dir, recording = directory / "slot35_recorded", directory / "slot35.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == PRESENTS and len(set(recorded.values())) > 1
+    out = directory / "slot35_replayed"
+    _score, rendered = replay(player, recording, out, backend, env)
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "CommandQueue::slot35(count=1, lists) -> ExecuteCommandLists" in log and "x2w-noop CommandQueue::slot35" not in log, \
+        "the replay submitted no list from queue slot 35:\n" + log[-2000:]
+    assert rendered == recorded, "the slot-35 replay differs from the recorded scene"
+    print("execute_slot35: %d presents equal, lists submitted from queue slot 35" % PRESENTS)
+    return 0
+
+
+def check_static_list(scene, player, backend, env, directory, vs, ps, root):
+    """A list closed before the recorder's window (f6,6) and submitted again in every frame inside it: the recording
+    carries the list's calls into the window, so presents 7-12 replay equal. With the carry off
+    (X2W_REPLAY_CARRY_MAX_MIB=0) the replayed list is empty and the pictures lose its corner."""
+    recorded_dir, recording = directory / "static_recorded", directory / "static.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = recording.read_bytes()
+    first_present = min(struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data) if tag == b"PRES")
+    carried = [struct.unpack_from("<QIHH", data, header)[0] for tag, header, *_ in chunks(data)
+               if tag == b"CALL" and struct.unpack_from("<QIHH", data, header)[2:] == (LIST_KIND, 52)
+               and struct.unpack_from("<Q", data, header)[0] < first_present]
+    assert carried, "the recording holds no list call from before its window"
+    whole = pictures(recorded_dir)
+    corner = whole["present_0007.png"][1][1:5]  # the first pixel of the first scanline
+    assert corner[0] > 200 and corner[2] > 200 and corner[1] < 50, "the live picture has no magenta corner: %r\n%s" % (corner, "\n".join(l[:200] for l in text.splitlines() if "Clear" in l or "slot35" in l or "list" in l.lower())[-3500:])
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    _score, played = replay(player, recording, directory / "static_replayed", backend, env, presents=6)
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "static-list window replay differs at %s\n%s" % (
+        differ, explain(whole[differ[0]], played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
+                        directory / "static_replayed" / "stderr.txt"))
+    # Mutant: the same run without the carry. The file lacks the list's calls and the replay's pictures differ.
+    bare_dir, bare = directory / "static_bare_recorded", directory / "static_bare.x2wr"
+    bare_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(bare), X2W_PRESENT_PICTURES=str(bare_dir),
+                          X2W_REPLAY_CARRY_MAX_MIB="0"))
+    assert code == 0, text[-3000:]
+    assert pictures(bare_dir)["present_0007.png"] == whole["present_0007.png"], "the live pictures changed with the carry off"
+    _score, lacking = replay(player, bare, directory / "static_bare_replayed", backend, env, presents=6)
+    data = bare.read_bytes()
+    first_present = min(struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data) if tag == b"PRES")
+    early = [struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data)
+             if tag == b"CALL" and struct.unpack_from("<QIHH", data, header)[2:] == (LIST_KIND, 52)
+             and struct.unpack_from("<Q", data, header)[0] < first_present]
+    assert not early, "the carry-off recording holds list calls from before its window: %s\n%s" % (early, text[-1500:])
+    equal = [a for a, b in pairs if lacking.get(a) == whole[b]]
+    assert not equal, "without the carry the replay still drew the list's corner in %s: replayed first pixel %r" % (
+        equal, lacking[equal[0]][1][1:5] if equal else None) + "\n" + (directory / "static_bare_replayed" / "stderr.txt").read_text(
+        errors="replace")[:3500]
+    print("static_list: presents 7-12 replay equal with the carried list, all differ without it")
+    return 0
+
+
+def check_static_release(scene, player, backend, env, directory, vs, ps, root):
+    """A list carried from before the window (f6,6) is Released inside it without a submit. The recorder must forget
+    its calls at that last Release (a new list at the same address would otherwise be submitted with them); the
+    address itself cannot be forced on a real runtime, so the test reads the bytes still held. The window then
+    replays equal, without the released list's magenta corner."""
+    recorded_dir, recording = directory / "release_recorded", directory / "release.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1",
+                          X2W_TEST_REPLAY_STATIC_RELEASE="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    held = re.search(r"carried bytes (\d+) before the release, (\d+) after", text)
+    assert held, "the scene did not report the carried bytes\n" + text[-2000:]
+    before_bytes, after_bytes = int(held.group(1)), int(held.group(2))
+    assert before_bytes > after_bytes, "the released list's calls are still held (%d before, %d after the release)" % (
+        before_bytes, after_bytes)
+    whole = pictures(recorded_dir)
+    before = whole["present_0006.png"][1][1:5]
+    after = whole["present_0007.png"][1][1:5]
+    assert before[0] > 200 and before[2] > 200 and before[1] < 50, "the picture before the window has no magenta corner: %r" % before
+    assert not (after[0] > 200 and after[2] > 200 and after[1] < 50), "the released list still drew live: %r" % after
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    _score, played = replay(player, recording, directory / "release_replayed", backend, env, presents=6)
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "the replay differs from live at %s: first pixel replayed %r, live %r" % (
+        differ, played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"........"))[1][1:5],
+        whole[differ[0]][1][1:5])
+    print("static_release: carried bytes %d -> %d at the release; presents 7-12 replay equal" % (before_bytes, after_bytes))
+    return 0
+
+
+def without_list_array(source, target):
+    """Copies a slot-35 recording without the list array of its queue submissions (as recorded before the recorder
+    captured it): drops the ARGM and OUTP chunks of argument 1 of every queue slot-35 call."""
+    data = source.read_bytes()
+    submits, out, dropped = set(), bytearray(), 0
+    for tag, header, _hb, _payload, _size in chunks(data):
+        if tag == b"CALL":
+            seq, _t, kind, slot = struct.unpack_from("<QIHH", data, header)
+            if kind == 1 and slot == 35:
+                submits.add(seq)
+    at = 0
+    for tag, header, header_bytes, _payload, size in chunks(data):
+        end = header + header_bytes + size
+        if tag in (b"ARGM", b"OUTP"):
+            seq, arg = struct.unpack_from("<QI", data, header)
+            if seq in submits and arg & 0xFF == 1:
+                out += data[at:header - 16]
+                at = end
+                dropped += 1
+    out += data[at:]
+    target.write_bytes(out)
+    assert dropped, "the recording holds no list array of queue slot 35"
+
+
+def check_infer_execute(scene, player, backend, env, directory, vs, ps, root):
+    """X2W_REPLAY_INFER_EXECUTE=1 on a recording without the slot-35 list array submits the closed lists in Close order
+    (pictures equal to the recorded run); without the setting those calls submit nothing."""
+    recorded_dir, recording = directory / "infer_recorded", directory / "infer.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_REPLAY_RECORD="all",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == PRESENTS and len(set(recorded.values())) > 1
+    old = directory / "infer_old.x2wr"
+    without_list_array(recording, old)
+    out = directory / "infer_off"
+    _score, rendered = replay(player, old, out, backend, env)
+    assert rendered != recorded, "a recording without the list array replayed its pictures with the inference off"
+    out = directory / "infer_on"
+    _score, rendered = replay(player, old, out, backend, env, player_env={"X2W_REPLAY_INFER_EXECUTE": "1"})
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "X2W_REPLAY_INFER_EXECUTE=1: queue slot 35" in log, log[-2000:]
+    assert log.count("X2W_REPLAY_INFER_EXECUTE=1: queue slot") == 1, "the inference is logged once"
+    assert rendered == recorded, "the inferred submissions differ from the recorded scene"
+    out = directory / "infer_recorded_array"
+    _score, rendered = replay(player, recording, out, backend, env, player_env={"X2W_REPLAY_INFER_EXECUTE": "1"})
+    assert "X2W_REPLAY_INFER_EXECUTE=1: queue slot" not in (out / "stderr.txt").read_text(errors="replace"), \
+        "a recorded list array was replaced by the inference"
+    assert rendered == recorded
+    print("infer_execute: %d presents equal with the inference on, not without it; a recorded array wins" % PRESENTS)
+    return 0
+
+
 def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     """The target placed by device slot 133 at a title address (no desktop heap) in frame 0, a window opened mid-run
     (f6,6): the file carries the placement's description, IID and output, and presents 7-12 replay equal. The same
@@ -460,6 +626,14 @@ def main(scene, player, backend, mode=None):
 
         if mode == "slot-layouts":
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "execute-slot35":
+            return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "static-list":
+            return check_static_list(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "static-release":
+            return check_static_release(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "infer-execute":
+            return check_infer_execute(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
         if mode == "paced":

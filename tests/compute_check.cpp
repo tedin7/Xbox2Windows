@@ -26,6 +26,9 @@ constexpr UINT uavs = 13, srvs = 21;
 // The image case header packs the dispatch count and a format/capability selector. The payload
 // carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
 constexpr UINT texture_rgba8_flag = 1u << 24;
+// Read-only image case selectors. The dispatch dimensions each fit in three bits.
+constexpr UINT texture_mip_zero_sampler_flag = 1u << 22;
+constexpr UINT texture_comparison_flag = 1u << 23;
 constexpr UINT texture_atomic_uint_flag = 1u << 25;
 constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
 constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
@@ -491,8 +494,13 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
     const bool rgba32_float = (store.groups & texture_rgba32_float_flag) != 0;
     const bool view_mip1 = (store.groups & texture_view_mip1_flag) != 0;
-    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag);
-    const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
+    const bool mip_zero = (store.groups & texture_mip_zero_sampler_flag) != 0;
+    const bool comparison = (store.groups & texture_comparison_flag) != 0;
+    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag |
+                      texture_mip_zero_sampler_flag | texture_comparison_flag);
+    const auto format = comparison ? DXGI_FORMAT_R32_FLOAT : rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
+        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+    const UINT base_words = texture_width * texture_height * texture_words_per_texel(format);
     std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
     // Older cases stop after the base image. A mip case appends levels one and two; an array case appends
@@ -511,15 +519,35 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
         store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5 || (rgba8 && rgba32_float) ||
+        (comparison && (rgba8 || rgba32_float || mip_zero)) ||
         (view_mip1 && texels.size() <= base_words * 2 && texels.size() % base_words == 0))
         throw std::runtime_error("Invalid compute image load reference");
-    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
-        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
-    auto root = D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)};
-    ComPtr<ID3DBlob> custom_root;
+    D3D12_SHADER_BYTECODE root{compute_tables, sizeof(compute_tables)};
+    ComPtr<ID3DBlob> case_root;
     if (sampler_manifest) {
-        custom_root = compute_texture_sampler_root(sampler_manifest);
-        root = {custom_root->GetBufferPointer(), custom_root->GetBufferSize()};
+        case_root = compute_texture_sampler_root(sampler_manifest);
+        root = {case_root->GetBufferPointer(), case_root->GetBufferSize()};
+    } else if (comparison || mip_zero) {
+        ComPtr<ID3D12VersionedRootSignatureDeserializer> embedded;
+        check(D3D12CreateVersionedRootSignatureDeserializer(root.pShaderBytecode, root.BytecodeLength,
+              IID_PPV_ARGS(&embedded)), "Read embedded compute table signature");
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* original = nullptr;
+        check(embedded->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &original),
+              "Get v1.1 compute table signature");
+        auto desc = *original;
+        if (desc.Desc_1_1.NumStaticSamplers != 1)
+            throw std::runtime_error("Expected one static sampler in the compute table signature");
+        auto sampler = desc.Desc_1_1.pStaticSamplers[0];
+        if (comparison) {
+            sampler.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+            sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+        } else {
+            sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+            sampler.MaxLOD = 0;
+        }
+        desc.Desc_1_1.pStaticSamplers = &sampler;
+        check(D3D12SerializeVersionedRootSignature(&desc, &case_root, nullptr), "Serialize compute case signature");
+        root = {case_root->GetBufferPointer(), case_root->GetBufferSize()};
     }
     const auto program = create_compute_program(device, shader, root);
     run_compute(device, true, program, false, &store, &texels, format,
@@ -829,4 +857,134 @@ void check_bvh_root_roundtrip(ID3D12Device* device)
     const auto program = create_compute_program(device, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
     run_compute(device, false, program);
     std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
+}
+
+int check_compute_waterfall_oracle(ID3D12Device* device, const char* shader_path)
+{
+    const auto code = read_compute_shader(shader_path);
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, code.data(), code.size(), IID_PPV_ARGS(&root)), "Create waterfall oracle root");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.Get();
+    pso_desc.CS = {code.data(), code.size()};
+    ComPtr<ID3D12PipelineState> pso;
+    check(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso)), "Create waterfall oracle pipeline");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = 4;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create oracle descriptor heap");
+    const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    const auto buf_desc = [](UINT64 size, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width = size;
+        d.Height = 1;
+        d.DepthOrArraySize = 1;
+        d.MipLevels = 1;
+        d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Flags = flags;
+        return d;
+    };
+    const auto write_upload = [](ID3D12Resource* res, const void* data, UINT sz) {
+        void* mapped = nullptr;
+        const D3D12_RANGE none{};
+        check(res->Map(0, &none, &mapped), "Map upload buffer");
+        std::memcpy(mapped, data, sz);
+        res->Unmap(0, nullptr);
+    };
+
+    std::array<ComPtr<ID3D12Resource>, 4> sources;
+    auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT rec = 0; rec < 4; ++rec) {
+        const std::array<UINT, 4> data{
+            1000u * (rec + 1u), 1000u * (rec + 1u) + 17u, 1000u * (rec + 1u) + 34u, 1000u * (rec + 1u) + 51u};
+        sources[rec] = resource(device, buf_desc(16), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        write_upload(sources[rec].Get(), data.data(), 16);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.NumElements = 4;
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device->CreateShaderResourceView(sources[rec].Get(), &srv, handle);
+        handle.ptr += inc;
+    }
+
+    auto keys_res = resource(device, buf_desc(16), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto init_res = resource(device, buf_desc(16), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto out_res = resource(device, buf_desc(16, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    auto rb_res = resource(device, buf_desc(16), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    constexpr std::array<UINT, 4> sentinels{0xc001cafeu, 0xc001cafeu, 0xc001cafeu, 0xc001cafeu};
+    write_upload(init_res.Get(), sentinels.data(), 16);
+
+    D3D12_COMMAND_QUEUE_DESC qdesc{};
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue)), "Create oracle queue");
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "Create oracle alloc");
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)),
+          "Create oracle list");
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create oracle fence");
+    check(list->Close(), "Close initial list");
+
+    const std::array<std::array<UINT, 4>, 5> inputs{{{0, 1, 2, 3}, {3, 2, 1, 0}, {2, 1, 2, 3}, {4, 9, 14, 19}, {7, 7, 7, 7}}};
+    UINT matches = 0, mismatches = 0;
+    UINT64 fence_value = 0;
+    const auto barrier = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {out_res.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+        list->ResourceBarrier(1, &b);
+    };
+
+    for (const auto& row : inputs) {
+        write_upload(keys_res.Get(), row.data(), 16);
+        for (UINT active = 0; active <= 4; ++active) {
+            check(alloc->Reset(), "Reset oracle alloc");
+            check(list->Reset(alloc.Get(), pso.Get()), "Reset oracle list");
+            barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(out_res.Get(), 0, init_res.Get(), 0, 16);
+            barrier(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+            list->SetDescriptorHeaps(1, heaps);
+            list->SetComputeRootSignature(root.Get());
+            list->SetComputeRootShaderResourceView(0, keys_res->GetGPUVirtualAddress());
+            list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+            list->SetComputeRootUnorderedAccessView(2, out_res->GetGPUVirtualAddress());
+            list->SetComputeRoot32BitConstant(3, active, 0);
+            list->Dispatch(1, 1, 1);
+            barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(rb_res.Get(), 0, out_res.Get(), 0, 16);
+            barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            check(list->Close(), "Close oracle list");
+            ID3D12CommandList* cmd = list.Get();
+            queue->ExecuteCommandLists(1, &cmd);
+            check(queue->Signal(fence.Get(), ++fence_value), "Signal oracle fence");
+            while (fence->GetCompletedValue() < fence_value) Sleep(1);
+
+            void* mapped = nullptr;
+            const D3D12_RANGE range{0, 16};
+            const D3D12_RANGE no_writes{};
+            check(rb_res->Map(0, &range, &mapped), "Map oracle readback");
+            std::array<UINT, 4> got{};
+            std::memcpy(got.data(), mapped, 16);
+            rb_res->Unmap(0, &no_writes);
+
+            std::array<UINT, 4> expected{};
+            for (UINT lane = 0; lane < 4; ++lane)
+                expected[lane] = lane < active ? 1000u * ((row[lane] & 3u) + 1u) + 17u * lane : 13u;
+            if (got == expected) ++matches;
+            else ++mismatches;
+        }
+    }
+    std::printf("dispatches=25 matches=%u mismatches=%u\n", matches, mismatches);
+    return 0;
 }

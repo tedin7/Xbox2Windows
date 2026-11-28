@@ -3729,6 +3729,34 @@ def mac_f32_controls():
         rejects("Unsupported compute instruction", aot.lower,
                 variant(MAC_F32, ("v_mac_f32_e32 v10, 0x45800800, v5", bad_line)),
                 64, **MAC_F32_BINDING)
+    # The mad() fusion probe against a simulated renderer whose mutated shader reads back `readback`.
+    class Case:
+        def write_bytes(self, data):
+            self.words = list(struct.unpack("<321I", data)[1:])
+
+    def probe(readback, code=None):
+        case = Case()
+
+        def run():
+            diff = next((i for i, (a, b) in enumerate(zip(case.words, readback)) if a != b), None)
+            if code is not None or diff is None:
+                return subprocess.CompletedProcess([], code or 0, "", "")
+            return subprocess.CompletedProcess([], 1, "", f"word={diff} expected={case.words[diff]:08x} "
+                                               f"actual={readback[diff]:08x}\nCompute readback differs\n")
+        fusion = mac_f32_mad_fusion(run, case, expected)
+        assert case.words == expected
+        return fusion
+    expected, fused = mac_f32_words(), mac_f32_words(fused=True)
+    folded = [e if i % 4 == 0 else f for i, (e, f) in enumerate(zip(expected, fused))]
+    assert probe(expected) == "unfused"  # no FMad fusion, as on an RX 5700 XT (#2730)
+    assert probe(folded) == "fused"  # fused FMad, word 0 folded unfused by DXC, as on an RTX 4090 (#2883)
+    for readback, code, message in ((fused, None, "neither model alone"), (expected, 3, "failed (exit 3)")):
+        try:
+            probe(readback, code)
+        except AssertionError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError(f"mac_f32: mad() fusion probe accepted a readback that must fail: {message}")
 
 
 def mac_f32_binary(directory, assembler, objcopy, library):
@@ -3742,18 +3770,25 @@ def mac_f32_binary(directory, assembler, objcopy, library):
 def mac_f32_mad_fusion(run_mutated, case, expected):
     """Whether this target fuses the `precise mad()` mutation: 'fused' or 'unfused' (#2730).
 
-    The mutated shader is read back against the fused and the unfused model. They differ at word 0, the
-    cancellation 4097 * 4097 - 16785408 (1.0 fused, +0 unfused). Exactly one model must match all 320 words;
-    a compile, dispatch or readback failure, or any other readback, fails the test.
+    The mutated shader is read back against the fused and the unfused model. Word 0, the cancellation
+    4097 * 4097 - 16785408, has only constant operands, and DXC 1.9.2602.17 folds it at compile time to the
+    unfused +0, so a target that fuses FMad fuses only the thread-dependent words (#2883). The fused model
+    therefore keeps word 0 unfused and differs from the unfused model at words 2, 10, 18, ... Exactly one model
+    must match all 320 words; a compile, dispatch or readback failure, or any other readback, fails the test.
+    A DXC that leaves word 0 to the driver would read back neither model on a fusing target and fail here.
     """
-    matches = {}
-    for name, model in (("fused", mac_f32_words(fused=True)), ("unfused", expected)):
+    fused = mac_f32_words(fused=True)
+    fused[0::4] = expected[0::4]
+    assert next(i for i, (a, b) in enumerate(zip(expected, fused)) if a != b) == 2
+    matches, first = {}, {}
+    for name, model in (("fused", fused), ("unfused", expected)):
         case.write_bytes(struct.pack("<321I", 1, *model))
         run = run_mutated()
         if run.returncode == 0:
             matches[name] = True
         elif run.returncode == 1 and "Compute readback differs" in run.stderr:
             matches[name] = False
+            first[name] = next((line for line in run.stderr.splitlines() if line.startswith("word=")), "")
         else:
             raise AssertionError(f"mac_f32: mad() fusion probe against the {name} model failed "
                                  f"(exit {run.returncode})\n{run.stdout}{run.stderr}")
@@ -3762,7 +3797,8 @@ def mac_f32_mad_fusion(run_mutated, case, expected):
         return "fused"
     if matches == {"fused": False, "unfused": True}:
         return "unfused"
-    raise AssertionError(f"mac_f32: mad() fusion probe read back neither model alone: {matches}")
+    raise AssertionError(f"mac_f32: mad() fusion probe read back neither model alone: {matches}, "
+                         f"first mismatch: {first}")
 
 
 def mac_f32_draw(directory, compiler, renderer, backend):
@@ -5595,7 +5631,12 @@ def shared_controls():
     atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
     for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
         assert f"Interlocked{method}(lds[" in atomics, method
-    assert "(0u - tid.x)" in atomics
+    # ds_sub_u32 is two additions, ~v then 1, on the same word. A single InterlockedAdd of a negated word on
+    # groupshared memory fails compute PSO creation on NVIDIA GeForce RTX 5080 (driver 32.0.16.2124).
+    sub = ("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], ~(tid.x));\n"
+           "    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n")
+    assert sub in atomics, atomics
+    assert "0u - " not in atomics, atomics
     lines = programs["shared_exchange"]
     # A barrier with no DS instruction before it is kept.
     assert aot.lower(SHARED_PREFIX + ["s_barrier"] + lines[len(SHARED_PREFIX):], 64,
@@ -5663,8 +5704,15 @@ def shared_draw(directory, compiler, renderer, backend):
             execution = subprocess.run(run)
             if execution.returncode:
                 return execution.returncode
-        for mutated, mismatched_word in shared_mutants(name, lines, binding):
-            src.write_text(aot.lower(mutated, 64, **binding), encoding="ascii")
+        mutants = [(aot.lower(mutated, 64, **binding), word) for mutated, word in shared_mutants(name, lines, binding)]
+        if name == "shared_atomics":
+            # Without the second addition ds_sub_u32 adds ~v, so the difference read as lane 0's second word
+            # is 64 short, one for each lane.
+            dropped = source.replace("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n", "")
+            assert dropped != source
+            mutants.append((dropped, 1))
+        for mutated, mismatched_word in mutants:
+            src.write_text(mutated, encoding="ascii")
             subprocess.run(compile, check=True)
             bad = subprocess.run(run, capture_output=True, text=True)
             if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:

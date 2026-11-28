@@ -29,8 +29,8 @@ PERMISSIVE = ["X2W_AUDIO_PERMISSIVE", "X2W_D3D12_DEVICE_NOOP", "X2W_D3D12_LIST_N
 CHECKED = PERMISSIVE + [
     "X2W_FAKE_USER", "X2W_XMEM_GPU_MIRROR", "X2W_HOST_CPU", "X2W_XMEM_STARTUP_BELOW_40", "X2W_HIDE_TITLE_WINDOW",
     "X2W_D3D12_RENDER", "X2W_DRAW_NULL_IDENTITY", "X2W_SHADER_CACHE", "X2W_TITLE_ID", "X2W_STORAGE_MB",
-    "X2W_STORAGE_PATH", "X2W_INPUT_SCRIPT", "X2W_XMEM_SHARED_VIEWS", "WINEDLLOVERRIDES", "WINEFSYNC", "WINEDEBUG",
-    "WINEPREFIX", "XDG_RUNTIME_DIR", "PULSE_SERVER", "X2W_FXC"]
+    "X2W_STORAGE_PATH", "X2W_INPUT_SCRIPT", "X2W_XMEM_SHARED_VIEWS", "X2W_XMEM_JOIN_CALLS", "WINEDLLOVERRIDES",
+    "WINEFSYNC", "WINEDEBUG", "WINEPREFIX", "XDG_RUNTIME_DIR", "PULSE_SERVER", "X2W_FXC"]
 GAME_OVERRIDES = "d3d12,d3d12core,dxgi,d3d11=n"  # docs/wine.md
 FAKE_USER_WARNING = ("WARNING: Without --fake-user, user API calls go to the host gaming runtime "
                      "(docs/startup-runtime.md).")
@@ -216,7 +216,7 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
         log = data / "logs"
     command = ["bash", str(startup / "run.sh"), "--exe", str(exe), "--data", "G:\\" if drive_data else str(data),
                "--log", log_arg, "--build-dir", "bld", "--seconds", "9", "--memory-gib", "3",
-               "--continue-asserts", "4", *switches]
+               "--continue-asserts", "4", "--assert-sites", "2", *switches]
     if translate:
         command += ["--render", "--translate", "--shader-cache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
@@ -292,13 +292,13 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     if missing:
         found.append(f"{label}: stand-in DLLs not copied next to the executable: {missing}")
     want = [win(exe), "G:\\" if drive_data else win(data), log_win, "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4", *passed]
+            "--trace-files", "1", "--continue-asserts", "4", "--assert-sites", "2", *passed]
     got = read_json(startup / "argv.json")
     if got != want:
         found.append(f"{label}: the debugger received {got}, expected {want}")
     seen = read_json(startup / "env.json") or {}
     expected = {name: "1" for name in PERMISSIVE}
-    expected.update(X2W_XMEM_SHARED_VIEWS="1", X2W_TITLE_ID="X2WTEST", X2W_STORAGE_MB="123",
+    expected.update(X2W_XMEM_SHARED_VIEWS="1", X2W_XMEM_JOIN_CALLS="1", X2W_TITLE_ID="X2WTEST", X2W_STORAGE_MB="123",
                     WINEDLLOVERRIDES=GAME_OVERRIDES, WINEFSYNC="1", WINEDEBUG="-all", WINEPREFIX=str(prefix))
     if translate:
         expected.update(X2W_D3D12_RENDER="1", X2W_DRAW_NULL_IDENTITY="1", X2W_SHADER_CACHE=win(root / "cache"),
@@ -418,6 +418,7 @@ def mutants_of(script):
         "no FakeUser warning": replace(script, '    echo "WARNING: Without --fake-user', '    : "WARNING: Without --fake-user'),
         "short DLL list": replace(script, " xg_xs GameInput; do", " xg_xs; do"),
         "no shared views": drop_line(script, "export X2W_XMEM_SHARED_VIEWS="),
+        "no join calls": drop_line(script, "export X2W_XMEM_JOIN_CALLS="),
         "watcher without --render": replace(script, 'if [ -n "$translate" ] && [ -n "$render" ]; then',
                                             'if [ -n "$translate" ]; then'),
         "config not read": replace(script, 'if [ -f "$config" ]; then', "if false; then"),

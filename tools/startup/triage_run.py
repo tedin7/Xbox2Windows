@@ -108,6 +108,29 @@ RE_SLOT = re.compile(r"(?:[A-Za-z0-9_]+!)?(?:([A-Za-z0-9_]+)::)?slot(\d{1,4})\b"
 RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
 SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported instruction " + MNEMONIC_FAMILY + r"\b"),
+     r"\1_* instruction"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported opcode\b"), "unsupported opcode"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported pixel entry VGPR\b"), "unsupported pixel entry VGPR"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unproven resource descriptor\b"), "unproven resource descriptor"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unbound numeric SGPR\b"), "unbound numeric SGPR"),
+    (re.compile(r"(?:unknown gfx1013 instruction format|truncated or misaligned gfx1013 instruction|"
+                r"reserved FLAT segment) at byte \d+\Z"), "undecodable word"),
+    # The fixed reasons of format_compute_runtime_manifest (src/direct_compute_cache.cpp); kind names are enum names.
+    (re.compile(r"unsupported startup runtime manifest bindings: ("
+                r"(?:SRV|UAV) kind [a-z0-9_]{1,32}(?: [a-z0-9-]{1,20})?(?: array)?|"
+                r"(?:SRV|UAV) registers not contiguous|group size has a zero dimension|"
+                r"root constants above root parameter 15|view above root parameter 15|"
+                r"more than (?:8 root constants in one root parameter|32 user data words|32 SRVs|8 UAVs)|"
+                r"resource heap view|sampler heap|comparison sampler|"
+                r"stride words from a view that is not one raw vector SRV)\Z"), r"runtime manifest: \1"),
+    (re.compile(r"graphics request key mismatch\b"), "graphics request key mismatch"),
+    (re.compile(r"compute request key mismatch\b"), "compute request key mismatch"),
+    (re.compile(r"stale pixel input description\b"), "stale pixel input description"),
+    (re.compile(r"pixel input description names another pipeline\Z"), "pixel input description names another pipeline"),
+    (re.compile(r"contradictory pixel input enable/address masks\Z"), "contradictory pixel input enable/address masks"),
+    (re.compile(r"pixel input (?:enable|address) mask missing\b"), "invalid pixel input description"),
+    (re.compile(r"invalid pixel input description\Z"), "invalid pixel input description"),
     (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
     (re.compile(r"buffer_load_format_(?:x|xy|xyz|xyzw) requires descriptor FORMAT and DST_SEL\Z"),
      "buffer_* instruction"),

@@ -32,11 +32,11 @@ struct PadShared {
 };
 
 struct IGameInputDevice {
-    const void* const* vtbl;
+    void* const* vtbl;
 };
 
 struct IGameInputReading {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     std::uint32_t Release()
     {
@@ -61,7 +61,7 @@ struct IGameInputReading {
 };
 
 struct IGameInput {
-    const void* const* vtbl;
+    void* const* vtbl;
 
     std::uint32_t Release()
     {

@@ -12,10 +12,13 @@ pool must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE
 back to the processor count. Requests are served oldest published first, with those published after the
 watcher started ahead of the backlog; a request published during a long --watch pass is translated next
 (one worker, and two forked workers), not after the backlog; and a --pending scan with four workers and a
---watch pass leave the same files as translating each pending request on its own.
+--watch pass leave the same files as translating each pending request on its own. --skip-failed (-s) or X2W_SKIP_FAILED=1 leaves an up-to-date failure alone in a --pending scan,
+and an in-memory completed cache skips published requests whose stage metadata has not changed without
+re-reading container bytecode on disk.
 """
 import contextlib
 import io
+from contextlib import suppress
 import json
 import multiprocessing
 import os
@@ -84,6 +87,139 @@ with tempfile.TemporaryDirectory() as tmp:
     touch(d / ('%016x.txt' % 9))
     expect('watch pass', scan(d, True), [1, 5, 6, 9])
     expect('one-shot pass', scan(d, False), [1, 4, 5, 6, 9])
+    completed = {}
+    expect('pass with completed dict', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+    expect('published key cached in completed', 2 in completed, True)
+    expect('rescan with completed matches', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+
+    # Cache invalidation P1: req_<key>.psin rewritten newer than published manifest drops key 2 from completed and rechecks
+    touch(d / ('req_%016x.psin' % 2), b'new description', mtime=now + 5)
+    expect('cache invalidation on rewritten description', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 2, 4, 5, 6, 9])
+    expect('key 2 invalidated from completed', 2 in completed, False)
+    (d / ('req_%016x.psin' % 2)).unlink()
+    expect('cache re-populates completed', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+    expect('key 2 re-cached', 2 in completed, True)
+
+    # Cache invalidation P2: manifest withdrawn (deleted) drops key 2 from completed and rechecks
+    (d / ('%016x.txt' % 2)).unlink()
+    expect('cache invalidation on withdrawn manifest', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 2, 4, 5, 6, 9])
+    expect('key 2 invalidated on withdrawn manifest', 2 in completed, False)
+    touch(d / ('%016x.txt' % 2))
+    expect('cache re-populates after manifest restored', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+    expect('key 2 re-cached', 2 in completed, True)
+
+    # Cache invalidation P3: bytecode lost (deleted stage file) drops key 2 from completed and rechecks
+    (d / ('%016x.vs.cso' % 2)).unlink()
+    expect('cache invalidation on lost bytecode stage', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 2, 4, 5, 6, 9])
+    expect('key 2 invalidated on lost stage', 2 in completed, False)
+    touch(d / ('%016x.vs.cso' % 2), b'DXBC')
+    expect('cache re-populates after bytecode restored', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+    expect('key 2 re-cached', 2 in completed, True)
+
+    # Cache invalidation P4: bytecode truncated to zero size drops key 2 from completed and rechecks
+    touch(d / ('%016x.vs.cso' % 2), b'')
+    expect('cache invalidation on zero-byte bytecode stage', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 2, 4, 5, 6, 9])
+    expect('key 2 invalidated on zero-byte stage', 2 in completed, False)
+    touch(d / ('%016x.vs.cso' % 2), b'DXBC')
+    expect('cache re-populates after zero-byte restored', gfx2hlsl.pending_keys(str(d), False, completed=completed), [1, 4, 5, 6, 9])
+    expect('key 2 re-cached', 2 in completed, True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    d_cli = Path(tmp)
+    now = time.time()
+    for ext in ('.b', '.root'):
+        touch(d_cli / ('req_%016x%s' % (4, ext)))
+    touch(d_cli / ('req_%016x.a' % 4), mtime=now - 10)
+    touch(d_cli / ('%016x.fail' % 4), b'prior refusal\n', mtime=now - 5)
+    # One-shot --pending retries key 4 (failure is present but retried): the .fail is newer than its request and not
+    # older than the translator build, so only X2W_RETRY_FAILED=1 asks for the retry.
+    out_default = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                                  '--pending', str(d_cli), '--jobs=1'],
+                                 capture_output=True, text=True, timeout=30,
+                                 env=dict(os.environ, X2W_RETRY_FAILED='1'))
+    expect('default --pending retries failure', ('%016x:' % 4) in out_default.stdout, True)
+    # With --skip-failed, key 4 is skipped and no translation is performed
+    out_skip = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                               '--pending', str(d_cli), '--skip-failed', '-j', '1'],
+                              capture_output=True, text=True, timeout=30)
+    expect('--skip-failed skips up-to-date failure', ('%016x:' % 4) in out_skip.stdout, False)
+    # With -s short flag
+    out_s = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                            '--pending', str(d_cli), '-s', '--jobs=1'],
+                           capture_output=True, text=True, timeout=30)
+    expect('-s skips up-to-date failure', ('%016x:' % 4) in out_s.stdout, False)
+    # With X2W_SKIP_FAILED=1
+    env_skip = dict(os.environ, X2W_SKIP_FAILED='1')
+    out_env = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                              '--pending', str(d_cli), '--jobs=1'],
+                             capture_output=True, text=True, timeout=30, env=env_skip)
+    expect('X2W_SKIP_FAILED=1 skips up-to-date failure', ('%016x:' % 4) in out_env.stdout, False)
+
+    # --watch CLI argument parsing: worker count (--jobs / -j) must reach watch_pass and interval must be parsed separately.
+    observed_watch = []
+    real_watch_pass = gfx2hlsl.watch_pass
+    real_sleep = time.sleep
+    try:
+        def mock_watch_pass_single(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False,
+                                   clock=None, completed=None):
+            observed_watch.append(('pass', jobs))
+            raise KeyboardInterrupt
+
+        def mock_sleep(secs):
+            observed_watch.append(('sleep', secs))
+
+        gfx2hlsl.watch_pass = mock_watch_pass_single
+        time.sleep = mock_sleep
+
+        saved_argv = sys.argv
+        try:
+            # --watch <dir> --jobs 4: jobs must be 4, interval must remain default 2.0 (not read 4 as interval)
+            sys.argv = ['gfx2hlsl.py', '--watch', str(d_cli), '--jobs', '4']
+            observed_watch.clear()
+            with suppress(KeyboardInterrupt):
+                gfx2hlsl.main()
+            expect('--watch --jobs 4 passes jobs to watch_pass', observed_watch, [('pass', 4)])
+
+            # --watch <dir> 3.5 --jobs 4: interval is 3.5, jobs is 4
+            pass_count = [0]
+            def mock_watch_pass_multi(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False,
+                                   clock=None, completed=None):
+                pass_count[0] += 1
+                observed_watch.append(('pass', jobs))
+                if pass_count[0] >= 2:
+                    raise KeyboardInterrupt
+                return True
+
+            gfx2hlsl.watch_pass = mock_watch_pass_multi
+            sys.argv = ['gfx2hlsl.py', '--watch', str(d_cli), '3.5', '--jobs', '4']
+            observed_watch.clear()
+            with suppress(KeyboardInterrupt):
+                gfx2hlsl.main()
+            expect('--watch 3.5 --jobs 4 parses interval and passes jobs', observed_watch,
+                   [('pass', 4), ('sleep', 3.5), ('pass', 4)])
+
+            # --watch <dir> --jobs=4: jobs is 4, interval is default 2.0
+            pass_count[0] = 0
+            sys.argv = ['gfx2hlsl.py', '--watch', str(d_cli), '--jobs=4']
+            observed_watch.clear()
+            with suppress(KeyboardInterrupt):
+                gfx2hlsl.main()
+            expect('--watch --jobs=4 passes jobs and keeps default interval', observed_watch,
+                   [('pass', 4), ('sleep', 2.0), ('pass', 4)])
+
+            # --watch <dir> -j 4: jobs is 4, interval is default 2.0
+            pass_count[0] = 0
+            sys.argv = ['gfx2hlsl.py', '--watch', str(d_cli), '-j', '4']
+            observed_watch.clear()
+            with suppress(KeyboardInterrupt):
+                gfx2hlsl.main()
+            expect('--watch -j 4 passes jobs and keeps default interval', observed_watch,
+                   [('pass', 4), ('sleep', 2.0), ('pass', 4)])
+        finally:
+            sys.argv = saved_argv
+    finally:
+        gfx2hlsl.watch_pass = real_watch_pass
+        time.sleep = real_sleep
 
 def mesh57_fixture(ms, ps, expected, tamper=False):
     root = (b'DXBC' + bytes(24) + struct.pack('<II', 1, 36) + b'RTS0' +
@@ -143,14 +279,49 @@ def mesh57_resume_controls():
             expect('slot 57 with only mesh bytecode is pending', scan(d, False), [key])
             touch(ps, bytecode)
             expect('slot 57 with both complete containers is done', scan(d, False), [])
+
+            # Warm-cache controls: populate completed, verify truncation invalidates and rechecks
+            completed = {}
+            expect('slot 57 completed cache populates', gfx2hlsl.pending_keys(str(d), False, completed=completed), [])
+            expect('slot 57 cached in completed', key in completed, True)
+            expect('slot 57 warm cache hit is done', gfx2hlsl.pending_keys(str(d), False, completed=completed), [])
+            # Truncating ps bytecode invalidates warm cache and marks key pending
+            touch(ps, bytecode[:-1])
+            expect('slot 57 warm cache detects truncated ps bytecode', gfx2hlsl.pending_keys(str(d), False, completed=completed), [key])
+            expect('slot 57 invalidated from completed on ps truncation', key in completed, False)
+            touch(ps, bytecode)
+            expect('slot 57 restored ps re-caches in completed', gfx2hlsl.pending_keys(str(d), False, completed=completed), [])
+            expect('slot 57 re-cached after ps restored', key in completed, True)
+            # Truncating ms bytecode invalidates warm cache and marks key pending
+            touch(ms, bytecode[:-1])
+            expect('slot 57 warm cache detects truncated ms bytecode', gfx2hlsl.pending_keys(str(d), False, completed=completed), [key])
+            expect('slot 57 invalidated from completed on ms truncation', key in completed, False)
+            touch(ms, bytecode)
+            expect('slot 57 restored ms re-caches in completed', gfx2hlsl.pending_keys(str(d), False, completed=completed), [])
+            expect('slot 57 re-cached after ms restored', key in completed, True)
+
             for stage in (ms, ps):
                 touch(stage, bytecode[:-1])
                 expect(f'{stage.suffixes[0]} with truncated bytecode is pending', scan(d, True), [key])
                 touch(stage, b'bad!' + bytecode[4:])
                 expect(f'{stage.suffixes[0]} with a bad container header is pending', scan(d, False), [key])
                 touch(stage, bytecode)
-            os.environ['X2W_FXC'] = ''
+
+            # Mesh-only ps none case with warm cache
+            touch(stem.with_suffix('.ms57.txt'), b'ps none\n')
             ps.unlink()
+            completed_none = {}
+            expect('slot 57 ps none populates completed', gfx2hlsl.pending_keys(str(d), False, completed=completed_none), [])
+            expect('slot 57 ps none cached in completed', key in completed_none, True)
+            expect('slot 57 ps none warm cache hit is done', gfx2hlsl.pending_keys(str(d), False, completed=completed_none), [])
+            # Truncating ms bytecode invalidates warm cache in ps none mode
+            touch(ms, bytecode[:-1])
+            expect('slot 57 ps none truncated ms is pending on warm cache', gfx2hlsl.pending_keys(str(d), False, completed=completed_none), [key])
+            expect('slot 57 ps none invalidated from completed on truncation', key in completed_none, False)
+            touch(ms, bytecode)
+            expect('slot 57 ps none restored ms re-caches', gfx2hlsl.pending_keys(str(d), False, completed=completed_none), [])
+
+            os.environ['X2W_FXC'] = ''
             expect('slot 57 manifest-only mode finishes without pixel bytecode', scan(d, False), [])
         finally:
             os.environ.pop('X2W_FXC', None)
@@ -236,12 +407,28 @@ def broken(out_dir, skip_failed=False, **watch_options):
     raise BrokenProcessPool('a worker was terminated abruptly')
 
 
+def broken_type_error(out_dir, skip_failed=False, jobs=None, completed=None):
+    raise TypeError('unexpected internal error')
+
+
 real = gfx2hlsl.translate_pending
 gfx2hlsl.translate_pending = broken
 try:
     expect('broken pool: pass reported as incomplete', gfx2hlsl.watch_pass('.', True), False)
 except BrokenProcessPool:
     failures.append('a broken process pool escaped watch_pass')
+finally:
+    gfx2hlsl.translate_pending = real
+
+# watch_pass does not swallow an unexpected internal TypeError raised by translate_pending.
+gfx2hlsl.translate_pending = broken_type_error
+try:
+    try:
+        gfx2hlsl.watch_pass('.', True)
+    except TypeError:
+        pass
+    else:
+        failures.append('watch_pass swallowed an unexpected TypeError')
 finally:
     gfx2hlsl.translate_pending = real
 with tempfile.TemporaryDirectory() as tmp:
@@ -252,12 +439,113 @@ saved = os.environ.get('X2W_TRANSLATE_JOBS')
 for value in ('', 'abc', '-3'):
     os.environ['X2W_TRANSLATE_JOBS'] = value
     expect('X2W_TRANSLATE_JOBS=%r' % value, gfx2hlsl.translation_jobs() >= 1, True)
+    expect('translation_jobs(%r)' % value, gfx2hlsl.translation_jobs(value) >= 1, True)
 os.environ['X2W_TRANSLATE_JOBS'] = '2'
 expect('X2W_TRANSLATE_JOBS=2', gfx2hlsl.translation_jobs(), 2)
 if saved is None:
     del os.environ['X2W_TRANSLATE_JOBS']
 else:
     os.environ['X2W_TRANSLATE_JOBS'] = saved
+
+# Both environment variable and explicit argument route through the Windows limit of 61 workers.
+saved_os_name = os.name
+saved_env = os.environ.get('X2W_TRANSLATE_JOBS')
+try:
+    os.name = 'nt'
+    # Environment form
+    os.environ['X2W_TRANSLATE_JOBS'] = '62'
+    expect('X2W_TRANSLATE_JOBS=62 capped to 61 on Windows', gfx2hlsl.translation_jobs(), 61)
+    os.environ['X2W_TRANSLATE_JOBS'] = '60'
+    expect('X2W_TRANSLATE_JOBS=60 not capped on Windows', gfx2hlsl.translation_jobs(), 60)
+    # Explicit argument form
+    os.environ.pop('X2W_TRANSLATE_JOBS', None)
+    expect('translation_jobs(62) capped to 61 on Windows', gfx2hlsl.translation_jobs(62), 61)
+    expect('translation_jobs(60) not capped on Windows', gfx2hlsl.translation_jobs(60), 60)
+    # Explicit argument overrides environment variable
+    os.environ['X2W_TRANSLATE_JOBS'] = '10'
+    expect('explicit jobs 62 overrides environment variable to 61 on Windows', gfx2hlsl.translation_jobs(62), 61)
+    expect('explicit jobs 4 overrides environment variable to 4 on Windows', gfx2hlsl.translation_jobs(4), 4)
+finally:
+    os.name = saved_os_name
+    if saved_env is None:
+        os.environ.pop('X2W_TRANSLATE_JOBS', None)
+    else:
+        os.environ['X2W_TRANSLATE_JOBS'] = saved_env
+
+# 62 synthetic pending RTV markers: verify worker pool capping across explicit and environment forms.
+with tempfile.TemporaryDirectory() as tmp:
+    d_62 = Path(tmp)
+    for n in range(62):
+        req = b'rtv1 %d 28' % (0x9000 + n)
+        touch(d_62 / ('req_%016x.rtv' % gfx2hlsl.fnv(req)), req)
+
+    from concurrent.futures import ProcessPoolExecutor as RealExecutor
+    observed_workers = []
+
+    class MockExecutor:
+        def __init__(self, max_workers=None, **kwargs):
+            observed_workers.append(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def submit(self, fn, *args, **kwargs):
+            from concurrent.futures import Future
+            future = Future()
+            future.set_result(None)
+            return future
+
+        def shutdown(self, *args, **kwargs):
+            pass
+
+        def map(self, fn, *iterables, **kwargs):
+            return []
+
+    sys.modules['concurrent.futures'].ProcessPoolExecutor = MockExecutor
+    try:
+        saved_os = os.name
+        os.name = 'nt'
+        try:
+            # 1. Explicit argument in translate_pending
+            del observed_workers[:]
+            gfx2hlsl.translate_pending(str(d_62), jobs=62)
+            expect('translate_pending with explicit jobs=62 capped to 61 on Windows', observed_workers, [61])
+
+            # 2. Environment variable in translate_pending
+            del observed_workers[:]
+            os.environ['X2W_TRANSLATE_JOBS'] = '62'
+            try:
+                gfx2hlsl.translate_pending(str(d_62))
+                expect('translate_pending with X2W_TRANSLATE_JOBS=62 capped to 61 on Windows', observed_workers, [61])
+            finally:
+                os.environ.pop('X2W_TRANSLATE_JOBS', None)
+
+            # 3. Watch mode forwarding explicit jobs=62
+            del observed_workers[:]
+            gfx2hlsl.watch_pass(str(d_62), skip_failed=True, jobs=62)
+            expect('watch_pass with explicit jobs=62 capped to 61 on Windows', observed_workers, [61])
+        finally:
+            os.name = saved_os
+    finally:
+        sys.modules['concurrent.futures'].ProcessPoolExecutor = RealExecutor
+
+    if os.name == 'nt':
+        # Live Windows CLI control: --pending with --jobs 62 executes without raising ValueError
+        res = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                              '--pending', str(d_62), '--jobs', '62'],
+                             capture_output=True, text=True, timeout=120)
+        expect('CLI --pending --jobs 62 exits 0 on Windows', res.returncode, 0)
+        expect('no ValueError in stderr for --jobs 62', 'ValueError: max_workers must be <= 61' in res.stderr, False)
+
+        res_env = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
+                                  '--pending', str(d_62)],
+                                 capture_output=True, text=True, timeout=120,
+                                 env=dict(os.environ, X2W_TRANSLATE_JOBS='62'))
+        expect('CLI --pending X2W_TRANSLATE_JOBS=62 exits 0 on Windows', res_env.returncode, 0)
+        expect('no ValueError in stderr for env form', 'ValueError: max_workers must be <= 61' in res_env.stderr, False)
 
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
@@ -433,8 +721,9 @@ try:
                (any(n.endswith('.txt') for n in tree(ref)), any(n.endswith('.fail') for n in tree(ref))), (True, True))
         code, _, _ = pending_run(par, 4)
         expect('parallel --pending exit', code, 0)
-        expect('parallel --pending leaves the same files as one request at a time', tree(par), tree(ref))
-        expect('a --watch pass leaves the same files as one request at a time', tree(watched), tree(ref))
+        expected = tree(ref) | {gfx2hlsl.KEY_SEED_NAME: (gfx2hlsl.key_seed_line() + os.linesep).encode('ascii')}
+        expect('parallel --pending leaves the same files and adds a key seed stamp', tree(par), expected)
+        expect('a --watch pass leaves the same files and adds a key seed stamp', tree(watched), expected)
 finally:
     if saved_fxc is None:
         os.environ.pop('X2W_FXC', None)

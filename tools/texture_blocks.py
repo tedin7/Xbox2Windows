@@ -33,7 +33,7 @@ FORMATS: dict[str, Format] = {
     "BC1_UNORM": Format("BC1_UNORM", 71, 4, 4, 1, 8, 2),
     "BC2_UNORM": Format("BC2_UNORM", 74, 4, 4, 1, 16, 2),
     "BC3_UNORM": Format("BC3_UNORM", 77, 4, 4, 1, 16, 2),
-    "BC4_UNORM": Format("BC4_UNORM", 79, 4, 4, 1, 8, 2),
+    "BC4_UNORM": Format("BC4_UNORM", 80, 4, 4, 1, 8, 2),
     "BC5_UNORM": Format("BC5_UNORM", 83, 4, 4, 1, 16, 2),
     "BC6H_UF16": Format("BC6H_UF16", 95, 4, 4, 1, 16, 2),
     "BC7_UNORM": Format("BC7_UNORM", 98, 4, 4, 1, 16, 2),
@@ -42,13 +42,20 @@ FORMATS: dict[str, Format] = {
 
 
 def format_info(name: str) -> Format:
-    try:
-        return FORMATS[name]
-    except KeyError:
-        raise ValueError(f"Unknown texture format {name!r}") from None
+    if not isinstance(name, str) or name not in FORMATS:
+        raise ValueError(f"Unknown texture format {name!r}")
+    return FORMATS[name]
+
+
+def _require_int(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Expected integer {name}, got {type(value).__name__}")
+    return value
 
 
 def _grid(width: int, height: int, format: Format) -> tuple[int, int]:
+    width = _require_int(width, "width")
+    height = _require_int(height, "height")
     if width <= 0 or height <= 0:
         raise ValueError("Expected positive pixel dimensions")
     return ((width + format.block_width - 1) // format.block_width,
@@ -75,7 +82,7 @@ def surface_bytes(width: int, height: int, format_name: str, *, pitch_blocks: in
     """Bytes in one block-row surface, including any row pitch padding."""
     format = _two_dimensional(format_name)
     columns, rows = _grid(width, height, format)
-    pitch = columns if pitch_blocks is None else pitch_blocks
+    pitch = columns if pitch_blocks is None else _require_int(pitch_blocks, "pitch_blocks")
     if pitch < columns:
         raise ValueError(f"Block pitch {pitch} is narrower than the {columns}-block surface")
     return rows * pitch * format.bytes_per_block
@@ -86,7 +93,7 @@ def linearize_blocks(payload, width: int, height: int, format_name: str, *,
     """Copy the visible blocks of a pitched block-row surface into tight rows."""
     format = _two_dimensional(format_name)
     columns, rows = _grid(width, height, format)
-    pitch = columns if pitch_blocks is None else pitch_blocks
+    pitch = columns if pitch_blocks is None else _require_int(pitch_blocks, "pitch_blocks")
     expected = surface_bytes(width, height, format_name, pitch_blocks=pitch)
     if len(payload) != expected:
         raise ValueError(f"Expected {expected} bytes for {format.name}, got {len(payload)}")
@@ -100,21 +107,27 @@ def linearize_blocks(payload, width: int, height: int, format_name: str, *,
 
 
 def tile_blocks(blocks, width: int, height: int, format_name: str, *,
-                pitch_blocks: int | None = None, padding: bytes | None = None) -> bytes:
+                pitch_blocks: int | None = None, padding: bytes | bytearray | memoryview | None = None) -> bytes:
     """Write tight block rows into a pitched block-row surface."""
     format = _two_dimensional(format_name)
     columns, rows = _grid(width, height, format)
+    pitch = columns if pitch_blocks is None else _require_int(pitch_blocks, "pitch_blocks")
+    expected = surface_bytes(width, height, format_name, pitch_blocks=pitch)
     block_bytes = format.bytes_per_block
     tight = columns * rows * block_bytes
     if len(blocks) != tight:
         raise ValueError(f"Expected {tight} tight bytes for {format.name}, got {len(blocks)}")
-    pitch = columns if pitch_blocks is None else pitch_blocks
-    expected = surface_bytes(width, height, format_name, pitch_blocks=pitch)
     if padding is None:
-        padding = b"\xff" * block_bytes
-    if len(padding) != block_bytes:
+        padding_bytes = b"\xff" * block_bytes
+    elif isinstance(padding, (bytes, bytearray)):
+        padding_bytes = bytes(padding)
+    elif isinstance(padding, memoryview) and padding.ndim == 1 and padding.format == "B":
+        padding_bytes = bytes(padding)
+    else:
+        raise ValueError(f"Expected bytes-like padding of {block_bytes} bytes, got {type(padding).__name__}")
+    if len(padding_bytes) != block_bytes:
         raise ValueError(f"Expected one {block_bytes}-byte padding block")
-    output = bytearray(padding * (rows * pitch))
+    output = bytearray(padding_bytes * (rows * pitch))
     row_bytes = columns * block_bytes
     for y in range(rows):
         source = y * row_bytes
@@ -136,12 +149,13 @@ def _volume_geometry(width: int, height: int, format: Format) -> tuple[int, int,
 def tile_volume_4k_s(slices, width: int, height: int, depth: int, format_name: str) -> bytes:
     """Tile tight BC7 volume slices, one padded 4 KiB surface per Z slice."""
     format = _volume(format_name)
+    depth = _require_int(depth, "depth")
     if depth <= 0:
         raise ValueError("Expected a positive volume depth")
+    _, _, slice_bytes, _ = _volume_geometry(width, height, format)
     slices = list(slices)
     if len(slices) != depth:
         raise ValueError(f"Expected {depth} volume slices, got {len(slices)}")
-    _, _, slice_bytes, _ = _volume_geometry(width, height, format)
     output = bytearray()
     for z, blocks in enumerate(slices):
         if len(blocks) != slice_bytes:
@@ -154,6 +168,7 @@ def tile_volume_4k_s(slices, width: int, height: int, depth: int, format_name: s
 def linearize_volume_4k_s(payload, width: int, height: int, depth: int, format_name: str) -> bytes:
     """Read tight BC7 volume slices from one 4 KiB surface per Z slice."""
     format = _volume(format_name)
+    depth = _require_int(depth, "depth")
     if depth <= 0:
         raise ValueError("Expected a positive volume depth")
     _, _, _, slice_stride = _volume_geometry(width, height, format)

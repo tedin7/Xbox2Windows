@@ -1,0 +1,1 @@
+tests/gdk_platform_profiles_check.py

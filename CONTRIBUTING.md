@@ -33,6 +33,8 @@ Start with the [first build](README.md#first-build). Create the Python environme
 
 On pull requests, `Build and test on Windows` builds the smoke-test targets with `cmake --build --preset pr` and runs `ctest --preset pr --no-tests=error`. The preset selects tests for CPU translation, PE startup, memory, archive decoding and WARP rendering, including the SPIR-V bridge checks. The bridge checks can skip locally if their tools are missing; hosted CI installs the pinned tools and requires the WARP bridge checks to pass. For a strict local run, run [the pinned tool setup](tools/setup-spirv-tools.ps1) (`.\tools\setup-spirv-tools.ps1` in PowerShell) before configuring or reconfiguring, then set `$env:X2W_REQUIRE_SPIRV_TOOLS = '1'` before running CTest. Run the tests for your specific change locally and include their results in the PR.
 
+Pull requests into `cpp-migration` also build `compile_dxil` and run `native_dxil_llvm_ident_controls` on Windows to check direct DXIL generation.
+
 On `main` and manual runs, CI runs the full non-hardware suites in Debug and Release (/O2), generates the coverage chart and smoke-tests the standalone GPU package. To check a branch in both configurations before merge, select it under **Actions → Windows checks → Run workflow**. The Ubuntu jobs assemble gfx1013 fixtures with LLVM 15 and run the platform-independent Python checks. [CI workflow](.github/workflows/windows.yml)
 
 Contributors supply physical GPU coverage. Record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the feature tier or wave width when relevant. Report capability skips separately from passes and failures. [Non-Windows host guide](docs/non-windows-hosts.md)

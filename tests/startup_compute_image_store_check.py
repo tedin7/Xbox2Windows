@@ -64,7 +64,7 @@ s_endpgm
 HEAD = ARRAY_PROLOGUE[:24]  # s_mov s12, s7; s_mov s13, 0; s_load_dwordx8 s[24:31]; v_lshl_add_u32 v8, s10, 2, v0
 STORE_1D = bytes.fromhex('000f20f0080e0600')  # image_store v[14:17], v8, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_1D
 STORE_3D = bytes.fromhex('100f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
-LINE_1D = 'w0[v8] = asfloat(uint4(v14, v15, v16, v17));'
+LINE_1D = 'w0[uint(v8)] = asfloat(uint4(v14, v15, v16, v17));'
 LINE_3D = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
 TEXTURE_1D_FLAG = 1 << 23  # tests/compute_check.cpp texture_1d_flag
 VOLUME_FLAG = (1 << 31) | (1 << 30)  # texture_volume_flag: RWTexture3D, RGBA32 float
@@ -158,7 +158,7 @@ def array_reference(layer):
 # The EXEC mask leaves one row live, so each of the eight active lanes owns one texel across both groups.
 # Four distinct finite values and distinct initial channel words detect reordered or overwritten components.
 PARTIAL_CASES = {
-    '1d': (STORE_1D, HEAD, 'v8', TEXTURE_1D_FLAG, 'tex1d'),
+    '1d': (STORE_1D, HEAD, 'uint(v8)', TEXTURE_1D_FLAG, 'tex1d'),
     '2d': (STORE, ARRAY_PROLOGUE, 'uint2(v8, v9)', fixture.FLOAT_TEXTURE_FLAG, 'tex2d'),
     'array': (ARRAY_STORE, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', ARRAY_FLAG, 'tex2da'),
     '3d': (STORE_3D, ARRAY_PROLOGUE + ARRAY_SLICE[1], 'uint3(v8, v9, v10)', VOLUME_FLAG, 'tex3d'),
@@ -446,7 +446,7 @@ def dispatch(directory, compiler, renderer, adapter):
     cases = (
         ('1D, full EXEC', source, 0, None),
         ('1D, omit store', source.replace(LINE_1D, ''), 32, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
-        ('1D, one texel off', source.replace('w0[v8]', 'w0[v8 + 1]'), 8, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
+        ('1D, one texel off', source.replace('w0[uint(v8)]', 'w0[uint(v8) + 1]'), 8, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
     )
     if draw_cases(directory, compiler, renderer, adapter, initial + expected + [0] * len(initial), cases,
                   selector=fixture.GROUPS | TEXTURE_1D_FLAG, compared=len(initial)) == 77:

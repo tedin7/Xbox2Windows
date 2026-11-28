@@ -1,5 +1,6 @@
 """64-bit VOPC controls; draw <dxc> <offscreen_check> <warp|hardware> [fxc]."""
 import hashlib
+import hlsl_pin  # noqa: E402
 import re
 import sys
 import tempfile
@@ -100,7 +101,7 @@ def controls():
     old = S.e32(S.OPCODES[False, 'lt', 'i16'], S.V(1), 2)
     assert S.translate(old)[2] == '(((asint(v1 << 16u) >> 16u) < (asint(v2 << 16u) >> 16u)) ? 1u : 0u)'
     pipeline = G.Pipeline(I3.VS_WORDS, S.K_WORDS, I3.root_blob(), ps_hw_inputs=S.PACKED)
-    assert hashlib.sha256(pipeline.hlsl_ps().encode()).hexdigest() == 'c49d0c6f04ae99b6b47a139d179193c6b4a4c1e1df932e5aa7c339ec83433be4'
+    assert hlsl_pin.digest(pipeline.hlsl_ps()) == 'bf67b970cf344cfbdce23a79f132724226821df1102251465962962c801dc090'
     assert hashlib.sha256(pipeline.manifest().encode()).hexdigest() == '43ded0ab436e974b155ca5b6e9248c264be3dd66388e9ee8b65d5e0312032c92'
     assert sum(a != b for a, b in zip(image(), image(True))) > 0
     assert 'exec = ' in G.Pipeline(I3.VS_WORDS, WORDS, I3.root_blob(), ps_hw_inputs=S.PACKED).hlsl_ps()

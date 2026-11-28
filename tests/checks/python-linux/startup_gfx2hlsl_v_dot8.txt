@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_v_dot8_check.py

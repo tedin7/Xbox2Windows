@@ -1,5 +1,6 @@
 """Controls for GETPC-relative per-lane GLOBAL address pattern recognition."""
 import hashlib
+import hlsl_pin  # noqa: E402
 import os
 import struct
 import tempfile
@@ -184,13 +185,13 @@ def translator_controls():
             status, _ = stream_interface.translate(path / 'old', stream_interface.vertex(), stream_interface.pixel())
             assert status == 'ok', status
             want = {
-                '.ps.hlsl': '7b7b2b7161c8df8dc4c526e45618208f29ce0edb99ad46ae0baa839ddaf93173',
-                '.vs.hlsl': '3742286636121f9816ec552bbd0761f4dd2a90356b49dceef3fc30ab3fbbe633',
+                '.ps.hlsl': '5aa0a67ce94f88d408a56a1054346428cabf8fa60e34be3a8129aa2ee103b72a',
+                '.vs.hlsl': 'f3700ba1fb04494ffcc9aa58d758a2d7d76ba30c2873cf0f8043be4709af0ab1',
                 '.txt': '5cb778176c0dd11018a6919890a39f6aacaefe6218b728397faf4deca8eaa120',
             }
             for suffix, digest in want.items():
                 matches = list((path / 'old').glob('*' + suffix))
-                assert len(matches) == 1 and hashlib.sha256(matches[0].read_bytes().replace(b'\r\n', b'\n')).hexdigest() == digest, suffix
+                assert len(matches) == 1 and hlsl_pin.digest(matches[0].read_bytes()) == digest, suffix
     finally:
         if saved is None:
             os.environ.pop('X2W_FXC', None)
