@@ -10,7 +10,8 @@
 // The title's frame-event waits (device slot 80) are played without their timeout, so they do not sleep to the title's
 // frame interval (a loading prefix spends most of its time there); --pace on keeps the recorded timeout.
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
-// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
+// Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), passes.jsonl
+// (X2W_PASS_STATS=1: the stand-in's pass thermometer, with the recorded call of each pass), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // recording could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
 // 77 no D3D12 adapter.
@@ -60,6 +61,7 @@ extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
     void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
 extern "C" __declspec(dllimport) long long x2w_d3d12_magenta_draws();
+extern "C" __declspec(dllimport) void x2w_d3d12_pass_stats_call(unsigned long long call);
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
@@ -1074,6 +1076,10 @@ int run(const Options& o)
     // X2W_REPLAY_DUMP reaches the delay-loaded shim from the environment or the recording's XENV.
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
+    wchar_t pass_stats_switch[4]{};
+    const bool pass_stats = GetEnvironmentVariableW(L"X2W_PASS_STATS", pass_stats_switch, 4) == 1 && pass_stats_switch[0] == L'1';
+    if (pass_stats && !GetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", nullptr, 0))
+        SetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     phase = "seeding the shader cache";
@@ -1182,6 +1188,7 @@ int run(const Options& o)
     const auto play_step = [&] {
         const bool learn_view_id = take_view_id && s.has_view_id;
         if (learn_view_id) take_view_id();  // discard any view stored by a previous step
+        if (pass_stats) x2w_d3d12_pass_stats_call(s.call.seq);  // the pass thermometer names passes by recorded call
         const bool played = play(p, r, s);
         if (learn_view_id && played)
             if (const u64 id = take_view_id())

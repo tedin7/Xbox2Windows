@@ -379,6 +379,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
         return refuse_copy("CopyBufferRegion", refusal);
     }
     timer.enter(copy15_desktop);
+    pass_stats_copy(self, to.resource, from.resource, 0, destination_offset, bytes);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
@@ -424,6 +425,7 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
                                                     to.resource == from.resource);
     if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, true);
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyResource", refusal);
+    pass_stats_copy(self, to.resource, from.resource);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
@@ -457,6 +459,7 @@ void __stdcall list_resolve_subresource(Wrapper* self, u64 destination, UINT des
     auto refusal = plan.refusal;
     if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, false);
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("ResolveSubresource", refusal);
+    pass_stats_copy(self, to.resource, from.resource, destination_subresource);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)

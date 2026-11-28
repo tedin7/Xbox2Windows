@@ -173,6 +173,8 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
         upload_texture(self, dst_wrapper, real_dst);
         draw_lock_release_exclusive();
     }
+    pass_stats_copy(self, real_dst, real_src,
+                    dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? dst->SubresourceIndex : 0);
     if (!src_fixed) require_state(self, real_src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (!dst_fixed) require_state(self, real_dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = *dst, from = *src;
