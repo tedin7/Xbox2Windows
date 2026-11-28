@@ -3298,7 +3298,7 @@ int main(int argc, char** argv) try
         if (root_srv_fixture) {
             params[2].Constants = {1, 0, 1};
             params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-            params[3].Descriptor = {0, 0};
+            params[3].Descriptor = {1, 0};  // t1: the table range holds t0
         }
         const D3D12_ROOT_SIGNATURE_DESC source_root{root_srv_fixture ? 4u : heap_fixture ? 3u : 2u, params, 0, nullptr,
             static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(heap_fixture ? 0x400 : 0)};
