@@ -6786,20 +6786,24 @@ class Stage:
         # RDNA 2 ISA §8.2.6, Table 45 stores mip-zero sizes minus one and absolute mip indices.
         # GetDimensions(0) returns the view's top mip: equivalent to max(mip_zero_size >> base, 1).
         # The raw size fields agree only at base zero. Match the full calculation before rebasing them.
+        # A bare `size >> base` (no max with 1) is the same value for every valid view (base < mip count), and the
+        # consumer may apply the max itself, so the bare shift is accepted as the top-mip size too.
         def top_mip(size):
             return alu('max_u32', alu('lshr_b32', size, base), one)
+
+        def top_mips(size):
+            return (top_mip(size), alu('lshr_b32', size, base))
 
         width_hi = alu('and_b32', word2, literal(0x3fff))
         width_shifted = alu('lshl_b32', width_hi, literal(2))
         for low in (alu('bfe_u32', word1, literal(0x2001e)), alu('lshr_b32', word1, literal(30))):
             width_lo = alu('add_u32', low, one)
-            if node in (top_mip(alu('lshl2_add_u32', width_hi, width_lo)),
-                        top_mip(alu('add_u32', width_lo, width_shifted)),
-                        top_mip(alu('add_u32', width_shifted, width_lo))):
+            if node in (top_mips(alu('lshl2_add_u32', width_hi, width_lo)) + top_mips(alu('add_u32', width_lo, width_shifted))
+                        + top_mips(alu('add_u32', width_shifted, width_lo))):
                 return self.heap_view_dimensions(source, kind, probe)[0]
         for field in (0xe000e, 0x10000e):
             height = alu('add_u32', alu('bfe_u32', word2, literal(field)), one)
-            if node == top_mip(height):
+            if node in top_mips(height):
                 return self.heap_view_dimensions(source, kind, probe)[1]
         if node == alu('sub_u32', last, base):
             return '(%s - 1u)' % self.heap_view_dimensions(source, kind, probe)[2]
