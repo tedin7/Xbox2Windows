@@ -2492,8 +2492,8 @@ def runtime_mismatch_report(actual, expected, correct, group_zero, clear, log):
     lines += ['  (%d,%d) got %s want %s' % item for item in wrong[:8]]
     if log.exists():
         text = [line for line in log.read_text(errors='replace').splitlines()
-                if 'slot57' in line or 'mesh' in line or 'ExecuteIndirect' in line or 'desktop pipeline' in line]
-        lines += ['log: ' + line[:200] for line in text[:20]]
+                if any(word in line for word in ('slot57', 'mesh', 'ExecuteIndirect', 'desktop pipeline', 'refused', 'heap'))]
+        lines += ["log: " + line[:240] for line in text[:40]]
     return '\n'.join(lines)
 
 
