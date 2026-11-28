@@ -6682,7 +6682,7 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
-            if s[0] == 'desc' and getattr(self, 'kind', None) in ('ps', 'vs') and names_one_value(s):
+            if s[0] == 'desc' and getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and names_one_value(s):
                 # The runtime supplies the original root-table dword for a numeric use of the descriptor.
                 return self.descriptor_number(s[:4], fixed_only=True)
             if s[0] == 'descnum' and len(s) == 3:
@@ -14673,6 +14673,17 @@ class Stage:
                 raise Unsupported('SMEM immediate offset %s' % ops[2])
             if imm is not None:
                 raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
+            if p[1] == ('smpheap',) and count == 4 and not base_off and not into_vcc and self.pipe.sampler_heap:
+                # A sampler at a constant byte offset of the sampler heap: the same table lookup as a run-time
+                # offset, with the offset held in the first destination register ("RDNA 2" Instruction Set
+                # Architecture, section 8.2 SMEM: the byte address is the base plus the immediate offset; a sampler
+                # descriptor is 16 bytes, so the entry is offset / 16, and x2w_sampler_entry keeps the guard).
+                d = dst[1]
+                self.used_s.add(d)
+                self.emit('s%d = %du;' % (d, off))
+                for i in range(count):
+                    self.sym[d + i] = ('smpheap', d, i)
+                return
             if p[1][0] == 'root':
                 if into_vcc:
                     raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
