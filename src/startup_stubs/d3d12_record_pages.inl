@@ -27,7 +27,7 @@ std::unordered_map<u64, std::vector<PageRange>> draw_pending;  // list -> spans 
 std::vector<PageRange> draw_ranges;  // the title ranges by address
 bool draw_ranges_missed;             // gathered again this Present for a span outside them
 LONG draw_ranges_present = -1, draw_time_present = -1;
-u64 draw_captures, draw_outside, draw_over_time, draw_pending_dropped;
+u64 draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped;
 u64 draw_table_spans, draw_descriptor_buffers;
 u64 draw_ranges_gathered;
 double draw_time_used, draw_ranges_ms;
@@ -83,17 +83,20 @@ struct NamedPageRange {
 };
 std::unordered_map<u64, NamedPageRange> named_page_ranges;  // pages_lock
 
+bool on_current_stack(u64 address)
+{
+    ULONG_PTR low, high;
+    GetCurrentThreadStackLimits(&low, &high);
+    return address >= low && address < high;
+}
+
 void remember_page_range(u64 address, u64 bytes, bool heap)
 {
     if (!address || !bytes) return;
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
         info.State != MEM_COMMIT || (!heap && info.Type != MEM_PRIVATE)) return;
-    if (!heap) {
-        ULONG_PTR low, high;
-        GetCurrentThreadStackLimits(&low, &high);
-        if (address >= low && address < high) return;
-    }
+    if (!heap && on_current_stack(address)) return;
     const u64 allocation = reinterpret_cast<u64>(info.AllocationBase);
     auto& range = named_page_ranges[address];
     if (range.allocation != allocation) range = {};
@@ -526,10 +529,10 @@ const PageRange* draw_find_range(u64 address)
 
 void draw_log_counters(LONG present, double used)
 {
-    log("x2w-replay draw pages: captures %llu, outside title memory %llu, over the per-present time %llu, "
+    log("x2w-replay draw pages: captures %llu, plain memory spans %llu, outside title memory %llu, over the per-present time %llu, "
         "pending dropped %llu, table spans %llu, descriptor buffers %llu, "
         "ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
-        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
+        draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
         draw_ranges_gathered, draw_ranges_ms,
         used, draw_pages_ms, present);
 }
@@ -540,6 +543,24 @@ bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
     if (used < draw_pages_ms) return false;
     draw_over_time += skipped;
     return true;
+}
+
+u64 draw_plain_end(u64 address, u64 end)
+{
+    if (on_current_stack(address)) return 0;
+
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
+        !committed_region_readable(info) || (info.Type != MEM_PRIVATE && info.Type != MEM_IMAGE))
+        return 0;
+
+    const void* allocation = info.AllocationBase;
+    u64 at = address;
+    do {
+        at = (std::min)(end, reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize);
+    } while (at < end && VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) &&
+             info.AllocationBase == allocation);
+    return at;
 }
 
 void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INTEGER& start)
@@ -577,10 +598,15 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
         draw_ranges_ms += static_cast<double>(gather_ticks) * 1000.0 / static_cast<double>(frequency.QuadPart);
         range = draw_find_range(span.address);
     }
-    if (!range) { ++draw_outside; return; }
-    if (page_after_cut(*range)) return;
-    const u64 end = (std::min)(range->address + range->bytes,
-        (span.address + (std::min<u64>)(span.bytes, draw_span_limit) + mask) & ~mask);
+    u64 end = (span.address + (std::min<u64>)(span.bytes, draw_span_limit) + mask) & ~mask;
+    if (range) {
+        if (page_after_cut(*range)) return;
+        end = (std::min)(end, range->address + range->bytes);
+    } else {
+        end = draw_plain_end(span.address, end);
+        if (!end) { ++draw_outside; return; }
+        ++draw_plain_spans;
+    }
     bool captured = false;
     for (u64 at = span.address & ~mask; at < end; at += page_slab_bytes) {
         if (page_budget_or_cap_reached() || draw_time_exhausted(start, 1)) break;
@@ -701,7 +727,7 @@ inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present, bool scan)
         stamp = page_prev_mark ? page_prev_mark : seq;
         page_prev_mark = seq;
     }
-    const bool log_draw = draw_pages && present % 20 == 0;
+    const bool log_draw = draw_pages && (present == 1 || present % 20 == 0);
     if ((!scan && !log_draw) || !TryAcquireSRWLockExclusive(&pages_lock)) return;
     if (log_draw) draw_log_counters(present, draw_time_present == present - 1 ? draw_time_used : 0.0);
     if (scan) {

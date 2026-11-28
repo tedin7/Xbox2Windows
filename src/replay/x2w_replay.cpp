@@ -122,6 +122,7 @@ struct Player {
     // The prefix: the calls before the window's first present (Recording::window_seq), how many were played, how long.
     u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0, prefix_left_out = 0;
     double prefix_seconds = 0;
+    u64 gpu_restored = 0, gpu_failed = 0, gpu_untranslated = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
 
@@ -134,10 +135,10 @@ struct Player {
     u64 page_target(u64 address, u64& bytes) const
     {
         auto above = handles.upper_bound(address);
-        if (above == handles.begin()) return address;
+        if (above == handles.begin()) return 0;
         --above;
         const u64 offset = address - above->first;
-        if (offset >= above->second.span) return address;
+        if (offset >= above->second.span) return 0;
         if (bytes > above->second.span - offset) bytes = above->second.span - offset;
         ++page_translated;
         return above->second.to + offset;
@@ -231,7 +232,9 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
         // Descriptor writes rebuild the backing in place. Other arguments on the same allocation granule still need their blobs.
-        if (p.descriptor_backing(m.address) || span_contains(page_replay().map_spans, m.address)) {
+        const auto& pages = page_replay();
+        if (p.descriptor_backing(m.address) ||
+            (span_contains(pages.map_spans, m.address) && pages.reserved(m.address, m.bytes))) {
             copies[i] = reinterpret_cast<unsigned char*>(m.address);
             ++p.title_memory_args;
             continue;
@@ -855,9 +858,10 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         std::fprintf(f, "\"view_tokens\": {\"rewritten\": %llu, \"unmapped\": %llu}, ",
                      pages.view_tokens_rewritten, pages.view_tokens_unmapped);
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
-                        "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
+                        "\"bad_maps\": %llu, \"unreserved_spans\": %llu, \"left_out\": %llu, "
+                        "\"title_memory_args\": %llu}, \"ranges\": [",
                      r.maps.size(), pages.maps_applied, pages.pages_written, pages.zero_pages, pages.missing_pages, pages.bad_maps,
-                     p.title_memory_args);
+                     pages.unreserved_spans, pages.left_out, p.title_memory_args);
         for (std::size_t i = 0; i < pages.spans.size(); ++i)
             std::fprintf(f, "%s{\"address\": \"0x%llx\", \"bytes\": %llu, \"hash\": \"%016llx\"}", i ? ", " : "", pages.spans[i].base,
                          pages.spans[i].end - pages.spans[i].base, span_hash(pages.spans[i]));
@@ -883,6 +887,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         }
         std::fprintf(f, ", \"prefix\": {\"calls\": %llu, \"played\": %llu, \"left_out\": %llu, \"wall_s\": %.3f}",
                      p.prefix_calls, p.prefix_played, p.prefix_left_out, p.prefix_seconds);
+        std::fprintf(f, ", \"gpu_state\": {\"restored\": %llu, \"failed\": %llu, \"untranslated\": %llu}",
+                     p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
         if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
@@ -1007,7 +1013,7 @@ int run(const Options& o)
         return 2;
     }
     // Reserve title ranges before the stand-in can allocate at those addresses.
-    if (std::string problem; !reserve_page_ranges(r, problem)) {
+    if (std::string problem; !reserve_page_ranges(r, problem, say)) {
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
@@ -1108,6 +1114,10 @@ int run(const Options& o)
     if (o.prefix_live) live = prefix_live_of(r, p.window_seq);
     p.pace = o.pace;
     bool in_prefix = true;
+    using RestoreSubresource = BOOL (*)(void*, UINT, const void*, const void*, UINT64);
+    const HMODULE shim = r.gpu_state.empty() ? nullptr : GetModuleHandleW(L"d3d12_xs.dll");
+    const auto restore = shim ? reinterpret_cast<RestoreSubresource>(GetProcAddress(shim, "x2w_d3d12_restore_subresource"))
+                              : nullptr;
     const auto end_prefix = [&](u64 calls) {
         in_prefix = false;
         p.prefix_calls = calls;
@@ -1116,6 +1126,21 @@ int run(const Options& o)
         say("x2w-replay: prefix: %llu of %llu calls played (%llu left out by --prefix-live), wall %.3f s",
             static_cast<unsigned long long>(p.prefix_played),
             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(p.prefix_left_out), p.prefix_seconds);
+        if (!r.gpu_state.empty() && p.window_seq != ~0ull)
+            apply_pages_before(r, p.window_seq + 1, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+        for (const auto& slice : r.gpu_state) {
+            const auto object = p.objects.find(slice.header.object);
+            if (object == p.objects.end() || !object->second) {
+                ++p.gpu_untranslated;
+            } else if (restore && restore(reinterpret_cast<void*>(object->second), slice.header.subresource,
+                                          &slice.header, slice.data, slice.header.bytes)) {
+                ++p.gpu_restored;
+            } else {
+                ++p.gpu_failed;
+            }
+        }
+        say("x2w-replay gpu state: %llu subresources restored, %llu failed, %llu untranslated",
+            p.gpu_restored, p.gpu_failed, p.gpu_untranslated);
     };
     u64 index = 0;
     Step s;  // the call being played, loaded from the mapping
@@ -1172,6 +1197,7 @@ int run(const Options& o)
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
     say("x2w-replay: view tokens: rewritten %llu, unmapped %llu", pages.view_tokens_rewritten, pages.view_tokens_unmapped);
+    say("x2w-replay: title ranges unreserved %llu, pages left out (unreserved) %llu", pages.unreserved_spans, pages.left_out);
     say("x2w-replay: frame waits not paced: %llu of %llu (%.3f s inside them)%s", static_cast<unsigned long long>(p.unpaced_waits),
         static_cast<unsigned long long>(p.event_waits), p.event_wait_seconds, p.pace ? ", --pace on" : "");
     say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",

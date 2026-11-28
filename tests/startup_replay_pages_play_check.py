@@ -105,11 +105,17 @@ def main(player):
             assert ranges == [{"address": "0x%x" % BASE, "bytes": SPAN, "hash": fnv(expected)}], (name, ranges, fnv(expected))
             assert summary["pages"]["applied"] == (2 if second else 1) and summary["pages"]["missing"] == 0, summary["pages"]
 
+        # A plain MAP range (no heap placement, no descriptor backing) that cannot be had is left out: the replay goes on,
+        # names the range and counts it (only heap placements and descriptor backings stop it with exit 3).
         recording(directory / "taken.x2wr", 0xFFFF800000000000)
         code, text = play(player, directory / "taken.x2wr", directory / "taken")
-        assert code == 3 and "0xffff800000000000" in text, (code, text[-2000:])
+        log_file = directory / "taken" / "stderr.txt"
+        text += log_file.read_text(errors="replace") if log_file.exists() else ""
+        assert code == 0 and "0xffff800000000000" in text and "could not be reserved" in text, (code, text[-2000:])
+        taken = json.loads((directory / "taken" / "replay_summary.json").read_text())["pages"]
+        assert taken["unreserved_spans"] == 1 and taken["left_out"] > 0 and taken["written"] == 0, taken
         check_missing_release(player, directory)
-        print("replay pages: image A,C,A,zeros at 0x%x; first map only A,B,A; a range that cannot be had stops with exit 3"
+        print("replay pages: image A,C,A,zeros at 0x%x; first map only A,B,A; a plain range that cannot be had is left out"
               % BASE)
         print("replay Release: known device calls played; missing resource with a stale RDX skipped")
     return 0
