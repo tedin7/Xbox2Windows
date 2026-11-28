@@ -16296,8 +16296,6 @@ class Stage:
                 if flag in mods:
                     raise Unsupported('image_sample%s on SQ_RSRC_IMG_CUBE with %s'
                                       % ('' if how == 'sample' else '_' + how, flag))
-            if getattr(self, 'kind', None) == 'cs':
-                raise Unsupported('cube image in a compute program (no texcube SRV binding)')
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
