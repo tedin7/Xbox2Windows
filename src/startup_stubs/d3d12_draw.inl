@@ -4479,7 +4479,8 @@ bool resolve_pixel_uavs(Wrapper* self, const Translation& tr, const Pass& pass, 
         std::memcpy(words, reinterpret_cast<const void*>(entry), size);
         // A raw view is either a descriptor the title wrote (its words are the buffer, bound through a placed alias)
         // or a view token naming a buffer UAV the title created (resolved below like a texture view).
-        if (uav.raw && words[0] != view_token_magic) {
+        const bool empty_entry = !(words[0] | words[1] | words[2] | words[3]);
+        if (uav.raw && words[0] != view_token_magic && !empty_entry) {
             if (const char* reason = pixel_raw_uav(self, words, out[i])) return refuse(i, reason, entry);
             for (std::size_t j = 0; j < i; ++j)
                 if (out[j].resource == out[i].resource) return refuse(i, "raw output also bound as a UAV", j);
