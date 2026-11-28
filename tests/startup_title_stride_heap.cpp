@@ -230,13 +230,15 @@ int main(int argc, char** argv)
     // Depth stencil heap. The console's DSV descriptors are 8 bytes; a desktop device's are larger (32 on WARP and most
     // hardware). A replay declares 8, and title handle k * 8 must reach descriptor k of the desktop heap. Without the
     // declaration (its minimum was 32) handles k * 8 land inside one another's descriptors and the bind or clear reads garbage.
-    {
+    // Pass 0 declares nothing: the heap's title memory size alone (8 records of the title's size) selects the records. Pass 1
+    // declares the increment. In both, descriptor 5 is read through a copy of it made into descriptor 6.
+    for (int pass = 0; pass < 2; ++pass) {
         // The console's 8 where this device's depth stencil increment is larger (hardware: 32); on WARP, whose own is 8, 16
         // stands in so that the title and desktop strides still differ.
         const UINT dsv_desktop = probe.desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         const UINT dsv_title = dsv_desktop == 8 ? 16 : 8;
         std::printf("DSV increments: desktop %u, title %u\n", dsv_desktop, dsv_title);
-        x2w_d3d12_replay_title_increment(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsv_title);
+        if (pass == 1) x2w_d3d12_replay_title_increment(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsv_title);
         void* dsv_memory = VirtualAlloc(nullptr, 8 * dsv_title, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
             dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, arg(dsv_memory), 8ull * dsv_title};
@@ -260,13 +262,16 @@ int main(int argc, char** argv)
         dsv.Format = DXGI_FORMAT_D32_FLOAT;
         dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         for (unsigned i = 0; i < 2; ++i) invoke(device, 21, arg(depth[i].Get()), arg(&dsv), dsv_start + slots[i] * dsv_title);
+        // Descriptor 5 is used through its copy in descriptor 6 (CopyDescriptorsSimple between title records).
+        const unsigned used[2] = {slots[0], 6};
+        invoke(device, 24, 1, dsv_start + used[1] * dsv_title, dsv_start + slots[1] * dsv_title, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         unsigned binds_before = 0, unresolved_before = 0, binds_after = 0, unresolved_after = 0;
         x2w_d3d12_render_target_stats(&binds_before, &unresolved_before);
         if (!ok(invoke(list, 139, arg(allocator), 0))) { std::printf("list reset failed (DSV)\n"); return 21; }
         using ClearDepth = void (WINAPI*)(void*, Word, UINT, float, UINT8, UINT, const void*);
         const auto clear_depth = reinterpret_cast<ClearDepth>((*static_cast<void***>(list))[51]);
         for (unsigned i = 0; i < 2; ++i) {
-            const Word handle = dsv_start + slots[i] * dsv_title;
+            const Word handle = dsv_start + used[i] * dsv_title;
             invoke(list, 50, 0, 0, 0, arg(&handle));
             clear_depth(list, handle, D3D12_CLEAR_FLAG_DEPTH, clears[i], 0, 0, nullptr);
         }
@@ -321,7 +326,7 @@ int main(int argc, char** argv)
             float value = 0;
             std::memcpy(&value, memory, sizeof(value));
             depth_readback->Unmap(0, nullptr);
-            std::printf("DSV descriptor %u cleared to %.3f, read %.3f\n", slots[i], clears[i], value);
+            std::printf("DSV pass %d descriptor %u cleared to %.3f, read %.3f\n", pass, used[i], clears[i], value);
             if (value != clears[i]) return 26;
         }
     }
