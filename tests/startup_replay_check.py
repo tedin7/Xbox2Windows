@@ -360,7 +360,7 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     assert carried, "the recording holds no list call from before its window"
     whole = pictures(recorded_dir)
     corner = whole["present_0007.png"][1][1:5]  # the first pixel of the first scanline
-    assert corner[0] > 200 and corner[2] > 200 and corner[1] < 50, "the live picture has no magenta corner: %r" % (corner,)
+    assert corner[0] > 200 and corner[2] > 200 and corner[1] < 50, "the live picture has no magenta corner: %r\n%s" % (corner, "\n".join(l[:200] for l in text.splitlines() if "Clear" in l or "slot35" in l or "list" in l.lower())[-3500:])
     pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
     _score, played = replay(player, recording, directory / "static_replayed", backend, env, presents=6)
     differ = [b for a, b in pairs if played.get(a) != whole[b]]
