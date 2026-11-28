@@ -655,7 +655,8 @@ bool draw_pages;
 double draw_pages_ms = 100.0;
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
-u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool root, bool submit, bool scan);
+u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9,
+                      u64 s0, u64 s1, u64 s2, bool root, bool submit, bool scan);
 void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
@@ -686,7 +687,10 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
         const bool scan = consumes_pages && (extra_title_pages ||
             (submit && (scan_submit_pages || replay_dump_enabled()) && window_open));
         const bool capture = draw_page_slot && draw_pages && window_open.load(std::memory_order_relaxed);
-        seq = scan || capture ? pages_before_call(K, N, rcx, rdx, r8, r9, root, submit, scan)
+        constexpr bool indirect = K == list_kind && N == 61;
+        seq = scan || capture ? pages_before_call(K, N, rcx, rdx, r8, r9,
+                                                 indirect ? s0 : 0, indirect ? s1 : 0, indirect ? s2 : 0,
+                                                 root, submit, scan)
                               : static_cast<u64>(InterlockedIncrement64(&next_seq));
     } else {
         seq = static_cast<u64>(InterlockedIncrement64(&next_seq));

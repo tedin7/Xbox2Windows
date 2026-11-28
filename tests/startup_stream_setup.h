@@ -9,7 +9,7 @@
 int pick_stream_adapter(bool hardware, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter);
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
-                            void*& device, void*& pso);
+                            void*& device, void*& pso, bool desktop_triangle = false);
 
 // The guest root signature that prepare_stream_pipeline created (null before it ran).
 void* stream_root_signature();

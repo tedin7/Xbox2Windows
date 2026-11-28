@@ -105,7 +105,7 @@ int pick_stream_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
 
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
-                            void*& device, void*& pso)
+                            void*& device, void*& pso, bool desktop_triangle)
 {
     std::ifstream vs_file(vs_path, std::ios::binary), ps_file(ps_path, std::ios::binary);
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
@@ -210,6 +210,31 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
     const bool layout = GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", nullptr, 0) != 0;
+    struct DesktopTriangleStream {
+        Stream shaders;
+        alignas(8) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE topology_tag;
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE topology;
+        alignas(8) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE targets_tag;
+        D3D12_RT_FORMAT_ARRAY targets;
+        alignas(8) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE raster_tag;
+        D3D12_RASTERIZER_DESC raster;
+        alignas(8) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE depth_tag;
+        D3D12_DEPTH_STENCIL_DESC depth;
+    };
+    if (desktop_triangle) {
+        DesktopTriangleStream stream{with_layout.stream,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, {{DXGI_FORMAT_R8G8B8A8_UNORM}, 1},
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, {},
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, {}};
+        stream.raster.FillMode = D3D12_FILL_MODE_SOLID;
+        stream.raster.CullMode = D3D12_CULL_MODE_NONE;
+        stream.raster.DepthClipEnable = TRUE;
+        stream.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+        return SUCCEEDED(reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso))
+            && pso ? 0 : 9;
+    }
     void* first = layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
     const SIZE_T whole = layout ? sizeof(with_layout) : sizeof(with_layout.stream);
     auto submit = [&](SIZE_T bytes) {
