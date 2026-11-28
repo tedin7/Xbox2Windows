@@ -1099,12 +1099,22 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT64 address = reinterpret_cast<UINT64>(allocation);
         const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
             static_cast<std::uint32_t>(address >> 32) | (4u << 16), static_cast<UINT>(data.size() / 4), 0};
-        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu : mesh_table->cpu), view.data(), sizeof(view));
+        // X2W_TEST_MESH57_TABLE_SLOT: the indexed-heap slot (0 or 3) that holds the data table view; slot 3 replaces the
+        // empty record. A title may place a table at any slot of the heap it indexes.
+        UINT table_slot = 0;
+        if (mesh57_heap) {
+            char slot_text[8]{};
+            if (GetEnvironmentVariableA("X2W_TEST_MESH57_TABLE_SLOT", slot_text, sizeof(slot_text)))
+                table_slot = static_cast<UINT>(std::strtoul(slot_text, nullptr, 10));
+            if (table_slot != 0 && table_slot != 3) return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu + table_slot * 32 : mesh_table->cpu), view.data(),
+                    sizeof(view));
         using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
         using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
         ID3D12DescriptorHeap* heaps[]{mesh_table->heap.Get()};
         if (!mesh57_heap) slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
-        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu : mesh_table->gpu);
+        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu + table_slot * 32 : mesh_table->gpu);
         if (mesh57_heap) {
             char selected[8]{};
             if (!GetEnvironmentVariableA("X2W_TEST_MESH57_HEAP_INDEX", selected, sizeof(selected))) return false;
