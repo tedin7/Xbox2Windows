@@ -198,6 +198,8 @@ void main() {
     subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', shader], check=True)
     (cache / f'{key}.txt').write_text(
         'x2w-manifest 2\nstage cs\nud 0\nsrv 0 tex2d table 1 64\nuav 0 table 1 0\n')
+    # An unmarked manifest is the Python translator's only with its <key>.cs.hlsl beside it.
+    (cache / f'{key}.cs.hlsl').write_text('// hand-written manifest fixture\n')
 
     def run(suffix='', *, enabled=True, refusal=None):
         settings = dict(env, X2W_COMPUTE_VIEW_TOKENS='1') if enabled else env

@@ -37,7 +37,7 @@ def fields(records, stride=4):
 
 CONTROLS = (
     ('dispatch-output-texture-token', None, 'an output buffer descriptor is a view token'),
-    ('dispatch', fields(0), 'an output buffer descriptor has zero records'),
+    # fields(0), an output descriptor with no records, is a null view here: its writes are dropped, as D3D12 drops them.
     ('dispatch', fields((16 << 20) // 4 + 1), 'an output buffer range is over 16 MiB or not whole dwords'),
     ('dispatch', fields(C.WORDS + 4), 'an output range crosses the end of a placed buffer'),
     ('dispatch-output-unplaced', None, 'an output is in title memory outside any placed buffer'),

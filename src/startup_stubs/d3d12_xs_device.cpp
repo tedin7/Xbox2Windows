@@ -2722,7 +2722,8 @@ void provenance_report()
 {
     std::lock_guard<std::mutex> lock(provenance_mutex);
     if (!provenance_presented) {
-        log("x2w-render exposure check: no presented surface was seen");
+        // Only worth a line when a dispatch was refused: a process that dispatched nothing refused has nothing to report.
+        if (!provenance_refusals.empty()) log("x2w-render exposure check: no presented surface was seen");
         return;
     }
     std::vector<const void*> needed_targets{provenance_presented};
