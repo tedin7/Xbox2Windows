@@ -2743,11 +2743,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
     const auto* original = resource_info(resource);
-    // A 1D linear console layout is a console texture (layout path); only the opt-in placed 1D texture, which
-    // slot 70 publishes when no console layout reads it, takes the placed_1d path.
+    // A 1D linear console layout is a console texture (layout path) unless the opt-in placed 1D path is on
+    // (X2W_PLACED_1D_TEXTURE), which then publishes it as before.
     const bool placed_1d = resource->own().tiled_address_srv && original &&
                            original->console.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
-                           !console_layout_srv(original->console);
+                           (placed_1d_texture_enabled() || !console_layout_srv(original->console));
     const bool tiled_address = resource->own().tiled_address_srv && !placed_1d;
     // Desktop address arrays use the plain footprint loop and the title's 64 KiB slice stride.
     const bool desktop_array = tiled_address && original && slot70_desktop_arrays_enabled() &&

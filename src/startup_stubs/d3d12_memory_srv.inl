@@ -1091,7 +1091,8 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
-    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !console_layout_srv(sampled.desc))
+    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        (placed_1d_texture_enabled() || !console_layout_srv(sampled.desc)))
         return static_cast<ID3D12Resource*>(resource->own().real);
     // An already-published token can outlive a write in a different layout.
     if ((partial_tiled_bc(sampled.desc) || console_layout_srv(sampled.desc)) &&
@@ -1443,8 +1444,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
-    if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled() &&
-        !console_layout_srv(*resource)) {  // a 1D linear console layout is read by the layout path below
+    if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled()) {  // opt-in: the placed 1D path also takes a 1D linear console layout
         auto view = input->view;
         const char* refusal = nullptr;
         const char* detail = nullptr;
