@@ -391,6 +391,32 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_static_release(scene, player, backend, env, directory, vs, ps, root):
+    """A list carried from before the window (f6,6) is Released inside it without a submit, and an empty list takes its
+    address and is submitted in every frame: the recording must not hand the old list's calls to the new one, so
+    presents 7-12 replay equal (no corner) instead of drawing the old list's magenta corner."""
+    recorded_dir, recording = directory / "release_recorded", directory / "release.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1",
+                          X2W_TEST_REPLAY_STATIC_RELEASE="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, "the scene ended with %d (33: the address was never reused)\n%s" % (code, text[-3000:])
+    whole = pictures(recorded_dir)
+    before = whole["present_0006.png"][1][1:5]
+    after = whole["present_0007.png"][1][1:5]
+    assert before[0] > 200 and before[2] > 200 and before[1] < 50, "the picture before the window has no magenta corner: %r" % before
+    assert not (after[0] > 200 and after[2] > 200 and after[1] < 50), "the released list still drew live: %r" % after
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    _score, played = replay(player, recording, directory / "release_replayed", backend, env, presents=6)
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "the replay differs from live at %s: first pixel replayed %r, live %r" % (
+        differ, played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"........"))[1][1:5],
+        whole[differ[0]][1][1:5])
+    print("static_release: presents 7-12 replay equal after the carried list was released and its address reused")
+    return 0
+
+
 def without_list_array(source, target):
     """Copies a slot-35 recording without the list array of its queue submissions (as recorded before the recorder
     captured it): drops the ARGM and OUTP chunks of argument 1 of every queue slot-35 call."""
@@ -598,6 +624,8 @@ def main(scene, player, backend, mode=None):
             return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
         if mode == "static-list":
             return check_static_list(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "static-release":
+            return check_static_release(scene, player, backend, env, directory, vs, ps, root)
         if mode == "infer-execute":
             return check_infer_execute(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":

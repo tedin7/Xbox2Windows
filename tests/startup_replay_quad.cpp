@@ -47,6 +47,8 @@ struct Scene {
     void* allocator = nullptr;
     void* list = nullptr;
     void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
+    void* static_allocator = nullptr;
+    bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: released in the window, its address reused by an empty list
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
     TitleRange title_range = TitleRange::none;
@@ -276,7 +278,7 @@ int create_scene(void* device, Scene& s)
     // A list built and closed before the recorder's window, submitted again every frame: a magenta corner over the frame.
     char static_list[2]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_LIST", static_list, sizeof(static_list)) == 1 && static_list[0] == '1') {
-        void* allocator = nullptr;
+        void*& allocator = s.static_allocator;
         const float magenta[] = {1.0f, 0.0f, 1.0f, 1.0f};
         const D3D12_RECT corner{0, 0, 12, 10};
         if (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
@@ -288,6 +290,7 @@ int create_scene(void* device, Scene& s)
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 139, arg(allocator))))) return 30;
         invoke(s.static_list, 52, s.rtv, arg(magenta), 1, arg(&corner));
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+        s.release_static = GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_RELEASE", nullptr, 0) != 0;
     }
     return 0;
 }
@@ -528,6 +531,24 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
+    if (s.release_static && frame == 6) {
+        // Inside the window: the carried list is Released without a submit, then lists are created until one gets its
+        // address (the others are Released at once). That list is closed empty and takes the old one's place in every submit.
+        const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+        void* const old_address = s.static_list;
+        invoke(s.static_list, 2);
+        s.static_list = nullptr;
+        for (int attempt = 0; attempt < 512 && !s.static_list; ++attempt) {
+            void* candidate = nullptr;
+            if (FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(s.static_allocator), 0,
+                                                   arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&candidate)))))
+                return 23;
+            if (candidate == old_address) s.static_list = candidate;
+            else invoke(candidate, 2);
+        }
+        if (!s.static_list) return 33;  // the stand-in never gave the address back
+        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+    }
     // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
     static const UINT execute_slot = [] {
         char value[8]{};

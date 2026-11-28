@@ -258,6 +258,23 @@ void carry_forget(u64 list)
     entry->accounted = entry->calls = 0;
     ReleaseSRWLockExclusive(&entry->lock);
 }
+// A list's last Release, in any phase (prefix, window, or between): its address may name another list next, so what
+// the entry held and its overflow mark go. No entry is created for a list that never carried anything.
+void carry_release(u64 list)
+{
+    AcquireSRWLockExclusive(&carry_lock);
+    const auto found = carry_lists().find(list);
+    ThreadBuffer* entry = found == carry_lists().end() ? nullptr : found->second;
+    ReleaseSRWLockExclusive(&carry_lock);
+    if (!entry) return;
+    AcquireSRWLockExclusive(&entry->lock);
+    InterlockedAdd64(&carry_total_bytes, -static_cast<LONG64>(entry->accounted));
+    entry->bytes.clear();
+    entry->bytes.shrink_to_fit();
+    entry->accounted = entry->calls = 0;
+    entry->overflow = false;
+    ReleaseSRWLockExclusive(&entry->lock);
+}
 void update_window(bool open)
 {
     window_open = open;
@@ -818,7 +835,13 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
                           !window_open.load(std::memory_order_relaxed);
     if (!active.load(std::memory_order_relaxed) ||
         (!window_open.load(std::memory_order_relaxed) && !(prefix_slot(K, N) && prefix_open.load(std::memory_order_relaxed)) && !carrying))
-        return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    {
+        const u64 early = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+        // Not recording right now (between phases): a last Release still ends the list's carried identity.
+        if constexpr (K == list_kind && N == 2)
+            if (static_cast<std::uint32_t>(early) == 0 && carry_max_bytes) carry_release(rcx);
+        return early;
+    }
     ThreadBuffer* carry = nullptr;
     if constexpr (carried) {
         if (carrying) {
@@ -873,7 +896,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     if constexpr (K == device_kind && N == 133) active_placement = previous;
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
     if constexpr (K == list_kind && N == 2)  // the last Release: whatever sits at this address next starts fresh
-        if (static_cast<std::uint32_t>(ret) == 0 && carry_max_bytes && prefix_open.load(std::memory_order_relaxed)) carry_entry(rcx, true);
+        if (static_cast<std::uint32_t>(ret) == 0 && carry_max_bytes) carry_release(rcx);
     carry_target = carry;
     record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
     carry_target = nullptr;
