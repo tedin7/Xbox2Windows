@@ -455,6 +455,22 @@ void record_generic(ArgumentCapture& capture)
     InterlockedAdd64(&generic_spent[slot], static_cast<LONG64>(before - capture.remaining));
 }
 
+// (count, array of command-list wrappers) with count 1 to 64 and a readable array of list wrappers: the shape the stand-in's
+// queue_dynamic treats as an ExecuteCommandLists on a slot whose meaning is not fixed.
+bool execute_shaped(u64 count, u64 array)
+{
+    if (count < 1 || count > 64 || array < 0x10000 || array >= 0x7fffffffffffull ||
+        !readable_range(array, static_cast<std::size_t>(count) * sizeof(u64)))
+        return false;
+    for (u64 i = 0; i < count; ++i) {
+        u64 list;
+        if (!copy_readable(array + i * sizeof(u64), &list, sizeof(list))) return false;
+        const auto* w = as_wrapper(reinterpret_cast<const void*>(list));
+        if (!w || w->own().kind != list_kind) return false;
+    }
+    return true;
+}
+
 void record_arguments(ArgumentCapture& capture)
 {
     const Call& call = capture.call;
@@ -593,22 +609,6 @@ void record_arguments(ArgumentCapture& capture)
         if (call.slot == 8) capture.arg(2, sizeof(void*));  // Map's output CPU address
         break;
     }
-}
-
-// (count, array of command-list wrappers) with count 1 to 64 and a readable array of list wrappers: the shape the stand-in's
-// queue_dynamic treats as an ExecuteCommandLists on a slot whose meaning is not fixed.
-bool execute_shaped(u64 count, u64 array)
-{
-    if (count < 1 || count > 64 || array < 0x10000 || array >= 0x7fffffffffffull ||
-        !readable_range(array, static_cast<std::size_t>(count) * sizeof(u64)))
-        return false;
-    for (u64 i = 0; i < count; ++i) {
-        u64 list;
-        if (!copy_readable(array + i * sizeof(u64), &list, sizeof(list))) return false;
-        const auto* w = as_wrapper(reinterpret_cast<const void*>(list));
-        if (!w || w->own().kind != list_kind) return false;
-    }
-    return true;
 }
 
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
