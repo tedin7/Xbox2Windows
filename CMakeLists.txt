@@ -4420,6 +4420,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # only for registers no window wrote; the refusal controls run here, the draws below cut quads (helper lanes).
     add_test(NAME startup_gfx2hlsl_dpp_whole_quad_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_whole_quad_window_check.py")
+    # DPP16 quad reads after s_wqm_b64 exec, sN of a lane mask (a pixel kill, then derivatives): lowered as the
+    # quad-wide OR of the mask bit; the controls run here, the draws below cut quads (helper lanes) and run mutants.
+    add_test(NAME startup_gfx2hlsl_dpp_wqm_widen COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_wqm_widen_check.py")
     # DPP16 quad broadcasts quad_perm:[k,k,k,k] (#2125): lowered to QuadReadLaneAt, so the pixel stage compiles as
     # ps_6_0; the controls and refusals run here, the draws below compare every pixel with a CPU reference.
     add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast COMMAND "${INTAKE_PYTHON}" -B
@@ -5006,6 +5010,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_dpp_whole_quad_window_${adapter} PROPERTIES TIMEOUT 180
                              SKIP_RETURN_CODE 77)
+    endforeach()
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_wqm_widen_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_wqm_widen_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_dpp_wqm_widen_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
     # A DPP16 quad min inside an if (EXEC narrowed by s_and_saveexec): the contract of a lane-exact EXEC model (a disabled
     # source lane is invalid, BOUND_CTRL decides), drawn by hand-written HLSL against a CPU reference; reading the disabled
