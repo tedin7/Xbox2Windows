@@ -391,6 +391,38 @@ def check_static_list(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_static_release(scene, player, backend, env, directory, vs, ps, root):
+    """A list carried from before the window (f6,6) is Released inside it without a submit. The recorder must forget
+    its calls at that last Release (a new list at the same address would otherwise be submitted with them); the
+    address itself cannot be forced on a real runtime, so the test reads the bytes still held. The window then
+    replays equal, without the released list's magenta corner."""
+    recorded_dir, recording = directory / "release_recorded", directory / "release.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1",
+                          X2W_TEST_REPLAY_STATIC_RELEASE="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    held = re.search(r"carried bytes (\d+) before the release, (\d+) after", text)
+    assert held, "the scene did not report the carried bytes\n" + text[-2000:]
+    before_bytes, after_bytes = int(held.group(1)), int(held.group(2))
+    assert before_bytes > after_bytes, "the released list's calls are still held (%d before, %d after the release)" % (
+        before_bytes, after_bytes)
+    whole = pictures(recorded_dir)
+    before = whole["present_0006.png"][1][1:5]
+    after = whole["present_0007.png"][1][1:5]
+    assert before[0] > 200 and before[2] > 200 and before[1] < 50, "the picture before the window has no magenta corner: %r" % before
+    assert not (after[0] > 200 and after[2] > 200 and after[1] < 50), "the released list still drew live: %r" % after
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    _score, played = replay(player, recording, directory / "release_replayed", backend, env, presents=6)
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "the replay differs from live at %s: first pixel replayed %r, live %r" % (
+        differ, played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"........"))[1][1:5],
+        whole[differ[0]][1][1:5])
+    print("static_release: carried bytes %d -> %d at the release; presents 7-12 replay equal" % (before_bytes, after_bytes))
+    return 0
+
+
 def without_list_array(source, target):
     """Copies a slot-35 recording without the list array of its queue submissions (as recorded before the recorder
     captured it): drops the ARGM and OUTP chunks of argument 1 of every queue slot-35 call."""
@@ -413,6 +445,51 @@ def without_list_array(source, target):
     out += data[at:]
     target.write_bytes(out)
     assert dropped, "the recording holds no list array of queue slot 35"
+
+
+def without_static_close(source, target):
+    """Copies a recording without the Close call of the list that is closed once (the static list, carried from before the
+    window): as in a file recorded before the carry existed, that list is never closed in it."""
+    data = source.read_bytes()
+    closes = {}
+    for tag, header, header_bytes, _payload, size in chunks(data):
+        if tag == b"CALL":
+            seq, _t, kind, slot, obj = struct.unpack_from("<QIHHQ", data, header)
+            if kind == LIST_KIND and slot == 9:
+                closes.setdefault(obj, []).append((header - 16, header + header_bytes + size))
+    once = [spans[0] for spans in closes.values() if len(spans) == 1]
+    assert len(once) == 1, "expected one list closed once, found %s" % sorted(len(v) for v in closes.values())
+    target.write_bytes(data[:once[0][0]] + data[once[0][1]:])
+
+
+def check_infer_prescan(scene, player, backend, env, directory, vs, ps, root):
+    """A static list (closed before the window, never closed in the file) is submitted with count 1 next to the frame's
+    two lists (one count-2 call), and the file's list arrays are gone. The prescan leaves the count-1 submit out, so every
+    present equals the live one. The static list's own clear is overwritten by the title list's full-target clear, so
+    skipping it changes no pixel; the log line names the skipped array. Without the prescan the count-1 submit takes a
+    list of the window and the pictures alternate."""
+    recorded_dir, recording = directory / "scan_recorded", directory / "scan.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1", X2W_TEST_REPLAY_EXTRA_LIST="1",
+                          X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    whole = pictures(recorded_dir)
+    strip = whole["present_0007.png"][1][1:5]
+    assert len(set(whole["present_%04d.png" % k] for k in range(7, 13))) > 1, "the live pictures do not change from frame to frame"
+    arrays = directory / "scan_arrays.x2wr"
+    old = directory / "scan_old.x2wr"
+    without_list_array(recording, arrays)
+    without_static_close(arrays, old)
+    out = directory / "scan_replayed"
+    _score, played = replay(player, old, out, backend, env, presents=6, player_env={"X2W_REPLAY_INFER_EXECUTE": "1"})
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "are not inferred: the file closes" in log, log[-2500:]
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "the replay with the prescan differs from live at %s (strip pixel %r)\n%s" % (differ, strip, log[-2500:])
+    print("infer_prescan: presents 7-12 equal with the static list's count-1 submit left out")
+    return 0
 
 
 def check_infer_execute(scene, player, backend, env, directory, vs, ps, root):
@@ -598,8 +675,12 @@ def main(scene, player, backend, mode=None):
             return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
         if mode == "static-list":
             return check_static_list(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "static-release":
+            return check_static_release(scene, player, backend, env, directory, vs, ps, root)
         if mode == "infer-execute":
             return check_infer_execute(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "infer-prescan":
+            return check_infer_prescan(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
         if mode == "paced":

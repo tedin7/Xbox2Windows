@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 import startup_compute_dispatch_texture_check as compute
-from startup_replay_check import change_last_clear, chunks, run
+from startup_replay_check import change_last_clear, chunks, pictures, replay, run
 from startup_stream_check import gfx2hlsl
 from startup_stream_draw_check import pixel, vertex
 
@@ -92,6 +92,49 @@ def indirect(directory, quad, player, adapter, env):
     return 0
 
 
+def late_indirect(directory, quad, player, env, mode="late"):
+    directory.mkdir()
+    source = directory / "triangle.hlsl"
+    source.write_text("""
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+}
+float4 ps() : SV_Target { return float4(1, 0, 1, 1); }
+""", encoding="ascii")
+    vs, ps, root = (directory / name for name in ("vs", "ps", "root"))
+    for entry, target, output in (("vs", "vs_5_0", vs), ("ps", "ps_5_0", ps)):
+        subprocess.run([env["X2W_FXC"], "/nologo", "/E", entry, "/T", target, "/Fo", output, source],
+                       env=env, check=True, timeout=30)
+    frames = 4
+    args = [quad, vs, ps, root, "warp", frames]
+    env = dict(env, X2W_TEST_REPLAY_INDIRECT=mode, X2W_D3D12_LINEAR_BUFFERS="copy")
+    reference = None
+    for enabled in ("1", "0"):
+        recording = directory / f"late-{enabled}.x2wr"
+        original = directory / f"live-{enabled}"
+        original.mkdir()
+        code, text = run(args, dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
+                                    X2W_PRESENT_PICTURES=str(original), X2W_REPLAY_DRAW_PAGES=enabled))
+        assert code == 0, text[-4000:]
+        live = pictures(original)
+        assert len(live) == frames, live.keys()
+        magenta = bytes((255, 0, 255, 255)) * 4
+        for frame, (_size, scanlines) in enumerate(live.values()):
+            assert (magenta in scanlines) == (frame % 2 == 0), (frame, text[-4000:])
+
+        _score, played = replay(player, recording, directory / f"played-{enabled}", "warp", env, presents=frames)
+        assert played.keys() == live.keys()
+        mismatches = [frame for frame, name in enumerate(live) if played[name] != live[name]]
+        if enabled == "1":
+            assert not mismatches, ("late indirect replay mismatches", mismatches)
+            reference = live
+        else:
+            assert live == reference, "draw pages changed the live pictures"
+            # Without the capture the CPU-written words (late) or the upload bytes the copies read (gpu) are missing.
+            assert mismatches == [0, 2], ("late indirect control mismatches", mismatches)
+    print("Four late indirect replay pictures match with draw pages enabled. Frames 0 and 2 differ with pages disabled.")
+
+
 def dispatch(directory, consumer, player, dxc, adapter, env):
     cache, _ = compute.prepare(directory)
     env = dict(env, X2W_SHADER_CACHE=str(cache), X2W_TEST_TRUNCATED_ONLY="1")
@@ -131,6 +174,9 @@ def main(quad, consumer, player, dxc, adapter):
         code = dispatch(directory / "compute", consumer, player, dxc, adapter, env)
         if code:
             return code
+        if adapter == "warp":
+            late_indirect(directory / "late", quad, player, env)
+            late_indirect(directory / "gpu", quad, player, env, "gpu")
     print("Replay dumps match for three indirect-scene and two compute-scene submissions. Only the mutated clear differs.")
     return 0
 

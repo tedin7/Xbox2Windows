@@ -19,6 +19,12 @@ constexpr unsigned title_view_stride = 32;
 inline unsigned view_heap_title_stride(D3D12_DESCRIPTOR_HEAP_TYPE type, unsigned count,
                                        std::uint64_t backing, std::uint64_t bytes, unsigned desktop_stride)
 {
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && backing >= 0x10000 && count && bytes % count == 0) {
+        // A depth stencil heap's title memory has records of the console's 8 bytes (or any power of two to 256): the
+        // size says so, and handles map to desktop descriptors by index, as for view heaps.
+        const std::uint64_t record = bytes / count;
+        if (record >= 8 && record <= 256 && (record & (record - 1)) == 0) return static_cast<unsigned>(record);
+    }
     return type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && backing >= 0x10000 &&
            bytes == std::uint64_t{count} * title_view_stride ? title_view_stride : desktop_stride;
 }

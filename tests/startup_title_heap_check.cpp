@@ -80,6 +80,12 @@ int rule(bool mutate)
            x2w_startup::view_heap_title_stride(views, 4, cpu, 4 * desktop_stride, desktop_stride) == desktop_stride, true);
     expect("missing backing keeps desktop stride",
            x2w_startup::view_heap_title_stride(views, 4, 0, 4 * title_stride, desktop_stride) == desktop_stride, true);
+    expect("console depth heap size selects 8 bytes",
+           x2w_startup::view_heap_title_stride(depth, 4, cpu, 4 * 8, desktop_stride) == 8, true);
+    expect("depth heap without backing keeps desktop stride",
+           x2w_startup::view_heap_title_stride(depth, 4, 0, 4 * 8, desktop_stride) == desktop_stride, true);
+    expect("depth heap of an odd size keeps desktop stride",
+           x2w_startup::view_heap_title_stride(depth, 4, cpu, 4 * 24, desktop_stride) == desktop_stride, true);
     expect("other heap keeps desktop stride",
            x2w_startup::view_heap_title_stride(targets, 4, cpu, 4 * title_stride, desktop_stride) == desktop_stride, true);
     for (unsigned i = 0; i < 4; ++i) {

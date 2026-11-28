@@ -1414,6 +1414,96 @@ def writes_exec(name, ops, mods=()):
     return 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld'))
 
 
+CROSS_LANE_READS = ('v_readfirstlane', 'v_readlane', 'v_writelane', 'v_permlane', 'ds_swizzle', 'ds_bpermute',
+                    'ds_permute')
+PARTIAL_LANE_WRITE_MODS = ('dst_sel', 'dst_unused', 'op_sel', 'd16', 'tfe', 'lwe')
+PARTIAL_LANE_WRITE_NAMES = ('_d16', 'mix', '_pk_', 'v_mac', 'v_fmac', 'v_pk_', 'v_cvt_pk', 'v_writelane')
+
+
+def bare_operand(token):
+    """The register token without its input modifiers: -v3, |v3|, abs(v3), neg(v3), sext(v3) read v3 all the same."""
+    token, previous = token.strip(), None
+    while token != previous:
+        previous = token
+        if token[:1] in ('-', '~') and token[1:]:
+            token = token[1:].strip()
+        elif len(token) > 2 and token[0] == token[-1] == '|':
+            token = token[1:-1].strip()
+        else:
+            inner = re.fullmatch(r'(?:abs|neg|sext)\((.*)\)', token)
+            token = inner.group(1).strip() if inner else token
+    return token
+
+
+def high_half_destination(name, ops, wave32):
+    """In wave64 a 64-bit scalar write printed as one register (a compare's or carry-out's SDST, an odd-start
+    s_*_b64 destination) also writes the next one: its name, else None."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('v_cmpx'):
+        return None
+    for dest in destinations(base, ops) if ops else ():
+        single = re.fullmatch(r's(\d+)', dest)
+        # A destination of 64 bits: a 64-bit scalar op (not one with a 32-bit result such as s_bcnt1_i32_b64), a
+        # compare's SDST or a carry-out.
+        wide_scalar = base.startswith('s_') and base.endswith(('_b64', '_u64', '_i64')) and not re.search(
+            r'_[iu]32_[bui]64$', base)
+        # A compare's or carry-out's SDST prints as one register only in wave64; a 64-bit scalar op in both sizes.
+        if single and (wide_scalar or not wave32 and (
+                base.startswith('v_cmp') or '_co' in base or VOP3B_SDST.match(base))):
+            return 's%d' % (int(single.group(1)) + 1)
+    return None
+
+
+def high_half_source(name, ops, wave32):
+    """In wave64 a lane-mask source printed as one register (the last operand of v_cndmask or a carry-in) also reads
+    the next one: its name, else None."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    single = ops and not wave32 and re.fullmatch(r's(\d+)', ops[-1])
+    if single and (base.startswith('v_cndmask') or '_co_ci' in base or base.startswith('v_div_fmas')):
+        return 's%d' % (int(single.group(1)) + 1)
+    return None
+
+
+def whole_quad_lane_registers(name, asm, scalar_reads, scalar_writes):
+    """(reads, writes, vector) for the whole-quad EXEC proof: the registers an instruction reads and writes as 'vN' and
+    scalar tokens, EXEC left out (the proof tracks it separately), and whether it is a per-lane (non-scalar) form.
+
+    Reads are over-approximated: a destination that keeps part of its old value (SDWA or op_sel halves, d16, a mix
+    or packed result, an accumulating mac/fmac, a writelane) also counts as read, so a dirty old value stays dirty. A
+    store or export writes no register."""
+    _, ops, mods = parse(asm)
+    base = re.sub(r'_e(32|64)$', '', name)
+    vector = not base.startswith('s_')
+    lanes = lambda tokens: {'v%d' % n for token in tokens for r in (reg_range(bare_operand(token)),)
+                            if r and r[0] == 'v' for n in range(r[1], r[2] + 1)}
+    keys = {m.split(':')[0] for m in mods}
+    atomic = base.startswith(('buffer_atomic', 'global_atomic', 'image_atomic', 'flat_atomic'))
+    stores = '_store' in base or base.startswith(('exp', 'ds_write')) or (atomic and 'glc' not in keys)
+    if stores:
+        dests, sources = [], ops
+    elif base == 'v_swap_b32':
+        dests, sources = ops[:2], ops[:2]
+    elif base.startswith('v_cmpx'):
+        # A VOPC with EXEC write: it writes only EXEC; every printed operand (an e64 SDST too) is a source.
+        dests, sources = [], ops
+    else:
+        dests = destinations(base, ops)
+        sources = ops[len(dests):] if len(dests) > 1 else ops[1:]
+    reads = lanes(sources) | (set(scalar_reads) - EXEC_KEYS)
+    writes = lanes(dests) | (set(scalar_writes) - EXEC_KEYS - {'scc'} if vector else set(scalar_writes) - EXEC_KEYS)
+    partial_mask = any(m in ('row_mask:0x%x' % k for k in range(15)) or m in ('bank_mask:0x%x' % k for k in range(15))
+                       for m in mods)
+    if vector and (keys & set(PARTIAL_LANE_WRITE_MODS) or partial_mask
+                   or any(part in base for part in PARTIAL_LANE_WRITE_NAMES)):
+        reads |= lanes(dests)
+    # Always dirty: a result that comes from another lane (readlane, permlane, swizzle, a DPP row or wave shift or a
+    # DPP8 select, whose lanes the host lays out differently), or an atomic's returned value (lane order).
+    cross = vector and (base.startswith(CROSS_LANE_READS) or atomic and 'glc' in keys
+                        or keys & {'row_shl', 'row_shr', 'row_ror', 'row_mirror', 'row_half_mirror', 'row_bcast',
+                                   'row_share', 'row_xmask', 'wave_shl', 'wave_shr', 'wave_rol', 'wave_ror', 'dpp8'})
+    return frozenset(reads), frozenset(writes), vector, bool(cross)
+
+
 # In wave32 VCC is vcc_lo alone and vcc_hi is a free scalar register that compilers allocate like any other (RDNA 2
 # ISA, "VCC": in wave32 only VCC_LO is the condition mask). The translator models it as an ordinary SGPR the program
 # never names, taken from the top of the 106 (beyond the user-data and system registers set at entry).
@@ -6219,6 +6309,10 @@ class Stage:
         self.odd_d16_first_refusal = None
         self.loop_uniform = None  # None until a heap load refuses; then loop header -> assumed uniform SGPRs
         self.retry_heap_dimensions = False
+        # A fourth retry, only after a pixel quad read refused for want of a whole-quad proof: the copy of EXEC saved
+        # before s_wqm becomes the guest's exact entry mask (IsHelperLane, shader model 6.6) instead of the host's 1.
+        self.retry_helper_exec = False
+        helper_original = None
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -6246,6 +6340,7 @@ class Stage:
             self.bad_sgprs = set()
             self._uniform_written = set()
             self.phi_new = {}
+            self.uses_helper_lane = False
             self.setup_entry()
             try:
                 self.translate()
@@ -6260,6 +6355,13 @@ class Stage:
                         or self.retry_lane_mask_joins(str(reason)) or self.retry_scc_edge_proof(str(reason))
                         or self.retry_loop_uniform(str(reason)) or self.retry_heap_image_number(str(reason))
                         or self.retry_latch_join(str(reason))):
+                    if self.retry_helper(str(reason)):
+                        helper_original = reason
+                        continue
+                    if (self.retry_helper_exec and helper_original is not None
+                            and self.WHOLE_QUAD_REFUSAL.search(str(reason))):
+                        # The exact-entry-EXEC pass met the same kind of refusal: report the ordinary one.
+                        raise helper_original
                     # If another unsupported instruction prevents completing the
                     # proof, retain the refusal that caused this retry.
                     if (self.retry_odd_d16_paths and self.odd_d16_first_refusal is not None and
@@ -6278,6 +6380,7 @@ class Stage:
             if (any(self.retry_reduction_exec(reason) or self.retry_join(reason)
                     or self.retry_lane_mask_joins(reason) or self.retry_scc_edge_proof(reason)
                     or self.retry_latch_join(reason) for reason in reasons)
+                    or any(self.retry_helper(reason) for reason in reasons)
                     or any(self.retry_loop_uniform(reason) for reason in reasons)
                     or any(self.retry_heap_image_number(reason) for reason in reasons)):
                 del refusals[first_refusal:]
@@ -6309,6 +6412,50 @@ class Stage:
             return False
         self.retry_scc_edges = True
         return True
+
+    # The refusals a quad read gets when no whole-quad proof reaches it (dpp_broadcast, the quad swaps, the flow proof).
+    WHOLE_QUAD_REFUSAL = re.compile(r'v_\w+_dpp (requires a straight-line pixel shader with entry EXEC|outside the entry '
+                                    r'prefix of a pixel stage|quad read at \+0x[0-9a-f]+ in a program with branches: '
+                                    r'the EXEC write|requires whole-quad EXEC \(s_wqm of exec first\)|without s_wqm '
+                                    r'exec, exec proving whole-quad activity)')
+
+    def retry_helper(self, reason):
+        """Translate again with the exact entry EXEC, once, after a whole-quad refusal of a pixel quad read in a
+        program that saves EXEC before its s_wqm (otherwise there is no entry mask to make exact)."""
+        if (self.kind != 'ps' or self.retry_helper_exec or not self.WHOLE_QUAD_REFUSAL.match(reason)
+                or not self.saves_entry_exec()):
+            return False
+        self.retry_helper_exec = True
+        self.force_joined.clear()
+        return True
+
+    def saves_entry_exec(self):
+        """Whether the program copies EXEC into a scalar register before its first s_wqm exec, exec."""
+        return bool(self.helper_exec_copies())
+
+    def helper_exec_copies(self):
+        """Offsets of the plain copies of EXEC (s_mov sN, exec) that run once, at the entry mask: before the first
+        s_wqm and before any branch or branch target, so no path reaches them a second time (a loop head) or after
+        EXEC changed. The helper retry gives exactly these the guest's bit."""
+        cached = getattr(self, '_helper_exec_copies', None)
+        if cached is not None and cached[0] is self.ins:
+            return cached[1]
+        targets = set()
+        for _off, _n, name, asm in self.ins:
+            if name == 's_branch' or name.startswith('s_cbranch'):
+                label = (parse(asm)[1] or [''])[0]
+                if label.startswith('label_0x'):
+                    targets.add(int(label[8:], 16))
+        copies = set()
+        for off, _n, name, asm in self.ins:
+            ops = parse(asm)[1]
+            if (name.startswith('s_wqm') or name == 's_branch' or name.startswith('s_cbranch') or off in targets
+                    or writes_exec(name, ops)):
+                break
+            if name in ('s_mov_b32', 's_mov_b64') and ops[1:2] in (['exec'], ['exec_lo']):
+                copies.add(off)
+        self._helper_exec_copies = (self.ins, copies)
+        return copies
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
     LATCH_REFUSALS = re.compile(r"(descriptor operand s\[\d+:\d+\] holds \('joined at a branch target',\)"
@@ -8889,22 +9036,105 @@ class Stage:
         full_exec = {'exec', 'exec_lo'} if wave32 else {'exec'}
         constants = {'0', '-1'}
         move, narrow, save = ('s_%s_%s' % (op, width) for op in ('mov', 'and', 'and_saveexec'))
+        mask_width = 0 if wave32 else 1
+        lane_mask_ops = {'s_%s_%s' % (op, width) for op in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor',
+                                                             'xnor', 'not')}
+        # Bitwise per-lane operations (and their saveexec forms): between a lane-exact EXEC and per-lane masks the
+        # result holds one bit per lane again.
+        narrowers = {'s_%s_%s' % (op, width) for op in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor',
+                                                        'xnor', 'and_saveexec', 'or_saveexec', 'xor_saveexec',
+                                                        'andn2_saveexec', 'orn2_saveexec', 'nand_saveexec',
+                                                        'nor_saveexec', 'xnor_saveexec')}
         operations = []
         for off, _, name, asm in self.ins:
             _, ops, mods = parse(asm)
-            _, _, writes = scalar_effects(name, asm)
-            operations.append((off, name, ops, mods, writes, writes_exec(name, ops) or bool(writes & EXEC_KEYS),
-                               name.startswith('exp') and 'vm' in asm.split()))
+            reads, _, writes = scalar_effects(name, asm)
+            lane_info = whole_quad_lane_registers(name, asm, reads, writes)
+            high = high_half_destination(name, ops, wave32)
+            if high and lane_info[1]:
+                # A true 64-bit destination: its upper half is written like the printed register.
+                lane_info = (lane_info[0], lane_info[1] | {high}) + lane_info[2:]
+            high_read = high_half_source(name, ops, wave32)
+            if high_read:
+                lane_info = (lane_info[0] | {high_read},) + lane_info[1:]
+            operations.append((off, name, ops, mods, reads, writes,
+                               writes_exec(name, ops) or bool(writes & EXEC_KEYS),
+                               name.startswith('exp') and 'vm' in asm.split()) + lane_info)
 
+        def mask_register(token):
+            reg = reg_range(token)
+            return bool(reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] == mask_width)
+
+        def mask_dest(token):
+            """A register that can hold a lane mask: a mask pair (a register in wave32), or VCC."""
+            vcc = {'vcc'} if wave32 else {'vcc', 'vcc_hi'}
+            return mask_register(token) or token in ('vcc', 'vcc_lo') and scalar_tokens(token) == vcc
+
+        def selector_mask(name, ops, facts):
+            """False when the instruction selects per lane by a scalar mask that is not one bit per lane: v_cndmask, a
+            carry-in or v_div_fmas reading VCC or an SGPR pair that no VALU compare or mask operation wrote (the host
+            tests bit 0 of it on every thread)."""
+            base = re.sub(r'_e(32|64)$', '', name)
+            if not (base.startswith(('v_cndmask', 'v_div_fmas')) or '_co_ci' in base) or not ops:
+                return True
+            token = ops[-1]
+            if base.startswith('v_div_fmas') or not (token in constants or scalar_tokens(token)):
+                token = 'vcc'
+            if token in constants:
+                return True
+            if token in full_exec:
+                return 'lexact' in facts
+            if token in ('vcc', 'vcc_lo'):
+                key = {'vcc'} if wave32 else {'vcc', 'vcc_hi'}
+            else:
+                key = set(scalar_tokens(token))
+                single = re.fullmatch(r's(\d+)', token)
+                if single and not wave32:
+                    key.add('s%d' % (int(single.group(1)) + 1))
+            return ('lane', frozenset(key)) in facts
+
+        def lane_mask(token, facts):
+            """Whether the operand holds one mask bit per lane: a constant, a lane-exact EXEC, or registers that a
+            VALU compare or a mask operation of such values wrote. A literal or any other scalar does not: the host
+            tests its bit 0 on every thread, the guest the bit of its own lane."""
+            if token in constants:
+                return True
+            if token in full_exec:
+                return 'lexact' in facts
+            # The marker names the whole mask (the pair in wave64) as written by one instruction.
+            return ('lane', frozenset(scalar_tokens(token))) in facts
+
+        # EXEC is tracked as three nested levels, each fact set holding the weaker ones too, so an intersection at a
+        # join keeps the weakest incoming level:
+        #   'exec'   whole-quad and lane-exact (the entry s_wqm, or a restore of a saved whole-quad mask);
+        #   'lexact' lane-exact but narrowed: derived from a lane-exact EXEC by a scalar mask operation or a v_cmpx whose
+        #            operands are clean (an if/else, a kill test), so every host thread holds the guest lane's EXEC bit;
+        #   'window' EXEC derived from something else, such as the exact entry mask, which the host cannot tell apart on
+        #            helper lanes (it starts every thread with EXEC 1).
+        # 'entry' marks the program before s_wqm; frozenset(sN) a register holding the whole-quad mask. Separately, the
+        # registers whose value may differ between guest and host lanes of a quad ("dirty"): every vector result
+        # written in a window or before s_wqm, every scalar result written in a window, every result computed from a
+        # dirty register, and a narrowed write keeps a dirty old value in its inactive lanes. Facts intersect at joins,
+        # dirty registers unite; both only move toward refusal, so the loop ends.
+        whole, exact, window = {'exec', 'lexact', 'window'}, {'lexact', 'window'}, {'window'}
+        # With the exact entry EXEC (retry_helper_exec) a copy of EXEC taken before s_wqm holds the guest's bit on every
+        # host thread, so it is clean and a restore of it narrows lane-exactly.
+        helper = getattr(self, 'retry_helper_exec', False) and getattr(self, 'kind', None) == 'ps'
+        helper_copies = self.helper_exec_copies() if helper else set()
         before = {0: {'entry'}}
+        dirty_before = {0: frozenset()}
         pending = {0}
         known = set()
         while pending:
             block = pending.pop()
             facts = before[block].copy()
+            dirty = set(dirty_before[block])
             lo, hi = bounds[block]
-            for off, name, ops, mods, writes, exec_write, discard in operations[lo:hi]:
-                if 'exec' in facts:
+            for (off, name, ops, mods, reads, writes, exec_write, discard,
+                 lane_reads, lane_writes, vector, cross) in operations[lo:hi]:
+                # A per-lane selection (v_cndmask, a carry-in, v_div_fmas) by a mask that is not one bit per lane.
+                bad_select = vector and not selector_mask(name, ops, facts)
+                if 'exec' in facts and dirty.isdisjoint(lane_reads) and not bad_select:
                     known.add(off)
                 else:
                     known.discard(off)
@@ -8912,36 +9142,110 @@ class Stage:
                     # An EXEC-guarded export can discard host lanes before a later restore.
                     facts.clear()
                     continue
+                # Operands read before this instruction's own writes: an EXEC write reads them as they were.
+                sources_clean = dirty.isdisjoint(lane_reads)
+                # Only the plain copy the helper retry emits as IsHelperLane is the guest's bit; any other use of EXEC
+                # before s_wqm (s_and with it, a count of it) still reads the host's 1 on helper lanes.
+                helper_copy = (helper and off in helper_copies)
+                if lane_writes:
+                    # A vector result written before s_wqm or in a window may differ on helper lanes (the guest skips
+                    # its off lanes, the host thread runs). A scalar result written in a window too: a block that an
+                    # execz branch skips can leave it different per quad. Cross-lane reads (readlane, permlane,
+                    # swizzle) take another lane and are never proven. EXEC read as data where it is not lane-exact
+                    # (the exact entry mask, a count of it) differs on helper lanes.
+                    if ((vector and 'lexact' not in facts) or not facts & {'entry', 'lexact'}
+                            or not sources_clean or cross or bad_select
+                            or ('lexact' not in facts and not (helper_copy and 'entry' in facts)
+                                and not reads.isdisjoint(EXEC_KEYS))):
+                        dirty |= lane_writes
+                    elif not (vector and 'exec' not in facts):
+                        # A narrowed vector write keeps the old value in its inactive lanes: a dirty one stays.
+                        dirty -= lane_writes
                 previous = facts
                 facts = {fact for fact in previous if not isinstance(fact, frozenset) or writes.isdisjoint(fact)}
+                # Any write that touches one register of a marked mask drops the marker. In wave64 a 64-bit write
+                # through a single printed register (an odd start, a compare's SDST) also covers the next one.
+                touched = set(writes) | lane_writes
+                facts = {fact for fact in facts if not (isinstance(fact, tuple) and not touched.isdisjoint(fact[1]))}
+                if not exec_write:
+                    # A register holding one mask bit per lane: a VALU compare's result, or a scalar mask operation
+                    # (and a copy) of such registers, constants and a lane-exact EXEC.
+                    # The mask destination of a compare (ops[0]) or of a carry-out (ops[1]: v_add_co, v_sub_co,
+                    # v_subrev_co, their carry-in forms, v_div_scale, v_mad_u64_u32).
+                    carry = VOP3B_SDST.match(re.sub(r'_e(32|64)$', '', name)) and len(ops) > 1
+                    if name.startswith('v_cmp') or carry:
+                        mask_op = ops[1] if carry and not name.startswith('v_cmp') else ops[0]
+                        tokens = set(scalar_tokens(mask_op)) if ops else set()
+                        single = re.fullmatch(r's(\d+)', mask_op)
+                        if single and not wave32:
+                            tokens.add('s%d' % (int(single.group(1)) + 1))
+                        if 'vcc' in tokens:
+                            tokens.discard('vcc_hi')
+                            tokens |= set() if wave32 else {'vcc_hi'}
+                        if tokens:
+                            facts.add(('lane', frozenset(tokens)))
+                    elif (not mods and name in lane_mask_ops and ops[1:] and mask_dest(ops[0])
+                          and (all(lane_mask(src, previous) for src in ops[1:])
+                               or helper_copy and 'entry' in previous and name == move)):
+                        facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
+                if (not exec_write and 'exec' in previous and name == move and not mods and ops[1:2]
+                        and ops[1] in full_exec and mask_register(ops[0])):
+                    # s_mov sN, exec: sN now holds the whole-quad mask.
+                    facts.add(frozenset(scalar_tokens(ops[0])))
                 if not exec_write:
                     continue
-                facts.discard('entry')
-                facts.discard('exec')
-                if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1]:
-                    if previous & {'entry', 'exec'}:
-                        facts.add('exec')
+                facts -= {'entry'} | whole
+                if name.startswith('s_wqm'):
+                    if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1] and (
+                            previous & {'entry', 'exec'}):
+                        facts |= whole
+                        continue
+                    # Any other s_wqm is a no-op on the host while the guest turns on the lanes of every touched
+                    # quad: from here a lane's EXEC bit and its writes may differ from the guest's.
+                    if 'window' in previous:
+                        facts |= window
+                        continue
+                    facts.clear()
                     continue
                 if not mods and 'exec' in previous:
                     if name == narrow and ops[0] in full_exec and (
                             set(ops[1:]) <= full_exec | constants and set(ops[1:]) & full_exec):
-                        facts.add('exec')
+                        facts |= whole
                         continue
                     if name == save and ops[1] in full_exec | constants:
-                        dst = reg_range(ops[0])
-                        if dst and dst[0] == 's' and dst[2] <= 105 and dst[2] - dst[1] == (0 if wave32 else 1):
-                            facts.update(('exec', frozenset(scalar_tokens(ops[0]))))
+                        if mask_register(ops[0]):
+                            facts |= whole | {frozenset(scalar_tokens(ops[0]))}
+                            facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
                             continue
-                    if name == move and ops[0] in full_exec and (
-                            ops[1] in full_exec or frozenset(scalar_tokens(ops[1])) in previous):
-                        facts.add('exec')
-                        continue
+                if (not mods and 'window' in previous and name == move and ops[0] in full_exec and
+                        (ops[1] in full_exec and 'exec' in previous or frozenset(scalar_tokens(ops[1])) in previous)):
+                    # A restore of a saved whole-quad mask ends a narrowing or a window.
+                    facts |= whole
+                    continue
+                # A v_cmpx writes EXEC from its compare whatever its operand modifiers (SDWA selects, neg/abs).
+                if 'window' in previous and (name.startswith('v_cmpx') or not mods and name.startswith('s_') and (
+                        not name.startswith(('s_movrel', 's_setpc', 's_swappc', 's_call', 's_rfe')))):
+                    # A scalar mask operation or a v_cmpx narrows EXEC. From a lane-exact EXEC with clean operands
+                    # it stays lane-exact; otherwise it opens (or continues) a window. A saveexec taken from
+                    # whole-quad EXEC records its destination as the whole-quad mask.
+                    if 'saveexec' in name and 'exec' in previous and mask_register(ops[0]):
+                        facts.add(frozenset(scalar_tokens(ops[0])))
+                    # Lane-exact only for a v_cmpx, or an s_and / s_andn2 (saveexec too) whose mask holds one bit per
+                    # lane (a VALU compare, a copy of EXEC); a literal or another scalar is a window.
+                    per_lane = name.startswith('v_cmpx') or (name in narrowers and ops[1:] and all(
+                        lane_mask(src, previous) for src in ops[1:]))
+                    if 'saveexec' in name and 'lexact' in previous and not mods and mask_register(ops[0]):
+                        facts.add(('lane', frozenset(scalar_tokens(ops[0]))))
+                    facts |= exact if 'lexact' in previous and sources_clean and per_lane else window
+                    continue
                 # A later restore cannot repair values produced by an inexact EXEC write.
                 facts.clear()
             for target in succ[block]:
                 merged = before.get(target, facts) & facts
-                if before.get(target) != merged:
+                merged_dirty = dirty_before.get(target, frozenset()) | dirty
+                if before.get(target) != merged or dirty_before.get(target) != merged_dirty:
                     before[target] = merged
+                    dirty_before[target] = frozenset(merged_dirty)
                     pending.add(target)
         return known
 
@@ -9104,7 +9408,7 @@ class Stage:
                 else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
         self.whole_quad_sites = set()
         if (getattr(self, 'kind', None) == 'ps' and not getattr(self, 'fetched', False) and
-                any(name in WHOLE_QUAD_DPP_OPS for _, _, name, _ in self.ins)):
+                any(name.endswith('_dpp') for _, _, name, _ in self.ins)):
             self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
         self.entry_wqm_sites = (self.entry_wqm_exec_sites()
                                 if branches and getattr(self, 'kind', None) == 'ps' and
@@ -11118,13 +11422,25 @@ class Stage:
     def quad_after_exec_write(self, base):
         """A float DPP quad read after an EXEC write that whole_quad_exec_sites proved lane-exact whole-quad: EXEC is no
         longer the entry mask, but every quad is whole, so the four reads are as safe as after the entry s_wqm."""
-        return (base in ('v_add_f32', 'v_subrev_f32') and not getattr(self, 'exec_known', False)
+        # The symbolic EXEC can also be known here (a restore of the saved mask on every path) while the entry s_wqm
+        # flag is gone; the CFG proof covers that case too.
+        # Any quad swap form: the proof is about EXEC and the source registers, not about the operation.
+        return (not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
                 and getattr(self, 'pc', None) in getattr(self, 'whole_quad_sites', ()))
 
     def quad_subrev_block_proof(self, base):
-        return (base == 'v_subrev_f32' and self.quad_flow_allowed()
-                and not getattr(self, 'fetched', False)
-                and self.pc in getattr(self, 'entry_wqm_sites', ()))
+        """A quad broadcast or subtraction where EXEC is proven whole-quad: the entry s_wqm mask on every path
+        (entry_wqm_sites, subtraction only), or a lane-exact whole-quad EXEC whose source registers no helper-divergent
+        write reached (whole_quad_sites, any form)."""
+        if not self.quad_flow_allowed() or getattr(self, 'fetched', False):
+            return False
+        if base == 'v_subrev_f32' and self.pc in getattr(self, 'entry_wqm_sites', ()):
+            return True
+        if self.pc in getattr(self, 'whole_quad_sites', ()):
+            # Proven here rather than by the entry s_wqm: quad_flow_refusals then checks only the branches.
+            self.whole_quad_reads.add(self.pc)
+            return True
+        return False
 
     def quad_flow_refusals(self, branches, targets):
         """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
@@ -12211,8 +12527,13 @@ class Stage:
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
             raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
-        if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
+        # v_cndmask_b32 takes the broadcast word as src0 and selects per lane by its own VCC bit (RDNA 2 ISA VOP2 DPP:
+        # only src0 is the exchanged operand), so the ordinary select lowering applies to the rewritten operand.
+        if (base not in ('v_mov_b32', 'v_cndmask_b32') and base not in VEC_F and base not in VEC_U
+                and base not in VEC_U_TO_F):
             raise Unsupported('DPP form of %s' % base)
+        if base == 'v_cndmask_b32' and (len(ops) != 4 or ops[3] not in ('vcc', 'vcc_lo') or rest):
+            raise Unsupported('v_cndmask_b32_dpp needs dst, src0, src1 and VCC without an output modifier')
         if len(ops) < 2:
             raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
         token = ops[1]
@@ -13374,7 +13695,7 @@ class Stage:
             d = dst[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
-                   if getattr(self, 'kind', None) in ('cs', 'vs', 'ms') and len(syms) == 2 else None)
+                   if getattr(self, 'kind', None) in ('cs', 'vs', 'ms', 'ps') and len(syms) == 2 else None)
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
                 if pair:
@@ -13568,6 +13889,22 @@ class Stage:
                 self.set_s(d, '0x%08xu' % value, ('const', value))
                 self.masks.discard(d)
                 return None
+        if (base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known
+                and getattr(self, 'retry_helper_exec', False) and self.pc in self.helper_exec_copies()):
+            # The guest's entry EXEC leaves helper lanes off, the host starts every thread with exec = 1: give the copy
+            # the guest's bit. It is not the host's EXEC, so a restore of it makes EXEC unknown and guards the writes.
+            # It differs per lane, so no scalar branch may treat it as uniform.
+            self.set_s(d, '(IsHelperLane() ? 0u : 1u)')
+            self.sym.pop(d, None)
+            self.masks.add(d)
+            self.uses_helper_lane = True
+            if self.tracks_uniformity():
+                self.varying_s.add(d)
+            if pair:
+                self.sym.pop(d + 1, None)
+                if self.tracks_uniformity():
+                    self.varying_s.add(d + 1)
+            return None
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
@@ -22360,6 +22697,34 @@ class Pipeline:
                 '    return ((bits >> 31u) != 0u ? 0u - packed : packed) & 0xffffu;',
                 '}',
             ))
+        if getattr(self, 'uses_ldexp', False):
+            # Integer arithmetic on the binary32 fields (sign, biased exponent, 24-bit significand): x * 2^n with one
+            # rounding to nearest even. The result exponent is e + n; at 255 or more it overflows to infinity, below 1
+            # the significand is shifted right by 1 - E bits and rounded (a carry into bit 23 is the smallest normal),
+            # and a shift past 25 bits is zero. A denormal source is normalised first. No float multiply is involved,
+            # so denormal results and the sign of a zero survive compilers that flush or fold them.
+            out.extend((
+                'uint x2w_ldexp(uint b, int n) {',
+                '    uint sign = b & 0x80000000u, m = b & 0x7fffffu;',
+                '    int e = int((b >> 23) & 0xffu);',
+                '    if (e == 255) return m != 0u ? (b | 0x00400000u) : b;',
+                '    if (e == 0) {',
+                '        if (m == 0u) return b;',
+                '        int s = 23 - int(firstbithigh(m));',
+                '        m <<= uint(s); e = 1 - s;',
+                '    } else {',
+                '        m |= 0x00800000u;',
+                '    }',
+                '    int E = e + clamp(n, -1000, 1000);',
+                '    if (E >= 255) return sign | 0x7f800000u;',
+                '    if (E >= 1) return sign | (uint(E) << 23) | (m & 0x7fffffu);',
+                '    int sh = 1 - E;',
+                '    if (sh > 25) return sign;',
+                '    uint keep = m >> uint(sh), rem = m & ((1u << uint(sh)) - 1u), half = 1u << uint(sh - 1);',
+                '    if (rem > half || (rem == half && (keep & 1u) != 0u)) keep += 1u;',
+                '    return sign | keep;',
+                '}',
+            ))
         if 'v_dot2_u32_u16' in self.uses_dot2:
             # RDNA 2 ISA V_DOT2_U32_U16: two unsigned 16-bit products + S2, exact uint32 clamp.
             out.append(
@@ -22632,7 +22997,7 @@ class Pipeline:
 
     def ps_profile(self):
         """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
-        if self.uses_dynamic_heap:
+        if self.uses_dynamic_heap or getattr(self.ps, 'uses_helper_lane', False):
             return 'ps_6_6'
         return 'ps_6_0' if self.ps.needs_sm6 else 'ps_5_1'
 
@@ -23521,7 +23886,9 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
     dynamic_heap = getattr(pipe, 'uses_dynamic_heap', False)
-    if dynamic_heap:
+    # IsHelperLane (the exact entry EXEC of a pixel stage, Stage.retry_helper_exec) is shader model 6.6 too.
+    model_6_6 = dynamic_heap or getattr(getattr(pipe, 'ps', None), 'uses_helper_lane', False)
+    if model_6_6:
         compile_enabled = check and os.environ.get('X2W_FXC') != ''
         fxc = ''
     else:
@@ -23534,7 +23901,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     manifest_path = name + '.txt'
     write_manifest = True
     # A quad intrinsic exists from shader model 6.0 only, and a pipeline does not mix DXBC and DXIL stages.
-    sm6 = dynamic_heap or any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
+    sm6 = model_6_6 or any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
     if compile_enabled and sm6:
         compiler = find_dxc()
         if compiler is None:
@@ -23542,7 +23909,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             message = 'dxc not found (X2W_DXC=%s): %s' % (os.environ.get('X2W_DXC', '<unset>'), feature)
             write_graphics_failure(base + '.fail', message)
             return message
-        model = '6_6' if dynamic_heap else '6_0'
+        model = '6_6' if model_6_6 else '6_0'
         profiles = (('vs', 'vs_' + model), ('ps', 'ps_' + model))
     else:
         compiler, profiles = fxc, (('vs', 'vs_5_1'), ('ps', 'ps_5_1'))
