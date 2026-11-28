@@ -164,6 +164,7 @@ def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False
     assert sum(draws["not_drawn_by_reason"].values()) <= draws["not_drawn"], draws
     assert any(line.startswith("x2w-replay draws drawn %d not_drawn %d " % (draws["drawn"], draws["not_drawn"]))
                for line in text.splitlines()), (draws, text[-500:])
+    assert draws["magenta_draws"] == 0 and " magenta draws 0" in text, draws  # the switch is off: no placeholder draw
     progress = [line for line in text.splitlines() if line.startswith("x2w-replay timing ")]
     if timing:
         check_timing(summary, recording, progress)

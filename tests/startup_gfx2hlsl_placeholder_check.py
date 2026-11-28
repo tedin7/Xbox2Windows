@@ -188,6 +188,61 @@ def check_requests(directory, family_retry):
     return content(supported, '.vs.hlsl'), shaders
 
 
+def check_magenta_switch(directory):
+    """X2W_MAGENTA_REFUSED=1 alone publishes the magenta placeholder; off, or with X2W_PLACEHOLDER_PS=0, the refusal stays.
+    Returns the magenta pixel shader source."""
+    def run(key_directory, **environment):
+        with patch.dict(os.environ, X2W_FXC='', **environment):
+            for name in ('X2W_PLACEHOLDER_PS', 'X2W_PLACEHOLDER_RGB', 'X2W_MAGENTA_REFUSED'):
+                if name not in environment:
+                    os.environ.pop(name, None)
+            key = request(key_directory, VS, SINGLE)
+            G.translate_request(str(key_directory), key)
+            return key
+
+    off = directory / 'off'
+    off.mkdir()
+    key = run(off)
+    assert result_file(off, key, '.fail').read_text().splitlines()[0] == REASON, 'switch off: the refusal must stand'
+    assert not result_file(off, key, '.txt').exists()
+    explicit_off = directory / 'explicit_off'
+    explicit_off.mkdir()
+    key = run(explicit_off, X2W_MAGENTA_REFUSED='1', X2W_PLACEHOLDER_PS='0')
+    assert not result_file(explicit_off, key, '.txt').exists(), 'X2W_PLACEHOLDER_PS=0 wins over the short switch'
+    on = directory / 'on'
+    on.mkdir()
+    key = run(on, X2W_MAGENTA_REFUSED='1')
+    manifest = result_file(on, key, '.txt').read_text().splitlines()
+    assert 'placeholder ps ' + REASON in manifest and 'placeholder rgb 255,0,255' in manifest, manifest
+    shader = result_file(on, key, '.ps.hlsl').read_text(encoding='ascii')
+    assert '255.0/255.0, 0.0/255.0, 255.0/255.0' in shader, shader[-400:]
+    return shader
+
+
+def check_whatif_const(directory):
+    """X2W_REPLAY_WHATIF=<key>:const stands one refused pixel shader in by flat grey; any other key keeps its refusal.
+    Returns the grey pixel shader source."""
+    with patch.dict(os.environ, X2W_FXC=''):
+        for name in ('X2W_PLACEHOLDER_PS', 'X2W_PLACEHOLDER_RGB', 'X2W_MAGENTA_REFUSED'):
+            os.environ.pop(name, None)
+        target = request(directory, VS, SINGLE)
+        other = request(directory, VS, MIXED, (2, 30))
+        os.environ['X2W_REPLAY_WHATIF'] = '%016x:const' % target
+        G.translate_request(str(directory), target)
+        G.translate_request(str(directory), other)
+        manifest = result_file(directory, target, '.txt').read_text().splitlines()
+        assert 'placeholder ps ' + REASON in manifest and 'placeholder rgb 128,128,128' in manifest, manifest
+        assert not result_file(directory, other, '.txt').exists(), 'an unrelated key keeps its refusal'
+        assert result_file(directory, other, '.fail').read_text().splitlines()[0] == REASON
+        os.environ['X2W_REPLAY_WHATIF'] = '%016x:pass' % target
+        (directory / ('%016x.txt' % target)).unlink()
+        G.translate_request(str(directory), target)
+        assert not result_file(directory, target, '.txt').exists(), 'only the const mode exists'
+        os.environ['X2W_REPLAY_WHATIF'] = '%016x:const' % target
+        G.translate_request(str(directory), target)
+        return result_file(directory, target, '.ps.hlsl').read_text(encoding='ascii')
+
+
 def compare(data, layout, reference, label, expected_mismatches=0):
     size = struct.calcsize(layout) * 64
     assert len(data) == size, f'{label}: expected {size} bytes, got {len(data)}'
@@ -201,7 +256,7 @@ def compare(data, layout, reference, label, expected_mismatches=0):
     )
 
 
-def draw_checks(directory, vs_source, shaders, dxc, renderer):
+def draw_checks(directory, vs_source, shaders, dxc, renderer, magenta_source=None, grey_source=None):
     def compile_shader(source, name, profile):
         try:
             return I3.compile_hlsl(dxc, 'dxc', source, name, profile, directory)
@@ -222,8 +277,18 @@ def draw_checks(directory, vs_source, shaders, dxc, renderer):
         return output.read_bytes()
 
     clear, green, integer = (-1.0,) * 4, (0.0, 1.0, 0.0, 1.0), (1, 2, 3, 1)
+    magenta_ps = compile_shader(magenta_source, 'magenta', 'ps_6_0') if magenta_source else None
+    grey_ps = compile_shader(grey_source, 'grey', 'ps_6_0') if grey_source else None
     compare(readback('-', 'color'), '<4f', clear, 'refused')
     compare(readback(single, 'color'), '<4f', green, 'single MRT0')
+    if grey_ps:
+        # X2W_REPLAY_WHATIF=<key>:const: the stood-in shader lights the triangle grey; the unrelated key stays as refused (clear).
+        half = struct.unpack('<f', struct.pack('<f', 128 / 255))[0]
+        compare(readback(grey_ps, 'color'), '<4f', (half, half, half, 1.0), 'what-if const MRT0')
+    if magenta_ps:
+        # X2W_MAGENTA_REFUSED=1: a draw whose pixel shader was refused covers the triangle in magenta. The off control is the
+        # first readback above (no pixel shader: the clear value stays).
+        compare(readback(magenta_ps, 'color'), '<4f', (1.0, 0.0, 1.0, 1.0), 'magenta single MRT0')
     float_bytes = struct.calcsize('<4f') * 64
     valid = readback(mixed, 'mixed')
     compare(valid[:float_bytes], '<4f', green, 'mixed MRT0')
@@ -247,12 +312,18 @@ if __name__ == '__main__':
         mutant_dir = directory / 'mutant'
         mutant_dir.mkdir()
         check_tail_mutant(mutant_dir)
+        magenta_dir = directory / 'magenta'
+        magenta_dir.mkdir()
+        magenta_source = check_magenta_switch(magenta_dir)
+        whatif_dir = directory / 'whatif'
+        whatif_dir.mkdir()
+        grey_source = check_whatif_const(whatif_dir)
         legacy = directory / 'legacy'
         legacy.mkdir()
         check_requests(legacy, '0')
         vs, shaders = check_requests(directory, '1')
         print('placeholder request, cache, export signature, and refusal checks passed')
         if len(sys.argv) == 4 and sys.argv[1] == 'draw':
-            draw_checks(directory, vs, shaders, *sys.argv[2:])
+            draw_checks(directory, vs, shaders, *sys.argv[2:], magenta_source=magenta_source, grey_source=grey_source)
         elif len(sys.argv) != 1:
             raise SystemExit('usage: startup_gfx2hlsl_placeholder_check.py [draw <dxc> <offscreen_check>]')
