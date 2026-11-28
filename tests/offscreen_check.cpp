@@ -1081,6 +1081,12 @@ OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_waterfall_oracle(const OperationContext& ctx)
+{
+    check_compute_waterfall_oracle(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_bvh_differential(const OperationContext& ctx)
 {
     return skip_if_false(check_bvh_differential(ctx.device, false));
@@ -1388,7 +1394,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
 // third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
-// mip levels whose cells all differ (tests/startup_image_3d.cpp).
+// mip levels whose cells all differ (tests/startup_image_3d.cpp). --startup-image-cube binds six 4x4 faces as a
+// TextureCube whose 96 texels all differ (#2943); z is passed through as for the other modes.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
@@ -1397,6 +1404,7 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
+    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
         char* end = nullptr;
@@ -2031,6 +2039,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
+    {"--compute-waterfall-oracle", 4, 4, nullptr, kNoGate, run_compute_waterfall_oracle},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
     {"--bvh-hits", 3, 3, nullptr, kGateSm65, run_bvh_hits},

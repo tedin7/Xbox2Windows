@@ -12,4 +12,8 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
             "$<TARGET_FILE:native_global_srv_heap_replay>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" ${adapter})
         set_tests_properties(native_global_srv_heap_replay_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     endforeach()
+    add_test(NAME native_raw_load_cache_bits_hardware COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_raw_load_cache_bits_check.py"
+            "$<TARGET_FILE:native_global_srv_heap_replay>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    set_tests_properties(native_raw_load_cache_bits_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()

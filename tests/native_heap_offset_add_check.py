@@ -40,6 +40,10 @@ PROGRAMS = {
     "scc_clobbered": (SELECT + [ADD_LO, 0xBF070808, ADD_HI] + LOAD + END, HIGH_WORD),
     # s_add_u32 s10, s5, 0x40: a constant offset is not a GPU selection; the heap table is used as a number
     "constant": (SELECT + [0x800AFF05, 0x40, ADD_HI] + LOAD + END, "unbound numeric SGPR s5"),
+    # Wave64, s_load_dwordx4 s[104:107], s[10:11], 0x0: the slot index would be written into VCC, which the wave64
+    # model keeps as mask data, so the overlap refusal comes before the heap contract.
+    "wave64_vcc_dst": (SELECT + [ADD_LO, ADD_HI, 0xF4081A05, 0xFA000000] + END,
+                       "symbolic scalar memory destination overlaps wave64 VCC", 64),
 }
 
 
@@ -53,9 +57,10 @@ def main(compile_dxil, sdk):
         subprocess.run([pathlib.Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "RS", "-Fo", binary, source],
                        check=True, capture_output=True)
         root = binary.read_bytes()
-        # Group 32x1x1, wave32 (bit 20 of dword 4), 7 user SGPRs.
-        sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, 7 << 1)
-        for name, (program, expected) in PROGRAMS.items():
+        for name, (program, expected, *wave) in PROGRAMS.items():
+            # Group 32x1x1 in wave32 (bit 20 of dword 4), or 64x1x1 in wave64, 7 user SGPRs.
+            threads = wave[0] if wave else 32
+            sa = struct.pack("<7I", 0, 0, 0, threads | (1 << 16), 1 | (0 if wave else 1 << 20), 0, 7 << 1)
             folder = base / name
             folder.mkdir()
             marker = write_request(folder, program, root, sa)

@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "name": "wave64_ballot_ps",
+      "source": "wave64_ballot_ps.hlsl",
+      "profile": "ps_6_0",
+      "entry": "main"
+    },
+    {
+      "name": "root_constants_vs",
+      "source": "root_constants_vs.hlsl",
+      "profile": "vs_6_0",
+      "entry": "main"
+    },
+    {
+      "name": "image_sample_c_lz_ps",
+      "source": "image_sample_c_lz_ps.hlsl",
+      "profile": "ps_6_0",
+      "entry": "main"
+    },
+    {
+      "name": "packed_types_cs",
+      "source": "packed_types_cs.hlsl",
+      "profile": "cs_6_0",
+      "entry": "main"
+    },
+    {
+      "name": "derivatives_ps",
+      "source": "derivatives_ps.hlsl",
+      "profile": "ps_6_0",
+      "entry": "main"
+    },
+    {
+      "name": "mesh_ngg_ms",
+      "source": "mesh_ngg_ms.hlsl",
+      "profile": "ms_6_5",
+      "entry": "main"
+    }
+  ]
+}

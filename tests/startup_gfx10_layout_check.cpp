@@ -234,7 +234,8 @@ void check_refusals()
     refused("linear volume", d);
     d = good; d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x115); refused("XOR mode", d);
     d = good; d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x209); refused("layout outside 0x1xx", d);
-    d = good; d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D; refused("volume", d);
+    d = good; d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x109); refused("volume outside 0x105", d);
     d = good; d.SampleDesc.Count = 4; refused("multisampled", d);
     d = good; d.Format = DXGI_FORMAT_R32G32B32_FLOAT; refused("12-byte texels", d);
     d = good; d.MipLevels = 16; refused("16 mips", d);
@@ -292,9 +293,9 @@ void check_address_textures()
     d = texture(256, 256, 1, 1, DXGI_FORMAT_BC7_UNORM, 0x105);
     d.SampleDesc.Count = 2;
     expect("multisampled", d, false);
-    d = texture(256, 256, 1, 1, DXGI_FORMAT_BC7_UNORM, 0x105);
+    d = texture(256, 256, 1, 1, DXGI_FORMAT_BC7_UNORM, 0x109);
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    expect("volume", d, false);
+    expect("volume outside 0x105", d, false);
     expect("BC1 width not whole blocks", texture(126, 128, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x105), false);
     expect("BC1 height not whole blocks", texture(128, 126, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x10a), false);
     expect("RGBA8 odd sides", texture(257, 129, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x106), true);

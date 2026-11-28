@@ -1067,6 +1067,41 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+EXEC_SUBSET = frozenset({('exec', 0), ('exec_hi', 1)})
+
+
+def subset_after(name, asm, may, clear):
+    """Forward step before an s_cbranch_execz: scalar words known to have bit 0 wherever current EXEC has bit 0.
+
+    When EXEC is unchanged, bitwise mask instructions propagate those subset facts via clear_after and non-mask
+    writes drop them. When EXEC is written, facts on the written wave half are dropped unless a move assigns EXEC
+    from a scalar mask word (so that word equals the new EXEC) or an OR widens EXEC with an existing bitmask.
+    Indirect scalar writes (s_movrel*) drop all non-EXEC facts."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('s_movrel'):
+        return EXEC_SUBSET
+    if not (may & EXEC_KEYS):
+        return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+    kept = ({0} if 'exec' not in may else set()) | ({1} if 'exec_hi' not in may else set())
+    shape = clear_shape(name, asm)
+    if shape and shape != 'cmpx':
+        op, saving, count, words = shape
+        if op == 'or' and (saving == '_saveexec' or any(
+                all(src[p] == ('exec', 'exec_hi')[p] for p in range(count)) for src in words[1:])):
+            return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+        out = {fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS}
+        if op == 'mov' and saving is None:
+            dest, src = words
+            for p, dw in enumerate(dest):
+                if dw in EXEC_KEYS:
+                    h = 0 if dw == 'exec' else 1
+                    sw = src[p]
+                    if re.fullmatch(r's\d+|vcc(_hi)?', sw):
+                        out.add((sw, h))
+            return frozenset(out) | EXEC_SUBSET
+    return frozenset(fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS) | EXEC_SUBSET
+
+
 def mask_lanes(name, asm):
     """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
     every operand holds the same lanes: wave half p of a 64-bit form."""
@@ -5838,6 +5873,111 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     return out
 
 
+RESHEAP_RANGE_SPACE = 2
+RESHEAP_RANGE_MAX = 1024
+
+
+def _lit_u32(tok):
+    if re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', tok) and tok not in FLOATS:
+        return int(tok, 0) & 0xffffffff
+    return None
+
+
+def _join_vbound(a, b):
+    if a is None or b is None or a[0] != b[0]:
+        return None
+    return (a[0], max(a[1], b[1]))
+
+
+def vgpr_heap_bounds(ins, succ):
+    """Forward CFG dataflow: map each instruction index to ({vreg: ('idx' | 'off5', max_idx)}, exec_is_entry).
+
+    A bound enters only while every active lane that can reach a waterfall head executes the bounding write
+    (proven before any EXEC change, or joined with the prior bound on every path after EXEC changes)."""
+    if not ins:
+        return []
+    before = [None] * len(ins)
+    before[0] = ({}, True)
+    work = [0]
+    for i in work:
+        regs, exec_entry = before[i]
+        _off, _n, name, asm = ins[i]
+        base, ops, mods = parse(asm)
+        base = re.sub(r'_e(32|64)$', '', base)
+        nxt_regs = dict(regs)
+        nxt_exec = exec_entry and not writes_exec(name, ops)
+        dst_v = set()
+        for tok in destinations(name, ops):
+            r = reg_range(tok)
+            if r and r[0] == 'v':
+                dst_v.update(range(r[1], r[2] + 1))
+        if 'movrel' in name:
+            nxt_regs.clear()
+        elif dst_v:
+            new_val = None
+            r0 = reg_range(ops[0]) if ops else None
+            single = r0 and r0[0] == 'v' and r0[1] == r0[2] and r0[1] <= 255 and dst_v == {r0[1]}
+            if single and not mods:
+                def src_idx_max(tok):
+                    k = _lit_u32(tok)
+                    if k is not None:
+                        return k
+                    rs = reg_range(tok)
+                    if rs and rs[0] == 'v' and rs[1] == rs[2] and regs.get(rs[1], ('',))[0] == 'idx':
+                        return regs[rs[1]][1]
+                    return None
+
+                if base in ('v_and_b32', 'v_min_u32') and len(ops) == 3:
+                    bounds = [b for b in (src_idx_max(ops[1]), src_idx_max(ops[2])) if b is not None]
+                    if bounds and min(bounds) < RESHEAP_RANGE_MAX:
+                        new_val = ('idx', min(bounds))
+                elif base == 'v_bfe_u32' and len(ops) == 4:
+                    width = _lit_u32(ops[3])
+                    if width is not None and width < 16 and ((1 << width) - 1) < RESHEAP_RANGE_MAX:
+                        new_val = ('idx', (1 << width) - 1)
+                elif base == 'v_lshrrev_b32' and len(ops) == 3:
+                    shift = _lit_u32(ops[1])
+                    if shift is not None:
+                        shift &= 31
+                        rs = reg_range(ops[2])
+                        if rs and rs[0] == 'v' and rs[1] == rs[2] and regs.get(rs[1], ('',))[0] == 'idx':
+                            new_val = ('idx', regs[rs[1]][1] >> shift)
+                        elif (0xffffffff >> shift) < RESHEAP_RANGE_MAX:
+                            new_val = ('idx', 0xffffffff >> shift)
+                elif base == 'v_lshlrev_b32' and len(ops) == 3:
+                    shift = _lit_u32(ops[1])
+                    rs = reg_range(ops[2])
+                    if (shift is not None and (shift & 31) == 5 and rs and rs[0] == 'v' and rs[1] == rs[2]
+                            and regs.get(rs[1], ('',))[0] == 'idx'):
+                        new_val = ('off5', regs[rs[1]][1])
+                elif base == 'v_mov_b32' and len(ops) == 2:
+                    k = _lit_u32(ops[1])
+                    rs = reg_range(ops[1])
+                    if k is not None and k < RESHEAP_RANGE_MAX:
+                        new_val = ('idx', k)
+                    elif rs and rs[0] == 'v' and rs[1] == rs[2] and rs[1] in regs:
+                        new_val = regs[rs[1]]
+            for v in dst_v:
+                merged = new_val if (single and exec_entry) else (_join_vbound(regs.get(v), new_val) if single else None)
+                if merged is not None:
+                    nxt_regs[v] = merged
+                else:
+                    nxt_regs.pop(v, None)
+        for s in succ[i]:
+            if before[s] is None:
+                before[s] = (nxt_regs, nxt_exec)
+                work.append(s)
+            else:
+                old_regs, old_exec = before[s]
+                m_exec = old_exec and nxt_exec
+                m_regs = {k: j for k, v in old_regs.items() if k in nxt_regs
+                          for j in (_join_vbound(v, nxt_regs[k]),) if j is not None}
+                if (m_regs, m_exec) != before[s]:
+                    before[s] = (m_regs, m_exec)
+                    work.append(s)
+    return before
+
+
 def adjacent_address_carries(ins, targets):
     """Map each candidate low add to its high-word carry read in the same basic block."""
     pairs = {}
@@ -7613,14 +7753,28 @@ class Stage:
                 value = reads | (out - writes)
                 if value != live_in[i]:
                     live_in[i], changed = value, True
+        vbounds = vgpr_heap_bounds(self.ins, succ)
         self.waterfall_reads = {}
         self.waterfall_scalar_loads = {}
+        self.waterfall_heap_bounds = {}
         for close, target in jumps:
             head = index.get(target)
             if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
-                self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+                self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps, vbounds)
+        pre_sub = [EXEC_SUBSET] + [None] * (len(self.ins) - 1)
+        changed = bool(self.ins)
+        while changed:
+            changed = False
+            for i in range(len(self.ins)):
+                if pre_sub[i] is None:
+                    continue
+                after = subset_after(*self.ins[i][2:], effects[i][2], pre_sub[i])
+                for s in succ[i]:
+                    if pre_sub[s] is None or not pre_sub[s] <= after:
+                        pre_sub[s] = after if pre_sub[s] is None else (pre_sub[s] & after)
+                        changed = True
         self.execz_counted_loops = {}
         refused, into = {}, {}
         self.execz_scalar_votes = {}
@@ -7643,7 +7797,7 @@ class Stage:
             t = self.execz_forward_join(b, t, succ, jumps, index)
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
             # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
-            entry = frozenset({('exec', 0), ('exec_hi', 1)})
+            entry = pre_sub[b] or EXEC_SUBSET
             before = {b + 1: entry} if b + 1 < t else {}
             if original_join < t:
                 # The modeled inactive lane enters here directly. Facts from the body
@@ -7655,7 +7809,7 @@ class Stage:
                 changed = False
                 for i in range(b + 1, t):
                     if i in before:
-                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | entry
+                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | EXEC_SUBSET
                         for s in succ[i]:
                             if b < s < t and before.get(s, after) & after != before.get(s):
                                 before[s], changed = before.get(s, after) & after, True
@@ -7704,7 +7858,7 @@ class Stage:
                               self.execz_scalar_exit(b, i, t, exit_index, effects, live_in, into)):
                         reason = 'branch out of the block'
                 elif may & EXEC_KEYS and (entered or i in before and
-                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
+                                          not EXEC_SUBSET <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks - allowed_pairs.get(i, set())) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
@@ -7858,7 +8012,109 @@ class Stage:
         unread[word] = None
         return None
 
-    def waterfall_refusal(self, head, close, effects, live_in, jumps):
+    def compute_resheap_sgpr(self):
+        pipe = getattr(self, 'pipe', None)
+        root = getattr(pipe, 'root', None)
+        if not root or not (root['flags'] & 0x400):
+            return None
+        reg = 4 if getattr(self, 'kind', None) == 'cs' else 8
+        for p in root['params']:
+            reg += 1 if p['type'] == 0 else p['count'] if p['type'] == 1 else 2
+        return reg
+
+    def waterfall_heap_check(self, head, close, effects, key, key_vtok, body_writes, numeric_writes,
+                             buffer_descriptors, vbounds):
+        """Return ('idx' | 'off5', max_idx) when every key-dependent descriptor selection in the waterfall
+        body reads a resource heap record at a proven bounded per-lane index, else None."""
+        if buffer_descriptors & numeric_writes:
+            return None
+        resheap_reg = self.compute_resheap_sgpr()
+        if resheap_reg is None or ('s%d' % resheap_reg) in body_writes or not vbounds:
+            return None
+        binfo = vbounds[head]
+        k_reg = int(key_vtok[1:])
+        key_bound = binfo[0].get(k_reg) if binfo else None
+        if not key_bound:
+            return None
+        ins = self.ins
+        local_idx = {key} if key_bound[0] == 'idx' else set()
+        local_off5 = {key} if key_bound[0] == 'off5' else set()
+        local_ptrs = set()
+        heap_aliases = {'s%d' % resheap_reg}
+        local_descs = set()
+        pending_carry = None
+        for j in range(head + 2, close - 1):
+            base, ops, mods = parse(ins[j][3])
+            base = re.sub(r'_e(32|64)$', '', base)
+            reads, _writes, may_write = effects[j]
+            if pending_carry is not None:
+                carry_d, want_j = pending_carry
+                pending_carry = None
+                hi_tok = 's%d' % (carry_d + 1)
+                carry_ok = (j == want_j and not mods and (
+                    (base == 's_add_u32' and ops == [hi_tok, '0', 'src_scc']) or
+                    (base == 's_addc_u32' and len(ops) == 3 and ops[0] == hi_tok and ops[2] == '0'
+                     and ops[1] not in body_writes)))
+                if not carry_ok:
+                    return None
+                local_ptrs.add(('s%d' % carry_d, hi_tok))
+                for w in may_write:
+                    local_idx.discard(w)
+                    local_off5.discard(w)
+                    heap_aliases.discard(w)
+                    local_descs = {tup for tup in local_descs if w not in tup}
+                continue
+            idx_hit = (base == 's_lshl_b32' and not mods and len(ops) == 3 and ops[1] in local_idx and ops[2] == '5')
+            mov_idx = base == 's_mov_b32' and not mods and len(ops) == 2 and ops[1] in local_idx
+            mov_off5 = base == 's_mov_b32' and not mods and len(ops) == 2 and ops[1] in local_off5
+            mov_heap = base == 's_mov_b32' and not mods and len(ops) == 2 and ops[1] in heap_aliases
+            add_hit = (base == 's_add_u32' and not mods and len(ops) == 3 and (
+                (ops[1] in heap_aliases and ops[2] in local_off5) or
+                (ops[2] in heap_aliases and ops[1] in local_off5)))
+            load_hit = False
+            if base == 's_load_dwordx4' and (reads & body_writes):
+                if mods or len(ops) != 3:
+                    return None
+                br, dr = reg_range(ops[1]), reg_range(ops[0])
+                if not br or br[0] != 's' or br[2] - br[1] != 1 or not dr or dr[0] != 's' or dr[2] - dr[1] != 3:
+                    return None
+                b_lo, b_hi = 's%d' % br[1], 's%d' % br[2]
+                off_tok = smem_offset(ops[2])
+                if not ((b_lo in heap_aliases and b_hi not in body_writes and off_tok in local_off5) or
+                        ((b_lo, b_hi) in local_ptrs and _lit_u32(off_tok) == 0)):
+                    return None
+                load_hit = tuple('s%d' % k for k in range(dr[1], dr[2] + 1))
+            elif base == 'buffer_load_dword' and (reads & body_writes):
+                br = reg_range(ops[2]) if len(ops) >= 3 else None
+                dtup = tuple('s%d' % k for k in range(br[1], br[2] + 1)) if br and br[0] == 's' and br[2] - br[1] == 3 else None
+                if dtup not in local_descs or any(tok in body_writes and tok not in dtup for tok in scalar_tokens(ops[2])):
+                    return None
+            for w in may_write:
+                local_idx.discard(w)
+                local_off5.discard(w)
+                heap_aliases.discard(w)
+                local_ptrs = {pair for pair in local_ptrs if w not in pair}
+                local_descs = {tup for tup in local_descs if w not in tup}
+            if idx_hit:
+                local_off5.add(ops[0])
+            elif mov_idx:
+                local_idx.add(ops[0])
+            elif mov_off5:
+                local_off5.add(ops[0])
+            elif mov_heap:
+                heap_aliases.add(ops[0])
+            elif add_hit:
+                dr = reg_range(ops[0])
+                if not dr or dr[0] != 's' or dr[1] != dr[2] or dr[1] >= 105:
+                    return None
+                pending_carry = (dr[1], j + 1)
+            elif load_hit:
+                local_descs.add(load_hit)
+        if pending_carry is not None:
+            return None
+        return key_bound
+
+    def waterfall_refusal(self, head, close, effects, live_in, jumps, vbounds=None):
         """Return None when the lane can pick its own key at the head of the waterfall.
 
         CMPX selects all remaining lanes with the first lane's key. WREXEC removes those lanes,
@@ -7913,7 +8169,7 @@ class Stage:
             # RDNA 2 SOP2 field extracts and integer min/max have the same scalar/SCC footprint
             # across signedness. VOP bitwise operations write only the executing lane's VGPR.
             if not width and base not in (
-                    's_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
+                    's_add_u32', 's_addc_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
                     's_bfe_u32', 's_bfe_i32', 's_max_u32', 's_max_i32', 's_min_u32', 's_min_i32', 's_mul_i32',
                     'v_mov_b32', 'v_xor_b32', 'v_and_b32', 'v_or_b32', 'v_not_b32', 'v_xnor_b32', 'v_add_nc_u32',
                     's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2'):
@@ -7949,6 +8205,8 @@ class Stage:
                 buffer_descriptors.update(scalar_tokens(ops[descriptor_index]))
             reads_before_write.update(reads - defined)
             defined.update(writes)
+            if base in ('s_add_u32', 's_addc_u32', 's_and_b32', 's_or_b32', 's_lshl_b32'):
+                defined.add('scc')
             body_writes.update(may_write)
             if (reads & keyed) or width or base == 's_buffer_load_dwordx2':
                 keyed.update(may_write)
@@ -7959,7 +8217,11 @@ class Stage:
         # The data byte offset can use the key. Loading or modifying the resource descriptor
         # with the key needs a separate proof that the runtime binds the whole range.
         if descriptor_inputs & body_writes or buffer_descriptors & numeric_writes:
-            return 'per-lane descriptor selection requires a proven bound heap range'
+            bound = self.waterfall_heap_check(head, close, effects, key, key_ops[1], body_writes, numeric_writes,
+                                              buffer_descriptors, vbounds)
+            if bound is None:
+                return 'per-lane descriptor selection requires a proven bound heap range'
+            self.waterfall_heap_bounds[ins[head][0]] = bound
         # The close leaves EXEC and SCC zero. The last physical pass's other scalar
         # values can differ per lane in this model and must be dead on every successor.
         # A scalar written from loop-invariant inputs only (no read of the key or of a key-dependent scalar, no
@@ -9072,6 +9334,10 @@ class Stage:
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
             self.heap_index_was = {}  # the marks the current instruction's destinations held before it
+            self.per_lane_index = {}  # SGPR -> (expr, max_idx) from bounded waterfall v_readfirstlane_b32
+            self.per_lane_index_was = {}
+            self.resheap_low_add = None
+            self.resheap_index_temps = []
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
@@ -9140,6 +9406,7 @@ class Stage:
                     self.scc_def = None
                 if not falls:
                     self.scc_verified = False
+                    self.resheap_low_add = None
                     self.align4_v.clear()
                     self.align4_s.clear()
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
@@ -9168,6 +9435,8 @@ class Stage:
                     self.masks, self.mask_high, self.join_masks = marks
                     carried_masks = arriving_masks.difference(*marks)
                     self.heap_index.clear()  # another path into the join may hold a different word
+                    self.per_lane_index.clear()
+                    self.resheap_low_add = None
                     self.align4_v.clear()
                     self.align4_s.clear()
                     pre_uniform = {
@@ -10689,8 +10958,11 @@ class Stage:
         if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
             # Any write ends a register's mark; the lowering below sets the new one, if any.
             wrote = scalar_destinations(name, asm)
-            wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
-            self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
+            wrote_h = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
+            self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote_h}
+            pl = getattr(self, 'per_lane_index', {})
+            wrote_p = set(pl) if 'any' in wrote else wrote & set(pl)
+            self.per_lane_index_was = {r: pl.pop(r) for r in wrote_p}
         try:
             term = self.lower(base, asm, ops, mods)
         finally:
@@ -11878,6 +12150,8 @@ class Stage:
             hi = reg_range(ops[1]) if len(ops) == 3 else None
             if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
                 self.scc_uniform = False
+            if self._complete_resheap_carry(base, ops, mods):
+                return None
             if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
                 return None
             raise Unsupported(base)
@@ -12836,6 +13110,26 @@ class Stage:
             self.set_scc('true' if value else 'false')
         return True
 
+    def _complete_resheap_carry(self, base, ops, mods):
+        if getattr(self, 'resheap_low_add', None) is None:
+            return False
+        low_d, expect_pc, per_lane_info = self.resheap_low_add
+        self.resheap_low_add = None
+        hi_tok = 's%d' % (low_d + 1)
+        hi_carry_ok = (self.pc == expect_pc and not mods and (
+            (base == 's_add_u32' and ops == [hi_tok, '0', 'src_scc']) or
+            (base == 's_addc_u32' and len(ops) == 3 and ops[0] == hi_tok and ops[2] == '0'
+             and reg_range(ops[1]) and reg_range(ops[1])[0] == 's'
+             and self.sym.get(reg_range(ops[1])[1]) == ('const', 0))))
+        if not hi_carry_ok:
+            return False
+        self.sym[low_d + 1] = ('ptrhi', ('resheap',), per_lane_info)
+        getattr(self, 'ptr_open_pairs', set()).discard(low_d)
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
+        self.scc_effect = 'emitted'
+        self.scc_verified = False
+        return True
+
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -12846,6 +13140,8 @@ class Stage:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
         dst = reg_range(ops[0])
+        if self._complete_resheap_carry(base, ops, mods):
+            return None
         if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
             if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
                 raise Unsupported('s_add_u32 destination %s' % ops[0])
@@ -13045,6 +13341,24 @@ class Stage:
                     getattr(self, 'mask_high', set()).discard(reg)
             if self.pointer_add(base, dname, srcs, syms):
                 return None
+            if (base == 's_add_u32' and not mods and len(srcs) == 2 and dst and dst[0] == 's'
+                    and dst[1] == dst[2] and dst[1] < 105 and hasattr(self, 'heap_index')):
+                for i in (0, 1):
+                    if syms[i] == ('ptr', ('resheap',)):
+                        off_r = reg_range(srcs[1 - i])
+                        heap_mark = ({**self.heap_index, **self.heap_index_was}.get(off_r[1])
+                                     if off_r and off_r[0] == 's' and off_r[1] == off_r[2] else None)
+                        if heap_mark and heap_mark[0] == 'per_lane':
+                            ptr_r = reg_range(srcs[i])
+                            if self.sym.get(ptr_r[1] + 1) != ('const', 0):
+                                raise Unsupported('s_load of a resource heap record through a pointer whose high '
+                                                  'word is not a constant zero')
+                            size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
+                            self.sym[dst[1]] = ('ptr', ('resheap',), heap_mark)
+                            self.__dict__.setdefault('ptr_open_pairs', set()).add(dst[1])
+                            self.resheap_low_add = (dst[1], self.pc + size, heap_mark)
+                            self.scc_verified = True
+                            return None
             if dname == 'm0':
                 if scc:
                     raise Unsupported(self.scc_refusal('scc from descriptor data', 'm0 write'))
@@ -13323,12 +13637,24 @@ class Stage:
         r = reg_range(srcs[0])
         if base == 's_lshl_b32' and lit[1:] == [5]:
             word = {**self.heap_index, **self.heap_index_was}.get(r[1]) if r and r[0] == 's' else None
+            per_lane = {**getattr(self, 'per_lane_index', {}), **getattr(self, 'per_lane_index_was', {})}.get(r[1]) \
+                if r and r[0] == 's' else None
             if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
                 self.heap_index[d] = self.pipe.uds[syms[0][1]]
             elif word and word[0] == 'bufword':
                 self.heap_index[d] = ('buffer',) + word[1:]
             elif word == ('heap_index_word',):
                 self.heap_index[d] = ('dynamic_buffer',)
+            elif per_lane is not None:
+                expr, bound = per_lane
+                self.heap_index[d] = ('per_lane', ('(s%d >> 5)' % d) if d == r[1] else expr, bound)
+        elif base == 's_mov_b32' and len(srcs) == 1 and r and r[0] == 's' and r[1] == r[2]:
+            word = {**self.heap_index, **self.heap_index_was}.get(r[1])
+            per_lane = {**getattr(self, 'per_lane_index', {}), **getattr(self, 'per_lane_index_was', {})}.get(r[1])
+            if word and word[0] == 'per_lane':
+                self.heap_index[d] = word
+            elif per_lane is not None:
+                self.per_lane_index[d] = ('s%d' % d, per_lane[1])
         elif base in ('s_add_u32', 's_add_i32', 's_mul_i32') and len(srcs) == 2:
             for i in (0, 1):
                 k = lit[1 - i]
@@ -13967,6 +14293,14 @@ class Stage:
         waterfall = count == 8 and getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
         if waterfall and p[1][0] != 'table':
             raise Unsupported('compute readfirstlane waterfall: s_load_dwordx8 requires a fixed descriptor table')
+        if len(p) > 2 and p[1] == ('resheap',) and isinstance(p[2], tuple) and p[2][0] == 'per_lane':
+            if (getattr(self, 'kind', None) != 'cs' or count != 4 or into_vcc or imm is not None
+                    or _lit_u32(smem_offset(ops[2])) != 0):
+                raise Unsupported('s_load of a resource heap record through %s' % (p,))
+            if (base[1] in getattr(self, 'ptr_open_pairs', ())
+                    or self.sym.get(base[2]) != ('ptrhi', ('resheap',), p[2])):
+                raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
+            return self._capture_resheap_desc(dst, p[2][1], p[2][2])
         if len(p) > 2 and not isinstance(p[2], int):
             # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
             raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
@@ -14136,6 +14470,16 @@ class Stage:
         self.pipe.uses_dynamic_heap = True
         return 'x2w_heap_load(%s, %s)' % (key[0][1], address)
 
+    def _capture_resheap_desc(self, dst, expr, bound):
+        if not hasattr(self, 'resheap_index_temps'):
+            self.resheap_index_temps = []
+        temp = 'h%d' % len(self.resheap_index_temps)
+        self.resheap_index_temps.append(temp)
+        self.emit('%s = %s;' % (temp, expr))
+        source = ('resheap', 'per_lane', temp, bound)
+        for i in range(4):
+            self.sym[dst[1] + i] = ('desc', source, 0, i)
+
     def heap_record(self, dst, base, token, imm, count):
         """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is an index shifted left by 5
         with no later write of R and no branch target in between: D is the buffer descriptor in the 32-byte heap
@@ -14143,7 +14487,7 @@ class Stage:
         unmodified table buffer at a literal byte offset or at a root constant word times a literal plus a literal
         (the marks, see mark_heap_index, end at a branch target). The manifest names the root constant or where the
         word is; the dispatch reads the word and the record. A uniform word from a non-table buffer instead
-        uses a shader-side lookup."""
+        uses a shader-side lookup. A bounded per-lane index in a proven waterfall loop is modelled too."""
         what = 's_load of a resource heap record'
         r = reg_range(token)
         index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
@@ -14154,7 +14498,7 @@ class Stage:
         if index == ('buffer',):
             raise Unsupported(what + ' whose index is read from a buffer other than a table buffer '
                               'at a dispatch-constant offset')
-        if not index or index[0] not in ('rootconst', 'buffer'):
+        if not index or index[0] not in ('rootconst', 'buffer', 'per_lane'):
             raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
         if count != 4:
             raise Unsupported('%s of %d dwords' % (what, count))
@@ -14162,6 +14506,8 @@ class Stage:
             raise Unsupported('%s with offset:%#x' % (what, imm))
         if self.sym.get(base[2]) != ('const', 0):
             raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
+        if index[0] == 'per_lane':
+            return self._capture_resheap_desc(dst, index[1], index[2])
         source = ('resheap',) + index[1:] if index[0] == 'rootconst' else ('resheap', 'word') + index[1:]
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', source, 0, i)
@@ -14472,6 +14818,8 @@ class Stage:
                 key = self.load_descriptor(ops[2], what, stride0_ok=not idxen, raw_conversion_ok=not idxen)
             else:
                 key = self.descriptor(ops[2])
+            if key is not None and isinstance(key[0], tuple) and key[0][:2] == ('resheap', 'per_lane') and idxen:
+                raise Unsupported('indexed load through a per-lane resource heap descriptor')
             buf = None if key is None or ((dynamic or heap_format) and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
         soffset = None
         immediate_offset = offset
@@ -15594,6 +15942,25 @@ class Stage:
             kinds = {**kinds, dim: 'texcube'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
+        # A cube sample addresses the face coordinates s and t and then the face id (#2943). The face coordinates
+        # are sc/|ma| + 1.5 and tc/|ma| + 1.5 with ma the v_cubema value, twice the major coordinate (Mesa
+        # ac_nir_lower_tex.c prepare_cube_coords; LLVM ConstantFoldAMDGCNCubeIntrinsic), so both lie in [1, 2].
+        # The lowering rebuilds a direction for TextureCube (x2w_cube_dir). Loads, derivative and LOD queries,
+        # packed addresses and compute stages have no TextureCube equivalent here and are refused by name.
+        cube = dim == 'SQ_RSRC_IMG_CUBE'
+        if cube:
+            if how in ('load', 'load_mip'):
+                raise Unsupported('image dimension SQ_RSRC_IMG_CUBE: Load is not defined on a TextureCube')
+            if how == 'd':
+                raise Unsupported('image_sample_d on SQ_RSRC_IMG_CUBE: cube derivatives are not converted')
+            if how == 'get_lod':
+                raise Unsupported('image_get_lod on SQ_RSRC_IMG_CUBE')
+            for flag in ('a16', 'd16'):
+                if flag in mods:
+                    raise Unsupported('image_sample%s on SQ_RSRC_IMG_CUBE with %s'
+                                      % ('' if how == 'sample' else '_' + how, flag))
+            if getattr(self, 'kind', None) == 'cs':
+                raise Unsupported('cube image in a compute program (no texcube SRV binding)')
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
@@ -15788,6 +16155,11 @@ class Stage:
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
             implicit_bias = False
+            if cube and words and (words[0] >> 28) & 1:
+                # SQ_IMG_SAMP_WORD0 bit 28 DISABLE_CUBE_WRAP (Mesa src/amd/registers/gfx10-rsrc.json): filtering then
+                # stops at a face edge, while a D3D12 TextureCube always filters across faces. With the bit clear both
+                # wrap across faces. A heap or register sampler is not read here, so its bit is not validated.
+                raise Unsupported('%s on SQ_RSRC_IMG_CUBE with DISABLE_CUBE_WRAP' % name)
             sjoin = None
             if dim == 'SQ_RSRC_IMG_2D' and how in ('l', 'lz') and not packed_2d and not heap and words is None:
                 r = reg_range(ops[3])
@@ -17376,6 +17748,12 @@ class Stage:
                 raise Unsupported('compute readfirstlane waterfall: ' + reason)
             self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
+            bound = getattr(self, 'waterfall_heap_bounds', {}).get(self.pc)
+            if bound:
+                if bound[0] == 'idx':
+                    self.per_lane_index[dst[1]] = ('s%d' % dst[1], bound[1])
+                elif bound[0] == 'off5':
+                    self.heap_index[dst[1]] = ('per_lane', '(s%d >> 5)' % dst[1], bound[1])
             return
         if not valid:
             raise Unsupported(READFIRSTLANE_UNIFORM)
@@ -18974,6 +19352,37 @@ class Stage:
     def op_v_dot8_u32_u4(self, ops, mods):
         return self.dot8_int('v_dot8_u32_u4', False, ops, mods)
 
+    def dot2_int(self, name, signed, ops, mods):
+        """VOP3P 2-halfword integer dot product with 32-bit accumulate and optional saturating clamp."""
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        if any(m != 'clamp' for m in mods):
+            raise Unsupported('%s with unsupported modifiers %s' % (name, mods))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        args = []
+        for tok in ops[1:4]:
+            if (tok.startswith('|') or tok.endswith('|') or tok.startswith(('abs(', 'neg('))
+                    or (tok.startswith('-') and not re.fullmatch(r'-\d+', tok))):
+                raise Unsupported('%s source modifier %s' % (name, tok))
+            sr = reg_range(tok)
+            if sr and (sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105)):
+                raise Unsupported('%s source %s' % (name, tok))
+            args.append(self.u(tok))
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None and isinstance(getattr(pipe, 'uses_dot2', None), set):
+            pipe.uses_dot2.add(name)
+        helper = 'dot2_i32_i16' if signed else 'dot2_u32_u16'
+        sat = 'true' if 'clamp' in mods else 'false'
+        self.set_v(dst[1], '%s(%s, %s, %s, %s)' % (helper, args[0], args[1], args[2], sat))
+
+    def op_v_dot2_i32_i16(self, ops, mods):
+        return self.dot2_int('v_dot2_i32_i16', True, ops, mods)
+
+    def op_v_dot2_u32_u16(self, ops, mods):
+        return self.dot2_int('v_dot2_u32_u16', False, ops, mods)
+
     def i64_words(self, tok, signed=False, literal=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
         32-bit hex literal when `literal` is set (zero-extended, sign-extended when the operation is signed)."""
@@ -19827,6 +20236,8 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
         if getattr(self, 'uniform_load_temps', None):
             lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in sorted(self.uniform_load_temps)))
+        if getattr(self, 'resheap_index_temps', None):
+            lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in self.resheap_index_temps))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         if any(bound is not None for _, bound, _, _ in getattr(self, 'mesh_wave_loads', {}).values()):
             lines.append('    bool wave_any = false;')
@@ -21226,10 +21637,12 @@ class Pipeline:
     uses_dynamic_heap_formats = False
     uses_pack16_rne = False
     uses_bvh = False
+    uses_cube_dir = False
     uses_gather_2d_lod = False
     uses_gather_2d_lod_offset = False
     uses_cube_dir = False
     uses_store_d16_x = False
+    uses_dot2 = ()
     uses_sad = ()
     uses_dot8 = ()
     uses_lerp_u8 = False
@@ -21275,11 +21688,14 @@ class Pipeline:
         self.srv_formats = dict(srv_formats) if isinstance(srv_formats, dict) else dict(enumerate(srv_formats))
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
+        self.resheap_count = 0
         self.uses_pack16_rne = False
         self.uses_bvh = False
+        self.uses_cube_dir = False
         self.uses_gather_2d_lod = False
         self.uses_gather_2d_lod_offset = False
         self.uses_store_d16_x = False
+        self.uses_dot2 = set()
         self.uses_sad = set()
         self.uses_dot8 = set()
         self.uses_lerp_u8 = False
@@ -21486,6 +21902,13 @@ class Pipeline:
         return view
 
     def resource(self, key, kind):
+        if isinstance(key[0], tuple) and key[0][:2] == ('resheap', 'per_lane'):
+            if kind != 'buf':
+                raise Unsupported('per-lane resource heap descriptor used as %s' % kind)
+            _tag, _sub, expr, bound = key[0]
+            if self.resheap_count <= bound:
+                self.resheap_count = bound + 1
+            return 'rh[NonUniformResourceIndex(%s)]' % expr
         if key[0][0] == 'dynamic_heap':
             raise Unsupported('dynamic resource heap views require a raw buffer load')
         if key in self.stored_images() or key in getattr(self, 'pixel_rw_images', ()):
@@ -21518,6 +21941,8 @@ class Pipeline:
         return self.uavs or {}
 
     def uav(self, key, kind, rw=False):
+        if isinstance(key[0], tuple) and key[0][:2] == ('resheap', 'per_lane'):
+            raise Unsupported('store through %s' % (key[0],))
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
         if self.uavs is None:
@@ -21737,6 +22162,8 @@ class Pipeline:
             out.append('#define r%d_is_integer ud%d' % (r['index'], entry))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'bvh': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
+        if getattr(self, 'resheap_count', 0):
+            out.append('ByteAddressBuffer rh[%d] : register(t0, space%d);' % (self.resheap_count, RESHEAP_RANGE_SPACE))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex2du': 'RWTexture2D<uint>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
@@ -21745,6 +22172,27 @@ class Pipeline:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
                        % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
+        if self.uses_cube_dir:
+            # A direction for TextureCube from a gfx10 cube address (#2943): s and t are the face coordinates
+            # sc/|ma| + 1.5 and tc/|ma| + 1.5 and f the face id, with the per-face sc and tc of v_cubesc and
+            # v_cubetc (cube() above). A major component of +-1 reproduces u = sc/|major| and v = tc/|major|.
+            # A cube-array id (8 * layer + face) keeps only its face, so layer 0 is sampled; faces 6 and 7, a
+            # negative or NaN id become faces 5 and 0. Coordinates outside [1, 2] are assumed to clamp to face edges
+            # (untested outside [1, 2]).
+            out.extend((
+                'float3 x2w_cube_dir(float s, float t, float f) {',
+                '    float u = clamp(2.0 * (s - 1.5), -1.0, 1.0);',
+                '    float v = clamp(2.0 * (t - 1.5), -1.0, 1.0);',
+                '    int k = (f >= 0.0 && f < 2147483648.0) ? ((int)f & 7) : 0;',
+                '    k = min(k, 5);',
+                '    if (k == 0) return float3(1.0, -v, -u);',
+                '    if (k == 1) return float3(-1.0, -v, u);',
+                '    if (k == 2) return float3(u, 1.0, v);',
+                '    if (k == 3) return float3(u, -1.0, -v);',
+                '    if (k == 4) return float3(u, -v, 1.0);',
+                '    return float3(-u, -v, -1.0);',
+                '}',
+            ))
         if self.uses_pack16_rne:
             # IEEE binary32 to binary16 round-to-nearest-even (quieting NaN while preserving its sign,
             # matching RDNA 2 hardware on binary32 inputs), plus exact UNORM16 ratio-to-half conversion
@@ -21935,6 +22383,28 @@ class Pipeline:
                 '    return ((bits >> 31u) != 0u ? 0u - packed : packed) & 0xffffu;',
                 '}',
             ))
+        if 'v_dot2_u32_u16' in self.uses_dot2:
+            # RDNA 2 ISA V_DOT2_U32_U16: two unsigned 16-bit products + S2, exact uint32 clamp.
+            out.append(
+                'uint dot2_u32_u16(uint a, uint b, uint c, bool sat) {'
+                ' uint p0 = (a & 0xffffu) * (b & 0xffffu);'
+                ' uint p1 = (a >> 16u) * (b >> 16u);'
+                ' uint r0 = c + p0; uint carry = (r0 < c) ? 1u : 0u;'
+                ' uint r1 = r0 + p1; carry += (r1 < r0) ? 1u : 0u;'
+                ' return (sat && carry != 0u) ? 0xffffffffu : r1; }')
+        if 'v_dot2_i32_i16' in self.uses_dot2:
+            # RDNA 2 ISA V_DOT2_I32_I16: two signed 16-bit products + int(S2), exact int32 clamp via 64-bit acc.
+            out.append(
+                'uint dot2_i32_i16(uint a, uint b, uint c, bool sat) {'
+                ' int p0 = (asint((a & 0xffffu) << 16u) >> 16) * (asint((b & 0xffffu) << 16u) >> 16);'
+                ' int p1 = (asint(a) >> 16) * (asint(b) >> 16);'
+                ' uint lo = c; int hi = (asint(c) < 0) ? -1 : 0;'
+                ' uint t0 = lo + asuint(p0); hi += ((p0 < 0) ? -1 : 0) + ((t0 < lo) ? 1 : 0); lo = t0;'
+                ' uint t1 = lo + asuint(p1); hi += ((p1 < 0) ? -1 : 0) + ((t1 < lo) ? 1 : 0); lo = t1;'
+                ' if (sat) {'
+                ' if (hi > 0 || (hi == 0 && (lo & 0x80000000u) != 0u)) return 0x7fffffffu;'
+                ' if (hi < -1 || (hi == -1 && (lo & 0x80000000u) == 0u)) return 0x80000000u; }'
+                ' return lo; }')
         if self.uses_bitreplicate:
             # RDNA 2 ISA S_BITREPLICATE_B64_B32: replicate each of the low 16 bits twice into 32 bits.
             out.append(
@@ -22248,6 +22718,8 @@ class Pipeline:
             if r.get('load'):
                 lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
+        if self.resheap_count:
+            lines.append('resheap %d %d' % (self.resheap_count, RESHEAP_RANGE_SPACE))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
@@ -22357,9 +22829,11 @@ class ComputePipeline(Pipeline):
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
+        self.resheap_count = 0
         self.uses_gather_2d_lod = False
         self.uses_gather_2d_lod_offset = False
         self.uses_store_d16_x = False
+        self.uses_dot2 = set()
         self.uses_bvh = False
         self.uses_sad = set()
         self.uses_dot8 = set()
@@ -22612,6 +23086,8 @@ class ComputePipeline(Pipeline):
                 if r.get('load'):
                     lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
+        if self.resheap_count:
+            lines.append('resheap %d %d' % (self.resheap_count, RESHEAP_RANGE_SPACE))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         return '\n'.join(lines) + '\n'

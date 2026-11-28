@@ -172,11 +172,11 @@ def check_single_root_srv(base, consumer, dxc, adapter):
     # Manifest parser refusal controls on bad `srv ... buf root ...` lines and descriptor-word udsrc on a root SRV.
     for bad_manifest, expected_reason in (
         (manifest.replace("srv 0 buf root 2", "srv 0 buf root -1"),
-         "a resource that is not a raw table buffer, a 2D texture or a cube map"),
+         "a resource that is not a raw table buffer, a 1D/2D/2D-array/3D texture or a cube map"),
         (manifest.replace("srv 0 buf root 2", "srv 0 buf root 2 trailing"),
-         "a resource that is not a raw table buffer, a 2D texture or a cube map"),
+         "a resource that is not a raw table buffer, a 1D/2D/2D-array/3D texture or a cube map"),
         (manifest.replace("srv 0 buf root 2", "srv 1 buf root 2"),
-         "a resource that is not a raw table buffer, a 2D texture or a cube map"),
+         "a resource that is not a raw table buffer, a 1D/2D/2D-array/3D texture or a cube map"),
         (manifest.replace("ud 3\nudsrc 0 rootconst 0 0\nudsrc 1 rootconst 0 1\nudsrc 2 rootconst 0 2",
                           "ud 4\nudsrc 0 rootconst 0 0\nudsrc 1 rootconst 0 1\nudsrc 2 rootconst 0 2\nudsrc 3 stride 0"),
          "an entry value names a descriptor that is not a buffer input or output"),

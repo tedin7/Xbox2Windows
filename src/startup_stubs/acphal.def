@@ -9,3 +9,4 @@ EXPORTS
     ApuIsVirtualAddressValid
     ApuMapApuAddress
     ApuMapVirtualAddress
+    x2w_acphal_xma_activity

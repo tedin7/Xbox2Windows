@@ -63,14 +63,14 @@ def program(group, wave32, implicit):
         vop2(26, 5, 130, 0),          # v5 = linear index * 4, the output byte offset
     ]
     if y > 1:
-        # V ramps within each pair of guest rows. Consecutive quads step two lanes
-        # in ddy, covering one texel (mip 0). Without flattening, the 2D spatial
-        # quad steps eight lanes in ddy, covering four texels (mip 2).
+        # Use a vertical-only ramp. Consecutive quads step two indices in ddy
+        # (0.75 texels) and have zero ddx. Spatial 2D quads step eight indices
+        # in ddy (three texels), so they sample above mip zero.
         code += [
             0x7E0202F0,              # v_mov_b32 v1, 0.5 (U)
-            vop2(27, 2, 143, 0),      # v2 = linear index & 15
+            vop2(27, 2, 142, 0),      # v2 = linear index & 14
             0x7E040D02,              # v_cvt_f32_u32 v2, v2
-            vop2(8, 2, 255, 2), bits(1 / (2 * HEIGHT)),  # V
+            vop2(8, 2, 255, 2), bits(3 / (8 * HEIGHT)),  # V
             0x7E060280,              # v_mov_b32 v3, 0 (explicit LOD)
         ]
     else:
@@ -200,8 +200,14 @@ def main(cli, sdk, *render_args):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         if not render_args:
+            dxc = Path(sdk) / 'dxc.exe'
             for group, wave32 in CASES:
-                tuple(compile_pair(cli, sdk, work, group, wave32))
+                shaders = compile_pair(cli, sdk, work, group, wave32)
+                for shader, dimensions in zip(shaders, ((math.prod(group), 1, 1), group)):
+                    dump = subprocess.check_output([dxc, '-dumpbin', shader], text=True, timeout=30)
+                    expected = '; NumThreads=(' + ','.join(map(str, dimensions)) + ')'
+                    actual = next((line for line in dump.splitlines() if line.startswith('; NumThreads=')), '')
+                    assert actual == expected, (shader.name, expected, actual)
             for group, reason in (
                 ((36, 1, 1), 'partial final wave in multi-wave group'),
                 ((6, 1, 1), 'implicit derivatives require a pixel stage'),

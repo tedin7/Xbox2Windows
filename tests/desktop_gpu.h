@@ -63,6 +63,7 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
                         bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
+int check_compute_waterfall_oracle(ID3D12Device* device, const char* shader_path);
 struct ComputeReadbackProgram {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;

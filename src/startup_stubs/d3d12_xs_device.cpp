@@ -2214,8 +2214,8 @@ bool released_chunks_recycled(Wrapper* list)
     InterlockedIncrement(&upload_resubmits_refused);
     static LONG logged;
     if (first_calls(logged, 8))
-        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
-            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned>(recycled));
+        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%llx were reused; "
+            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned long long>(recycled));
     return true;
 }
 
@@ -2248,7 +2248,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
     submit.submitted(chunks, signaled);
-    submit.submitted(large_buffers, signaled, max_upload_chunks);
+    submit.submitted(large_buffers, signaled, large_upload_base);
     if (compute_title_inputs_enabled()) {
         for (Wrapper* list : lists) {
             const auto recording = compute_input_recordings.find(list);
@@ -3618,7 +3618,7 @@ UploadReservation reserve_large_upload(Wrapper* list, std::size_t bytes, UploadC
     };
     for (unsigned i = 0; i < buffers.size(); ++i) {
         if (buffers[i].capacity != rounded) continue;
-        const auto slice = reuse_upload_chunk(buffers[i], max_upload_chunks + i, rounded, queue_submits);
+        const auto slice = reuse_upload_chunk(buffers[i], large_upload_base + i, rounded, queue_submits);
         if (slice.mapped) return finish(i, slice);
     }
     if (buffers.size() < max_large_upload_buffers && rounded <= limit - allocated_bytes &&
@@ -3629,7 +3629,7 @@ UploadReservation reserve_large_upload(Wrapper* list, std::size_t bytes, UploadC
     // A completed larger resource can also hold the copy at offset zero.
     for (unsigned i = 0; i < buffers.size(); ++i) {
         if (buffers[i].capacity <= rounded) continue;
-        const auto slice = reuse_upload_chunk(buffers[i], max_upload_chunks + i, rounded, queue_submits);
+        const auto slice = reuse_upload_chunk(buffers[i], large_upload_base + i, rounded, queue_submits);
         if (slice.mapped) return finish(i, slice);
     }
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -3753,20 +3753,20 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource, bool snapshot = false)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(list, bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes, snapshot);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, bool snapshot = false)
 {
-    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource, snapshot);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
@@ -4627,9 +4627,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
     return TRUE;
 }
 
-// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
-// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
-// desktop desc. Only occlusion queries are
+// Query slots 28 to 30, confirmed by the GXDK 261000 ID3D12GraphicsCommandList8 function table
+// (command_list_slot_names.h): they are bound only with X2W_D3D12_QUERY_SLOTS=1 because the behavior is
+// diagnostic. The heap reaches device slot 39 with the desktop desc. Only occlusion queries are
 // forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
 // heap it names is refused and logged with its values instead of reaching the desktop list.
 enum QueryMethod { begin_query, end_query, resolve_query };
@@ -8913,8 +8913,8 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_written_probe(void* address, uns
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
 // serves pageSize 2 (bits 14-15) from a 64 MiB block, then asserts that the block was used up:
 // the console runtime evidently takes committed-resource memory from XMemAlloc with allocatorId
-// 0x80. Hypothesis used here: attributes = pageSize (2 from 4 MiB up, else 1) << 14 | 0x80 << 16 |
-// log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
+// 0x80. Hypothesis used here: attributes = pageSize (2, a 2 MiB page, selected from 4 MiB up; else 1)
+// << 14 | 0x80 << 16 | log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
 // own memory and does not alias it.
 using XMemAllocHook = void*(__stdcall*)(SIZE_T, ULONGLONG);
 XMemAllocHook title_alloc_hook()
@@ -10190,8 +10190,8 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
-        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
-        // bindings are opt-in. Unset, the slots stay no-ops.
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): the 261000 table confirms BeginQuery, EndQuery and
+        // ResolveQueryData at 28 to 30, but the bindings stay opt-in. Unset, the slots stay no-ops.
         if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
             list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
             list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);

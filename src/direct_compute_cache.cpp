@@ -727,18 +727,51 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     return verified(std::move(pair));
 }
 
-std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program) {
-    if (!program.group[0] || !program.group[1] || !program.group[2])
+static const char *view_kind_name(ComputeViewKind kind) {
+    static const char *const names[] = {
+        "buffer_srv", "typed_buffer_srv", "texture_srv", "texture_uav", "raw_vector_srv", "half_scalar_uav",
+        "heap_stride_srv", "raw_buffer_uav", "typed_buffer_uav", "half_buffer_uav", "root_buffer_srv",
+        "comparison_texture_srv", "half2_texture_uav", "half4_texture_uav", "cube_sample_srv", "cube_comparison_srv",
+        "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "heap_sampler",
+        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav"};
+    const auto index = static_cast<size_t>(kind);
+    return index < std::size(names) ? names[index] : "unknown";
+}
+
+// "SRV kind texture_srv 3d": the binding kind, and for image kinds the ISA dimension and a descriptor array.
+static std::string view_shape(const char *type, const ComputeViewBinding &b) {
+    std::string out = std::string(type) + " kind " + view_kind_name(b.kind);
+    if (std::string_view(out).find("texture") != std::string_view::npos ||
+        std::string_view(out).find("sample") != std::string_view::npos ||
+        std::string_view(out).find("cube") != std::string_view::npos) {
+        static const char *const dims[] = {"1d", "2d", "3d", "cube", "1d-array", "2d-array", "2d-msaa", "2d-msaa-array"};
+        out += ' ';
+        out += b.image_dimension < std::size(dims) ? dims[b.image_dimension] : "unknown-dimension";
+    }
+    if (b.array_count != 1)
+        out += " array";
+    return out;
+}
+
+std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program, std::string *reason) {
+    auto refuse = [&](std::string why) -> std::optional<std::string> {
+        if (reason)
+            *reason = std::move(why);
         return std::nullopt;
+    };
+    if (!program.group[0] || !program.group[1] || !program.group[2])
+        return refuse("group size has a zero dimension");
     unsigned ud_count = 0;
     for (const auto &block : program.constants) {
-        if (block.root_parameter >= 16 || block.count > 8)
-            return std::nullopt;
+        if (block.root_parameter >= 16)
+            return refuse("root constants above root parameter 15");
+        if (block.count > 8)
+            return refuse("more than 8 root constants in one root parameter");
         ud_count += block.count;
     }
     ud_count += static_cast<unsigned>(program.stride_srvs.size());
     if (ud_count > 32)
-        return std::nullopt;
+        return refuse("more than 32 user data words");
 
     auto sorted = program.bindings;
     std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
@@ -751,27 +784,41 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     unsigned srv_count = 0, uav_count = 0;
     std::ostringstream srv_lines, uav_lines, sampler_lines;
     for (const auto &b : sorted) {
+        if (b.root_parameter == compute_resource_heap)
+            return refuse("resource heap view");
+        if (b.root_parameter == compute_sampler_heap)
+            return refuse("sampler heap");
         if (b.root_parameter >= 16)
-            return std::nullopt;
+            return refuse("view above root parameter 15");
         if (!compute_uav(b.kind)) {
             if (b.shader_register != srv_count++)
-                return std::nullopt;
+                return refuse("SRV registers not contiguous");
             if (b.kind == ComputeViewKind::buffer_srv || b.kind == ComputeViewKind::raw_vector_srv ||
                 b.kind == ComputeViewKind::byte_window_srv) {
                 srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
-            } else if (b.kind == ComputeViewKind::texture_srv && b.image_dimension == 1 && b.array_count == 1) {
-                srv_lines << "srv " << b.shader_register << " tex2d table " << b.root_parameter << ' ' << b.byte_offset
-                          << '\n';
+            } else if (b.kind == ComputeViewKind::texture_srv && b.array_count == 1 &&
+                       (b.image_dimension == 0 || b.image_dimension == 1 || b.image_dimension == 2 ||
+                        b.image_dimension == 5)) {
+                const char *tex = b.image_dimension == 0   ? "tex1d"
+                                  : b.image_dimension == 1 ? "tex2d"
+                                  : b.image_dimension == 2 ? "tex3d"
+                                                           : "tex2da";
+                srv_lines << "srv " << b.shader_register << ' ' << tex << " table " << b.root_parameter << ' '
+                          << b.byte_offset << '\n';
             } else {
-                return std::nullopt;
+                return refuse(view_shape("SRV", b));
             }
         } else {
             if (b.shader_register != uav_count++)
-                return std::nullopt;
+                return refuse("UAV registers not contiguous");
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
+                       (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8)) {
+                uav_lines << "uav " << b.shader_register << " bufhalf table " << b.root_parameter << ' '
+                          << b.byte_offset << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";
@@ -785,17 +832,19 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
                           << " float table " << b.root_parameter << ' ' << b.byte_offset << " channels 4\n";
             } else {
-                return std::nullopt;
+                return refuse(view_shape("UAV", b));
             }
         }
     }
-    if (srv_count > 32 || uav_count > 8)
-        return std::nullopt;
+    if (srv_count > 32)
+        return refuse("more than 32 SRVs");
+    if (uav_count > 8)
+        return refuse("more than 8 UAVs");
 
     for (size_t i = 0; i < program.samplers.size(); ++i) {
         const auto &s = program.samplers[i];
         if (s.comparison)
-            return std::nullopt;
+            return refuse("comparison sampler");
         char line[64];
         std::snprintf(line, sizeof(line), "%s %zu %08x %08x %08x %08x\n", s.explicit_lod ? "smpl" : "smp", i,
                       s.words[0], s.words[1], s.words[2], s.words[3]);
@@ -812,7 +861,7 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     for (unsigned srv : program.stride_srvs) {
         if (srv >= srv_count || sorted[srv].kind != ComputeViewKind::raw_vector_srv ||
             sorted[srv].array_count != 1)
-            return std::nullopt;
+            return refuse("stride words from a view that is not one raw vector SRV");
         out << "udsrc " << ud_index++ << " stride " << srv << '\n';
     }
     out << srv_lines.str() << uav_lines.str() << sampler_lines.str()

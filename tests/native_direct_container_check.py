@@ -187,7 +187,78 @@ def comparison_program(op=47, dim=1, sampler=0x08001012):
     return [*setup, 0xf0000100 | (dim << 3) | op << 18, 0x00220400]
 
 
+# Scalar ops whose direct lowering writes SCC. The byte-window field refuses when
+# the next instruction still looks like an SCC reader, so these have to sit in
+# uses_scc_after's overwrite list next to s_max_u32.
+SCC_WRITERS = ("s_absdiff_i32", "s_min_u32", "s_min_i32", "s_max_i32")
+
+
+def scc_overwrite_names(source):
+    start = source.index("const bool overwrites = ")
+    end = source.index("const bool preserves_pair", start)
+    return set(re.findall(r'n == "([^"]+)"', source[start:end]))
+
+
+def symbolic_field_scc_live(program, writers):
+    """Same backward walk as uses_scc_after, for a straight-line program.
+
+    Returns whether SCC is live at the instruction after program[0].
+    """
+    preserves = {"s_mov_b32", "s_mov_b64", "s_ff1_i32_b64", "s_brev_b32"}
+    readers = {"s_cselect_b32"}
+    live = [False] * len(program)
+    previous = [[] for _ in program]
+    pending = []
+    for index, name in enumerate(program):
+        scalar = name.startswith("s_") and name != "s_endpgm"
+        reads = name in readers
+        uncertain = scalar and not reads and name not in writers and name not in preserves
+        if reads or uncertain:
+            live[index] = True
+            pending.append(index)
+            continue
+        if name in writers or name == "s_endpgm":
+            continue
+        previous[index + 1].append(index)
+    while pending:
+        index = pending.pop()
+        for pred in previous[index]:
+            if live[pred]:
+                continue
+            live[pred] = True
+            pending.append(pred)
+    return live[1]
+
+
+def check_scc_writer_mutant():
+    source = pathlib.Path(__file__).resolve().parents[1].joinpath(
+        "src", "gfx1013_direct_compute.inl").read_text(encoding="utf-8")
+    start = source.index("const bool overwrites = ")
+    end = source.index("const bool preserves_pair", start)
+    block = source[start:end]
+    writers = scc_overwrite_names(source)
+    assert "s_and_b32" in writers and "s_max_u32" in writers
+    for name in SCC_WRITERS:
+        assert block.count(f'n == "{name}"') == 1, name
+    killed = ["s_and_b32", "s_mov_b32", "s_mov_b32", "s_absdiff_i32", "s_cselect_b32",
+              "v_mov_b32", "s_endpgm"]
+    select = ["s_and_b32", "s_mov_b32", "s_mov_b32", "s_ff1_i32_b64", "s_cselect_b32", "s_endpgm"]
+    assert symbolic_field_scc_live(select, writers)
+    assert not symbolic_field_scc_live(killed, writers)
+    mutant = block
+    for name in SCC_WRITERS:
+        mutant = mutant.replace(f'n == "{name}"', 'n == "s_endpgm"', 1)
+    dropped = set(re.findall(r'n == "([^"]+)"', mutant)) - {"s_endpgm"}
+    for name in SCC_WRITERS:
+        program = ["s_and_b32", "s_mov_b32", "s_mov_b32", name, "v_mov_b32", "s_endpgm"]
+        assert not symbolic_field_scc_live(program, writers), name
+        assert symbolic_field_scc_live(program, dropped), name
+    assert symbolic_field_scc_live(killed, dropped)
+    print("scc writer mutant: each new case is live once its overwrite entry is removed")
+
+
 def main():
+    check_scc_writer_mutant()
     if len(sys.argv) == 4 and sys.argv[1] in ("--sampler-pso", "--graphics-sampler-pso"):
         sdk, probe = sys.argv[2:]
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,6 +416,21 @@ def main():
         check("descriptor-sop1-before-scc-read", cs,
               compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        # s_min_i32 / s_min_u32 / s_max_i32 / s_absdiff_i32 write SCC, same as s_max_u32.
+        # After the address-field rewrite they kill that symbolic SCC. s_cselect with
+        # no such writer in between stays refused above. The source mutant in
+        # check_scc_writer_mutant drops each overwrite entry and the same shape is live.
+        use_diff = 0x7e00021a  # v_mov_b32 v0, s26
+        for name, word in (
+                ("s_min_i32", 0x831a1716),      # s_min_i32 s26, s22, s23
+                ("s_min_u32", 0x839a1716),
+                ("s_max_i32", 0x841a1716),
+                ("s_absdiff_i32", 0x961a1716)):
+            check("descriptor-" + name + "-kills-scc", cs,
+                  compute(words(*address_field, *pair_zero, word, use_diff, end), table=True))
+        check("descriptor-absdiff-then-cselect", cs,
+              compute(words(*address_field, *pair_zero, 0x961a1716, 0x85191716, use_diff, end),
+                      table=True))
         or_saveexec = 0xbe983dc1  # s_or_saveexec_b32 s24, -1
         check("descriptor-or-saveexec-kill", cs, compute(words(*address_field, or_saveexec, read_scc, end), table=True))
         check("or-saveexec-exec-destination", cs, compute(words(0xbefe3dc1, end)),
@@ -451,13 +537,10 @@ def main():
         root_vs = vertex(constants=(0,2,1), program=[*root_load, 0x7e00020f, 0xf80008cf, 0, end])
         check("address-vs", "gfx1013-container-vs", root_vs)
         check("address-cs", cs, compute(words(*root_load, end), root_descriptor=True))
-        for offset in (106, 107):
-            check(f"wave64-smem-offset-{offset}", cs,
-                  compute(words(0xf4000200, offset << 25, end), threads=64,
-                          root_descriptor=True, wave32=False), "unsupported scalar memory addressing")
-        check("wave64-smem-vcc-dst", cs,
-              compute(words(0xf4000000 | 107 << 6, 125 << 25, end), threads=64,
-                      root_descriptor=True, wave32=False), "unsupported scalar memory destination range")
+        check("wave64-smem-symbolic-vcc-dst", cs,
+              compute(words(0xbe810380, 0xf4080000 | 104 << 6, 125 << 25, end),
+                      threads=64, table=True, wave32=False),
+              "symbolic scalar memory destination overlaps wave64 VCC")
         check("wave32-smem-cross-vcc", cs,
               compute(words(0xf40c0000 | 104 << 6, 125 << 25, end), root_descriptor=True),
               "unsupported scalar memory destination range")

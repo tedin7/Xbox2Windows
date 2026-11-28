@@ -6,14 +6,16 @@
 //   the texture padded to whole blocks;
 // - a mip chain: each layer of blocks holds the tail block, then the mips from the smallest to the largest,
 //   and the tail mips sit at their origins inside the tail block;
+// - a block-compressed volume: laid out as the uncompressed volume of its 4x4 blocks, one depth layer each;
 // - that every element of a volume gets its own bytes inside the texture, and that a tile followed by a
 //   detile (with padded row and layer pitches) returns the texels it started from, for every mip;
 // - the descriptions it takes and refuses, and the slot-70 views it allows on them.
 // `--addrlib` compares the size and every element address of a set of volumes with
 // Addr2ComputeSurfaceInfo and Addr2ComputeSurfaceAddrFromCoord (ADDR_RSRC_TEX_3D, ADDR_SW_4KB_S) and
 // skips (77) when the build has no addrlib. `--mutate thin` lays each volume out as a thin 2D array of
-// its depth layers, and `--mutate tail` puts every mip of the tail at the start of the tail block; both
-// are negative controls and must fail.
+// its depth layers, `--mutate tail` puts every mip of the tail at the start of the tail block, and
+// `--mutate bc` sizes a block-compressed volume's blocks and mips by its texel sides instead of its 4x4
+// blocks; all three are negative controls and must fail.
 //
 // Reference: AMD addrlib as Mesa carries it under src/amd/addrlib, at the revision tools/fetch_addrlib.py
 // pins (Mesa 25.1.0, commit 5c142e46f3f6e752ed745fd48912ebb8fad67145): src/gfx10/gfx10SwizzlePattern.h,
@@ -35,6 +37,7 @@ using x2w_startup::gfx10::Layout;
 int failures = 0;
 bool thin = false;      // --mutate thin
 bool flat_tail = false; // --mutate tail
+bool bc_texels = false; // --mutate bc
 
 void fail(const std::string& what)
 {
@@ -60,6 +63,15 @@ D3D12_RESOURCE_DESC volume(UINT width, UINT height, UINT depth, DXGI_FORMAT form
 Layout layout_of(D3D12_RESOURCE_DESC d)
 {
     if (thin) d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const x2w_startup::gfx10::Element element = x2w_startup::gfx10::element_of(d.Format);
+    if (bc_texels && element.texels > 1) {
+        // The same volume with an uncompressed element of the block's size: blocks and mips are sized
+        // by the texel sides, while the elements visited stay the 4x4 blocks.
+        d.Format = element.bytes == 8 ? DXGI_FORMAT_R16G16B16A16_UNORM : DXGI_FORMAT_R32G32B32A32_UINT;
+        Layout l(d);
+        l.texels = element.texels;
+        return l;
+    }
     Layout l(d);
     for (UINT mip = l.first_tail; flat_tail && mip < l.mips; ++mip) l.origin_x[mip] = l.origin_y[mip] = 0;
     return l;
@@ -143,6 +155,34 @@ void check_mip_chain()
     expect("mip 2 next layer of blocks", at(l, 0, 0, 8, 2), 11 * 4096 + 0x800);
 }
 
+// A block-compressed volume is the volume of its 4x4 blocks: BC1 64x64x16 with five mips takes the
+// addresses of an 8-byte 16x16x16 volume with five mips, and BC7 48x20x9 with three mips those of a
+// 16-byte 12x5x9 volume with three mips, element for element.
+void check_block_compressed()
+{
+    struct Pair {
+        D3D12_RESOURCE_DESC bc, blocks;
+    };
+    const Pair pairs[] = {
+        {volume(64, 64, 16, DXGI_FORMAT_BC1_UNORM, 0x105, 5), volume(16, 16, 16, DXGI_FORMAT_R16G16B16A16_UNORM, 0x105, 5)},
+        {volume(48, 20, 9, DXGI_FORMAT_BC7_UNORM, 0x105, 3), volume(12, 5, 9, DXGI_FORMAT_R32G32B32A32_UINT, 0x105, 3)},
+    };
+    for (const Pair& pair : pairs) {
+        const Layout bc = layout_of(pair.bc), blocks = layout_of(pair.blocks);
+        const std::string name = "block-compressed " + std::to_string(pair.bc.Width) + "x" + std::to_string(pair.bc.Height);
+        if (bc.bytes() != blocks.bytes()) fail(name + ": size " + std::to_string(bc.bytes()));
+        bool same = true;
+        for (UINT mip = 0; mip < bc.mips; ++mip) {
+            if (bc.columns(mip) < blocks.columns(mip) || bc.rows(mip) < blocks.rows(mip) || bc.layers(mip) != blocks.layers(mip))
+                same = false;
+            for (UINT z = 0; z < blocks.layers(mip); ++z)
+                for (UINT y = 0; y < blocks.rows(mip); ++y)
+                    for (UINT x = 0; x < blocks.columns(mip); ++x) same = same && at(bc, x, y, z, mip) == at(blocks, x, y, z, mip);
+        }
+        if (!same) fail(name + ": an element differs from the uncompressed volume of its blocks");
+    }
+}
+
 struct Shape {
     UINT width, height, depth;
     DXGI_FORMAT format;
@@ -159,6 +199,12 @@ const Shape shapes[] = {
     {16, 16, 16, DXGI_FORMAT_R32G32B32A32_FLOAT, 5}, {8, 4, 8, DXGI_FORMAT_R8G8B8A8_UNORM, 4},
     {64, 64, 64, DXGI_FORMAT_R16_FLOAT, 2},          {33, 17, 9, DXGI_FORMAT_R16G16B16A16_FLOAT, 6},
     {4, 4, 64, DXGI_FORMAT_R8_UNORM, 7},             {256, 32, 8, DXGI_FORMAT_R16_FLOAT, 9},
+    // Block-compressed volumes: 8- and 16-byte blocks, with and without a chain, sides that are not
+    // powers of two, and mips smaller than a block.
+    {64, 64, 16, DXGI_FORMAT_BC1_UNORM, 5},          {32, 32, 32, DXGI_FORMAT_BC7_UNORM, 6},
+    {12, 20, 9, DXGI_FORMAT_BC5_UNORM, 5},           {256, 256, 8, DXGI_FORMAT_BC3_UNORM, 9},
+    {4, 4, 4, DXGI_FORMAT_BC4_UNORM, 3},             {128, 128, 128, DXGI_FORMAT_BC5_SNORM, 8},
+    {40, 8, 3, DXGI_FORMAT_BC6H_UF16, 1},
 };
 
 void check_distinct_and_round_trip()
@@ -225,8 +271,8 @@ void check_descriptions()
     supported("more mips than a layout holds", d, false);
     d.MipLevels = 0;
     supported("no mips", d, false);
-    supported("BC1", volume(32, 32, 32, DXGI_FORMAT_BC1_UNORM), false);
-    supported("BC7", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM), false);
+    supported("BC1", volume(32, 32, 32, DXGI_FORMAT_BC1_UNORM), true);
+    supported("BC7 with a mip chain", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM, 0x105, 6), true);
     supported("4 KiB display", volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 0x106), false);
     supported("256 B standard", volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 0x101), false);
     supported("64 KiB standard", volume(32, 32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 0x109), false);
@@ -250,7 +296,9 @@ void check_descriptions()
     d = good;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     address("unordered access", d, false);
-    address("BC7", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM), false);
+    address("BC7", volume(32, 32, 32, DXGI_FORMAT_BC7_UNORM), true);
+    address("BC1 not whole blocks wide", volume(30, 32, 32, DXGI_FORMAT_BC1_UNORM), false);
+    address("BC1 any depth", volume(32, 32, 3, DXGI_FORMAT_BC1_UNORM), true);
     d = good;
     d.MipLevels = 6;
     address("mip chain", d, true);
@@ -329,6 +377,19 @@ int addrlib_check()
     create.regValue.gbAddrConfig = 0x40 | 4u | (4u << 8);
     if (AddrCreate(&create, &created) != ADDR_OK) return 1;
     const AddrFormat addr_formats[5] = {ADDR_FMT_8, ADDR_FMT_16, ADDR_FMT_8_8_8_8, ADDR_FMT_16_16_16_16, ADDR_FMT_32_32_32_32};
+    // A block-compressed format is passed as itself, so that addrlib turns its texel sides into blocks.
+    const auto addr_format = [&](DXGI_FORMAT f, UINT size) {
+        switch (f) {
+        case DXGI_FORMAT_BC1_UNORM: return ADDR_FMT_BC1;
+        case DXGI_FORMAT_BC2_UNORM: return ADDR_FMT_BC2;
+        case DXGI_FORMAT_BC3_UNORM: return ADDR_FMT_BC3;
+        case DXGI_FORMAT_BC4_UNORM: return ADDR_FMT_BC4;
+        case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: return ADDR_FMT_BC5;
+        case DXGI_FORMAT_BC6H_UF16: return ADDR_FMT_BC6;
+        case DXGI_FORMAT_BC7_UNORM: return ADDR_FMT_BC7;
+        default: return addr_formats[size];
+        }
+    };
     std::vector<D3D12_RESOURCE_DESC> cases;
     for (const Shape& s : shapes) cases.push_back(volume(s.width, s.height, s.depth, s.format, 0x105, s.mips));
     for (UINT size = 0; size < 5; ++size)
@@ -342,6 +403,14 @@ int addrlib_check()
         for (const auto& side : chains)
             for (UINT mips = 2; ((std::max)({side[0], side[1], side[2]}) >> (mips - 1)) != 0; ++mips)
                 cases.push_back(volume(side[0], side[1], side[2], by_size[size], 0x105, mips));
+    // Every mip count of a set of block-compressed chains, for each BC format.
+    constexpr DXGI_FORMAT bc[] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC4_UNORM,
+                                  DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC6H_UF16, DXGI_FORMAT_BC7_UNORM};
+    constexpr UINT bc_chains[4][3] = {{64, 64, 16}, {12, 20, 9}, {4, 4, 32}, {256, 8, 8}};
+    for (DXGI_FORMAT f : bc)
+        for (const auto& side : bc_chains)
+            for (UINT mips = 1; ((std::max)({side[0], side[1], side[2]}) >> (mips - 1)) != 0; ++mips)
+                cases.push_back(volume(side[0], side[1], side[2], f, 0x105, mips));
     unsigned compared = 0, elements = 0, mismatches = 0;
     for (const D3D12_RESOURCE_DESC& d : cases) {
         const Layout l(d);
@@ -354,7 +423,7 @@ int addrlib_check()
         in.flags.texture = 1;
         in.swizzleMode = ADDR_SW_4KB_S;
         in.resourceType = ADDR_RSRC_TEX_3D;
-        in.format = addr_formats[size];
+        in.format = addr_format(d.Format, size);
         in.bpp = l.bytes_per_element * 8;
         in.width = l.width;
         in.height = l.height;
@@ -387,8 +456,8 @@ int addrlib_check()
                         ain.flags.texture = 1;
                         ain.resourceType = ADDR_RSRC_TEX_3D;
                         ain.bpp = in.bpp;
-                        ain.unalignedWidth = l.width;
-                        ain.unalignedHeight = l.height;
+                        ain.unalignedWidth = l.columns(0);  // in elements: 4x4 blocks for BC
+                        ain.unalignedHeight = (l.height + l.texels - 1) / l.texels;
                         ain.numSlices = l.depth;
                         ain.numMipLevels = l.mips;
                         ain.numSamples = 1;
@@ -416,13 +485,15 @@ int main(int argc, char** argv)
     const bool mutate = argc == 3 && std::strcmp(argv[1], "--mutate") == 0;
     thin = mutate && std::strcmp(argv[2], "thin") == 0;
     flat_tail = mutate && std::strcmp(argv[2], "tail") == 0;
-    if (argc != 1 && !thin && !flat_tail) {
-        std::printf("usage: startup_gfx10_volume_check [--addrlib | --mutate thin | --mutate tail]\n");
+    bc_texels = mutate && std::strcmp(argv[2], "bc") == 0;
+    if (argc != 1 && !thin && !flat_tail && !bc_texels) {
+        std::printf("usage: startup_gfx10_volume_check [--addrlib | --mutate thin | --mutate tail | --mutate bc]\n");
         return 2;
     }
     check_equations();
     check_block_order();
     check_mip_chain();
+    check_block_compressed();
     check_distinct_and_round_trip();
     check_descriptions();
     if (failures) {
@@ -430,6 +501,6 @@ int main(int argc, char** argv)
         return 1;
     }
     std::printf("startup_gfx10_volume: PASS (5 element sizes, block order, a mip chain, %zu volumes round-tripped mip by mip, "
-                "17 layouts, 8 address descriptions, 9 views)\n", sizeof(shapes) / sizeof(shapes[0]));
+                "17 layouts, 10 address descriptions, 9 views, 2 block-compressed volumes against their blocks)\n", sizeof(shapes) / sizeof(shapes[0]));
     return 0;
 }

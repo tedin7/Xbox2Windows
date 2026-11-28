@@ -136,7 +136,7 @@ def hardware(replay, sdk, work, root):
     return 0
 
 
-def main(mode, tool, sdk):
+def main(mode, tool, sdk, *, checks=None):
     with tempfile.TemporaryDirectory() as temp:
         work = Path(temp)
         shader = work / "root.hlsl"
@@ -144,7 +144,9 @@ def main(mode, tool, sdk):
         root = work / "root.bin"
         subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG",
                         "-Fo", root, shader], check=True)
-        return {"controls": controls, "hardware": hardware}[mode](tool, sdk, work, root.read_bytes())
+        if checks is None:
+            checks = {"controls": controls, "hardware": hardware}
+        return checks[mode](tool, sdk, work, root.read_bytes())
 
 
 if __name__ == "__main__":

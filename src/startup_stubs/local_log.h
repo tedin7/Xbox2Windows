@@ -55,6 +55,16 @@ inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
     return false;
 }
 
+// Seconds since this process was created: one time base for lines from different stand-in DLLs.
+inline double process_seconds() noexcept
+{
+    FILETIME created{}, exited{}, kernel{}, user{}, now{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime; };
+    return ticks(now) > ticks(created) ? static_cast<double>(ticks(now) - ticks(created)) / 1e7 : 0.0;
+}
+
 // First-chance exceptions stop the whole process while a debugger is attached, so a probe or a copy that is
 // refused before it touches an unmapped address is worth a query. faults_avoided counts those refusals; the
 // totals line of the render heartbeat prints it.
@@ -222,14 +232,17 @@ inline void forget_mapped_spans() noexcept
 }
 
 // The pre-check is a debugging aid: it only pays off while a debugger would stop on every first-chance fault.
-// It runs when a debugger is attached or X2W_PROBE_PRECHECK is set to anything but 0 (read once, cached);
-// otherwise probes and copies keep the plain touch / __try path at no extra cost.
+// X2W_PROBE_PRECHECK decides when it is set (0 off, anything else on); unset, the pre-check runs when a debugger is
+// attached. Read once, cached. Title runs always start under debug_launch.py, where a VirtualQuery per probe can
+// cost far more than the faults it avoids, so X2W_PROBE_PRECHECK=0 turns it off there. Off, probes and copies keep
+// the plain touch / __try path at no extra cost.
 inline bool precheck_enabled() noexcept
 {
     static const bool enabled = [] {
         char value[8] = {};
         const DWORD n = GetEnvironmentVariableA("X2W_PROBE_PRECHECK", value, sizeof(value));
-        return IsDebuggerPresent() != FALSE || (n != 0 && n < sizeof(value) && value[0] != '0');
+        if (n != 0 && n < sizeof(value)) return value[0] != '0';
+        return IsDebuggerPresent() != FALSE;
     }();
     return enabled;
 }

@@ -1,0 +1,1 @@
+tests/startup_image_cube_check.py

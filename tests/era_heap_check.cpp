@@ -85,22 +85,27 @@ bool allocation_checks()
 
 bool failure_checks()
 {
-    // Mix each reserved bit with a valid heap alignment and with the AMD graphics word.
-    for (unsigned bit = 33; bit < 64; ++bit) {
+    // Mix each of the 30 reserved bits with a valid heap alignment and with the AMD graphics word.
+    for (unsigned bit = 34; bit < 64; ++bit) {
         const auto reserved = std::uint64_t{1} << bit;
         if (!rejects(257, reserved | (std::uint64_t{6} << 24)) || !rejects(512, reserved | amd_word)) {
             return false;
         }
     }
+    // The address-below-4-GiB bit is valid but this allocator does not provide such an address.
+    if (!rejects(257, (std::uint64_t{1} << 33) | (std::uint64_t{6} << 24)) ||
+        !rejects(512, (std::uint64_t{1} << 33) | amd_word)) {
+        return false;
+    }
     // Physical memory types 7-9 are not modeled. Types 10-15 are undefined.
     for (std::uint64_t type = 7; type < 16; ++type) {
         if (!rejects(512, (amd_word & ~memory_type_mask) | (type << 29))) return false;
     }
-    // Graphics memory with 4 MB pages or a 128 KiB alignment exceeds the desktop
+    // Graphics memory with 2 MB pages or a 128 KiB alignment exceeds the desktop
     // allocation granularity. The undefined page size value 3 fails for every type.
-    const auto four_mb_pages = (amd_word & ~(std::uint64_t{3} << 14)) | (std::uint64_t{2} << 14);
+    const auto two_mb_pages = (amd_word & ~(std::uint64_t{3} << 14)) | (std::uint64_t{2} << 14);
     const auto wide_alignment = (amd_word & ~(std::uint64_t{31} << 24)) | (std::uint64_t{17} << 24);
-    if ((allocation_granularity() < (std::size_t{4} << 20) && !rejects(512, four_mb_pages)) ||
+    if ((allocation_granularity() < (std::size_t{2} << 20) && !rejects(512, two_mb_pages)) ||
         (allocation_granularity() < (std::size_t{1} << 17) && !rejects(512, wide_alignment)) ||
         !rejects(512, amd_word | (std::uint64_t{3} << 14)) ||
         !rejects(64, bink_word | (std::uint64_t{3} << 14))) {
@@ -117,9 +122,9 @@ bool observed_word_checks()
     const auto bink = era_heap::decode(bink_word);
     const auto amd = era_heap::decode(amd_word);
     if (bink.object_type != 0 || bink.page_size != 0 || bink.allocator_id != 0xe5 ||
-        bink.alignment != 5 || bink.memory_type != 0 || bink.reserved != 0 ||
+        bink.alignment != 5 || bink.memory_type != 0 || bink.reserved != 0 || bink.address_below_4gib != 0 ||
         amd.object_type != 0 || amd.page_size != 1 || amd.allocator_id != 0 ||
-        amd.alignment != 8 || amd.memory_type != 5 || amd.reserved != 0) {
+        amd.alignment != 8 || amd.memory_type != 5 || amd.reserved != 0 || amd.address_below_4gib != 0) {
         return false;
     }
 
@@ -404,8 +409,9 @@ bool concurrency_checks()
     return ok.load();
 }
 
-// Every field of the ERA attribute layout (objectType:14, pageSize:2, allocatorId:8, alignment:5, memoryType:4,
-// reserved:31) at its widest value alone, all at once, and one word with a distinct value in each field. The
+// Every field of the XALLOC_ATTRIBUTES layout (objectType:14, pageSize:2, allocatorId:8, alignment:5, memoryType:4,
+// address-below-4-GiB:1, reserved:30) at its widest value alone, all at once, and one word with a distinct value
+// in each field. The
 // observed words leave the object type and the reserved bits at 0, so a narrowed mask or a shifted field boundary
 // would decode them unchanged. narrow_object_type expects a 13-bit object type and is the negative control.
 bool decode_field_checks(bool narrow_object_type)
@@ -416,16 +422,17 @@ bool decode_field_checks(bool narrow_object_type)
         era_heap::Fields fields;
     };
     constexpr std::uint64_t mixed = 0x2a5cull | 2ull << 14 | 0xb7ull << 16 | 0x13ull << 24 | 9ull << 29 |
-                                    0x5a5a5a5ull << 33;
+                                    1ull << 33 | 0x2a5a5a5ull << 34;
     const Case cases[] = {
-        {"object type", 0x3fff, {0x3fff, 0, 0, 0, 0, 0}},
-        {"page size", 3ull << 14, {0, 3, 0, 0, 0, 0}},
-        {"allocator", 0xffull << 16, {0, 0, 0xff, 0, 0, 0}},
-        {"alignment", 0x1full << 24, {0, 0, 0, 0x1f, 0, 0}},
-        {"memory type", 0xfull << 29, {0, 0, 0, 0, 0xf, 0}},
-        {"reserved", 0x7fffffffull << 33, {0, 0, 0, 0, 0, 0x7fffffff}},
-        {"all ones", ~0ull, {0x3fff, 3, 0xff, 0x1f, 0xf, 0x7fffffff}},
-        {"mixed", mixed, {0x2a5c, 2, 0xb7, 0x13, 9, 0x5a5a5a5}},
+        {"object type", 0x3fff, {0x3fff, 0, 0, 0, 0, 0, 0}},
+        {"page size", 3ull << 14, {0, 3, 0, 0, 0, 0, 0}},
+        {"allocator", 0xffull << 16, {0, 0, 0xff, 0, 0, 0, 0}},
+        {"alignment", 0x1full << 24, {0, 0, 0, 0x1f, 0, 0, 0}},
+        {"memory type", 0xfull << 29, {0, 0, 0, 0, 0xf, 0, 0}},
+        {"address 32-bit mapping", 1ull << 33, {0, 0, 0, 0, 0, 1, 0}},
+        {"reserved", 0x3fffffffull << 34, {0, 0, 0, 0, 0, 0, 0x3fffffff}},
+        {"all ones", ~0ull, {0x3fff, 3, 0xff, 0x1f, 0xf, 1, 0x3fffffff}},
+        {"mixed", mixed, {0x2a5c, 2, 0xb7, 0x13, 9, 1, 0x2a5a5a5}},
     };
     bool ok = true;
     for (const auto& c : cases) {
@@ -436,10 +443,11 @@ bool decode_field_checks(bool narrow_object_type)
         const auto got = era_heap::decode(c.word);
         if (got.object_type != want.object_type || got.page_size != want.page_size ||
             got.allocator_id != want.allocator_id || got.alignment != want.alignment ||
-            got.memory_type != want.memory_type || got.reserved != want.reserved) {
-            std::printf("FAIL: decode %s: %x %u %x %u %u %llx\n", c.name, got.object_type, got.page_size,
+            got.memory_type != want.memory_type || got.reserved != want.reserved ||
+            got.address_below_4gib != want.address_below_4gib) {
+            std::printf("FAIL: decode %s: %x %u %x %u %u %x %u\n", c.name, got.object_type, got.page_size,
                         got.allocator_id, got.alignment, got.memory_type,
-                        static_cast<unsigned long long>(got.reserved));
+                        got.reserved, got.address_below_4gib);
             ok = false;
         }
     }

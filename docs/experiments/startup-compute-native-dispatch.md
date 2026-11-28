@@ -80,7 +80,13 @@ ctest --preset dev --no-tests=error -V -R '^(startup_compute_dispatch(_.*)?|star
 ## Limits
 
 - Compute only. Graphics pipelines are not translated in-process.
-- A scalar buffer load, a texture, a sampler and the typed, half and indexed views are refused.
+- A scalar buffer load, a texture, a sampler and the typed, half and indexed views are refused. This is the
+  in-process route. The published-manifest route (`<key>.txt` from `compile_dxil --requests`) binds a
+  title's 1D, 2D, 2D-array and 3D texture SRV (`srv N tex1d|tex2d|tex2da|tex3d table R B`). For 1D, 2D-array
+  and 3D the title's view must be described, have the manifest's dimension and fit its texture, otherwise the
+  Dispatch is refused (on a dimension mismatch the draw path binds a null view instead). "Fits" is
+  `address_view_fits`: the view format is the storage format or a member of its typeless family, the mip and
+  slice range lie inside the texture, and ResourceMinLODClamp is 0. Cube texture SRVs are not published.
 - One descriptor shape was dispatched: stride 4 and 320 records, for the input and for the output.
 - An indirect Dispatch of a natively translated program was not run.
 - A captured request starts with a 36-byte prefix of `v_nop` words before `s_inst_prefetch`. The route passes

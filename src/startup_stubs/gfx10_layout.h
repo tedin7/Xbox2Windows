@@ -72,12 +72,12 @@ inline UINT block_log2(UINT mode)
 }
 
 // A three-dimensional texture in the 4 KiB standard mode (0x105), which addrlib lays out in thick blocks
-// (Gfx10Lib::HwlIsThick: a 3D resource in a standard or display mode): uncompressed texels, with a mip
-// chain or without.
+// (Gfx10Lib::HwlIsThick: a 3D resource in a standard or display mode), with a mip chain or without. A
+// block-compressed element is a 4x4 block of one depth layer.
 inline bool supports_volume(const D3D12_RESOURCE_DESC& d)
 {
     const Element element = element_of(d.Format);
-    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && swizzle_mode(d) == 5 && element.bytes && element.texels == 1 &&
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && swizzle_mode(d) == 5 && element.bytes &&
            d.Width && d.Height && d.DepthOrArraySize && d.Width <= 2048 && d.Height <= 2048 && d.DepthOrArraySize <= 2048 &&
            d.MipLevels && d.MipLevels <= max_mips && d.SampleDesc.Count == 1;
 }
@@ -228,7 +228,8 @@ struct Layout {
     // layer of every mip (Gfx10Lib::ComputeSurfaceInfoMacroTiled and ComputeSurfaceAddrFromCoordMacroTiled
     // for a thick surface): first the shared tail block when the chain has one, then the mips from the
     // smallest to the largest, each pitch x height blocks in x, then y. Mip sizes round up at every level
-    // (GetMipSize). A mip is in the tail when it is at most a block wide and half a block high
+    // (GetMipSize), in elements: a block-compressed volume is first rounded up to whole 4x4 blocks
+    // (ElemLib::AdjustSurfaceInfo), and its depth is not divided. A mip is in the tail when it is at most a block wide and half a block high
     // (GetMipTailDim: a 4 KiB block halves its height) and at most five mips remain (GetMaxNumMipsInTail for
     // a thick 4 KiB block). Tail mip k from the end sits at byte (k << 8) of the tail block; that offset,
     // read back as 256-byte micro blocks of Block256_3d, is its origin in x and y. Its z is not moved.
@@ -264,17 +265,18 @@ struct Layout {
                 if (bit < zs) z_bits[v] |= 1u << z_at[bit];
             }
         const auto shifted = [](UINT v, UINT mip) { return (std::max)(1u, (v + (1u << mip) - 1) >> mip); };
+        const UINT columns0 = (width + texels - 1) / texels, rows0 = (height + texels - 1) / texels;
         constexpr UINT tail_mips = 5;
         first_tail = mips;
         for (UINT mip = 0; mips > 1 && mip < mips; ++mip)
-            if (shifted(width, mip) <= block_width && shifted(height, mip) <= block_height / 2 && mips - mip <= tail_mips) {
+            if (shifted(columns0, mip) <= block_width && shifted(rows0, mip) <= block_height / 2 && mips - mip <= tail_mips) {
                 first_tail = mip;
                 break;
             }
         std::array<std::uint64_t, max_mips> size{};
         for (UINT mip = 0; mip < first_tail; ++mip) {
-            blocks_wide[mip] = (shifted(width, mip) + block_width - 1) / block_width;
-            size[mip] = std::uint64_t{blocks_wide[mip]} * ((shifted(height, mip) + block_height - 1) / block_height) * block_bytes;
+            blocks_wide[mip] = (shifted(columns0, mip) + block_width - 1) / block_width;
+            size[mip] = std::uint64_t{blocks_wide[mip]} * ((shifted(rows0, mip) + block_height - 1) / block_height) * block_bytes;
         }
         std::uint64_t offset = first_tail < mips ? block_bytes : 0;
         for (UINT mip = first_tail; mip-- > 0;) {

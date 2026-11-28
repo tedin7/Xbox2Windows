@@ -107,11 +107,16 @@ def controls():
     assert 'Texture1D<float4> r0' in pipe.hlsl_ps()
     assert 'r0.Sample(q0, F(v0))' in pipe.hlsl_ps()
     assert 'srv 0 tex1d table 0 0' in pipe.manifest()
+    # The MIMG words carry no address count: the disassembler sizes the address from the dimension. With the cube
+    # dimension (field 3) the same words are a three-register cube sample, translated since #2943; the 2D MSAA
+    # dimension (field 6) stays an unverified dimension and must be refused.
+    cube = translate(WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0'))).hlsl_ps()
+    assert 'TextureCube<float4> r0' in cube and 'r0.Sample(q0, x2w_cube_dir(F(v0), F(v1), F(v2)))' in cube, cube
     unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('300f80f0'))
     try:
         translate(unsupported)
-    except G.Unsupported as exc:
-        assert 'image dimension SQ_RSRC_IMG_2D_MSAA' in str(exc), str(exc)
+    except G.Unsupported as error:
+        assert 'image dimension SQ_RSRC_IMG_2D_MSAA' in str(error), error
     else:
         raise AssertionError('MSAA image dimension accepted')
 

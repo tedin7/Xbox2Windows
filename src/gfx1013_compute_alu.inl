@@ -45,6 +45,7 @@ static const std::map<Name,AluRule> alu_rules = {
     {"v_mul_u32_u24",{2,AluType::Bits,"({0} & 0xffffffu) * ({1} & 0xffffffu)"}},
     {"v_or_b32",{2,AluType::Bits,"{0} | {1}"}},
     {"v_rcp_f32",{1,AluType::Float,"1.0 / {0}"}},
+    {"v_rcp_iflag_f32",{1,AluType::Float,"1.0 / {0}"}},
     {"v_sin_f32",{1,AluType::Float,"sin({0} * 6.283185307)"}},
     {"v_sqrt_f32",{1,AluType::Float,"sqrt({0})"}},
     {"v_sub_f32",{2,AluType::Float,"{0} - {1}"}},

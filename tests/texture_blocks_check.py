@@ -21,7 +21,7 @@ BC_2D_FORMATS = (
     ("BC1_UNORM", 71, 8),
     ("BC2_UNORM", 74, 16),
     ("BC3_UNORM", 77, 16),
-    ("BC4_UNORM", 79, 8),
+    ("BC4_UNORM", 80, 8),
     ("BC5_UNORM", 83, 16),
     ("BC6H_UF16", 95, 16),
     ("BC7_UNORM", 98, 16),

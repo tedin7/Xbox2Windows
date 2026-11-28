@@ -1,0 +1,15 @@
+add_executable(bcpack_formats_check tests/bcpack_formats_check.cpp)
+target_compile_features(bcpack_formats_check PRIVATE cxx_std_17)
+target_include_directories(bcpack_formats_check PRIVATE src)
+target_compile_definitions(bcpack_formats_check PRIVATE X2W_BCPACK_LANE_TESTS)
+add_test(NAME bcpack_all_formats COMMAND bcpack_formats_check)
+add_test(NAME bcpack_all_formats_golden_control COMMAND bcpack_formats_check --mutate)
+set_tests_properties(bcpack_all_formats bcpack_all_formats_golden_control PROPERTIES TIMEOUT 120)
+set_tests_properties(bcpack_all_formats_golden_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_bcpack_storage COMMAND startup_stub_consumer bcpack-storage)
+set_tests_properties(startup_bcpack_storage PROPERTIES TIMEOUT 60)
+
+# Explicit target only: normal builds and all runtime DLLs need no oracle bridge.
+add_library(bcpack_oracle_bridge SHARED EXCLUDE_FROM_ALL tests/bcpack_oracle_bridge.cpp)
+target_compile_features(bcpack_oracle_bridge PRIVATE cxx_std_17)
+target_include_directories(bcpack_oracle_bridge PRIVATE src)

@@ -64,6 +64,33 @@ void check_ring_reuse()
     check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "untracked submit prevents reuse");
 }
 
+void check_snapshot_pool()
+{
+    // The snapshot pool's chunks are numbered after the ring's in the same recording mask and the same per-queue table.
+    check(snapshot_chunk_base == max_upload_chunks && max_snapshot_chunks == 8 && upload_chunk_bits == 40, "pool numbering");
+    unsigned char storage[4 * kAlign];
+    std::array<UploadRingChunk, 2> ring{};
+    std::array<UploadRingChunk, 2> snap{};
+    UploadRingChunk& chunk = snap[1];
+    chunk = {nullptr, storage, sizeof(storage), sizeof(storage)};
+    UploadChunkMask recording = 0;
+    ring[1].hold(recording, 1);
+    snap[0].hold(recording, snapshot_chunk_base + 0);
+    snap[1].hold(recording, snapshot_chunk_base + 1);
+    check(ring[1].recordings == 1 && snap[0].recordings == 1 && snap[1].recordings == 1 && ring[0].recordings == 0, "holds land in their pool");
+    TestFence fence;
+    std::map<unsigned, UploadQueue<TestFence>> queues{{0, {&fence, 1}}};
+    queues[0].submitted(recording, true);
+    check(!queues[0].completed(snapshot_chunk_base + 1), "a snapshot chunk in flight is not complete");
+    fence.value = 1;
+    check(queues[0].completed(snapshot_chunk_base + 1) && queues[0].completed(snapshot_chunk_base + 7), "completed, or never used");
+    check(!reuse_upload_chunk(chunk, snapshot_chunk_base + 1, kAlign, queues).mapped, "a held chunk is not reused");
+    discard_upload_chunks(recording, ring.data(), snap.data());
+    check(recording == 0 && ring[1].recordings == 0 && snap[0].recordings == 0 && snap[1].recordings == 0, "discard releases both pools");
+    const auto again = reuse_upload_chunk(chunk, snapshot_chunk_base + 1, kAlign, queues);
+    check(again.mapped == storage && again.generation == 1, "a finished, unheld snapshot chunk is reused");
+}
+
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 bookkeeping: a closed list stops holding its chunks once its submit is fenced,
 // the fence alone then guards the chunks, and a later submit of the same list before its Reset fences the intact
 // chunks again and reports the reused ones.
@@ -95,7 +122,7 @@ void check_release_at_submit()
     const auto reused = reuse_upload_chunk(chunks[0], 0, bytes, queues);
     check(reused.mapped == storage[0] && reused.generation == 1, "release: chunk reused after the fence");
 
-    UploadChunkMask recycled = UINT32_MAX;
+    UploadChunkMask recycled = UINT64_MAX;
     const auto intact = resubmitted_upload_chunks(released, chunks.data(), recycled);
     check(intact == 2 && recycled == 1, "release: a resubmit finds chunk 1 intact and chunk 0 reused");
 
@@ -107,6 +134,50 @@ void check_release_at_submit()
           "release: the intact chunk is reused after the resubmit's fence");
     check(resubmitted_upload_chunks(released, chunks.data(), recycled) == 0 && recycled == 3,
           "release: both chunks reported once reused");
+}
+
+void check_snapshot_release_at_submit()
+{
+    constexpr unsigned ring_index = max_upload_chunks - 1;
+    constexpr unsigned snapshot_index = upload_chunk_bits - 1;
+    constexpr auto ring_bit = UploadChunkMask{1} << ring_index;
+    constexpr auto snapshot_bit = UploadChunkMask{1} << snapshot_index;
+    constexpr auto both = ring_bit | snapshot_bit;
+    unsigned char storage[2][kAlign];
+    std::array<UploadRingChunk, max_upload_chunks> ring{};
+    std::array<UploadRingChunk, max_snapshot_chunks> snapshots{};
+    auto& ring_chunk = ring.back();
+    auto& snapshot = snapshots.back();
+    ring_chunk = {nullptr, storage[0], kAlign, kAlign, 2};
+    snapshot = {nullptr, storage[1], kAlign, kAlign, 3};
+    UploadChunkMask recording = 0;
+    ring_chunk.hold(recording, ring_index);
+    snapshot.hold(recording, snapshot_index);
+    check(recording == both, "snapshot release: both boundary bits are recorded");
+
+    TestFence first, second;
+    std::map<unsigned, UploadQueue<TestFence>> queues{{0, {&first, 1}}, {1, {&second, 1}}};
+    queues[0].submitted(recording, true);
+    ReleasedUploadChunks released;
+    release_upload_chunks_at_submit(recording, ring.data(), released, snapshots.data());
+    check(!recording && !ring_chunk.recordings && !snapshot.recordings, "snapshot release: both holds dropped");
+    check(released.chunks == both && released.generation[ring_index] == 2 && released.generation[snapshot_index] == 3,
+          "snapshot release: both generations saved");
+    check(!reuse_upload_chunk(snapshot, snapshot_index, kAlign, queues).mapped,
+          "snapshot release: first fence guards the snapshot after release");
+
+    UploadChunkMask recycled = UINT64_MAX;
+    const auto intact = resubmitted_upload_chunks(released, ring.data(), recycled, snapshots.data());
+    check(intact == both && !recycled, "snapshot release: intact resubmit includes both pools");
+    queues[1].submitted(intact, true);
+    first.value = 1;
+    check(!reuse_upload_chunk(snapshot, snapshot_index, kAlign, queues).mapped,
+          "snapshot release: the other queue's resubmit fence still guards reuse");
+    second.value = 1;
+    const auto reused = reuse_upload_chunk(snapshot, snapshot_index, kAlign, queues);
+    check(reused.mapped == storage[1] && reused.generation == 4, "snapshot release: reuse after both fences");
+    check(resubmitted_upload_chunks(released, ring.data(), recycled, snapshots.data()) == ring_bit &&
+          recycled == snapshot_bit, "snapshot release: a recycled snapshot alone invalidates the recording");
 }
 
 }  // namespace
@@ -156,7 +227,9 @@ int main()
           "existing reservations survive exhaustion");
 
     check_ring_reuse();
+    check_snapshot_pool();
     check_release_at_submit();
+    check_snapshot_release_at_submit();
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

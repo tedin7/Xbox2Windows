@@ -33,7 +33,7 @@ FORMATS: dict[str, Format] = {
     "BC1_UNORM": Format("BC1_UNORM", 71, 4, 4, 1, 8, 2),
     "BC2_UNORM": Format("BC2_UNORM", 74, 4, 4, 1, 16, 2),
     "BC3_UNORM": Format("BC3_UNORM", 77, 4, 4, 1, 16, 2),
-    "BC4_UNORM": Format("BC4_UNORM", 79, 4, 4, 1, 8, 2),
+    "BC4_UNORM": Format("BC4_UNORM", 80, 4, 4, 1, 8, 2),
     "BC5_UNORM": Format("BC5_UNORM", 83, 4, 4, 1, 16, 2),
     "BC6H_UF16": Format("BC6H_UF16", 95, 4, 4, 1, 16, 2),
     "BC7_UNORM": Format("BC7_UNORM", 98, 4, 4, 1, 16, 2),

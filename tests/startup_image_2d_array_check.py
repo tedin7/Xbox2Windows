@@ -24,7 +24,7 @@ translated to Load(int4(x, y, slice, mip)). Its fixtures are source-built stages
 of a slice (root constant 1) at a constant mip level. They are drawn with --startup-image-2d-array-mips: a
 4x4 texture of two slices with three mip levels whose cells all differ, texel (x, y) of slice s at mip m
 holding ((1 + x + 4y + 16s + 32m) / 128, x, y, s + 2m). The expected colours come from mip_cell() below.
-Cube maps stay refused. The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
+Cube loads stay refused (cube sampling: tests/startup_image_cube_check.py). The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
 accept them, so 'binary <llvm-mc> mip' is opt-in and CI does not pass it.
 """
 import re
@@ -261,7 +261,7 @@ def mip_controls():
         G.D.MIMG_DIMS[5] = original
     assert G.D.MIMG_DIMS[5] == original
 
-    # Cube maps are refused as before. 2D and 3D keep their forms (same words, dim field changed).
+    # Cube loads are refused as before. 2D and 3D keep their forms (same words, dim field changed).
     cube = bytearray(MIP_IMAGE)
     cube[0] = 0x18
     try:

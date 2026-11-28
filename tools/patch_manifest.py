@@ -14,9 +14,20 @@ A manifest is TOML:
     expect_sha256 = "<sha256 of the len(bytes) original bytes at rva>"
     bytes = "90c3"               # the replacement, lowercase hex
 
+    [[patch]]
+    id = "s001"
+    kind = "shader"              # the translation files of one shader cache key
+    why = "<issue or root cause>"
+    remove_when = "<condition>"
+    key = "0123456789abcdef"     # the cache key, 16 lowercase hex digits
+    pipeline = "compute"         # graphics, compute or mesh86
+    revision = "x2w-startup-shader-29cs"
+    files = [{ ext = ".txt", file = "s001.txt", sha256 = "<sha256>" },
+             { ext = ".cs.cso", file = "s001.cs.cso", sha256 = "<sha256>" }]
+
 The whole manifest is validated and the input's SHA-256 compared before anything is returned, so
-a manifest that fails any check applies nothing. Only the memory kind is defined so far, and
-nothing applies it yet.
+a manifest that fails any check applies nothing. The memory and shader kinds are defined, checked
+for shape only; nothing applies them yet.
 """
 
 import argparse
@@ -28,9 +39,26 @@ import tomllib
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX = re.compile(r"(?:[0-9a-f]{2})+")
+KEY = re.compile(r"[0-9a-f]{16}")
+# Names Windows opens as a device instead of a file in the directory, alone or before an extension (Microsoft,
+# "Naming Files, Paths, and Namespaces"). Matched against the part before the first dot, trailing spaces dropped.
+DEVICE = re.compile(r"(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)",
+                    re.IGNORECASE)
 COMMON = {"id", "kind", "why", "remove_when"}
 # Every key of a kind is required. hook and data get their tables with their stages.
-KINDS = {"memory": {"rva", "expect_sha256", "bytes"}}
+KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
+# Shader patches, per pipeline: the form of the runtime's key revision (src/startup_stubs/d3d12_draw.inl and
+# mesh86_cache.inl; <n> is the number each revision bump raises), the translation files the runtime reads for one
+# key, and the ones without which it has no translation. A later consumer must check which is current. compute
+# also needs .cs.hlsl when its .txt has no native line, and mesh86 reads .ps.cso only for a request with a pixel
+# shader; this loader reads neither, so both stay optional.
+PIPELINES = {
+    "graphics": ("x2w-startup-shader-<n>", (".txt", ".vs.cso", ".ps.cso"), (".txt", ".vs.cso", ".ps.cso")),
+    "compute": ("x2w-startup-shader-<n>cs", (".txt", ".cs.cso", ".cs.hlsl"), (".txt", ".cs.cso")),
+    "mesh86": ("x2w-startup-mesh-86-<n>", (".mesh86.txt", ".ms.cso", ".ps.cso"), (".mesh86.txt", ".ms.cso")),
+}
+REVISIONS = {name: re.compile(re.escape(form).replace("<n>", "[1-9][0-9]*"))
+             for name, (form, _, _) in PIPELINES.items()}
 
 
 def _keys(table, keys, where):
@@ -54,9 +82,60 @@ def _sha256(value, where):
     return value
 
 
+def _file_name(value, where):
+    """A bare file name, for a later consumer to resolve in the manifest's directory.
+
+    That consumer is the runtime, which runs on Windows, so a name that Windows would not resolve to a file of that
+    name in the directory is refused too: one it cannot hold, one whose trailing dot or space it drops, a device.
+    """
+    name = _text(value, where)
+    if any(c in name for c in "/\\:") or name in (".", ".."):
+        raise ValueError(f"{where} {name!r} must be a bare file name, without a directory, drive or '..'")
+    if any(c in '<>"|?*' for c in name) or any(ord(c) < 32 for c in name):
+        raise ValueError(f"{where} {name!r} has a character a Windows file name cannot hold")
+    if name.endswith((".", " ")):
+        raise ValueError(f"{where} {name!r} ends in a dot or a space, which Windows drops")
+    if DEVICE.fullmatch(name.split(".", 1)[0].rstrip(" ")):
+        raise ValueError(f"{where} {name!r} is a Windows device name")
+    return name
+
+
+def _shader(entry, where):
+    """The key, pipeline, revision and files of a shader patch, checked for shape only."""
+    key = entry["key"]
+    if not isinstance(key, str) or not KEY.fullmatch(key):
+        raise ValueError(f"{where} key must be 16 lowercase hex digits")
+    pipeline = entry["pipeline"]
+    if not isinstance(pipeline, str) or pipeline not in PIPELINES:
+        raise ValueError(f"{where} pipeline must be one of: {', '.join(PIPELINES)}")
+    form, extensions, required = PIPELINES[pipeline]
+    revision = entry["revision"]
+    if not isinstance(revision, str) or not REVISIONS[pipeline].fullmatch(revision):
+        raise ValueError(f"{where} revision {revision!r} is not a {pipeline} key revision ({form})")
+    if not isinstance(entry["files"], list) or not entry["files"]:
+        raise ValueError(f"{where} files must be a non-empty array of tables")
+    files = {}
+    for index, item in enumerate(entry["files"]):
+        at = f"{where} files[{index}]"
+        _keys(item, {"ext", "file", "sha256"}, at)
+        ext = item["ext"]
+        if not isinstance(ext, str) or ext not in extensions:
+            raise ValueError(f"{at} ext {ext!r} is not a {pipeline} translation file ({', '.join(extensions)})")
+        if ext in files:
+            raise ValueError(f"{where} lists {ext} twice")
+        files[ext] = {"ext": ext, "file": _file_name(item["file"], f"{at} file"),
+                      "sha256": _sha256(item["sha256"], f"{at} sha256")}
+    if missing := [ext for ext in required if ext not in files]:
+        raise ValueError(f"{where} {pipeline} override is missing: {', '.join(missing)}")
+    return {"key": key, "pipeline": pipeline, "revision": revision, "files": list(files.values())}
+
+
 def parse(text):
     """Return (input_sha256, patches) from manifest text, or raise ValueError."""
-    data = tomllib.loads(text)
+    try:
+        data = tomllib.loads(text)
+    except RecursionError:  # tomllib recurses once per nested array or inline table
+        raise ValueError("manifest is nested too deeply to parse") from None
     _keys(data, {"target", "patch"}, "manifest")
     _keys(data["target"], {"input_sha256"}, "[target]")
     target = _sha256(data["target"]["input_sha256"], "input_sha256")
@@ -73,6 +152,13 @@ def parse(text):
         if any(p["id"] == pid for p in patches):
             raise ValueError(f"duplicate patch id: {pid}")
         where = f"patch {pid}"
+        if kind == "shader":
+            patch = {"id": pid, "kind": kind, "why": _text(entry["why"], f"{where} why"),
+                     "remove_when": _text(entry["remove_when"], f"{where} remove_when"), **_shader(entry, where)}
+            if other := next((p["id"] for p in patches if p.get("key") == patch["key"]), None):
+                raise ValueError(f"patches {other} and {pid} override the same key {patch['key']}")
+            patches.append(patch)
+            continue
         rva = entry["rva"]
         if type(rva) is not int or not 0 <= rva < 1 << 32:
             raise ValueError(f"{where} rva must be an integer in [0, 2^32)")
@@ -105,6 +191,18 @@ def load(manifest_path, input_path):
     target, patches = parse(raw.decode("utf-8"))
     with open(input_path, "rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return _bound(raw, target, patches, digest)
+
+
+def load_data(manifest_path, data):
+    """load() for an input the caller has already read: data is hashed, so the bytes that pass the gate are
+    the bytes the caller goes on to use, even if the file on disk changes in between."""
+    raw = Path(manifest_path).read_bytes()
+    target, patches = parse(raw.decode("utf-8"))
+    return _bound(raw, target, patches, hashlib.sha256(data).hexdigest())
+
+
+def _bound(raw, target, patches, digest):
     if digest != target:
         raise ValueError(f"manifest is for another input: manifest input_sha256 {target}, input sha256 {digest}")
     return {"manifest_sha256": hashlib.sha256(raw).hexdigest(), "input_sha256": digest, "patches": patches}

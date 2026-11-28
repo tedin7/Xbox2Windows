@@ -27,7 +27,14 @@ ctest --preset dev --no-tests=error -j 1 -R '^native_compute_implicit_lod_' -V
 On an NVIDIA GeForce RTX 5080 (Windows 11, Release), the hardware fixture
 matches its CPU reference for 4-, 12-, 32- and 96-thread wave32 groups,
 64- and 128-thread wave64 groups, and the multidimensional (8,4,1) and
-(8,4,2) groups. Its other readbacks cover bias selecting mip 2, point depth
+(8,4,2) groups. The multidimensional fixture varies the texture coordinate
+only in the quad's vertical direction. Its derivative spans 0.75 texels
+for consecutive quads and three texels for spatial 2D quads. This keeps
+the expected sample below the first mip transition and leaves the wrong
+quad layout observable with the fixture's trilinear sampler.
+The compile controls check that implicit shaders emit flattened DXIL
+group dimensions and explicit-LOD shaders keep the requested dimensions.
+Its other readbacks cover bias selecting mip 2, point depth
 comparison at mip 1, both LOD query outputs, and the four taps of mip-zero
 Gather. Bias and Gather each use the same CPU reference for their implicit
 and explicit-LOD shaders. Inbox WARP reports the capability skip

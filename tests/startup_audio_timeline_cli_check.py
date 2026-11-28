@@ -239,9 +239,9 @@ class StartupAudioTimelineCliNegativeAndMutationTests(unittest.TestCase):
             valid_jsonl.write_bytes(_jsonl_bytes([{"action": "a", "qpc": 100.0}]))
             flags = ["--process-origin-qpc", "100", "--action", "a"]
 
-            nul_csv = root / "nul.csv"
+            nul_csv = root / "nul_byte.csv"
             nul_csv.write_bytes(b"process_s,frames,rms,peak,flags\n0.0,4800,\x000.1,0.2,0\n")
-            self._assert_exit_2([str(nul_csv), str(valid_jsonl), *flags], expected_fragment="nul.csv:2:")
+            self._assert_exit_2([str(nul_csv), str(valid_jsonl), *flags], expected_fragment="nul_byte.csv:2:")
 
             # Field larger than csv.field_size_limit() triggers real csv.Error in both in-process & subprocess.
             oversized_csv = root / "oversized.csv"

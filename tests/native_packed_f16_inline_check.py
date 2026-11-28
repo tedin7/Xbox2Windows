@@ -204,8 +204,8 @@ def refusal_programs():
         # Float inline constants refused on integer packed min/max
         (vop3p('min_u16', 4, (257, 242)) + [0xBF810000], 'unsupported packed 16-bit min/max source'),
         (vop3p('max_i16', 4, (240, 257)) + [0xBF810000], 'unsupported packed 16-bit min/max source'),
-        # Existing clamp refusal preserved on inline FMA
-        (vop3p('fma', 4, (257, 242, 128), clamp=1) + [0xBF810000], 'unsupported packed binary16 arithmetic encoding'),
+        # Unused third-source modifier refused on 2-source VOP3P add
+        (vop3p('add', 4, (257, 242), neg_lo=4) + [0xBF810000], 'unsupported packed binary16 arithmetic encoding'),
     ]
 
 

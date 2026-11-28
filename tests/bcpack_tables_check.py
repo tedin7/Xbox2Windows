@@ -43,9 +43,9 @@ class BCPackTablesCheck(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         content = HEADER.read_text(encoding="utf-8")
-        inl = ROOT / "src" / "startup_stubs" / "bcpack_tables_bcn.inl"
-        if inl.exists() and '#include "bcpack_tables_bcn.inl"' in content:
-            content = content.replace('#include "bcpack_tables_bcn.inl"', inl.read_text(encoding="utf-8"))
+        for name in ("bcpack_tables_bcn.inl", "bcpack_tables_extra.inl"):
+            inl = HEADER.parent / name
+            content = content.replace(f'#include "{name}"', inl.read_text(encoding="utf-8"))
         cls.text = strip_comments(content)
 
     def test_rans_model_tables(self):
@@ -96,22 +96,46 @@ class BCPackTablesCheck(unittest.TestCase):
                 for b in row:
                     self.assertIn(b, range(256))
 
-    def test_bc1_window_structure(self):
-        window = extract_array(self.text, "BC1_WINDOW")
-        self.assertEqual(len(window), 256)
-        for row in window:
-            self.assertEqual(len(row), 6)
-            for b in row:
-                self.assertIn(b, range(256))
+    def test_bc1_bc2_exact_tables_structure(self):
+        for fmt in (1, 2):
+            ranks = extract_array(self.text, f"BC{fmt}_POSITION_RANK")
+            self.assertEqual(len(ranks), 256)
+            self.assertEqual({tuple(row) for row in ranks},
+                             {(a, b, c, d) for a in range(4) for b in range(4)
+                              for c in range(4) for d in range(4)})
+            dictionary = extract_array(self.text, f"BC{fmt}_FULL_DICTIONARY")
+            self.assertEqual(len(dictionary), 255)
+            for row in dictionary:
+                if fmt == 2:
+                    alpha, ep, ix = row
+                    self.assertEqual(len(alpha), 16)
+                    self.assertTrue(all(v in range(16) for v in alpha))
+                else:
+                    ep, ix = row
+                self.assertEqual(len(ep), 6)
+                self.assertTrue(all(v in range(64 if i % 3 == 1 else 32)
+                                    for i, v in enumerate(ep)))
+                self.assertEqual(len(ix), 16)
+                self.assertTrue(all(v in range(4) for v in ix))
 
-    def test_bc1_quad_masks_structure(self):
-        quad_masks = extract_array(self.text, "BC1_QUAD_MASKS")
-        self.assertEqual(len(quad_masks), 4)
-        for row in quad_masks:
-            self.assertEqual(len(row), 256)
-            for mask in row:
-                self.assertGreaterEqual(mask, 0)
-                self.assertLessEqual(mask, 0xFFFFFFFF)
+    def test_bc6_tables_structure(self):
+        dictionary = extract_array(self.text, "BC6_DICTIONARY")
+        self.assertEqual(len(dictionary), 255)
+        for ep, ix in dictionary:
+            self.assertEqual(len(ep), 4)
+            for endpoint in ep:
+                self.assertEqual(len(endpoint), 3)
+                self.assertTrue(all(v in range(65536) for v in endpoint))
+            self.assertEqual(len(ix), 16)
+            self.assertTrue(all(v in range(65536) for v in ix))
+        wire = extract_array(self.text, "BC6_WIRE")
+        self.assertEqual(len(wire), 14)
+        for mode, row in enumerate(wire):
+            self.assertEqual(len(row), 82 if mode < 10 else 65)
+            for field, bit in row:
+                self.assertIn(field, range(14))
+                self.assertIn(bit, range(16))
+        self.assertEqual(len(extract_array(self.text, "BC6_ENDPOINT_BITS")), 15)
 
     def test_bc4_tables_structure(self):
         pairs = extract_array(self.text, "RANK_PAIR_BC4")
@@ -201,10 +225,6 @@ class BCPackTablesCheck(unittest.TestCase):
             ix = [0 if v is None else v for v in entry["ix"]]
             expected_dict.append([subsets, [ep[0:8], ep[8:16], ep[16:24]], [ix[0:16], ix[16:32]]])
         self.assertEqual(extract_array(self.text, "BC7_DICTIONARY"), expected_dict)
-
-        window_json = json.loads((REF_DATA / "bc1_window.json").read_text(encoding="utf-8"))["slots"]
-        expected_window = [[0] * 6 if e is None else e["value"] for e in window_json]
-        self.assertEqual(extract_array(self.text, "BC1_WINDOW"), expected_window)
 
         # BC4 checks
         bc4_json = json.loads((REF_DATA / "bc4.json").read_text(encoding="utf-8"))

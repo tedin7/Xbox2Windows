@@ -1,14 +1,20 @@
 # Packed 16-bit min/max in direct DXIL
 
 The native frontend lowers the six gfx1013 VOP3P forms
-`v_pk_min/max_{i16,u16,f16}`. Each source supplies one halfword to each
-result lane through `op_sel` and `op_sel_hi`. The instruction writes one
-packed word and uses the existing vector write predicate. It accepts
-numeric VGPRs and SGPRs, literal words and inline zero. It refuses
-noncanonical unused source fields, negation and clamp.
+`v_pk_min/max_{i16,u16,f16}` for both Compute and Pixel shaders. Each source
+supplies one halfword to each result lane through `op_sel` and `op_sel_hi`. The
+instruction writes one packed word and uses the existing vector write predicate.
+It accepts numeric VGPRs and SGPRs, literal words and inline zero. It refuses
+unused third-operand fields (`src2`, `op_sel[2]`, and third-operand
+`neg_lo[2]`/`neg_hi[2]`). On the integer variants (`v_pk_min/max_{i16,u16}`),
+`neg_lo`, `neg_hi` and `clamp` remain refused.
 
 Signed and unsigned integer lanes compare the selected 16-bit values.
-Binary16 lanes compare the bit patterns using the startup HLSL
+Binary16 lanes (`v_pk_min_f16`, `v_pk_max_f16`) support `neg_lo[1:0]`,
+`neg_hi[1:0]` and `clamp`: `neg_lo`/`neg_hi` flip the sign bit of the selected
+low/high binary16 input half per operand before comparison, and `clamp`
+saturates each resulting half to `[+0.0, 1.0]` with `NaN -> +0.0` after min/max
+selection. Binary16 lanes compare the bit patterns using the startup HLSL
 `minmax16_bits` contract. This preserves signed-zero ordering and
 subnormal encodings and prefers the numeric operand over a NaN. Two NaNs
 produce the repository's canonical quiet NaN, a payload convention that
@@ -37,8 +43,11 @@ ctest --preset dev --no-tests=error -j 1 -R '^native_packed_minmax_' -V
 ```
 
 The synthetic Compute replays compare 2,064 words per type, including the
-untouched words and guards. A sparse EXEC replay checks that inactive lanes
-keep their previous word. Swapping the low and high selector groups changes
-the binary16 readback. The Pixel fixture exports each resulting
-halfword as an exactly representable binary32 integer and checks both
-results. Compute replay requires shader model 6.6 and wave32.
+untouched words and guards, plus 9 packed modifier cases (`MOD_CASES` for
+`neg_lo`, `neg_hi`, and `clamp` across both `v_pk_min_f16` and `v_pk_max_f16`)
+when validating `f16`. A sparse EXEC replay checks that inactive lanes keep
+their previous word. Swapping the low and high selector groups changes the
+binary16 readback. The Pixel fixture exports each resulting halfword as an
+exactly representable binary32 integer and checks both results across 4 integer
+cases per integer type and 13 `f16` cases (4 base cases plus 9 modifier cases).
+Compute replay requires shader model 6.6 and wave32.

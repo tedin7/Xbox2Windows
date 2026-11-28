@@ -1,11 +1,13 @@
-"""v_add_f16, v_sub_f16, v_subrev_f16 and v_mul_f16 in the direct C++ compute path.
+"""Binary16 binary and unary ALU in the direct C++ compute path.
 
 Each source contributes its low 16 bits. abs clears bit 15 of that half, then neg toggles it.
 The operation runs in f32 and rounds to binary16 the way v_cvt_f16_f32 does. The result is the low
 16 bits and the destination's high half keeps its value (LLVM GCNSubtarget::zeroesHigh16BitsOfDest:
 "On gfx10, all 16-bit instructions preserve the high bits"). Every destination holds HI_A in its high
 half before the operation, so each stored word is HI_A | result. The reference is half_op in f16_packed_model.py (sub is an add of
-the negated second source, subrev swaps the sources). NaN payloads are compared by class.
+the negated second source, subrev swaps the sources). Exp2 matches exact bits.
+Rsq permits the other encoding only within 8 f32 ULP of a binary16 midpoint.
+For the other operations NaNs match by class.
 
   native_f16_alu_check.py model
       no dumper and no GPU: the case table, the f32 rounding cross-check, and the two mutants
@@ -23,6 +25,7 @@ import tempfile
 from pathlib import Path
 
 import f16_packed_model as M
+from f16_exp_midpoints import check_cpp_table, exp_f16_midpoints
 from native_compute_clear_check import write_request
 from native_direct_container_check import pack, words
 from native_scalar_lds_check import scalar, sop1, vmove
@@ -31,12 +34,15 @@ GROUPS = 2
 WORDS = 2064
 SENTINEL = 0x69696969  # native_store_replay fills untouched words with 0x69
 BASE = 8
-STRIDE = 128
-SHIFT = 9
+STRIDE = 512
+SHIFT = 11
 assert 4 * STRIDE == 1 << SHIFT
 
 OPS = ('add', 'sub', 'subrev', 'mul')
 OP_CODE = {'add': 0x32, 'sub': 0x33, 'subrev': 0x34, 'mul': 0x35}
+UNARY_CODE = {'rcp': 0x54, 'sqrt': 0x55, 'exp': 0x58, 'rsq': 0x56}
+UNARY_INPUTS = M.GRID + [0x8001, 0x0400, 0x3800, 0x4000, 0x4400, 0x3555,
+                         0x4bff, 0x4c00, 0x4c40, 0xce00, 0xce40, 0xce80]
 # Binary16 rounding of the nine inline float encodings, in encoding order.
 INLINE_F16 = {
     240: 0x3800, 241: 0xb800, 242: 0x3c00, 243: 0xbc00, 244: 0x4000,
@@ -68,6 +74,8 @@ def binary16(op, a, b):
         return M.half_op('add', a, b ^ 0x8000)
     if op == 'subrev':
         return M.half_op('add', b, a ^ 0x8000)
+    if op == 'exp' and a in exp_f16_midpoints():
+        return exp_f16_midpoints()[a]
     return M.half_op(op, a, b)
 
 
@@ -79,14 +87,6 @@ def modified(bits, abs_mask, neg, index):
     return bits & 0xffff
 
 
-def same_half(got, want):
-    """Bit equality of two stored words: the high half must be the kept HI_A, the low halves equal. Any NaN
-    matches any NaN."""
-    if got >> 16 != HI_A >> 16 or want >> 16 not in (0, HI_A >> 16):
-        return False
-    return same_binary16(got & 0xffff, want & 0xffff)
-
-
 def same_binary16(got, want):
     """Bit equality of two binary16 values (16 bits each). Any NaN matches any NaN."""
     if got >> 16 or want >> 16:
@@ -94,6 +94,20 @@ def same_binary16(got, want):
     if M.is_nan(got) or M.is_nan(want):
         return M.is_nan(got) and M.is_nan(want)
     return got == want
+
+
+def same_alu_result(got, want, op, alternate):
+    if op == 'exp':
+        return got == want
+    return same_binary16(got, want) or got == alternate
+
+
+def same_half(got, want, case=None):
+    """Check the preserved HI_A and compare the low half with the reference."""
+    if got >> 16 != HI_A >> 16 or want >> 16 not in (0, HI_A >> 16):
+        return False
+    return same_alu_result(got & 0xffff, want & 0xffff,
+                           case.op if case else None, case.alternate if case else None)
 
 
 def _u32(value):
@@ -130,9 +144,19 @@ def packed_half_rne(bits):
 
 
 def f32_half(op, a, b):
-    """f32 operation of two exact f16 values, then the integer binary16 round."""
+    """f32 operation on exact f16 inputs, then the integer binary16 round."""
     left, right = M.h2f(a), M.h2f(b)
-    value = {'add': left + right, 'sub': left - right, 'subrev': right - left, 'mul': left * right}[op]
+    if op in UNARY_CODE:
+        value = M.half_unary_value(op, left)
+    else:
+        value = {'add': left + right, 'sub': left - right, 'subrev': right - left, 'mul': left * right}[op]
+    if op == 'exp':
+        if M.is_nan(a):
+            return 0x7e00
+        if a == 0xce40:
+            return 0
+        if a in exp_f16_midpoints():
+            return exp_f16_midpoints()[a]
     bits = struct.unpack('<I', struct.pack('<f', value))[0]
     return packed_half_rne(bits)
 
@@ -141,8 +165,13 @@ def vop2(op, dst, src0, src1):
     return [(op << 25) | ((dst & 255) << 17) | ((src1 & 255) << 9) | (src0 & 511)]
 
 
-def vop3(op, dst, src0, src1, abs_mask=0, neg=0, clamp=0, omod=0, opsel=0):
-    word = (0xd4000000 | ((0x100 + op) << 16) | ((abs_mask & 7) << 8) | ((opsel & 15) << 11) |
+def vop1(op, dst, src0):
+    return [0x7e000000 | ((dst & 255) << 17) | (op << 9) | (src0 & 511)]
+
+
+def vop3(op, dst, src0, src1, abs_mask=0, neg=0, clamp=0, omod=0, opsel=0, unary=False):
+    base = 0x180 if unary else 0x100
+    word = (0xd4000000 | ((base + op) << 16) | ((abs_mask & 7) << 8) | ((opsel & 15) << 11) |
             ((clamp & 1) << 15) | (dst & 255))
     other = (src0 & 511) | ((src1 & 511) << 9) | ((omod & 3) << 27) | ((neg & 7) << 29)
     return [word, other]
@@ -174,10 +203,20 @@ class Case:
             a = (192 - 193) & 0xffff
         self.a = a & 0xffff
         self.b = b & 0xffff
-        self.want = binary16(op, modified(self.a, abs_mask, neg, 0), modified(self.b, abs_mask, neg, 1))
+        left = modified(self.a, abs_mask, neg, 0)
+        if op == 'rsq':
+            self.want, self.alternate = M.rsq_rounding(left)
+        else:
+            self.want = binary16(op, left, modified(self.b, abs_mask, neg, 1))
+            self.alternate = None
 
     def emit(self):
         a_word, b_word = HI_A | self.a, HI_B | self.b
+        if self.op in UNARY_CODE:
+            op = UNARY_CODE[self.op]
+            instruction = (vop3(op, 3, 257, 0, self.abs_mask, self.neg, unary=True)
+                           if self.kind == 'vop3' else vop1(op, 3, 257))
+            return mov(1, a_word) + mov(3, HI_A) + instruction
         op = OP_CODE[self.op]
         if self.kind == 'overlap':
             self.dest = 1
@@ -214,6 +253,18 @@ def all_cases():
     items.append(Case('add', 0x3c00, 0x4000, 'overlap'))
     items.append(Case('subrev', 0x3c00, 0x4000, 'overlap'))
     items.append(Case('add', 0x3c00, 0x4000, 'issue'))
+    for op in UNARY_CODE:
+        items.extend(Case(op, a, 0, kind) for kind in ('vop1', 'vop3') for a in UNARY_INPUTS)
+        items.append(Case(op, 0xc000, 0, 'vop3', abs_mask=1))
+        items.append(Case(op, 0x4000, 0, 'vop3', neg=1))
+    for kind in ('vop1', 'vop3'):
+        items.extend(Case('exp', a, 0, kind) for a in exp_f16_midpoints())
+        items.append(Case('rsq', 0x3bfe, 0, kind))
+    items += [
+        Case('exp', 0x91c5, 0, 'vop3', abs_mask=1),
+        Case('exp', 0x11c5, 0, 'vop3', neg=1),
+        Case('exp', 0x91c5, 0, 'vop3', neg=1),
+    ]
     assert len(items) < STRIDE
     return items
 
@@ -237,7 +288,7 @@ def program(items):
 
 
 def dpp_program():
-    assert STRIDE == 32 * len(DPP_CASES)
+    assert 32 * len(DPP_CASES) <= STRIDE  # 4 words per lane, inside one group
     code = preamble()
     code += [sop1(3, 126, 193)]  # the preamble leaves EXEC at lane 0; set up every lane
     code += vop2(0x1A, 8, 132, 0) + vop2(0x25, 8, 7, 8)  # 16 * lane + group byte base
@@ -268,6 +319,8 @@ def dpp_reference():
 
 
 def swapped_want(case):
+    if case.op in UNARY_CODE:
+        return case.want
     op = {'sub': 'subrev', 'subrev': 'sub'}.get(case.op, case.op)
     return binary16(op, modified(case.a, case.abs_mask, case.neg, 0), modified(case.b, case.abs_mask, case.neg, 1))
 
@@ -282,6 +335,7 @@ def reject_mutants(items):
 
 
 def check_model(items):
+    check_cpp_table()
     assert binary16('add', 0x3c00, 0x1000) == 0x3c00
     assert binary16('add', 0x3c01, 0x1000) == 0x3c02
     assert binary16('add', 0x7bff, 0x7bff) == 0x7c00
@@ -292,11 +346,29 @@ def check_model(items):
     assert binary16('sub', 0x4200, 0x3c00) == 0x4000
     assert binary16('subrev', 0x3c00, 0x4200) == 0x4000
     assert binary16('sub', 0x3c00, 0x4000) != binary16('subrev', 0x3c00, 0x4000)
+    assert M.half_op('rcp', 0x8000) == 0xfc00
+    assert M.half_op('rcp', 0xfc00) == 0x8000
+    assert M.half_op('sqrt', 0x8000) == 0x8000
+    assert M.half_op('sqrt', 0x4400) == 0x4000
+    assert M.is_nan(M.half_op('sqrt', 0xbc00))
+    assert M.half_op('exp', 0x8000) == 0x3c00
+    assert M.half_op('exp', 0x4c00) == 0x7c00  # 2**16 overflows binary16.
+    assert M.half_op('exp', 0xce00) == 0x0001  # 2**-24 is the least subnormal.
+    assert M.half_op('exp', 0xce40) == 0x0000  # 2**-25 ties to zero.
+    for source, rsq in ((0x0000, 0x7c00), (0x8000, 0xfc00), (0x7c00, 0x0000),
+                        (0x3c00, 0x3c00), (0x0001, 0x6c00), (0x4400, 0x3800)):
+        assert M.half_op('rsq', source) == rsq
+    for source in (0xbc00, 0x8001, 0xfc00, 0x7e01):
+        assert M.is_nan(M.half_op('rsq', source))
+    assert M.rsq_rounding(0x3bfe) == (0x3c01, 0x3c00)
+    assert M.rsq_rounding(0x3c00) == (0x3c00, None)
+    assert not same_alu_result(0x3c00, 0x3c01, 'exp', None)
+    assert not same_alu_result(0x7e01, 0x7e00, 'exp', None)
     for case in items:
         left = modified(case.a, case.abs_mask, case.neg, 0)
         right = modified(case.b, case.abs_mask, case.neg, 1)
         got = f32_half(case.op, left, right)
-        assert same_half(HI_A | got, case.want), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
+        assert same_half(HI_A | got, case.want, case), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
     wants = [case.want for case in items]
     assert 0x8000 in wants and 0x0000 in wants and 0x7c00 in wants and 0x3c00 in wants and 0x3c02 in wants
     assert any(M.is_nan(value) for value in wants)
@@ -320,8 +392,20 @@ def refusal_programs():
     programs.append(([0xb98005c1] + add + [0xbf810000], 'unsupported binary16 rounding or denormal mode'))
     programs.append(([0xbfa40001] + add + [0xbf810000], 'unsupported compute control instruction s_round_mode'))
     programs.append(([0xbfa5000c] + add + [0xbf810000], 'unsupported compute control instruction s_denorm_mode'))
-    programs.append((vop2(0x3c, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_pk_fmac_f16'))
     programs.append((vop2(0x3a, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_min_f16'))
+    for name, op in UNARY_CODE.items():
+        programs.append((vop1(op, 3, 250) + [0, 0xbf810000], 'unsupported v_%s_f16 DPP form' % name))
+        programs.append((vop3(op, 3, 257, 0, clamp=1, unary=True) + [0xbf810000],
+                         'unsupported v_%s_f16 clamp or omod' % name))
+        programs.append((vop3(op, 3, 257, 0, omod=1, unary=True) + [0xbf810000],
+                         'unsupported v_%s_f16 clamp or omod' % name))
+        programs.append((vop3(op, 3, 257, 0, opsel=1, unary=True) + [0xbf810000],
+                         'unsupported v_%s_f16 high-half op_sel' % name))
+        for mode in (0xbfa4000c, 0xbfa50000):
+            programs.append(([mode] + vop1(op, 3, 257) + [0xbf810000],
+                             'unsupported binary16 rounding or denormal mode'))
+    for instruction in (vop1(0x57, 3, 257), vop3(0x57, 3, 257, 0, unary=True)):
+        programs.append((instruction + [0xbf810000], 'direct DXIL lowering for v_log_f16'))
     return programs
 
 
@@ -384,8 +468,12 @@ def _f32(bits):
 
 
 def _fbin(op, left, right):
-    value = {'fadd': _f32(left) + _f32(right), 'fsub': _f32(left) - _f32(right),
-             'fmul': _f32(left) * _f32(right)}[op]
+    if op == 'fdiv':
+        assert left == 0x3f800000
+        value = M.half_unary_value('rcp', _f32(right))
+    else:
+        value = {'fadd': _f32(left) + _f32(right), 'fsub': _f32(left) - _f32(right),
+                 'fmul': _f32(left) * _f32(right)}[op]
     return struct.unpack('<I', struct.pack('<f', value))[0]
 
 
@@ -478,7 +566,7 @@ def _exec(line, values, memory, stores):
             raise AssertionError(rhs)
         values[name] = ('i32', bits)
         return
-    floated = re.fullmatch(r'(fadd|fsub|fmul) float (\S+), (\S+)', rhs)
+    floated = re.fullmatch(r'(fadd|fsub|fmul|fdiv) float (\S+), (\S+)', rhs)
     if floated:
         def bits_of(token):
             if token.startswith('%'):
@@ -520,6 +608,15 @@ def _exec(line, values, memory, stores):
             val = _f32(bits)
             clamped = 0.0 if (math.isnan(val) or val <= 0.0) else (1.0 if val >= 1.0 else val)
             values[name] = ('float', struct.unpack('<I', struct.pack('<f', clamped))[0])
+        elif 'unary.f32' in rhs:
+            call = re.fullmatch(r'call float @dx\.op\.unary\.f32\(i32 (21|24|25), float (%\w+)\)', rhs)
+            assert call, rhs
+            op = {'21': 'exp', '24': 'sqrt', '25': 'rsq'}[call.group(1)]
+            kind, bits = values[call.group(2)]
+            assert kind == 'float', rhs
+            # Exercise the guest sign fix even with a host Rsqrt that treats -0 as +0.
+            value = M.half_unary_value(op, 0.0 if op == 'rsq' and bits == 0x80000000 else _f32(bits))
+            values[name] = ('float', struct.unpack('<I', struct.pack('<f', value))[0])
         elif 'createHandleFromBinding' in rhs or 'annotateHandle' in rhs:
             values[name] = ('handle', 0)
         else:
@@ -591,11 +688,12 @@ def run_ir(dumper):
         text = run.stdout
         assert 'legacyF16ToF32' in text and 'legacyF32ToF16' not in text, 'rounding opcode'
         assert 'fadd float' in text and 'fsub float' in text and 'fmul float' in text
+        assert 'fdiv float' in text and all(f'@dx.op.unary.f32(i32 {op},' in text for op in (21, 24, 25))
         assert '939524096' in text, 'integer nearest-even rounding'
         stores = sorted(interpret(text))
         assert [addr for addr, _ in stores] == [4 * i for i in range(len(want))], stores[:4]
         bad = [(i, hex(got), hex(expected)) for i, ((_, got), expected) in enumerate(zip(stores, want))
-               if not same_half(got, expected)]
+               if not same_half(got, expected, items[i])]
         assert not bad, bad[:8]
         run = dump(dumper, work, dpp_program(), 'dpp')
         assert run.returncode == 0 and 'waveReadLaneAt.i32' in run.stdout, (run.stdout, run.stderr)
@@ -615,28 +713,29 @@ def group_offsets(count):
 
 
 def run_gpu(gpu, sdk):
-    code, want = program(all_cases())
+    items = all_cases()
+    code, want = program(items)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         src, root = work / 'root.hlsl', work / 'root.bin'
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([str(Path(sdk) / 'dxc.exe'), '-T', 'rootsig_1_1', '-E', 'SIG', '-Fo', root, src], check=True)
         sa = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, 0x80 | (5 << 1))
-        for name, instructions, reference in (('alu', code, want), ('dpp', dpp_program(), dpp_reference())):
+        for name, instructions, reference, cases in (('alu', code, want, items),
+                                                     ('dpp', dpp_program(), dpp_reference(), None)):
             marker = write_request(work, instructions, root.read_bytes(), sa)
             dest = work / (name + '-readback.bin')
             run = subprocess.run([gpu, sdk, str(marker), str(work / 'cache'), '0', str(dest), '--direct'])
             if run.returncode == 77:
                 sys.exit(77)
             run.check_returncode()
-            results = {slot: value for offsets in group_offsets(len(reference))
-                       for slot, value in zip(offsets, reference)}
+            results = {slot: (value, cases[n] if cases else None) for offsets in group_offsets(len(reference))
+                       for n, (slot, value) in enumerate(zip(offsets, reference))}
             actual = struct.unpack('<2064I', dest.read_bytes())
             bad = []
             for index, got in enumerate(actual):
-                model = results.get(index, SENTINEL)
-                # Compare NaNs by class, keep the destination high half, and check the guard words.
-                ok = same_half(got, model) if index in results else got == model
+                model, case = results.get(index, (SENTINEL, None))
+                ok = same_half(got, model, case) if index in results else got == model
                 if not ok:
                     bad.append((index, hex(got), hex(model)))
             assert not bad, (name, bad[:10])

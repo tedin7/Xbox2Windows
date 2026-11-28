@@ -92,6 +92,7 @@ static const char* mnemonic(Encoding enc, unsigned op) {
         case 0x25: return "v_exp_f32";
         case 0x27: return "v_log_f32";
         case 0x2a: return "v_rcp_f32";
+        case 0x2b: return "v_rcp_iflag_f32";
         case 0x33: return "v_sqrt_f32";
         case 0x35: return "v_sin_f32";
         default: break;

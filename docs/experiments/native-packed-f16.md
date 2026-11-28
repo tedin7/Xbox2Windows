@@ -2,9 +2,11 @@
 
 The direct compiler lowers the VOP3P `v_pk_add_f16`, `v_pk_mul_f16`, and
 `v_pk_fma_f16` instructions. Each result half has independent source-half
-selectors and input negation. The packed word uses the normal EXEC-masked
-destination write. The lowering accepts numeric registers, literal words, and
-inline zero.
+selectors, input negation, and optional VOP3P `clamp` (`[+0.0, 1.0]`
+saturation per half after rounding, mapping `-0.0` and `NaN` to `+0.0`). The
+packed word uses the normal EXEC-masked destination write. The lowering accepts
+numeric registers, literal words, inline integers, and inline binary16 float
+constants.
 
 ADD and MUL widen the inputs, use binary32 arithmetic, then round to binary16
 with the existing integer nearest-even conversion. FMA forms the exact 22-bit
@@ -16,10 +18,17 @@ binary16 midpoint the exact sum fell on. The final nearest-even conversion
 therefore agrees with a single binary16 rounding.
 
 The supported MODE preserves subnormals, rounds to nearest even, and leaves
-`FP16_OVFL` clear. Clamp, unsupported source encodings, and undetermined or
-unsupported MODE keep explicit refusals. NaN results use the canonical
-`0x7e00` half from the project's arithmetic reference. NaN payload behavior
-has not been measured on an RDNA2 device.
+`FP16_OVFL` clear. Unused third-operand modifier fields on `add`/`mul`,
+unsupported source encodings, and undetermined or unsupported MODE keep
+explicit refusals. NaN results without `clamp` use the canonical `0x7e00` half
+from the project's arithmetic reference. NaN payload behavior has not been
+measured on an RDNA2 device.
+
+In addition to [native_packed_f16_check.py](../../tests/native_packed_f16_check.py),
+[native_packed_f16_clamp_check.py](../../tests/native_packed_f16_clamp_check.py)
+verifies VOP3P `clamp` across `v_pk_add_f16`, `v_pk_mul_f16`, and
+`v_pk_fma_f16` in IR, DXIL controls, and lossless Pixel readbacks (WARP and
+hardware), plus Compute replay where SM 6.6 wave32 is supported.
 
 ## Reproduction
 

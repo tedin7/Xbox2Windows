@@ -116,6 +116,14 @@ SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"native compute \+0x[0-9a-fA-F]+: unbound numeric SGPR\b"), "unbound numeric SGPR"),
     (re.compile(r"(?:unknown gfx1013 instruction format|truncated or misaligned gfx1013 instruction|"
                 r"reserved FLAT segment) at byte \d+\Z"), "undecodable word"),
+    # The fixed reasons of format_compute_runtime_manifest (src/direct_compute_cache.cpp); kind names are enum names.
+    (re.compile(r"unsupported startup runtime manifest bindings: ("
+                r"(?:SRV|UAV) kind [a-z0-9_]{1,32}(?: [a-z0-9-]{1,20})?(?: array)?|"
+                r"(?:SRV|UAV) registers not contiguous|group size has a zero dimension|"
+                r"root constants above root parameter 15|view above root parameter 15|"
+                r"more than (?:8 root constants in one root parameter|32 user data words|32 SRVs|8 UAVs)|"
+                r"resource heap view|sampler heap|comparison sampler|"
+                r"stride words from a view that is not one raw vector SRV)\Z"), r"runtime manifest: \1"),
     (re.compile(r"graphics request key mismatch\b"), "graphics request key mismatch"),
     (re.compile(r"compute request key mismatch\b"), "compute request key mismatch"),
     (re.compile(r"stale pixel input description\b"), "stale pixel input description"),

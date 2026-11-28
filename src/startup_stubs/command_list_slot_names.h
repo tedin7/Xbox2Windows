@@ -2,25 +2,24 @@
 // `x2w-noop` log so a line reads "CommandList::slot14(Dispatch)" instead of "CommandList::slot14".
 // Plain standard C++ with no Windows types, so the table can be compiled and tested on its own.
 //
-// What is claimed, and why:
-// - Slots 0 to 9 and 12 to 25 follow the public desktop ID3D12GraphicsCommandList order. The
-//   implemented slots agree with it at both ends of every run: 7 (GetDevice), 9 (Close), 12 and 13
-//   (the draws), 20 to 23 (topology, viewports, scissors, blend factor) and 25 (pipeline state), so
-//   the slots between them (0 to 6, 8, 14 to 19, 24) take the desktop names.
-// - Slots 10 and 11 are not named. The desktop order puts Reset and ClearState there, but this
-//   console list resets through slot 139, so the desktop order is not known to hold at 10 and 11.
-// - Slot 26 accepts the UAV form of ResourceBarrier. Slots 27 to 31 are not named here. The slots
-//   that follow are the desktop ones moved up by four
-//   (32 is SetDescriptorHeaps, desktop 28), so four console methods sit somewhere in 26 to 31.
-//   As a hypothesis, d3d12_xs_device.cpp binds 28, 29 and 30 as BeginQuery, EndQuery and
-//   ResolveQueryData, only with the diagnostic X2W_D3D12_QUERY_SLOTS=1. No fixture here establishes
-//   which console methods sit there.
-// - Slots 32 to 59 are named as the desktop slots 28 to 55 plus four. Implemented and checked
-//   against the desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52. Past 52 the rule is not
-//   checked: ExecuteIndirect (desktop 59) is at 61, desktop plus two, so the run of four has ended
-//   by then. The 56 to 58 names below are kept as the rule gives them.
-// - Slots 61 (ExecuteIndirect) and 139 (Reset) are implemented in d3d12_xs_device.cpp.
-// - Other slots have no confirmed meaning.
+// The 0 to 61, 139 and 148 rows were checked against the GXDK 261000
+// ID3D12GraphicsCommandList8 function table through a local oracle outside the repository. The
+// header itself is not copied into this repository; only the public desktop method names and the
+// slot numbers are recorded.
+// - Slots 0 to 8 are IUnknown, ID3D12Object and ID3D12DeviceChild.
+// - 9 Close, 10 Reset and 11 ClearState.
+// - 12 to 27 follow the desktop ID3D12GraphicsCommandList order through ExecuteBundle.
+// - 28 to 31 are BeginQuery, EndQuery, ResolveQueryData and SetPredication. They sit before the
+//   desktop SetDescriptorHeaps rather than after DiscardResource.
+// - 32 to 55 are the desktop slots 28 to 51 plus four: SetDescriptorHeaps through DiscardResource.
+// - 56 to 58 are the unshifted desktop SetMarker, BeginEvent and EndEvent.
+// - 59 and 60 are console-only marker methods and stay unnamed in this repository.
+// - 61 is ExecuteIndirect (desktop 59, plus two).
+// - 139 is the console reset path the title calls. The base Reset is at 10; the log calls the
+//   console path "Reset (console)" so both rows have distinct names.
+// - 62 to 138 and 140 and above are console-only methods. They stay unnamed because their names
+//   and signatures are not needed by the current log. Slot 148 is the allocation path used by
+//   list_allocate_upload; it stays unnamed here for the same reason.
 #pragma once
 
 #include <cstddef>
@@ -48,7 +47,9 @@ static_assert(desktop_method_count == 51, "ID3D12GraphicsCommandList has 51 meth
 inline constexpr int console_shift = 4;  // console slot = desktop slot + 4, from SetDescriptorHeaps on
 inline constexpr int resource_barrier_slot = 26;
 inline constexpr int first_shifted_slot = 32;
-inline constexpr int last_shifted_slot = 59;
+inline constexpr int last_shifted_slot = 55;
+inline constexpr int first_desktop_marker_slot = 56;
+inline constexpr int last_desktop_marker_slot = 58;
 inline constexpr int execute_indirect_slot = 61;
 inline constexpr int reset_slot = 139;
 
@@ -58,11 +59,14 @@ inline const char* name(int slot) noexcept
     const auto desktop = [](int index) { return desktop_names[index - first_desktop_method]; };
     static constexpr const char* iunknown[] = {"QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData",
                                                 "SetPrivateDataInterface", "SetName", "GetDevice", "GetType"};
+    static constexpr const char* query[] = {"BeginQuery", "EndQuery", "ResolveQueryData", "SetPredication"};
     if (slot >= 0 && slot < first_desktop_method) return iunknown[slot];
-    if (slot == first_desktop_method || (slot >= 12 && slot <= resource_barrier_slot)) return desktop(slot);
+    if (slot >= first_desktop_method && slot <= 27) return desktop(slot);
+    if (slot >= 28 && slot <= 31) return query[slot - 28];
     if (slot >= first_shifted_slot && slot <= last_shifted_slot) return desktop(slot - console_shift);
+    if (slot >= first_desktop_marker_slot && slot <= last_desktop_marker_slot) return desktop(slot);
     if (slot == execute_indirect_slot) return "ExecuteIndirect";
-    if (slot == reset_slot) return "Reset";
+    if (slot == reset_slot) return "Reset (console)";
     return nullptr;
 }
 

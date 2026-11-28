@@ -33,3 +33,28 @@ and a sparse EXEC mask. A third dispatch drops all clamp bits and verifies
 that the affected words change to the wrapping results. Each dispatch
 compares 2,048 words and 16 guards. The native replay requires shader model
 6.6 and wave32.
+
+## VOP2 dot-accumulate
+
+The frontend also translates the VOP2 form `v_dot4c_i32_i8`. It is the signed
+byte dot, with the destination register as its accumulator:
+`D = dot4(S0, S1) + D`, wrapping modulo 2^32. It uses `Dot4AddI8Packed`, the
+same as `v_dot4_i32_i8`. S0 may be a VGPR, an SGPR, an inline constant or a
+literal; S1 is a VGPR.
+
+Only the plain 32-bit VOP2 encoding is accepted. The VOP3 form and any abs,
+neg, clamp or output modifier are refused with "unsupported packed byte
+dot-accumulate operand modifiers". DPP16 is refused with "unsupported DPP
+arithmetic", and SDWA with "unimplemented direct SDWA operand profile".
+
+```powershell
+cmake --build --preset dev --target compile_dxil native_store_replay
+ctest --preset dev --no-tests=error -R '^native_dot4c_(ir|hardware)$' -V
+```
+
+`native_dot4c_ir` checks the DXIL for literal, SGPR, inline and VGPR sources,
+and the DPP16 and SDWA refusals. `native_dot4c_hardware` dispatches two 32-lane
+groups for each case and compares every output word against expected values.
+The cases include accumulators that cross the signed 32-bit boundary in both
+directions and a sparse EXEC mask,
+under which inactive lanes keep their old destination value.

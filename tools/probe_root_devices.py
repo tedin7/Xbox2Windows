@@ -32,8 +32,13 @@ def main(argv=None):
         backends.append("hardware")
     result = {"windows": sys.getwindowsversion().build, "controls": {}, "images": {}}
     try:
+        if not args.bin.is_dir():
+            raise NotADirectoryError(f"--bin path is not a directory: {args.bin}")
         for name in ("compute_root", "compute_tables"):
-            rows = measure(command, (args.bin / (name + ".cso")).read_bytes())
+            control_path = args.bin / (name + ".cso")
+            if not control_path.is_file():
+                raise FileNotFoundError(f"Control shader is missing or not a file: {control_path}")
+            rows = measure(command, control_path.read_bytes())
             if (len(rows) != 1 or not isinstance(rows[0], dict)
                     or rows[0].get("cleared") != 0 or rows[0].get("remaining_flags") != 0
                     or any(rows[0].get(key) != "0x00000000" for key in ["serialize", *backends])):
@@ -45,7 +50,16 @@ def main(argv=None):
         dest = PROJECT / "out/calls" / ("root-devices-warp.json" if args.warp_only else "root-devices.json")
         if dest.resolve().is_relative_to(args.build.resolve()):
             parser.error("Choose an input directory separate from the report directory")
-        inventory = json.loads((dest.parent / "six-apis.json").read_bytes())
+        if not args.build.is_dir():
+            raise NotADirectoryError(f"Build directory is not a directory: {args.build}")
+        if dest.parent.is_file():
+            raise NotADirectoryError(f"Output parent is not a directory: {dest.parent}")
+        if dest.is_dir():
+            raise IsADirectoryError(f"Output path is a directory: {dest}")
+        inventory_path = dest.parent / "six-apis.json"
+        if not inventory_path.is_file():
+            raise FileNotFoundError(f"Inventory file is missing or not a file: {inventory_path}")
+        inventory = json.loads(inventory_path.read_bytes())
         if not isinstance(inventory, dict):
             raise ValueError("Invalid six-apis.json inventory")
         for name in NAMES:
@@ -58,7 +72,10 @@ def main(argv=None):
                 container_specs = [(int(item["rva"], 16), item["bytes"], item["rva"]) for item in containers]
             except (KeyError, TypeError) as exc:
                 raise ValueError(f"Invalid six-apis.json entry for {name}: {exc}") from exc
-            image = (args.build / name).read_bytes()
+            image_path = args.build / name
+            if not image_path.is_file():
+                raise FileNotFoundError(f"Build image is missing or not a file: {image_path}")
+            image = image_path.read_bytes()
             if hashlib.sha256(image).hexdigest() != expected_sha256:
                 raise ValueError(f"Regenerate six-apis.json for {name}")
             layouts = {}

@@ -67,3 +67,32 @@ No key had `an output view token is not a buffer UAV of a desktop resource` as i
 the 12 translated keys, and the first refused dispatch of each of the other 11, named a buffer unordered access view
 of a desktop resource. That run made 2,453,727 compute dispatches, so dispatch counts compare only within one run.
 Whether the 12 translated keys write the right values was not checked.
+
+## Published half-width buffer stores
+
+A native slot 67 request with a `half_buffer_uav` now publishes
+`uav <register> bufhalf table <parameter> <byte> bytes <stride>`. The
+stride selects a typed buffer view of `R16_FLOAT`, `R16G16_FLOAT` or
+`R16G16B16A16_FLOAT` for 2, 4 or 8 bytes respectively. The runtime
+requires the matching gfx10 buffer format, identity selects over the
+written components and structured out-of-bounds mode. It binds the
+descriptor's record count and element-aligned offset into an aliased
+placed buffer after checking typed-store support. The typed range can
+end on a halfword. Raw outputs keep their dword and 16-byte alignment
+checks. Buffer UAV tokens are tracked in #2961.
+
+The source-built check compiles a D16 store for each width with
+`compile_dxil --requests`, then runs the published translation through
+slot 14. Each dispatch attempts more stores than the view has records.
+The reference checks 13 records at a nonzero view offset, plus the
+full prefix and suffix. Invalid formats, selectors, strides, swizzle,
+out-of-bounds mode and ranges are refused before a dispatch is recorded.
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_compute_half_buffer_uav_' -V
+```
+
+The descriptor checks follow the buffer resource format in the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+The matching desktop view uses `FirstElement` and `NumElements` from
+the [D3D12 buffer UAV contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_buffer_uav).

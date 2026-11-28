@@ -545,6 +545,7 @@ def controls():
         refused(name, 'image_sample_b modifier reserved')
     refused('sampler bias', 'image_sample_b with a sampler LOD bias (word 2 0x4000001)')
     refused('sampler bias sec', 'image_sample_b with a sampler LOD bias (word 2 0x4004000)')
+    print('cube: TextureCube SampleBias with x2w_cube_dir')
     print('refused: b_cl, c_b, offset, gather4_b, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
           'reserved bits, sampler LOD bias')
 

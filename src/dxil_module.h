@@ -224,7 +224,13 @@ class DxilModule {
         // AMD's DXIL compiler (amdxc64.dll) dereferences Module::getNamedMetadata("llvm.ident") without a null check.
         const auto ident = node("!\"x2w\""), version = node("i32 1, i32 6"),
                    model = node("!\"" + stage + "\", i32 6, i32 6");
-        const unsigned flags = features | (uses_wave ? 524288 : 0);
+        // 0x8000: more than 8 UAV slots. DXC sums the declared UAV range sizes; the validator
+        // refuses a module whose flags do not match.
+        unsigned uav_slots = 0;
+        for (const auto &r : resources)
+            if (r.cls == 1)
+                uav_slots += (std::min)(r.count, 9u);
+        const unsigned flags = features | (uses_wave ? 524288 : 0) | (uav_slots > 8 ? 0x8000 : 0);
         Text properties = "null", signature = "null", view_state;
         if (stage == "cs") {
             const auto size =

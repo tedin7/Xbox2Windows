@@ -1107,6 +1107,9 @@ def expected(name):
         for i in range(16):
             out[i] = input_word(i // 8)
         return out
+    if name == 'O-loop-subset':
+        out[:8] = [9, 1, 2, 9, 9, 9, 9, 9]
+        return out
     if name == 'O-dword':
         for group in range(4):
             out[2 + group] = KEY ^ group
@@ -1276,6 +1279,8 @@ for field, offset_bytes in (('offset0', '1f00'), ('offset1', '001f')):
     words = patch(WORDS_G, '100034d804050000', '000034d804050000')
     words = patch(words, '0524dcd806000006', offset_bytes + 'dcd806000006')
     CASES[f'G-{field}-only'] = (source, words, *CASES['G'][2:])
+CASES['O-loop-subset'] = (LOOP_BREAK_SOURCE.replace('s_cbranch_scc0 6\n', 's_nop 0\n', 1),
+                          patch(LOOP_BREAK_WORDS, '060084bf', '000080bf'), USER7 | TGID_X | tidig(1), (8, 1, 1), (1, 1, 1))
 
 
 MBCNT_REFUSALS = (
@@ -1415,6 +1420,130 @@ def check_execz_exit_run():
     with mock_patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
         G.ComputePipeline(code, root_blob(), CASES['O'][2], (8, 1, 1), refusals=refusals)
     assert any(reason in text for text, _ in refusals), refusals
+
+
+def check_execz_mask_subset():
+    """Pre-branch EXEC subset tracking (#2645 T1): sM <= EXEC carried into an execz block lets remasks preserve skipped bits."""
+    # With the early exit branch replaced by s_nop, the counted loop still exercises s_mov_b32 exec_lo, s22 before
+    # s_cbranch_execz and s_andn2_b32 + s_mov_b32 exec_lo, s22 inside the skipped block.
+    def trace_loop(lanes, narrow_before=False):
+        outer = {lane for lane in lanes}
+        if narrow_before:
+            # Saving s22 before narrowing EXEC makes s22 a superset of EXEC at s_cbranch_execz, not a subset.
+            saved = set(outer)
+            exec_mask = {lane for lane in outer if lane < 1}
+        else:
+            saved = {lane for lane in outer if lane < 3}
+            exec_mask = set(saved)
+        values = dict.fromkeys(lanes, 9)
+        for counter in range(1, 4):
+            if exec_mask:
+                breaking = {lane for lane in exec_mask if counter > lane}
+                saved -= breaking
+                exec_mask = set(saved)  # s_mov_b32 exec_lo, saved
+                values.update(dict.fromkeys(exec_mask, counter))
+            exec_mask = set(saved)
+        return values
+
+    lanes = range(8)
+    wave = trace_loop(lanes)
+    singles = [trace_loop([lane]) for lane in lanes]
+    assert list(wave.values()) == [s[lane] for lane, s in enumerate(singles)] == [9, 1, 2, 9, 9, 9, 9, 9]
+    # Near-miss wave-vs-singleton disagreement when the saved mask holds skipped lanes: lane 1 skips the block in the
+    # singleton model (9) while the wave enters via lane 0 and re-enables lane 1 through the stale saved mask (1).
+    bad_wave = trace_loop(lanes, narrow_before=True)
+    bad_singles = [trace_loop([lane], narrow_before=True) for lane in lanes]
+    assert bad_wave[1] == 1 and bad_singles[1][1] == 9
+
+    hlsl = translate('O-loop-subset').hlsl_cs()
+    assert 'exec = (s22) & 1;\n        if (exec & 1) v5 = s24;' in hlsl, hlsl
+    # LOOP_BREAK_WORDS drops the T1 exec write refusal while keeping T2 (loop exit crosses a backward s_cbranch_scc0).
+    st = object.__new__(G.Stage)
+    st.kind = 'cs'
+    st.ins = G.decode(LOOP_BREAK_WORDS)
+    st.calculated_pc = {}
+    assert st.execz_refusals() == {
+        0x30: 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
+    }
+
+    # Build straight-line execz checks from llvm-mc-15 verified instructions in SPLICE / LOOP_BREAK_WORDS.
+    W = dict(SPLICE)
+    W.update({
+        's_nop 0': '000080bf',
+        's_and_b32 s22, exec_lo, vcc_lo': '7e6a1687',
+        's_mov_b32 s23, s22': '160397be',
+        's_mov_b32 s24, 1': '810398be',
+        'v_cmpx_gt_u32 s24, v0': '1800a87d',
+        's_andn2_b32 s22, s22, exec_lo': '167e168a',
+        's_andn2_b32 s23, s23, exec_lo': '177e178a',
+        's_mov_b32 exec_lo, s22': '1603febe',
+        's_mov_b32 exec_lo, s23': '1703febe',
+        'v_mov_b32 v5, s24': '18020a7e',
+        's_and_b32 exec_lo, exec_lo, vcc_lo': '7e6a7e87',
+        's_mov_b32 s23, 0': '800397be',
+        's_mov_b32 vcc_lo, -1': 'c103eabe',
+    })
+    end = bytes.fromhex('000081bf')
+    def seq(*lines):
+        return WORDS_A[:STORE_A] + b''.join(bytes.fromhex(W[line]) for line in lines) + end
+
+    # Accepted pre-branch subset setup without re-assigning EXEC directly before s_cbranch_execz.
+    pre_and_copy = seq(
+        's_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 3, v0',
+        's_and_b32 s22, exec_lo, vcc_lo', 's_mov_b32 s23, s22', 's_mov_b32 s24, 1',
+        's_cbranch_execz 4', 'v_cmpx_gt_u32 s24, v0', 's_andn2_b32 s23, s23, exec_lo',
+        's_mov_b32 exec_lo, s23', 'v_mov_b32 v5, s24', 's_mov_b32 exec_lo, s21',
+        'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    assert 'exec = (s23) & 1;' in translate('A', code=pre_and_copy).hlsl_cs()
+    pre_mov = seq(
+        's_mov_b32 s21, exec_lo', 's_cbranch_execz 3', 's_mov_b32 exec_lo, s21',
+        'v_mov_b32 v5, s24', 's_nop 0', 's_mov_b32 exec_lo, s21',
+        'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    assert 'exec = (s21) & 1;' in translate('A', code=pre_mov).hlsl_cs()
+
+    # Near-miss controls: each violates subset provenance and must stay refused as an exec write.
+    narrowed_saveexec = seq(
+        's_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_saveexec_b32 s0, vcc_lo',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, s21', 'v_mov_b32 v5, s24', 's_nop 0',
+        's_or_b32 exec_lo, exec_lo, s0', 'buffer_store_dword v5, v4, s[16:19], 0 offen',
+    )
+    narrowed_cmpx = seq(
+        's_mov_b32 s24, 1', 's_mov_b32 s21, exec_lo', 'v_cmpx_gt_u32 s24, v0',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, s21', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    overwritten_before = seq(
+        's_mov_b32 s21, exec_lo', 's_mov_b32 exec_lo, vcc_lo', 's_mov_b32 vcc_lo, -1',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    overwritten_inside = seq(
+        's_mov_b32 s21, exec_lo', 's_mov_b32 exec_lo, vcc_lo',
+        's_cbranch_execz 3', 's_mov_b32 vcc_lo, -1', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    join_one_arm = seq(
+        's_mov_b32 s21, exec_lo', 's_cbranch_scc1 2', 's_mov_b32 exec_lo, vcc_lo', 's_branch 2',
+        's_mov_b32 vcc_lo, -1', 's_nop 0',
+        's_cbranch_execz 3', 's_mov_b32 exec_lo, vcc_lo', 's_nop 0', 's_nop 0',
+        's_mov_b32 exec_lo, s21',
+    )
+    for near_miss in (narrowed_saveexec, narrowed_cmpx, overwritten_before, overwritten_inside, join_one_arm):
+        refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write',
+                lambda code=near_miss: translate('A', code=code).hlsl_cs())
+
+    # Unit checks for 64-bit moves and non-narrowing/invalidating steps in subset_after().
+    assert G.subset_after('s_mov_b64', 's_mov_b64 exec, s[22:23]', {'exec', 'exec_hi', 'scc'}, G.EXEC_SUBSET) == (
+        G.EXEC_SUBSET | {('s22', 0), ('s23', 1)})
+    both = G.subset_after('s_mov_b64', 's_mov_b64 s[22:23], exec', {'s22', 's23', 'scc'}, G.EXEC_SUBSET)
+    assert both == (G.EXEC_SUBSET | {('s22', 0), ('s23', 1)}), both
+    assert G.subset_after('v_cmpx_gt_u32_e32', 'v_cmpx_gt_u32_e32 s24, v0', G.EXEC_KEYS, both) == G.EXEC_SUBSET
+    assert G.subset_after('s_movreld_b32', 's_movreld_b32 s0, s1', {'m0'}, both) == G.EXEC_SUBSET
+    assert G.subset_after('s_or_saveexec_b32', 's_or_saveexec_b32 s21, vcc_lo',
+                          {'s21', 'exec', 'exec_hi', 'scc'}, {('exec', 0), ('exec_hi', 1), ('s22', 0)}) == (
+        {('exec', 0), ('exec_hi', 1), ('s21', 0), ('s22', 0)})
 
 
 def check_mbcnt():
@@ -2058,6 +2187,7 @@ def check_controls():
     check_mbcnt()
     check_execz_exit_run()
     check_execz_loop_break()
+    check_execz_mask_subset()
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
@@ -2722,6 +2852,8 @@ CONTROLS = {
     'm-else-unswitched': ('M', 'exec = (s0 & ~exec) & 1;', 'exec = (s0) & 1;'),  # the then lanes run the else arm
     'n-unmasked': ('NM', 's23 = (vcc & exec) & 1;', 's23 = (vcc) & 1;'),  # lanes 6 and 7 store with their stale vcc
     'o-mask-kept': ('O', 's0 = (s0 & ~exec) & 1;', 's0 = (s0) & 1;'),  # lanes 0-2 keep their bit and store
+    'o-subset-remask-dropped': ('O-loop-subset', 'exec = (s22) & 1;\n        if (exec & 1) v5 = s24;',
+                                'exec = 1u;\n        if (exec & 1) v5 = s24;'),  # broken lanes overwrite v5
     'k-block-entered': ('K', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipped waves run it
     'p-dropped-andn2': ('P', 's23 = (s23 & ~exec) & 1;', 's23 = (s23) & 1;'),  # an entering lane keeps its old bit
     'p-dropped-or': ('P', 's23 = (s23 | s22) & 1;', 's23 = (s23) & 1;'),  # an entering lane loses its compare bit

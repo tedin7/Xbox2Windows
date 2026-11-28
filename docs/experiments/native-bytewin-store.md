@@ -11,6 +11,7 @@ The compiler proves that all three edits originate from the descriptor
 selected by word 0. The OR works on a loaded word 3 or one whose selector
 has already been cleared. The original table slot supplies the raw UAV.
 The host UAV's extent determines which writes are in range.
+Direct compute raw stores accept and ignore the GLC, DLC and SLC cache-policy bits.
 Non-indexed dword atomics reuse the raw store UAV window, and the wave32 fixture checks add with and without GLC, unsigned min, compare-and-swap, and indexed and 64-bit refusals.
 
 ## Verification

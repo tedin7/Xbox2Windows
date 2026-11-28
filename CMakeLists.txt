@@ -1204,6 +1204,15 @@ target_compile_features(startup_chad_check PRIVATE cxx_std_17)
 add_dependencies(startup_chad_check startup_stub_chad)
 add_test(NAME startup_chad_check COMMAND startup_chad_check "$<TARGET_FILE:startup_stub_chad>")
 set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
+# Activity counter of the AcpHal and XApu stand-ins (X2W_AUDIO_ACTIVITY=1): exact counts, a zero-write control, the
+# same results with the counter on and off, and a caller that unloads both DLLs and must exit cleanly
+# (docs/startup-runtime.md).
+add_executable(startup_acphal_xma_activity tests/startup_acphal_xma_activity.cpp)
+target_compile_features(startup_acphal_xma_activity PRIVATE cxx_std_17)
+add_dependencies(startup_acphal_xma_activity startup_stub_acphal startup_stub_xapu)
+add_test(NAME startup_acphal_xma_activity COMMAND startup_acphal_xma_activity "$<TARGET_FILE:startup_stub_acphal>"
+    "$<TARGET_FILE:startup_stub_xapu>")
+set_tests_properties(startup_acphal_xma_activity PROPERTIES TIMEOUT 60)
 
 # BMP writer of the draw dumps (src/startup_stubs/draw_bmp.h); the mutated runs are negative controls.
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
@@ -1442,6 +1451,10 @@ target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 # The DLL the probe calls for the debugger's call-hook case (--trace-calls).
 add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
 add_dependencies(startup_debug_probe startup_debug_calls)
+# Input for the launcher's --map-drive check (tests/startup_map_drive_check.py): the consumer opens its
+# package through a mapped letter, and the launcher rewrites that open.
+add_executable(startup_map_drive_consumer tests/startup_map_drive_consumer.cpp)
+target_compile_features(startup_map_drive_consumer PRIVATE cxx_std_17)
 # A visible window that changes its picture at a known time: input for the --capture-every check (tests/startup_debug_window_check.py).
 add_executable(startup_window_probe tests/startup_window_probe.cpp)
 target_compile_features(startup_window_probe PRIVATE cxx_std_17)
@@ -3059,6 +3072,8 @@ set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TR
 set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME startup_local_log_precheck_off COMMAND startup_local_log_check --phase precheck-off)
 set_tests_properties(startup_local_log_precheck_off PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
+add_test(NAME startup_local_log_precheck_off_debugger COMMAND startup_local_log_check --phase precheck-off-debugger)
+set_tests_properties(startup_local_log_precheck_off_debugger PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 # A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/subresource_states.h), debug layer on.
 add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
@@ -5237,7 +5252,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_compute_phi64_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast f-second-fill g-swapped-offsets g-overlap
-                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept
+                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept o-subset-remask-dropped
                 n-dropped-broadcast p-dropped-andn2 p-dropped-or p-block-entered q-block-entered q-not-all-ones
                 s-min-strict s-borrow-flipped)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
@@ -5649,6 +5664,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_debug_events COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_events_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_events PROPERTIES TIMEOUT 120)
+
+    # tools/startup/debug_launch.py --map-drive: a console package on another volume is opened through
+    # a mapped letter, and the launcher rewrites that open in the caller's own name.
+    add_test(NAME startup_map_drive COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+        "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(startup_map_drive PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Two threads with their own caller-owned names in flight at once: all 64 opens are rewritten, succeed
+    # and restore their caller strings while the debugger holds the other threads for each step; the
+    # control without holding them (--suspend-others 0) must lose opens. Needs the step window (#1281).
+    add_test(NAME startup_map_drive_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+        "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}" overlap)
+    set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")

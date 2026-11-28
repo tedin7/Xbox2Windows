@@ -386,8 +386,6 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
 
     modifiers = "raw buffer load needs a linear byte offset and no modifiers"
     for name, diagnostic, addressing in (
-        ("raw_glc", modifiers, {"flags": 1 << 14}),
-        ("raw_slc", modifiers, {"flags2": 1 << 22}),
         ("raw_idxen", modifiers, {"flags": 1 << 13}),
         ("raw_descriptor_soffset", "unbound numeric SGPR s20", {"soffset": 20}),
         ("raw_literal_soffset", "raw buffer load scalar offset needs an SGPR or inline integer", {"soffset": 255}),

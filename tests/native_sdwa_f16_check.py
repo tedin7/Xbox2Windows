@@ -20,10 +20,11 @@ LANE_STRIDE = fixture.STRIDE // 2
 LANE_BYTE_SHIFT = fixture.SHIFT - 1
 
 
-def sdwa(opcode, dst, unused, src0, src1, reg0=1, reg1=2, dst_mod=0):
+def sdwa(opcode, dst, unused, src0, src1=0, reg0=1, reg1=2, dst_mod=0, unary=False):
     ext = (reg0 | (dst << 8) | (unused << 11) | dst_mod |
            (src0 << 16) | (src1 << 24))
-    return fixture.vop2(opcode, 3, 249, reg1) + [ext]
+    instruction = fixture.vop1(opcode, 3, 249) if unary else fixture.vop2(opcode, 3, 249, reg1)
+    return instruction + [ext]
 
 
 def cvt_sdwa(src0, dst_mod=CLAMP):
@@ -62,24 +63,30 @@ class Case:
         self.src0, self.src1 = src0, src1
         self.shift = 16 if dst == WORD_1 else 0
         self.mask = 0xffff << self.shift
+        self.alternate = model.rsq_rounding(self.read(a, src0))[1] if op == 'rsq' else None
         self.want = self.expected(src0, src1, unused)
 
-    def expected(self, src0, src1, unused):
-        def read(value, control):
-            picked = model.pick(value, (control & 7) == WORD_1)
-            return fixture.modified(picked, bool(control & ABS), bool(control & NEG), 0)
+    @staticmethod
+    def read(value, control):
+        picked = model.pick(value, (control & 7) == WORD_1)
+        return fixture.modified(picked, bool(control & ABS), bool(control & NEG), 0)
 
-        result = fixture.binary16(self.op, read(self.a, src0), read(self.b, src1))
+    def expected(self, src0, src1, unused):
+        result = fixture.binary16(self.op, self.read(self.a, src0), self.read(self.b, src1))
         other = OLD & ~self.mask if unused == PRESERVE else 0
         return (result << self.shift) | other
 
     def emit(self):
+        if self.op in fixture.UNARY_CODE:
+            return (fixture.mov(1, self.a) + fixture.mov(self.dest, OLD) +
+                    sdwa(fixture.UNARY_CODE[self.op], self.dst, self.unused, self.src0, unary=True))
         return (fixture.mov(1, self.a) + fixture.mov(2, self.b) + fixture.mov(self.dest, OLD) +
                 sdwa(fixture.OP_CODE[self.op], self.dst, self.unused, self.src0, self.src1))
 
     def matches(self, got):
         return (got & ~self.mask == self.want & ~self.mask and
-                fixture.same_binary16((got & self.mask) >> self.shift, (self.want & self.mask) >> self.shift))
+                fixture.same_alu_result((got & self.mask) >> self.shift,
+                                        (self.want & self.mask) >> self.shift, self.op, self.alternate))
 
 
 def cases():
@@ -96,6 +103,14 @@ def cases():
         Case('add', 0x7e014400, 0x45003c00, WORD_0, PRESERVE, WORD_1, DWORD),
         # neg on one source and abs on the other: -(1.0) + |-2.0| = 1.0; dropping either modifier changes the sum.
         Case('add', 0x44003c00, 0xc0004500, WORD_1, PAD, WORD_0 | NEG, WORD_1 | ABS),
+    ]
+    for op in fixture.UNARY_CODE:
+        items.append(Case(op, 0xc4003800, 0, WORD_1, PRESERVE, WORD_1 | ABS, 0))
+        items.append(Case(op, 0x44004000, 0, WORD_0, PAD, DWORD | NEG, 0))
+    items += [
+        Case('rsq', 0x44000000, 0, WORD_1, PAD, WORD_0 | NEG, 0),
+        Case('rsq', 0x3bfe4400, 0, WORD_1, PRESERVE, WORD_1, 0),
+        Case('exp', 0x91c54400, 0, WORD_1, PRESERVE, WORD_1 | ABS, 0),
     ]
     assert len(items) < fixture.STRIDE
     return items
@@ -135,6 +150,8 @@ def refusals():
         (cvt_sdwa(WORD_1, CLAMP | (1 << 14)), dest_error),
         (sdwa(0x39, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # max
         (sdwa(0x3a, WORD_0, PAD, WORD_0, WORD_0), 'unimplemented direct SDWA operand profile'),  # min
+        (sdwa(0x55, WORD_0, PAD, DWORD, dst_mod=1 << 13, unary=True), dest_error),
+        (sdwa(0x57, WORD_0, PAD, WORD_0, unary=True), 'unimplemented direct SDWA operand profile'),
     ] + [
         (sdwa(op, WORD_0, PAD, DWORD, DWORD, dst_mod=1 << modifier), dest_error)
         for op in (PKRTZ, ADD_CO_CI) for modifier in (13, 14)

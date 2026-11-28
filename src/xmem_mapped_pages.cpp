@@ -129,6 +129,7 @@ void collect_empty_slabs(std::vector<HANDLE>& closed) noexcept
 void unpin_slot(const Slot& slot, std::vector<HANDLE>* closed = nullptr)
 {
     const auto found = memory.pins.find(slot);
+    if (found == memory.pins.end()) return;  // not pinned: nothing to do
     if (--found->second.references) return;
     const bool retired = found->second.retired;
     memory.pins.erase(found);

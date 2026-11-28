@@ -261,6 +261,7 @@ def controls():
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
+    print('cube: TextureCube SampleLevel with x2w_cube_dir')
     print('refused: offset, compare, gather, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.

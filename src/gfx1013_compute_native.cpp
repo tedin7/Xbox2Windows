@@ -29,6 +29,11 @@ static bool binary16_alu(std::string_view name) {
     return name == "v_add_f16" || name == "v_sub_f16" || name == "v_subrev_f16" || name == "v_mul_f16";
 }
 
+static bool binary16_unary(std::string_view name) {
+    return name == "v_rcp_f16" || name == "v_sqrt_f16" || name == "v_exp_f16" ||
+           name == "v_rsq_f16";
+}
+
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
     std::ostringstream out;
     out << "native compute +0x" << std::hex << pc << ": " << reason;
@@ -90,8 +95,8 @@ struct Inst {
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
 unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
-// Wave32 compute can use both VCC words as scalar data.
-unsigned smem_sgpr_limit(bool wave32_compute) { return wave32_compute ? 108 : 106; }
+// Direct compute stores both VCC words in scalar registers.
+unsigned smem_sgpr_limit(bool direct_compute) { return direct_compute ? 108 : 106; }
 
 Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
@@ -165,7 +170,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.dst = (a >> 6) & 127;
         i.src[0] = (a & 63) * 2;
         const unsigned soffset = i.b >> 25;
-        const unsigned limit = smem_sgpr_limit(direct && !graphics && !wave64);
+        const unsigned limit = smem_sgpr_limit(direct && !graphics);
         if ((i.b & 0x01f00000u) || (a & 0x14000) || (i.op & ~8u) > 4 ||
             (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset >= limit)))
             refuse(pc, "unsupported scalar memory addressing");
@@ -206,12 +211,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "formatted store needs an index-only linear view and supported component count");
             i.name = "buffer_store_format";
         } else if (i.op >= 0x1c && i.op <= 0x1f) {
-            if ((a & 0x3e000u) || (i.b & 0xe00000u))
+            // Direct compute ignores GLC, DLC and SLC cache-policy hints on raw stores.
+            const bool compute = direct && !graphics;
+            if ((a & (compute ? 0x32000u : 0x3e000u)) ||
+                (i.b & (compute ? 0xa00000u : 0xe00000u)))
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
             if (direct && !graphics) {
-                if ((a & 0x0203e000u) || (i.b & 0x00e00000u))
+                // GLC, DLC and SLC are cache-policy hints on raw loads.
+                if ((a & 0x02032000u) || (i.b & 0x00a00000u))
                     refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
                 // The MUBUF encoding has no trailing literal word.
                 const unsigned soffset = i.b >> 24;
@@ -287,9 +296,10 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
-        const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
+        const bool half_alu = !graphics && ((i.enc == Encoding::Vop2 && binary16_alu(encoded.name)) ||
+                                           (i.enc == Encoding::Vop1 && binary16_unary(encoded.name)));
         const bool dpp8 = i.src[0] == 233 || i.src[0] == 234;
-        if (direct && half_alu && dpp8)
+        if (direct && half_alu && (dpp8 || (i.enc == Encoding::Vop1 && i.src[0] == 250)))
             refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
@@ -306,7 +316,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
                 "v_floor_f32", "v_ceil_f32", "v_fract_f32", "v_trunc_f32", "v_rndne_f32",
-                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
+                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
                                   name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
@@ -679,7 +689,7 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.enc == Encoding::Smem) {
         auto base = s[i.src[0]];
         const unsigned offset_reg = i.b >> 25;
-        const Symbol index = offset_reg < smem_sgpr_limit(!graphics && !wave64) ? s[offset_reg] : Symbol{};
+        const Symbol index = offset_reg < smem_sgpr_limit(direct && !graphics) ? s[offset_reg] : Symbol{};
         unsigned n = memory_count(i);
         const bool heap_address = i.op == 2 && i.b >> 25 == 125 && heap_offset_address(s, i.src[0]);
         for (unsigned j = 0; j < n; ++j) {
@@ -700,10 +710,20 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
         if (i.name == "s_mov_b64")
             set(i.dst + 1, high);
-    } else if (!graphics && !wave64 && (i.name == "s_and_saveexec_b32" || i.name == "s_or_saveexec_b32")) {
-        // Both the saved EXEC and the updated EXEC are numeric mask words.
+    } else if (!graphics && !wave64 && i.enc == Encoding::Sop1 &&
+               ((i.name.size() > 13 && i.name.substr(i.name.size() - 13) == "_saveexec_b32") ||
+                i.name == "s_andn1_wrexec_b32" || i.name == "s_andn2_wrexec_b32")) {
+        // Both the saved/written destination and the updated EXEC are numeric mask words.
         set(i.dst, {});
         set(126, {});
+    } else if (!graphics && i.enc == Encoding::Sop1 && i.name.size() >= 13 &&
+               (i.name.substr(i.name.size() - 13) == "_saveexec_b64" ||
+                i.name.substr(i.name.size() - 11) == "_wrexec_b64")) {
+        // These instructions also overwrite both EXEC words implicitly.
+        set(i.dst, {});
+        set(i.dst + 1, {});
+        set(126, {});
+        set(127, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};

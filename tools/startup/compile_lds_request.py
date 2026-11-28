@@ -8,8 +8,12 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 
+_STARTUP_DIR = str(Path(__file__).resolve().parent)
+if _STARTUP_DIR not in sys.path:
+    sys.path.insert(0, _STARTUP_DIR)
 import gfx2hlsl as gfx
 
 
@@ -92,8 +96,12 @@ class ComputeStage(gfx.Stage):
             elif term[0] == 'end':
                 dest = []
             elif term[0] == 'jump':
+                if term[1] not in index:
+                    raise gfx.Unsupported(f'branch target {term[1]} is outside the compute stage')
                 dest = [index[term[1]]]
             elif term[0] == 'branch':
+                if term[2] not in index:
+                    raise gfx.Unsupported(f'branch target {term[2]} is outside the compute stage')
                 dest = [i+1,index[term[2]]]
             else:
                 raise gfx.Unsupported('unsupported compute branch')
@@ -130,6 +138,15 @@ class ComputeStage(gfx.Stage):
         return lines
 
 
+class CompileLdsRequestError(ValueError):
+    """Error raised by this tool's own CLI and artifact guards.
+
+    Only this type (plus gfx.Unsupported and subprocess.CalledProcessError)
+    is caught in main(); anything else keeps its traceback, so a real
+    translator bug is never mistaken for a deliberate refusal.
+    """
+
+
 class ComputePipeline(gfx.ComputePipeline):
     stage_type = ComputeStage
 
@@ -138,7 +155,44 @@ class ComputePipeline(gfx.ComputePipeline):
         super().__init__(*args, **kwargs)
 
 
-def main():
+def _validate_regular_file(path: Path, label: str) -> None:
+    if path.is_dir():
+        raise CompileLdsRequestError(f'{label} path is a directory: {path}')
+    if not path.exists():
+        raise CompileLdsRequestError(f'{label} file not found: {path}')
+    if not path.is_file():
+        raise CompileLdsRequestError(f'{label} path is not a regular file: {path}')
+
+
+def _validate_writable_dir(path: Path, label: str) -> None:
+    """Reject paths that are files or whose parents are files or dangling links.
+
+    A symlink component is allowed: the bundle is written through a
+    TemporaryDirectory inside the output and moved into place with an atomic
+    rename, so a symlinked output or cache is simply the caller's chosen
+    location. Only a component that is not a directory at all is refused.
+    """
+    if path.is_file() or (path.exists() and not path.is_dir()):
+        raise CompileLdsRequestError(f'{label} path is not a directory: {path}')
+    for parent in path.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise CompileLdsRequestError(f'{label} parent is not a directory: {parent}')
+
+
+def _validate_paths(args: argparse.Namespace) -> None:
+    _validate_regular_file(args.marker, 'request marker')
+    for ext in ('.root', '.data', '.desc', '.sa', '.sb'):
+        _validate_regular_file(args.marker.with_suffix(ext), f'companion {ext}')
+    _validate_regular_file(args.compiler, 'compiler')
+    if not args.sdk.exists():
+        raise CompileLdsRequestError(f'SDK directory not found: {args.sdk}')
+    if not args.sdk.is_dir():
+        raise CompileLdsRequestError(f'SDK path is not a directory: {args.sdk}')
+    _validate_writable_dir(args.output, 'output')
+    _validate_writable_dir(args.cache, 'cache')
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('marker',type=Path)
     parser.add_argument('output',type=Path)
@@ -147,7 +201,7 @@ def main():
     parser.add_argument('--cache',required=True,type=Path)
     parser.add_argument('--rw-image',required=True,nargs=2,type=int,metavar=('PARAM','BYTE_OFFSET'))
     parser.add_argument('--wave-size',required=True,type=int,choices=[32,64])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     name = args.marker.name
     if not re.fullmatch(r'req_[0-9a-f]{16}\.c67',name):
         parser.error('expected req_<16 hex digits>.c67')
@@ -155,41 +209,58 @@ def main():
     param,off = args.rw_image
     if param < 0 or off < 0 or off%32:
         parser.error('expected a nonnegative parameter and a 32-byte-aligned descriptor offset')
-    args.output.mkdir(parents=True,exist_ok=True)
-    with TemporaryDirectory(dir=args.output) as temp:
-        bundle = Path(temp)/'bundle'
-        request = bundle/'request'
-        request.mkdir(parents=True)
-        for ext in ('.c67','.root','.data','.desc','.sa','.sb'):
-            path = args.marker.with_suffix(ext)
-            shutil.copyfile(path,request/path.name)
-        pipeline = gfx.load_compute_request(str(request),key,
-            pipeline_type=partial(ComputePipeline,feedback=(('table',param),off)))
-        source = pipeline.hlsl_cs().replace('[numthreads(',f'[WaveSize({args.wave_size})]\n[numthreads(')
-        stage = bundle/f'{key:016x}.cs.hlsl'
-        stage.write_text(source,encoding='utf-8')
-        bytecode = stage.with_suffix('.cso')
-        subprocess.run([args.compiler,args.sdk,args.cache,'cs_6_6',stage,bytecode],check=True)
-        manifest = bundle/f'{key:016x}.txt'
-        manifest.write_text(pipeline.manifest(),encoding='utf-8')
-        metadata = {'schema':1,'request':f'request/{name}','profile':'cs_6_6','rw_image':[param,off],
-                    'wave_size':args.wave_size,'sha256':{}}
-        for path in sorted(bundle.rglob('*')):
-            if path.is_file():
-                metadata['sha256'][path.relative_to(bundle).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-        replay = json.dumps(metadata,indent=2,sort_keys=True)+'\n'
-        (bundle/'replay.json').write_bytes(replay.encode())
-        dest = args.output/f'{key:016x}-{hashlib.sha256(replay.encode()).hexdigest()}'
-        try:
-            bundle.rename(dest)
-        except OSError:
-            if not dest.is_dir() or (dest/'replay.json').read_bytes()!=replay.encode():
-                raise
-            for relative,digest in metadata['sha256'].items():
-                if hashlib.sha256((dest/relative).read_bytes()).hexdigest()!=digest:
-                    raise RuntimeError(f'damaged replay artifact {relative}')
-        print(dest)
+    try:
+        _validate_paths(args)
+        args.output.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=args.output) as temp:
+            bundle = Path(temp) / 'bundle'
+            request = bundle / 'request'
+            request.mkdir(parents=True)
+            for ext in ('.c67', '.root', '.data', '.desc', '.sa', '.sb'):
+                path = args.marker.with_suffix(ext)
+                shutil.copyfile(path, request / path.name)
+            pipeline = gfx.load_compute_request(
+                str(request), key,
+                pipeline_type=partial(ComputePipeline, feedback=(('table', param), off)),
+            )
+            source = pipeline.hlsl_cs().replace('[numthreads(', f'[WaveSize({args.wave_size})]\n[numthreads(')
+            stage = bundle / f'{key:016x}.cs.hlsl'
+            stage.write_text(source, encoding='utf-8')
+            bytecode = stage.with_suffix('.cso')
+            subprocess.run([args.compiler, args.sdk, args.cache, 'cs_6_6', stage, bytecode], check=True)
+            manifest = bundle / f'{key:016x}.txt'
+            manifest.write_text(pipeline.manifest(), encoding='utf-8')
+            metadata = {
+                'schema': 1, 'request': f'request/{name}', 'profile': 'cs_6_6',
+                'rw_image': [param, off], 'wave_size': args.wave_size, 'sha256': {},
+            }
+            for path in sorted(bundle.rglob('*')):
+                if path.is_file():
+                    metadata['sha256'][path.relative_to(bundle).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            replay = json.dumps(metadata, indent=2, sort_keys=True) + '\n'
+            (bundle / 'replay.json').write_bytes(replay.encode())
+            dest = args.output / f'{key:016x}-{hashlib.sha256(replay.encode()).hexdigest()}'
+            try:
+                bundle.rename(dest)
+            except OSError as error:
+                if not dest.is_dir():
+                    raise CompileLdsRequestError(f'cannot move replay bundle to {dest}: {error}') from error
+                replay_path = dest / 'replay.json'
+                if not replay_path.is_file() or replay_path.read_bytes() != replay.encode():
+                    raise CompileLdsRequestError(f'damaged replay artifact replay.json in {dest}') from error
+                for relative, digest in metadata['sha256'].items():
+                    try:
+                        data = (dest / relative).read_bytes()
+                    except OSError:
+                        raise CompileLdsRequestError(f'damaged replay artifact {relative}') from None
+                    if hashlib.sha256(data).hexdigest() != digest:
+                        raise CompileLdsRequestError(f'damaged replay artifact {relative}')
+            print(dest)
+    except (gfx.Unsupported, subprocess.CalledProcessError, CompileLdsRequestError) as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 #include "shader_dxil_compiler.h"
 #include "direct_compute_cache.h"
 #include "native_compute_output.h"
+#include "shader_compute_request.h"
 #include "gfx1013_pixel.h"
 #include "gfx1013_sampled_pixel.h"
 #include "gfx1013_vertex_id.h"
@@ -101,7 +102,7 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
                                               const fs::path& input_path, const fs::path& destination,
                                               const fs::path& cache, std::ostream& report,
                                               const x2w::NativeComputeShader *linked=nullptr,
-                                              bool emit_manifest=false) {
+                                              bool emit_manifest=false, std::string *manifest_reason=nullptr) {
     Clock::time_point start;
     std::string source;
     std::optional<std::string> manifest;
@@ -145,7 +146,7 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
             }
             report<<"global_srv select="<<views.request.selected<<" need="<<x2w_startup::global_srv_type_name(views.request.needed)<<'\n';
         }
-        if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program);
+        if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program, manifest_reason);
         source=direct?std::move(program.dxil_ir):std::move(program.hlsl);profile=L"cs_6_6";
     } else if (profile.compare(0,clear_prefix.size(),clear_prefix)==0) {
         auto offset=profile.substr(clear_prefix.size());
@@ -236,6 +237,11 @@ static std::string format_fail_line(std::string_view message) {
         out = "unknown refusal";
     out.push_back('\n');
     return out;
+}
+
+// A compute program that translates but has no runtime manifest: the runtime cannot dispatch it translated.
+static std::string manifest_refusal(const std::string &reason) {
+    return "unsupported startup runtime manifest bindings: " + reason;
 }
 
 static bool is_ident_char(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
@@ -481,7 +487,9 @@ static int run_refusals(int argc, wchar_t** argv) {
                     try {
                         if (task.compute) {
                             auto req = x2w::read_compute_request(compute_inputs[task.index]);
-                            (void)x2w::translate_compute(req, 0, true);
+                            std::string reason;
+                            if (!x2w::format_compute_runtime_manifest(x2w::translate_compute(req, 0, true), &reason))
+                                throw std::runtime_error(manifest_refusal(reason));
                         } else {
                             auto input = x2w::read_graphics_request(graphics_inputs[task.index]);
                             bool hit = false;
@@ -734,9 +742,10 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         fs::remove(fs::path(stem) += L".cs.hlsl", ignored);
         bool hit = false;
         auto program = x2w::prepare_direct_compute(req.marker, 0, false, cache_dir, hit, x2w::HeapViewContract::none);
-        auto manifest = x2w::format_compute_runtime_manifest(program);
+        std::string reason;
+        auto manifest = x2w::format_compute_runtime_manifest(program, &reason);
         if (!manifest)
-            throw std::runtime_error("unsupported startup runtime manifest bindings");
+            throw std::runtime_error(manifest_refusal(reason));
         auto cs_dxil = compile_to_dxil(compiler, program.dxil_ir, L"cs_6_6", cache_dir, true, sink);
         publish_atomic(fs::path(stem) += L".cs.cso", cs_dxil.data(), cs_dxil.size());
         publish_atomic(manifest_path, manifest->data(), manifest->size());
@@ -884,7 +893,390 @@ static int run_watch(int argc, wchar_t** argv) {
     }
 }
 
+static std::string format_key16(uint64_t key) {
+    char buf[20];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(key));
+    return std::string(buf);
+}
+
+static fs::path rekey_request_path(const fs::path& dir, const std::string& hex16, const char* ext) {
+    return dir / ("req_" + hex16 + ext);
+}
+
+static bool read_rekey_bytes(const fs::path& path, size_t max_bytes, std::string& out, std::string& error) {
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) {
+        error = "unreadable " + path.filename().string() + ": not a regular file";
+        return false;
+    }
+    const auto file_bytes = fs::file_size(path, ec);
+    if (ec || file_bytes > max_bytes) {
+        error = "unreadable " + path.filename().string() + ": " + (ec ? ec.message() : "oversized file");
+        return false;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        error = "unreadable " + path.filename().string() + ": cannot open";
+        return false;
+    }
+    out.assign(static_cast<size_t>(file_bytes), '\0');
+    if (file_bytes && !file.read(out.data(), static_cast<std::streamsize>(file_bytes))) {
+        error = "unreadable " + path.filename().string() + ": short read";
+        return false;
+    }
+    return true;
+}
+
+static void publish_rekey_file(const fs::path& dst_file, const void* data, size_t size,
+                               size_t& written, size_t& kept) {
+    std::error_code ec;
+    if (fs::exists(dst_file, ec)) {
+        ++kept;
+        return;
+    }
+    if (ec)
+        throw fs::filesystem_error("cannot inspect destination file", dst_file, ec);
+    publish_atomic(dst_file, data, size);
+    ++written;
+}
+
+static int run_rekey(int argc, wchar_t** argv) {
+    fs::path src_dir, dst_dir;
+    int positional = 0;
+    unsigned hw_threads = std::thread::hardware_concurrency();
+    int jobs = static_cast<int>((std::min)(64u, (std::max)(1u, hw_threads)));
+    auto usage = []() {
+        std::cerr << "usage: compile_dxil --rekey OLD_CACHE_DIR NEW_REQUEST_DIR [--jobs N]\n";
+        return 2;
+    };
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring_view arg = argv[i];
+        if (arg == L"--jobs") {
+            if (i + 1 >= argc)
+                return usage();
+            try {
+                jobs = parse_jobs_count(argv[++i]);
+            } catch (const std::exception& error) {
+                std::cerr << "error: " << error.what() << '\n';
+                return 2;
+            }
+        } else if (!arg.empty() && arg.front() == L'-') {
+            return usage();
+        } else {
+            if (positional == 0) src_dir = fs::path(arg);
+            else if (positional == 1) dst_dir = fs::path(arg);
+            else return usage();
+            ++positional;
+        }
+    }
+    if (positional != 2)
+        return usage();
+
+    std::error_code ec;
+    if (!fs::is_directory(src_dir, ec)) {
+        std::cerr << "error: " << src_dir.string() << " is not a directory\n";
+        return 2;
+    }
+    if (fs::exists(dst_dir, ec)) {
+        if (!fs::is_directory(dst_dir, ec)) {
+            std::cerr << "error: " << dst_dir.string() << " is not a directory\n";
+            return 2;
+        }
+        if (fs::equivalent(src_dir, dst_dir, ec)) {
+            std::cerr << "error: the new request dir must not be the old cache\n";
+            return 2;
+        }
+    } else if (ec) {
+        std::cerr << "error: cannot inspect " << dst_dir.string() << ": " << ec.message() << '\n';
+        return 2;
+    }
+
+    enum class Kind { graphics, compute, m57 };
+    struct Marker {
+        Kind kind;
+        uint64_t old_key = 0;
+        std::string old_hex;
+    };
+    struct RtvMarker {
+        uint64_t old_key = 0;
+        std::string old_hex;
+    };
+
+    std::vector<Marker> graphics_markers, compute_markers, m57_markers;
+    std::vector<RtvMarker> rtv_markers;
+    size_t m86_count = 0;
+
+    try {
+        for (const auto& entry : fs::directory_iterator(src_dir)) {
+            if (!entry.is_regular_file(ec)) {
+                ec.clear();
+                continue;
+            }
+            const fs::path path = entry.path();
+            const std::wstring wname = path.filename().wstring();
+            if (wname.size() < 22 || wname.rfind(L"req_", 0) != 0)
+                continue;
+            const std::wstring wstem = path.stem().wstring();
+            if (wstem.size() != 20)
+                continue;
+            const std::wstring_view whex = std::wstring_view(wstem).substr(4);
+            if (!is_lower_hex16(whex))
+                continue;
+            std::string hex16;
+            hex16.reserve(16);
+            for (wchar_t ch : whex)
+                hex16.push_back(static_cast<char>(ch));
+            uint64_t old_key = 0;
+            const auto parsed = std::from_chars(hex16.data(), hex16.data() + hex16.size(), old_key, 16);
+            if (parsed.ec != std::errc{} || parsed.ptr != hex16.data() + hex16.size())
+                continue;
+            const std::wstring ext = path.extension().wstring();
+            if (ext == L".a")
+                graphics_markers.push_back({Kind::graphics, old_key, std::move(hex16)});
+            else if (ext == L".c67")
+                compute_markers.push_back({Kind::compute, old_key, std::move(hex16)});
+            else if (ext == L".m57")
+                m57_markers.push_back({Kind::m57, old_key, std::move(hex16)});
+            else if (ext == L".rtv")
+                rtv_markers.push_back({old_key, std::move(hex16)});
+            else if (ext == L".m86")
+                ++m86_count;
+        }
+    } catch (const fs::filesystem_error& error) {
+        std::cerr << "error: cannot list " << src_dir.string() << ": " << error.what() << '\n';
+        return 1;
+    }
+
+    auto by_old_key = [](const auto& a, const auto& b) { return a.old_key < b.old_key; };
+    std::sort(graphics_markers.begin(), graphics_markers.end(), by_old_key);
+    std::sort(compute_markers.begin(), compute_markers.end(), by_old_key);
+    std::sort(m57_markers.begin(), m57_markers.end(), by_old_key);
+    std::sort(rtv_markers.begin(), rtv_markers.end(), by_old_key);
+
+    std::vector<Marker> work;
+    work.reserve(graphics_markers.size() + compute_markers.size() + m57_markers.size());
+    work.insert(work.end(), graphics_markers.begin(), graphics_markers.end());
+    work.insert(work.end(), compute_markers.begin(), compute_markers.end());
+    work.insert(work.end(), m57_markers.begin(), m57_markers.end());
+
+    struct WorkResult {
+        uint64_t new_key = 0;
+        bool has_ia = false;
+        bool has_psin = false;
+        std::string rewritten_psin;
+        std::string error;
+    };
+    std::vector<WorkResult> results(work.size());
+
+    auto hash_item = [&](size_t idx) {
+        const Marker& m = work[idx];
+        WorkResult& res = results[idx];
+        std::string err;
+        try {
+            if (m.kind == Kind::graphics) {
+                std::string a, b, root, ia, psin_raw;
+                if (!read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".b"), 64ull << 20, b, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".root"), 16ull << 20, root, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".a"), 64ull << 20, a, err)) {
+                    res.error = std::move(err);
+                    return;
+                }
+                const fs::path ia_path = rekey_request_path(src_dir, m.old_hex, ".ia");
+                std::error_code file_ec;
+                if (fs::is_regular_file(ia_path, file_ec)) {
+                    if (!read_rekey_bytes(ia_path, 1ull << 20, ia, err)) {
+                        res.error = std::move(err);
+                        return;
+                    }
+                    res.has_ia = true;
+                }
+                const fs::path psin_path = rekey_request_path(src_dir, m.old_hex, ".psin");
+                std::string psin_entry;
+                if (fs::is_regular_file(psin_path, file_ec)) {
+                    if (!read_rekey_bytes(psin_path, 128, psin_raw, err)) {
+                        res.error = std::move(err);
+                        return;
+                    }
+                    auto parsed_psin = x2w::parse_pixel_input_description(psin_raw, m.old_key);
+                    psin_entry = std::move(parsed_psin.entry);
+                    res.has_psin = true;
+                    res.new_key = x2w::graphics_request_key(a, b, root, ia, psin_entry);
+                    res.rewritten_psin = x2w::format_pixel_input_description(res.new_key, parsed_psin.ena, parsed_psin.addr);
+                } else {
+                    res.new_key = x2w::graphics_request_key(a, b, root, ia);
+                }
+            } else if (m.kind == Kind::compute) {
+                std::string desc, sa, sb, data, root, c67;
+                constexpr size_t limit = 64ull << 20;
+                if (!read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".desc"), limit, desc, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".sa"), limit, sa, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".sb"), limit, sb, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".data"), limit, data, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".root"), limit, root, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".c67"), limit, c67, err)) {
+                    res.error = std::move(err);
+                    return;
+                }
+                res.new_key = x2w::compute_request_key(c67, data, root, desc, sa, sb);
+            } else {
+                std::string ps57, root, m57;
+                constexpr size_t limit = 64ull << 20;
+                if (!read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".ps57"), limit, ps57, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".root"), limit, root, err) ||
+                    !read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ".m57"), limit, m57, err)) {
+                    res.error = std::move(err);
+                    return;
+                }
+                res.new_key = x2w::mesh57_request_key(m57, ps57, root);
+            }
+        } catch (const std::exception& ex) {
+            res.error = ex.what();
+        }
+    };
+
+    if (!work.empty()) {
+        const int worker_count = (std::min)(jobs, static_cast<int>(work.size()));
+        if (worker_count <= 1) {
+            for (size_t i = 0; i < work.size(); ++i)
+                hash_item(i);
+        } else {
+            std::atomic<size_t> next{};
+            std::vector<std::future<void>> workers;
+            workers.reserve(worker_count);
+            for (int w = 0; w < worker_count; ++w) {
+                workers.emplace_back(std::async(std::launch::async, [&]() {
+                    for (size_t i = next++; i < work.size(); i = next++)
+                        hash_item(i);
+                }));
+            }
+            for (auto& w : workers)
+                w.get();
+        }
+    }
+
+    std::vector<std::string> bad;
+    std::map<uint64_t, uint64_t> new_graphics_map;
+    for (size_t i = 0; i < work.size(); ++i) {
+        if (!results[i].error.empty()) {
+            bad.push_back("req_" + work[i].old_hex + ": " + results[i].error);
+        } else if (work[i].kind == Kind::graphics) {
+            new_graphics_map[work[i].old_key] = results[i].new_key;
+        }
+    }
+
+    std::map<uint64_t, std::string> rtv_rewritten;
+    for (const auto& rm : rtv_markers) {
+        std::string raw, err;
+        if (!read_rekey_bytes(rekey_request_path(src_dir, rm.old_hex, ".rtv"), 256, raw, err)) {
+            bad.push_back("req_" + rm.old_hex + ".rtv: " + err);
+            continue;
+        }
+        try {
+            const auto parsed = x2w::parse_rtv_variant_text(raw, rm.old_key);
+            const auto it = new_graphics_map.find(parsed.base_key);
+            if (it == new_graphics_map.end()) {
+                bad.push_back("req_" + rm.old_hex + ".rtv: .rtv base request " + format_key16(parsed.base_key) +
+                              " is not a complete graphics request");
+                continue;
+            }
+            std::string rewritten = x2w::format_rtv_variant_text(it->second, parsed.formats);
+            const uint64_t new_rtv_key = x2w::fnv1a_64(rewritten);
+            rtv_rewritten.try_emplace(new_rtv_key, std::move(rewritten));
+        } catch (const std::exception& ex) {
+            bad.push_back("req_" + rm.old_hex + ".rtv: " + ex.what());
+        }
+    }
+
+    if (!bad.empty()) {
+        std::cerr << "error: " << bad.size() << " of " << (work.size() + rtv_markers.size())
+                  << " requests are incomplete or unreadable; nothing written\n";
+        const size_t limit = (std::min)(bad.size(), size_t{10});
+        for (size_t i = 0; i < limit; ++i)
+            std::cerr << "  " << bad[i] << '\n';
+        return 1;
+    }
+
+    try {
+        fs::create_directories(dst_dir);
+        size_t written = 0, kept = 0;
+
+        const size_t gfx_end = graphics_markers.size();
+        const size_t cmp_end = gfx_end + compute_markers.size();
+        const size_t m57_end = cmp_end + m57_markers.size();
+
+        auto publish_group = [&](size_t begin, size_t end, const char* label) {
+            std::set<uint64_t> done_keys;
+            size_t already_current = 0;
+            for (size_t i = begin; i < end; ++i) {
+                const Marker& m = work[i];
+                const WorkResult& res = results[i];
+                if (m.old_key == res.new_key)
+                    ++already_current;
+                if (!done_keys.insert(res.new_key).second)
+                    continue;
+                const std::string new_hex = format_key16(res.new_key);
+                auto copy_part = [&](const char* ext, size_t max_bytes) {
+                    const fs::path dst_file = rekey_request_path(dst_dir, new_hex, ext);
+                    std::error_code file_ec;
+                    if (fs::exists(dst_file, file_ec)) {
+                        ++kept;
+                        return;
+                    }
+                    if (file_ec)
+                        throw fs::filesystem_error("cannot inspect destination file", dst_file, file_ec);
+                    std::string bytes, err;
+                    if (!read_rekey_bytes(rekey_request_path(src_dir, m.old_hex, ext), max_bytes, bytes, err))
+                        throw std::runtime_error(err);
+                    publish_atomic(dst_file, bytes.data(), bytes.size());
+                    ++written;
+                };
+                if (m.kind == Kind::graphics) {
+                    copy_part(".b", 64ull << 20);
+                    copy_part(".root", 16ull << 20);
+                    if (res.has_ia)
+                        copy_part(".ia", 1ull << 20);
+                    if (res.has_psin)
+                        publish_rekey_file(rekey_request_path(dst_dir, new_hex, ".psin"),
+                                           res.rewritten_psin.data(), res.rewritten_psin.size(), written, kept);
+                    copy_part(".a", 64ull << 20);
+                } else if (m.kind == Kind::compute) {
+                    constexpr size_t limit = 64ull << 20;
+                    copy_part(".desc", limit);
+                    copy_part(".sa", limit);
+                    copy_part(".sb", limit);
+                    copy_part(".data", limit);
+                    copy_part(".root", limit);
+                    copy_part(".c67", limit);
+                } else {
+                    constexpr size_t limit = 64ull << 20;
+                    copy_part(".ps57", limit);
+                    copy_part(".root", limit);
+                    copy_part(".m57", limit);
+                }
+            }
+            std::cout << label << ": " << (end - begin) << " requests, " << already_current
+                      << " already current -> " << done_keys.size() << " keys\n";
+        };
+
+        publish_group(0, gfx_end, "graphics");
+        publish_group(gfx_end, cmp_end, "compute");
+        publish_group(cmp_end, m57_end, "m57");
+        for (const auto& [new_key, text] : rtv_rewritten)
+            publish_rekey_file(rekey_request_path(dst_dir, format_key16(new_key), ".rtv"),
+                               text.data(), text.size(), written, kept);
+        std::cout << "rtv variants: " << rtv_markers.size() << " requests -> " << rtv_rewritten.size() << " keys\n";
+        std::cout << "not re-keyed (own key strings): m86 " << m86_count << '\n';
+        std::cout << "files: " << written << " written, " << kept << " already present in " << dst_dir.string() << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "error: failed writing " << dst_dir.string() << ": " << error.what() << '\n';
+        return 1;
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && std::wstring_view(argv[1]) == L"--rekey")
+        return run_rekey(argc, argv);
     if (argc >= 2 && std::wstring_view(argv[1]) == L"--watch")
         return run_watch(argc, argv);
     if (argc >= 2 && std::wstring_view(argv[1]) == L"--refusals")
@@ -917,6 +1309,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
                      "Use --refusals REQUEST_DIRECTORY [--jobs N] [--json] for a read-only refusal summary.\n"
                      "Use --watch SDK_DIRECTORY CACHE_DIRECTORY REQUEST_DIRECTORY [--jobs N] [--interval MS] [--once] to translate pending requests.\n"
+                     "Use --rekey OLD_CACHE_DIR NEW_REQUEST_DIR [--jobs N] to copy requests under the current cache revision keys.\n"
                      "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n";
         return 2;
     }
@@ -1019,8 +1412,12 @@ int wmain(int argc, wchar_t** argv) {
                 std::error_code ignored;
                 fs::remove(manifest_path, ignored);
                 fs::remove(fs::path(stems[i]) += L".cs.hlsl", ignored);  // see compile_watch_item
-                auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true);
+                std::string reason;
+                auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true, &reason);
                 if (manifest) publish_atomic(manifest_path, manifest->data(), manifest->size());
+                // Not a .fail: that file is the watchers' retry marker, and this compile succeeded.
+                if (!manifest && !reason.empty())
+                    report << "no_manifest input=" << inputs[i].filename().string() << ' ' << manifest_refusal(reason) << '\n';
                 fs::remove(fs::path(stems[i]) += L".fail", ignored);
                 return;
             }

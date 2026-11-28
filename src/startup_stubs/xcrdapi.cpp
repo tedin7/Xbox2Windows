@@ -1133,27 +1133,18 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (input) {
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
-                std::vector<unsigned char> decoded(destination_size);
-                std::size_t produced = 0;
-                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
-                    output = std::move(decoded);
-                    data = output.data();
-                    decode_length = produced;
-                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
-                    bcpack_decoded = true;
-                } else {
-                    outcome = "bcpack failed";
-                    failure = StorageFailure::bcpack;
-                    data = nullptr;
-                }
-            } else {
-                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
-                // title's loading continues. Counted as bcpack_blank.
-                output.assign(destination_size, 0);
+            std::vector<unsigned char> decoded(destination_size);
+            std::size_t produced = 0;
+            if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                output = std::move(decoded);
                 data = output.data();
-                decode_length = destination_size;
-                outcome = "BCPack not decoded: zero-filled";
+                decode_length = produced;
+                outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                bcpack_decoded = true;
+            } else {
+                outcome = "bcpack failed";
+                failure = StorageFailure::bcpack;
+                data = nullptr;
             }
         }
         if (data) {

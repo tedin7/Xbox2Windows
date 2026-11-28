@@ -7,6 +7,8 @@
 // unmapped range is refused by the probe and the guarded copies with zero first-chance exceptions.
 #include "startup_stubs/local_log.h"
 
+#include <intrin.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -713,11 +715,21 @@ void test_protected_prefix_not_counted()
     check(judged, "one round kept the free tail free to be judged");
 }
 
-// Without a debugger and without X2W_PROBE_PRECHECK the pre-check is off: a free range is still refused, but by
-// the touch / __try path (nothing counted in faults_avoided) and the touch is a real first-chance fault.
-int precheck_off_child()
+// With X2W_PROBE_PRECHECK=0 the pre-check is off: a free range is still refused, but by the touch / __try path
+// (nothing counted in faults_avoided) and the touch is a real first-chance fault. simulate_debugger sets the PEB's
+// BeingDebugged byte first, which is what IsDebuggerPresent reads, so the explicit 0 must win over an attached
+// debugger (title runs always start under debug_launch.py); no real debugger is attached, so faults still reach
+// the vectored handler.
+int precheck_off_child(bool simulate_debugger)
 {
-    if (IsDebuggerPresent()) return 0;  // a debugger turns the pre-check on by design
+    auto* const being_debugged = reinterpret_cast<volatile unsigned char*>(__readgsqword(0x60) + 2);
+    const unsigned char was = *being_debugged;
+    if (simulate_debugger) {
+        *being_debugged = 1;
+        check(IsDebuggerPresent() != FALSE, "precheck off: the simulated debugger is visible to IsDebuggerPresent");
+    } else if (IsDebuggerPresent()) {
+        return 0;  // unset-style run under a real debugger: nothing to judge here
+    }
     constexpr std::size_t kPage = 0x1000;
     counted_thread = static_cast<LONG>(GetCurrentThreadId());
     void* const handler = AddVectoredExceptionHandler(1, count_first_chance);
@@ -740,11 +752,13 @@ int precheck_off_child()
         if (faults != 0) ++faulted;
     }
     RemoveVectoredExceptionHandler(handler);
+    *being_debugged = was;
     check(judged >= 5, "precheck off: enough rounds judged");
     check(refused == judged, "precheck off: a free range is still not readable");
     check(counted_rounds == 0, "precheck off: no refusal is counted as an avoided fault");
     check(faulted == judged, "precheck off: the free range is found by the touch, one first-chance fault each");
-    std::printf("startup_local_log precheck off: %d of %d FAILED\n", failures, cases);
+    std::printf("startup_local_log precheck off%s: %d of %d FAILED\n", simulate_debugger ? " (debugger)" : "",
+                failures, cases);
     return failures ? 1 : 0;
 }
 
@@ -754,7 +768,8 @@ int main(int argc, char** argv)
 {
     const bool two_args = argc == 3;
     if (two_args && std::strcmp(argv[1], "--phase") == 0) {
-        if (std::strcmp(argv[2], "precheck-off") == 0) return precheck_off_child();
+        if (std::strcmp(argv[2], "precheck-off") == 0) return precheck_off_child(false);
+        if (std::strcmp(argv[2], "precheck-off-debugger") == 0) return precheck_off_child(true);
         if (std::strcmp(argv[2], "concurrency") == 0) return concurrency_child(false);
         if (std::strcmp(argv[2], "concurrency-reopen") == 0) return concurrency_child(true);
         if (std::strcmp(argv[2], "recovery-missing") == 0) return recovery_child(Recovery::missing);

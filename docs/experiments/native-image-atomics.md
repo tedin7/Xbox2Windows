@@ -1,9 +1,15 @@
 # Direct Compute atomics on unsigned 2D textures
 
 The native Compute compiler lowers `image_atomic_add`, `image_atomic_umax`,
-and `image_atomic_cmpswap` on a fixed table descriptor for a 2D `R32_UINT`
-UAV. DXIL uses `RWTexture2D<uint>` with two integer coordinates and honours
-the guest EXEC mask. GLC writes the pre-operation value to the data VGPR.
+`image_atomic_cmpswap`, `image_atomic_swap`, `image_atomic_umin`,
+`image_atomic_and`, `image_atomic_or` and `image_atomic_xor` on a fixed table
+descriptor for a 2D `R32_UINT` UAV. Swap, umin, and, or and xor use DXIL
+`AtomicBinOp` Exchange (8), UMin (6), And (1), Or (2) and Xor (3). Signed
+`image_atomic_smin` and `_smax` are outside the verified scope and stay
+refused, as do `sub`, `inc`, `dec` and the float atomics.
+
+DXIL uses `RWTexture2D<uint>` with two integer coordinates and honours the
+guest EXEC mask. GLC writes the pre-operation value to the data VGPR.
 Compare-and-swap takes replacement from the first data VGPR and comparison
 from the next one. Atomic writes are included when translating memory waits
 and barriers.
@@ -33,12 +39,20 @@ add with only 16 active lanes. Each returning operation also feeds its result
 to a second atomic. Clearing only the first operation's GLC bit changes the
 second readback and fails the comparison.
 
+The [binary-operation fixture](../../tests/native_image_atomic_binops_check.py)
+reuses that program for swap, umin, and, or and xor. Its controls check each
+`AtomicBinOp` code, the operand refusals and the refused opcodes. Its readback
+compares the same 336 words for distinct and contended texels, with GLC on and
+off and 16 active lanes.
+
 The runtime fixture publishes the native compiler's DXIL and manifest from a
 source-built device slot 67 request. A dispatch through the stand-in matches
 all 256 words, with the one target texel incremented by 32 across two groups.
 The same program with a float UAV is refused and leaves all 1,024 halfwords
-unchanged. On Windows 11 build `26300.10075` both ran on the RTX 4070 with
-driver `32.0.16.2124`. Direct DXIL requires wave32. Local WARP exposes four
+unchanged. On Windows 11 build `26300.10075` the synthetic and runtime fixtures
+ran on the RTX 4070 with driver `32.0.16.2124`. The binary-operation fixture
+passed on an NVIDIA GeForce RTX 5080 (Windows 11, driver `32.0.16.2101`).
+Direct DXIL requires wave32. Local WARP exposes four
 lanes, so the native execution test reports a capability skip there.
 
 ## References

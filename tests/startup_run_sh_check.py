@@ -216,7 +216,7 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
         log = data / "logs"
     command = ["bash", str(startup / "run.sh"), "--exe", str(exe), "--data", "G:\\" if drive_data else str(data),
                "--log", log_arg, "--build-dir", "bld", "--seconds", "9", "--memory-gib", "3",
-               "--continue-asserts", "4", *switches]
+               "--continue-asserts", "4", "--assert-sites", "2", *switches]
     if translate:
         command += ["--render", "--translate", "--shader-cache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
@@ -292,7 +292,7 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     if missing:
         found.append(f"{label}: stand-in DLLs not copied next to the executable: {missing}")
     want = [win(exe), "G:\\" if drive_data else win(data), log_win, "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4", *passed]
+            "--trace-files", "1", "--continue-asserts", "4", "--assert-sites", "2", *passed]
     got = read_json(startup / "argv.json")
     if got != want:
         found.append(f"{label}: the debugger received {got}, expected {want}")

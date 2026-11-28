@@ -103,8 +103,11 @@ def controls(cli, sdk, work):
     dump = subprocess.run([Path(sdk) / 'dxc.exe', '-dumpbin', output], check=True,
                           capture_output=True, text=True).stdout
     assert 'fadd float' in dump and 'fmul float' in dump and '@dx.op.unaryBits.i32(i32 33,' in dump, dump
+    clamped_source = request(work, root, compute_program(CASES[:1], bad=0x8000))
+    clamped_output, clamped_run = compile_shader(cli, sdk, work, 'gfx1013-direct-cs@0', clamped_source)
+    assert clamped_run.returncode == 0 and clamped_output.is_file(), clamped_run.stdout + clamped_run.stderr
     for options, message in (
-        ({'bad': 0x8000}, 'packed binary16 arithmetic encoding'),
+        ({'bad': 0x0400}, 'packed binary16 arithmetic encoding'),
         ({'bad': 0x2000}, 'packed binary16 arithmetic encoding'),
         ({'mode': (0xBFA50003,)}, 'binary16 rounding or denormal mode'),
         ({'mode': (0xBFA40004,)}, 'binary16 rounding or denormal mode'),
@@ -112,7 +115,7 @@ def controls(cli, sdk, work):
         source = request(work, root, compute_program(CASES[:1], **options))
         _, run = compile_shader(cli, sdk, work, 'gfx1013-direct-cs@0', source)
         assert run.returncode and message in run.stderr, (options, run.stderr)
-    print('ADD/MUL and integer FMA compiled; unsupported modifiers and modes were refused')
+    print('ADD/MUL and integer FMA compiled (including clamp); unsupported modifiers and modes were refused')
 
 
 def operands(case, high):

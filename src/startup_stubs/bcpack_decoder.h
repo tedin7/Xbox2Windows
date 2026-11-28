@@ -2,6 +2,7 @@
 // Adapted from bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com).
 // Source: https://github.com/Ahmet-Dedeler/bcpack-rs
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// New BC1/2/6H reconstruction in bcpack_blocks_extra.inl is an original MIT contribution.
 // Incorporates rANS interval models derived from Microsoft silicon-rans (MIT License).
 #pragma once
 
@@ -1185,48 +1186,6 @@ inline bool decode_bc7_blocks(const std::vector<uint16_t>& symbols, size_t num_b
     return true;
 }
 
-inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t target,
-                              uint8_t* output, size_t output_capacity) {
-    if (output_capacity < target * 8) return false;
-    const uint8_t ENDPOINT_WIDTHS[6] = { 5, 6, 5, 5, 6, 5 };
-    uint8_t hist[256][6] = {};
-    for (size_t i = 0; i < target; ++i) {
-        uint16_t l0_sym = symbols[0 * target + i];
-        size_t v = l0_sym & 0xFF;
-        size_t d = (v & 1) ? (255 - (v >> 1)) : (v >> 1);
-        uint8_t pred[6] = {};
-        if (d == 0) {
-            // zero
-        } else if (d <= i) {
-            std::memcpy(pred, hist[(i - d) & 255], 6);
-        } else {
-            size_t slot = (static_cast<int>(i) - static_cast<int>(d)) & 255;
-            std::memcpy(pred, BC1_WINDOW[slot], 6);
-        }
-        uint8_t e[6];
-        for (int k = 0; k < 6; ++k) {
-            uint16_t sym = symbols[(2 + k) * target + i];
-            int32_t res = unzigzag(sym);
-            uint32_t mask = (1u << ENDPOINT_WIDTHS[k]) - 1;
-            e[k] = static_cast<uint8_t>((pred[k] + res) & mask);
-        }
-        std::memcpy(hist[i & 255], e, 6);
-        uint16_t c0 = (static_cast<uint16_t>(e[0]) << 11) | (static_cast<uint16_t>(e[1]) << 5) | e[2];
-        uint16_t c1 = (static_cast<uint16_t>(e[3]) << 11) | (static_cast<uint16_t>(e[4]) << 5) | e[5];
-        uint32_t idx0 = symbols[8 * target + i] & 0xFF;
-        uint32_t idx1 = symbols[9 * target + i] & 0xFF;
-        uint32_t idx2 = symbols[10 * target + i] & 0xFF;
-        uint32_t idx3 = symbols[11 * target + i] & 0xFF;
-        uint32_t w = BC1_QUAD_MASKS[0][idx0] | BC1_QUAD_MASKS[1][idx1] |
-                     BC1_QUAD_MASKS[2][idx2] | BC1_QUAD_MASKS[3][idx3];
-        uint8_t* blk = output + i * 8;
-        std::memcpy(blk + 0, &c0, 2);
-        std::memcpy(blk + 2, &c1, 2);
-        std::memcpy(blk + 4, &w, 4);
-    }
-    return true;
-}
-
 inline constexpr uint8_t ALPHA_CODE[8] = { 0, 2, 3, 4, 5, 6, 7, 1 };
 inline constexpr uint8_t COLOUR_CODE[4] = { 0, 2, 3, 1 };
 
@@ -1485,83 +1444,46 @@ inline bool decode_bc3_blocks(const std::vector<uint16_t>& symbols, size_t num_b
     return true;
 }
 
+#include "bcpack_blocks_extra.inl"
+
 inline bool decode_bcpack(const unsigned char* input, size_t input_size, unsigned bc_format,
                           unsigned char* output, size_t output_size, size_t* produced) {
-    if (!input || !output || !produced) return false;
-    if (input_size == 0 || output_size == 0) return false;
+    if (!produced) return false;
+    *produced = 0;
+    if (!input || !output || input_size == 0 || output_size == 0 ||
+        bc_format < 1 || bc_format > 7) return false;
 
-    if (bc_format == 7) {
-        if (output_size % 16 != 0) return false;
-        size_t num_blocks = output_size / 16;
-        size_t target_per_lane = num_blocks * 2;
-        const uint8_t ab[16] = { 3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4 };
-        std::vector<uint16_t> symbols;
-        if (!decode_lanes(input, input_size, ab, 16, target_per_lane, symbols)) {
-            return false;
-        }
-        if (!decode_bc7_blocks(symbols, num_blocks, output, output_size)) {
-            return false;
-        }
-        *produced = output_size;
-        return true;
-    } else if (bc_format == 1) {
-        if (output_size % 8 != 0) return false;
-        size_t num_blocks = output_size / 8;
-        size_t target_per_lane = num_blocks;
-        const uint8_t ab[12] = { 7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7 };
-        std::vector<uint16_t> symbols;
-        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
-            return false;
-        }
-        if (!decode_bc1_blocks(symbols, num_blocks, output, output_size)) {
-            return false;
-        }
-        *produced = output_size;
-        return true;
-    } else if (bc_format == 4) {
-        if (output_size % 8 != 0) return false;
-        size_t num_blocks = output_size / 8;
-        size_t target_per_lane = num_blocks;
-        const uint8_t ab[12] = { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 };
-        std::vector<uint16_t> symbols;
-        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
-            return false;
-        }
-        if (!decode_bc4_blocks(symbols, num_blocks, output, output_size)) {
-            return false;
-        }
-        *produced = output_size;
-        return true;
-    } else if (bc_format == 5) {
-        if (output_size % 16 != 0) return false;
-        size_t num_blocks = output_size / 16;
-        size_t target_per_lane = num_blocks * 2;
-        const uint8_t ab[12] = { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 };
-        std::vector<uint16_t> symbols;
-        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
-            return false;
-        }
-        if (!decode_bc5_blocks(symbols, num_blocks, output, output_size)) {
-            return false;
-        }
-        *produced = output_size;
-        return true;
-    } else if (bc_format == 3) {
-        if (output_size % 16 != 0) return false;
-        size_t num_blocks = output_size / 16;
-        size_t target_per_lane = num_blocks * 2;
-        const uint8_t ab[12] = { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 };
-        std::vector<uint16_t> symbols;
-        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
-            return false;
-        }
-        if (!decode_bc3_blocks(symbols, num_blocks, output, output_size)) {
-            return false;
-        }
-        *produced = output_size;
-        return true;
+    // Hardware alphabet indices, not literal symbol bit widths.
+    static constexpr uint8_t alphabets[7][16] = {
+        {7,7,4,5,4,4,5,4,7,7,7,7},
+        {3,3,3,3,3,3,3,3,3,3,4,5,4,7,7},
+        {3,3,7,5,5,5,5,4,5,4,7,7},
+        {7,7,7,7,5,5,5,5,5,5,5,5},
+        {3,3,7,7,5,5,5,5,5,5,5,5},
+        {3,3,7,7,7,4,4,4,5,5,5,7,7,7,7,4},
+        {3,3,7,7,7,7,7,6,6,4,5,7,7,7,7,4},
+    };
+    const size_t bytes_per_block = bc_format == 1 || bc_format == 4 ? 8 : 16;
+    if (output_size % bytes_per_block) return false;
+    const size_t blocks = output_size / bytes_per_block;
+    const size_t target = output_size / 8;
+    const size_t lanes = bc_format >= 6 ? 16 : bc_format == 2 ? 15 : 12;
+    std::vector<uint16_t> symbols;
+    if (target > symbols.max_size() / lanes) return false;
+    if (!decode_lanes(input, input_size, alphabets[bc_format-1], lanes, target, symbols)) return false;
+    bool ok = false;
+    switch (bc_format) {
+    case 1: ok = decode_bc1_blocks(symbols,blocks,output,output_size); break;
+    case 2: ok = decode_bc2_blocks(symbols,blocks,output,output_size); break;
+    case 3: ok = decode_bc3_blocks(symbols,blocks,output,output_size); break;
+    case 4: ok = decode_bc4_blocks(symbols,blocks,output,output_size); break;
+    case 5: ok = decode_bc5_blocks(symbols,blocks,output,output_size); break;
+    case 6: ok = decode_bc6_blocks(symbols,blocks,output,output_size); break;
+    case 7: ok = decode_bc7_blocks(symbols,blocks,output,output_size); break;
     }
-    return false;
+    if (!ok) return false;
+    *produced = output_size;
+    return true;
 }
 
 } // namespace x2w_bcpack

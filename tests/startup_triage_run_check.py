@@ -59,6 +59,11 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
         # A device slot 67 compute request with the same reason is counted in its own class.
         (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
         (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
+        # A compute runtime manifest reason is a fixed category; text outside its allowlist is not copied.
+        for key, line in ((5, "unsupported startup runtime manifest bindings: UAV kind texture_uav cube"),
+                          (6, "unsupported startup runtime manifest bindings: SRV kind /home/alice/x")):
+            (cache_dir / f"{key:016x}.fail").write_text(line + "\n", encoding="utf-8")
+            (cache_dir / f"req_{key:016x}.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -77,6 +82,8 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
             "| 1 | `compute: image_load_mip tfe` |",
+            "| 1 | `compute: runtime manifest: UAV kind texture_uav cube` |",
+            f"| 1 | `compute: {triage_run.OTHER}` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
@@ -503,6 +510,9 @@ def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
         ("native compute +0x14: unsupported instruction v_add3_u32 0xd76d0002u", "v_* instruction"),
         ("native compute +0x8: unsupported opcode 0xdeadbeefu", "unsupported opcode"),
         ("native compute +0x10: unsupported pixel entry VGPR 2", "unsupported pixel entry VGPR"),
+        ("unsupported startup runtime manifest bindings: SRV kind texture_srv 2d array",
+         "runtime manifest: SRV kind texture_srv 2d array"),
+        ("unsupported startup runtime manifest bindings: more than 8 UAVs", "runtime manifest: more than 8 UAVs"),
         ("native compute +0x1c: unproven resource descriptor s12", "unproven resource descriptor"),
         ("native compute +0x20: unbound numeric SGPR s0", "unbound numeric SGPR"),
         ("unknown gfx1013 instruction format at byte 24", "undecodable word"),
