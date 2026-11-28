@@ -118,7 +118,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
     if actual is None:
         raise AssertionError("linear WARP fixture unexpectedly skipped")
     # Literal UNORM8 reference for A and B, alternating mip 0 and mip 1.
-    samples = ((51, 102), (153, 204), (51, 102), (51, 102))
+    # Column 3 binds an address whose memory was never written: the layout path now reads it (zeros), as main does for linear 0x100.
+    samples = ((51, 102), (153, 204), (51, 102), (0, 0))
     expected = bytes(c for y in range(4) for x in range(8)
                      for c in (samples[x // 2][y % 2], 0, 0, 255))
     if actual != expected:
