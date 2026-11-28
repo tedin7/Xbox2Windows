@@ -342,6 +342,44 @@ def check_execute_slot35(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_static_list(scene, player, backend, env, directory, vs, ps, root):
+    """A list closed before the recorder's window (f6,6) and submitted again in every frame inside it: the recording
+    carries the list's calls into the window, so presents 7-12 replay equal. With the carry off
+    (X2W_REPLAY_CARRY_MAX_MIB=0) the replayed list is empty and the pictures lose its corner."""
+    recorded_dir, recording = directory / "static_recorded", directory / "static.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(recording), X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = recording.read_bytes()
+    first_present = min(struct.unpack_from("<Q", data, header)[0] for tag, header, *_ in chunks(data) if tag == b"PRES")
+    carried = [struct.unpack_from("<QIHH", data, header)[0] for tag, header, *_ in chunks(data)
+               if tag == b"CALL" and struct.unpack_from("<QIHH", data, header)[2:] == (LIST_KIND, 52)
+               and struct.unpack_from("<Q", data, header)[0] < first_present]
+    assert carried, "the recording holds no list call from before its window"
+    whole = pictures(recorded_dir)
+    pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
+    _score, played = replay(player, recording, directory / "static_replayed", backend, env, presents=6)
+    differ = [b for a, b in pairs if played.get(a) != whole[b]]
+    assert not differ, "static-list window replay differs at %s\n%s" % (
+        differ, explain(whole[differ[0]], played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
+                        directory / "static_replayed" / "stderr.txt"))
+    # Mutant: the same run without the carry. The file lacks the list's calls and the replay's pictures differ.
+    bare_dir, bare = directory / "static_bare_recorded", directory / "static_bare.x2wr"
+    bare_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_EXEC_SLOT="35", X2W_TEST_REPLAY_STATIC_LIST="1", X2W_REPLAY_RECORD="f6,6",
+                          X2W_REPLAY_RECORD_FILE=str(bare), X2W_PRESENT_PICTURES=str(bare_dir),
+                          X2W_REPLAY_CARRY_MAX_MIB="0"))
+    assert code == 0, text[-3000:]
+    assert pictures(bare_dir)["present_0007.png"] == whole["present_0007.png"], "the live pictures changed with the carry off"
+    _score, lacking = replay(player, bare, directory / "static_bare_replayed", backend, env, presents=6)
+    assert all(lacking.get(a) != whole[b] for a, b in pairs), "without the carry the replay still drew the list's corner"
+    print("static_list: presents 7-12 replay equal with the carried list, all differ without it")
+    return 0
+
+
 def without_list_array(source, target):
     """Copies a slot-35 recording without the list array of its queue submissions (as recorded before the recorder
     captured it): drops the ARGM and OUTP chunks of argument 1 of every queue slot-35 call."""
@@ -547,6 +585,8 @@ def main(scene, player, backend, mode=None):
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
         if mode == "execute-slot35":
             return check_execute_slot35(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "static-list":
+            return check_static_list(scene, player, backend, env, directory, vs, ps, root)
         if mode == "infer-execute":
             return check_infer_execute(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":

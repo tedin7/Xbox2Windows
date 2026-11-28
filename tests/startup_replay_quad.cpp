@@ -46,6 +46,7 @@ struct Scene {
     void* queue = nullptr;
     void* allocator = nullptr;
     void* list = nullptr;
+    void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
     TitleRange title_range = TitleRange::none;
@@ -272,6 +273,20 @@ int create_scene(void* device, Scene& s)
                                            arg(&s.list)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&s.fence)))))
         return 23;
+    // A list built and closed before the recorder's window, submitted again every frame: a green corner over the frame.
+    char static_list[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_LIST", static_list, sizeof(static_list)) == 1 && static_list[0] == '1') {
+        void* allocator = nullptr;
+        const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+        const D3D12_RECT corner{0, 0, 12, 10};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
+                                               arg(&allocator)))) ||
+            FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(allocator), 0,
+                                               arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&s.static_list)))))
+            return 23;
+        invoke(s.static_list, 52, s.rtv, arg(green), 1, arg(&corner));
+        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+    }
     return 0;
 }
 
@@ -517,6 +532,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         return GetEnvironmentVariableA("X2W_TEST_REPLAY_EXEC_SLOT", value, sizeof(value)) ? static_cast<UINT>(std::atoi(value)) : 10u;
     }();
     invoke(s.queue, execute_slot, 1, arg(&s.list));
+    if (s.static_list) invoke(s.queue, execute_slot, 1, arg(&s.static_list));
     if (slice) {
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
