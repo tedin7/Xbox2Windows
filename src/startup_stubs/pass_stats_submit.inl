@@ -43,8 +43,10 @@ void Tracker::execute(ID3D12CommandQueue* queue, const std::vector<ID3D12Command
     std::lock_guard<std::mutex> guard(lock_);
     Submission s;
     for (ID3D12CommandList* list : lists) {
+        ++counts_[executed];
         const auto found = recordings_.find(static_cast<ID3D12GraphicsCommandList*>(list));
         if (found == recordings_.end()) continue;
+        ++counts_[tracked];
         for (const Record& record : found->second.passes) s.reports.push_back({record});
     }
     if (s.reports.empty()) return;
@@ -297,8 +299,12 @@ void Tracker::present(LONG frame, ID3D12Resource* surface)
         }
     }
     write_lines(text);
-    log("x2w-pass stats: present %ld: %zu passes, %zu reductions in %zu submissions%s%s", frame, views.size(), reductions,
-        submissions_.size(), failure ? ", failure: " : "", failure ? failure : "");
+    const unsigned* c = counts_;
+    log("x2w-pass stats: present %ld: %zu passes, %zu reductions in %zu submissions%s%s; hooks: draws %u, not drawn %u, "
+        "dispatches %u, copies %u, clears %u, closes %u, lists executed %u (tracked %u)", frame, views.size(), reductions,
+        submissions_.size(), failure ? ", failure: " : "", failure ? failure : "", c[draws], c[not_drawn_calls],
+        c[dispatches], c[copies], c[clears], c[closes], c[executed], c[tracked]);
+    std::fill(std::begin(counts_), std::end(counts_), 0u);
     report_collapse(frame, surface, views, records);
     submissions_.clear();
     passes_this_present_ = 0;

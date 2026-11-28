@@ -233,6 +233,9 @@ private:
     std::unordered_map<ID3D12CommandQueue*, std::pair<ComPtr<ID3D12Fence>, u64>> fences_;
     Pipelines pipelines_;
     unsigned passes_this_present_ = 0;
+    // Hook calls since the last present: draws, not drawn, dispatches, copies, clears, closes, executed lists, of them tracked.
+    enum Count { draws, not_drawn_calls, dispatches, copies, clears, closes, executed, tracked, count_kinds };
+    unsigned counts_[count_kinds]{};
     u64 bytes_this_present_ = 0;
     std::FILE* file_ = nullptr;
     bool file_tried_ = false;
@@ -361,6 +364,7 @@ void Tracker::draw(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key)
     Pass& pass = pass_of(self);
     std::vector<Write> writes = targets_of(pass);
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[draws];
     Recording& r = recordings_[list];
     Record* open = r.open ? &r.passes.back() : nullptr;
     if (open && open->kind == Kind::clear && covers(writes, open->writes)) {
@@ -381,6 +385,7 @@ void Tracker::not_drawn(const Pass& pass, ID3D12GraphicsCommandList* list, u64 k
 {
     std::vector<Write> writes = targets_of(pass);
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[not_drawn_calls];
     Recording& r = recordings_[list];
     Record* open = r.open ? &r.passes.back() : nullptr;
     if (open && open->kind == Kind::clear && covers(writes, open->writes)) {
@@ -411,6 +416,7 @@ void Tracker::dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, 
     if (outputs.empty()) return;  // a dispatch that writes nothing ends no pass
     Pass& pass = pass_of(self);
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[dispatches];
     Recording& r = recordings_[list];
     Record* open = r.open ? &r.passes.back() : nullptr;
     if (open && open->kind == Kind::clear && covers(outputs, open->writes)) {
@@ -434,6 +440,7 @@ void Tracker::copy(Wrapper* self, ID3D12GraphicsCommandList* list, Write destina
 {
     Pass& pass = pass_of(self);
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[copies];
     Recording& r = recordings_[list];
     Record* open = r.open ? &r.passes.back() : nullptr;
     if (!open || open->kind != Kind::copy) {
@@ -464,6 +471,7 @@ void Tracker::clear(Wrapper* self, ID3D12GraphicsCommandList* list, ID3D12Resour
 {
     Pass& pass = pass_of(self);
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[clears];
     Recording& r = recordings_[list];
     Record* open = r.open ? &r.passes.back() : nullptr;
     if (open && open->kind != Kind::copy && writes_resource(open->writes, target)) {
@@ -482,6 +490,7 @@ void Tracker::clear(Wrapper* self, ID3D12GraphicsCommandList* list, ID3D12Resour
 void Tracker::close(Wrapper* self, ID3D12GraphicsCommandList* list)
 {
     std::lock_guard<std::mutex> guard(lock_);
+    ++counts_[closes];
     const auto found = recordings_.find(list);
     if (found == recordings_.end()) return;
     found->second.open = false;
