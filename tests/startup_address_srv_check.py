@@ -128,8 +128,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
              if "Device::slot70" in line and "layout=0x100" in line]
     if any("reason=unsupported_description" in line for line in lines):
         raise AssertionError(f"linear description refused: {lines}")
-    if sum("reason=texture_no_resource" in line for line in lines) != 1:
-        raise AssertionError(f"expected one missing-resource refusal: {lines}")
+    if any("reason=texture_no_resource" in line for line in lines):
+        raise AssertionError(f"a linear address without a live resource is read by the layout path, not refused: {lines}")
     print(f"{backend}: linear placed mip views; all 32 RGBA pixels exact")
 
 
