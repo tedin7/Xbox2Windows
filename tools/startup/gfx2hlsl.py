@@ -22362,6 +22362,34 @@ class Pipeline:
                 '    return ((bits >> 31u) != 0u ? 0u - packed : packed) & 0xffffu;',
                 '}',
             ))
+        if getattr(self, 'uses_ldexp', False):
+            # Integer arithmetic on the binary32 fields (sign, biased exponent, 24-bit significand): x * 2^n with one
+            # rounding to nearest even. The result exponent is e + n; at 255 or more it overflows to infinity, below 1
+            # the significand is shifted right by 1 - E bits and rounded (a carry into bit 23 is the smallest normal),
+            # and a shift past 25 bits is zero. A denormal source is normalised first. No float multiply is involved,
+            # so denormal results and the sign of a zero survive compilers that flush or fold them.
+            out.extend((
+                'uint x2w_ldexp(uint b, int n) {',
+                '    uint sign = b & 0x80000000u, m = b & 0x7fffffu;',
+                '    int e = int((b >> 23) & 0xffu);',
+                '    if (e == 255) return m != 0u ? (b | 0x00400000u) : b;',
+                '    if (e == 0) {',
+                '        if (m == 0u) return b;',
+                '        int s = 23 - int(firstbithigh(m));',
+                '        m <<= uint(s); e = 1 - s;',
+                '    } else {',
+                '        m |= 0x00800000u;',
+                '    }',
+                '    int E = e + clamp(n, -1000, 1000);',
+                '    if (E >= 255) return sign | 0x7f800000u;',
+                '    if (E >= 1) return sign | (uint(E) << 23) | (m & 0x7fffffu);',
+                '    int sh = 1 - E;',
+                '    if (sh > 25) return sign;',
+                '    uint keep = m >> uint(sh), rem = m & ((1u << uint(sh)) - 1u), half = 1u << uint(sh - 1);',
+                '    if (rem > half || (rem == half && (keep & 1u) != 0u)) keep += 1u;',
+                '    return sign | keep;',
+                '}',
+            ))
         if 'v_dot2_u32_u16' in self.uses_dot2:
             # RDNA 2 ISA V_DOT2_U32_U16: two unsigned 16-bit products + S2, exact uint32 clamp.
             out.append(
