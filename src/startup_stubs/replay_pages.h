@@ -10,6 +10,7 @@
 // Pure C++: no Windows calls, so a fixture can compare the rebuilt image byte for byte.
 #pragma once
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -83,6 +84,10 @@ public:
         std::size_t first = 0;
         std::vector<PageKey> keys;
         bool open = false, run_zero = false;
+        // Pages a later-stamped capture had already seen unchanged, then an older-stamped write changed in the file.
+        // Their newest content is written again at that later stamp, or the replay would end on the older write.
+        struct Restore { std::size_t index; PageKey key; bool zero; std::uint64_t seq; };
+        std::vector<Restore> restores;
         const auto close_run = [&] {
             if (!open) return;
             const RunHeader run{static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(run_zero ? run_pages_ : keys.size()), run_zero ? 1u : 0u};
@@ -106,11 +111,22 @@ public:
             if (last != last_.end() && last->second.zero == zero && last->second.key == key &&
                 !(seq > last->second.seq && last->second.uncertain)) {
                 ++stats_.unchanged;
+                last->second.observed = (std::max)(last->second.observed, seq);
                 close_run();
                 continue;
             }
-            if (last == last_.end() || seq >= last->second.seq)
-                last_[at] = {key, zero, seq, last != last_.end() && seq == last->second.seq};
+            std::uint64_t observed = seq;
+            if (last != last_.end()) {
+                observed = (std::max)(last->second.observed, seq);
+                if (last->second.observed > seq && seq >= last->second.seq)
+                    restores.push_back({i, last->second.key, last->second.zero, last->second.observed});
+            }
+            if (last == last_.end() || seq >= last->second.seq) {
+                if (!restores.empty() && restores.back().index == i)
+                    last_[at] = {restores.back().key, restores.back().zero, restores.back().seq, false, observed};
+                else
+                    last_[at] = {key, zero, seq, last != last_.end() && seq == last->second.seq, observed};
+            }
             if (open && run_zero != zero) close_run();
             if (!open) { open = true; run_zero = zero; first = i; run_pages_ = 0; }
             ++run_pages_;
@@ -125,16 +141,29 @@ public:
             }
         }
         close_run();
-        if (!run_count) return true;  // no page changes need a MAP at this stamp
-        MapHeader header{address, bytes, seq, run_count, 0};
-        sink_("MAP ", &header, sizeof(header), runs.data(), runs.size());
+        if (run_count) {
+            MapHeader header{address, bytes, seq, run_count, 0};
+            sink_("MAP ", &header, sizeof(header), runs.data(), runs.size());
+        }
+        for (const Restore& restore : restores) {
+            std::vector<unsigned char> one;
+            const RunHeader run{static_cast<std::uint32_t>(restore.index), 1u, restore.zero ? 1u : 0u};
+            const auto* r = reinterpret_cast<const unsigned char*>(&run);
+            one.insert(one.end(), r, r + sizeof(run));
+            if (!restore.zero) {
+                const auto* k = reinterpret_cast<const unsigned char*>(&restore.key);
+                one.insert(one.end(), k, k + sizeof(PageKey));
+            }
+            MapHeader header{address, bytes, restore.seq, 1, 0};
+            sink_("MAP ", &header, sizeof(header), one.data(), one.size());
+        }
         return true;
     }
 
     const PageStats& stats() const { return stats_; }
 
 private:
-    struct Last { PageKey key; bool zero; std::uint64_t seq; bool uncertain; };
+    struct Last { PageKey key; bool zero; std::uint64_t seq; bool uncertain; std::uint64_t observed; };
     Sink sink_;
     PageStats stats_;
     std::size_t run_pages_ = 0;

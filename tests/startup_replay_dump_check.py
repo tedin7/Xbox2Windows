@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -93,20 +92,6 @@ def indirect(directory, quad, player, adapter, env):
     return 0
 
 
-def summary(recording):
-    data = recording.read_bytes()
-    out = []
-    for tag, header, _hb, payload, size in chunks(data):
-        if tag == b"MAP ":
-            address, nbytes, seq, runs, _ = struct.unpack_from("<QQQII", data, header)
-            out.append(("MAP", hex(address), seq, runs))
-        elif tag == b"CALL":
-            seq, _t, kind, slot = struct.unpack_from("<QIHH", data, header)
-            if slot in (61, 15):
-                out.append(("CALL", seq, kind, slot))
-    return out
-
-
 def late_indirect(directory, quad, player, env, mode="late"):
     directory.mkdir()
     source = directory / "triangle.hlsl"
@@ -141,7 +126,7 @@ float4 ps() : SV_Target { return float4(1, 0, 1, 1); }
         assert played.keys() == live.keys()
         mismatches = [frame for frame, name in enumerate(live) if played[name] != live[name]]
         if enabled == "1":
-            assert not mismatches, ("late indirect replay mismatches", mismatches, mode, summary(recording))
+            assert not mismatches, ("late indirect replay mismatches", mismatches)
             reference = live
         else:
             assert live == reference, "draw pages changed the live pictures"
