@@ -100,6 +100,10 @@ HEAP_MESH[1:1] = HEAP_SETUP + [
 ] + HEAP_ARM + ['bf800000']  # s_nop 0, the join before the exchange
 
 
+FORMATTED_HEAP_MESH = HEAP_MESH.copy()
+FORMATTED_HEAP_MESH[FORMATTED_HEAP_MESH.index('e03810c0')] = 'e00c10c0'
+
+
 def heap_root():
     params = [(1, 0, 60), (0, 0, 72), (1, 0, 80)]
     rts = (struct.pack('<6I', 2, 3, 24, 0, 0, 0x400)
@@ -1614,6 +1618,7 @@ def mesh_root_layout_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     mesh_root_layout_controls()
+    group_reference_controls()
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, HEAP_MESH, root_blob=heap_root())
         expect('heap branch translates', result, 'ok')
@@ -1656,10 +1661,19 @@ def controls():
         advanced[advanced.index('bf840004')] = 'bf840005'
         expect('advanced heap refused', request(tmp, advanced, root_blob=heap_root())[1],
                "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
-        formatted = HEAP_MESH.copy()
-        formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
-        # A formatted buffer load through a heap record translates since the heap format table exists.
-        expect('formatted heap load translates', request(tmp, formatted, root_blob=heap_root())[1], 'ok')
+        formatted = FORMATTED_HEAP_MESH.copy()
+        key, result = request(tmp, formatted, root_blob=heap_root())
+        expect('formatted heap translates', result, 'ok')
+        source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+        manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text()
+        expect('formatted heap manifest', 'dynamic_heap_formats\n' in manifest, True)
+        expect('formatted heap info SRV', 'ByteAddressBuffer info = ResourceDescriptorHeap[heap_count];' in source
+               and 'x2w_heap_info(' in source, True)
+        rewritten = formatted.copy()
+        rewritten.insert(rewritten.index('e00c10c0'), 'be9f0380')  # s_mov_b32 s31, 0
+        rewritten[rewritten.index('bf840004')] = 'bf840005'
+        expect('rewritten formatted heap record refused', request(tmp, rewritten, root_blob=heap_root())[1],
+               'unsupported: dynamic resource heap descriptor requires four intact words')
     with tempfile.TemporaryDirectory() as group_tmp:
         key, group_result = request(group_tmp, GROUP_MESH)
         expect('numeric group index translates', group_result, 'ok')
@@ -1690,6 +1704,8 @@ def controls():
         expect('published files', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
         expect('a translated request is not pending', G.pending_keys(tmp, False), [])
         manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+        expect('mesh manifest identifies request key', [line for line in manifest if line.startswith('key ')],
+               ['key %016x' % key])
         expect('paired manifest stage information',
                [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
                ['params 1', 'targets 0'])
@@ -2076,6 +2092,18 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
+
+
+def group_reference_controls():
+    """Check that the runtime fixture's negative controls have distinct images."""
+    points, colours, indices = geometry()
+    full = rasterise(points, colours, indices, len(points), len(indices))
+    group_zero = rasterise(points, colours, indices[:2], len(points), 2)
+    no_constants = rasterise(points, colours, indices, 0, 0)
+    clear = [(0, 0, 0, 255)] * (SIDE * SIDE)
+    expect('one group differs from two groups', group_zero != full, True)
+    expect('zero entry counts leave the target clear', no_constants, clear)
+    expect('zero entry counts differ from two groups', no_constants != full, True)
 
 
 def lane_mask_reference(label, full, mutant=None):
@@ -2670,11 +2698,13 @@ def reference_per_lane(points, colours, triangles, bound, old, wave_red):
     return rasterise(points, rendered, triangles, 128, len(triangles))
 
 
-def publish_request(directory, publisher, adapter):
-    ms, ps = code(MESH), code(PIXEL)
+def publish_request(directory, publisher, adapter, mesh=MESH, heap=None):
+    ms, ps = code(mesh), code(PIXEL)
     (directory / 'ms.bin').write_bytes(ms)
     (directory / 'ps.bin').write_bytes(ps)
     env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
+    if heap is not None:
+        env['X2W_TEST_MESH57_HEAP'] = str(heap)
     result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
     print(result.stdout, end='')
     if result.returncode:
@@ -2694,6 +2724,153 @@ def publish_request(directory, publisher, adapter):
     if FAILED:
         return 1, None
     return 0, (cache, key, root_blob)
+
+
+# The runtime refusal of a slot 57 draw whose data table sits at a non-zero slot of the indexed heap (known limit).
+TABLE_SLOT_REFUSAL = 'the table descriptor entry is not readable'
+
+
+def runtime_mismatch_report(actual, expected, correct, group_zero, clear, log):
+    """Say which known image a wrong runtime image is closest to, where it differs and what the runtime logged."""
+    def pixels(image):
+        return [tuple(image[i:i + 4]) for i in range(0, len(image), 4)]
+    got, want = pixels(actual), pixels(expected)
+    counts = [sum(a != b for a, b in zip(got, pixels(ref))) for ref in (expected, correct, group_zero, clear)]
+    lines = ['pixels differing from: expected %d, two groups %d, group zero %d, clear %d; non-clear pixels %d'
+             % (*counts, sum(p != (0, 0, 0, 255) for p in got))]
+    wrong = [(i % SIDE, i // SIDE, a, b) for i, (a, b) in enumerate(zip(got, want)) if a != b]
+    worst = [max(abs(a[c] - b[c]) for _, _, a, b in wrong) for c in range(4)] if wrong else []
+    lines.append('largest channel difference (r, g, b, a): %s' % (worst,))
+    lines += ['  (%d,%d) got %s want %s' % item for item in wrong[:8]]
+    if log.exists():
+        text = [line for line in log.read_text(errors='replace').splitlines()
+                if any(word in line for word in ('slot57', 'mesh', 'ExecuteIndirect', 'desktop pipeline', 'refused', 'heap'))]
+        lines += ["log: " + line[:240] for line in text[:40]]
+    return '\n'.join(lines)
+
+
+def runtime(dxc, renderer, adapter, publisher):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    correct = b''.join(map(bytes, rasterise(points, colours, indices, len(points), len(indices))))
+    group_zero = b''.join(map(bytes, rasterise(points, colours, indices[:2], len(points), 2)))
+    clear = bytes((0, 0, 0, 255)) * (SIDE * SIDE)
+    assert correct != group_zero and correct != clear
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        status, published = publish_request(directory, publisher, adapter, GROUP_MESH)
+        if status:
+            return status
+        cache, key, _ = published
+        data = directory / 'data.bin'
+        arguments = directory / 'args.bin'
+        pixels = directory / 'pixels.bin'
+        log = directory / 'runtime.log'
+        data.write_bytes(buffer(points, colours, words))
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
+                   X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data),
+                   X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
+                   X2W_TRAP_LOG=str(log))
+        def execute(groups, expected, no_constants=False, reason=None):
+            arguments.write_bytes(struct.pack('<3I', *groups))
+            pixels.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+            case_env = dict(env)
+            if no_constants:
+                case_env['X2W_TEST_MESH57_NO_CONSTANTS'] = '1'
+            result = subprocess.run([publisher, adapter, 'mesh'], env=case_env, capture_output=True, text=True)
+            if result.returncode == 77:
+                return 77
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+            actual = pixels.read_bytes()
+            if actual != expected:
+                raise AssertionError(f'mesh runtime {groups}: image differs at '
+                                     f'{sum(a != b for a, b in zip(actual, expected))} bytes\n'
+                                     + runtime_mismatch_report(actual, expected, correct, group_zero, clear, log))
+            if reason and (not log.exists() or reason not in log.read_text(errors='replace')):
+                raise AssertionError(f'mesh runtime did not log {reason}')
+            return 0
+        if execute((2, 1, 1), clear, reason='slot57 mesh translation pending') == 77:
+            return 77
+        if G.translate_request(str(cache), key) != 'ok':
+            raise AssertionError('mesh request translation failed')
+        manifest = cache / f'{key:016x}.ms57.txt'
+        original = manifest.read_text()
+        manifest.write_text(original.replace(f'key {key:016x}', 'key 0000000000000000'))
+        if execute((2, 1, 1), clear, reason='manifest key mismatch') == 77:
+            return 77
+        manifest.write_text(original)
+        for groups, expected, missing in (((2, 1, 1), correct, False), ((1, 2, 1), correct, False),
+                                          ((1, 1, 1), group_zero, False), ((2, 1, 1), clear, True)):
+            if execute(groups, expected, missing) == 77:
+                return 77
+    # Publish the heap-indexed root with the exact fixture used for the runtime draw.
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        heap = directory / 'heap.bin'
+        heap_colours = [(255, 0, 0, 255), (0, 255, 0, 255)]
+        heap_bytes = b''.join(buffer(points, [colour] * len(points), words) for colour in heap_colours)
+        heap.write_bytes(heap_bytes)
+        decoded = [tuple(round(c * 255) for c in struct.unpack_from('<4f', heap_bytes, i * 512 + 192))
+                   for i in range(2)]
+        images = [b''.join(map(bytes, rasterise(points, [colour] * len(points), indices[:2], len(points), 2)))
+                  for colour in [(0, 0, 0, 0), *decoded]]
+        assert len(set(images)) == 3
+        status, published = publish_request(directory, publisher, adapter, FORMATTED_HEAP_MESH, heap)
+        if status:
+            return status
+        cache, key, root_blob = published
+        pipe = G.MeshPipeline(code(FORMATTED_HEAP_MESH), code(PIXEL), root_blob)
+        pipe.hlsl_ms()
+        assert 'dynamic_heap_formats\n' in pipe.manifest()
+        if G.translate_request(str(cache), key) != 'ok':
+            raise AssertionError('formatted heap mesh request translation failed')
+        data, arguments, pixels, log = (directory / name for name in ('data.bin', 'args.bin', 'pixels.bin', 'runtime.log'))
+        data.write_bytes(buffer(points, colours, words))
+        arguments.write_bytes(struct.pack('<3I', 1, 1, 1))
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
+                   X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data),
+                   X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
+                   X2W_TEST_MESH57_HEAP=str(heap), X2W_TRAP_LOG=str(log))
+        env.pop('X2W_TEST_MESH57_NO_CONSTANTS', None)
+        # Heap slot 0 holds the data table view (the guest binds one heap); 1 and 2 the typed records; 3 is empty.
+        for index, want in ((1, images[1]), (3, images[0]), (2, images[2])):
+            pixels.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+            result = subprocess.run([publisher, adapter, 'mesh'], env=dict(env, X2W_TEST_MESH57_HEAP_INDEX=str(index)),
+                                    capture_output=True, text=True)
+            if result.returncode == 77:
+                return 77
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+            actual = pixels.read_bytes()
+            if actual != want:
+                raise AssertionError(f'formatted heap record {index}: image differs\n' +
+                                     runtime_mismatch_report(actual, want, images[1], images[2], clear, log))
+        # KNOWN LIMIT: a data table at a non-zero slot of the indexed heap (here slot 3) is not resolved by the runtime
+        # yet; the draw is refused with this logged reason and nothing is drawn. When the runtime resolves it, this case
+        # must draw record 1 instead: replace the expectation, do not delete the case.
+        pixels.unlink(missing_ok=True)
+        log.unlink(missing_ok=True)
+        result = subprocess.run([publisher, adapter, 'mesh'], capture_output=True, text=True,
+                                env=dict(env, X2W_TEST_MESH57_HEAP_INDEX='1', X2W_TEST_MESH57_TABLE_SLOT='3'))
+        if result.returncode == 77:
+            return 77
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+        actual = pixels.read_bytes()
+        logged = log.read_text(errors='replace') if log.exists() else ''
+        if actual == images[1]:
+            raise AssertionError('table at heap slot 3 now draws: the known limit is lifted, update this case')
+        if actual != clear or TABLE_SLOT_REFUSAL not in logged:
+            raise AssertionError('table at heap slot 3: expected the logged refusal "%s" and a clear image\n%s'
+                                 % (TABLE_SLOT_REFUSAL, runtime_mismatch_report(actual, clear, images[1], images[2],
+                                                                                clear, log)))
+        print('table at heap slot 3: refused as the known limit (%s)' % TABLE_SLOT_REFUSAL)
+    return 0
 
 
 def draw(dxc, renderer, adapter, publisher=None):
@@ -3180,6 +3357,8 @@ def main(argv):
         status = draw_shift(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['runtime'] and len(argv) == 6:
+        status = runtime(*argv[2:])
     elif len(argv) == 1:
         controls()
     else:

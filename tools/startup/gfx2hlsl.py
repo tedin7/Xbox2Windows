@@ -23358,6 +23358,8 @@ def translate_mesh57(out_dir, key):
     base = name
     output_key, marker = approx_result(key, pipe)
     name = os.path.join(out_dir, '%016x' % output_key)
+    # The runtime checks this line against the key it loaded the manifest by (the published file name).
+    manifest = manifest.replace('\n', '\nkey %016x\n' % output_key, 1)
     if marker:
         manifest += '# ' + marker + '\n'
     for stage, _, hlsl in sources:
