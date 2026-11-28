@@ -2324,6 +2324,8 @@ def lane_mask_mutants(label, source):
 
 def draw_lane_masks(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
+    # The stand-in draw binds no integer view twins (srvint), which the runtime does bind for slot 57.
+    os.environ['X2W_INTEGER_TEXTURE_SRVS'] = '0'
     os.environ.pop('X2W_FXC', None)
     for label, mesh in MASK_CASES + MASK_MEMORY + MASK_GENERIC + ROUND2_DRAWS:
         # A group has two guest waves. A second S1 draw changes wave 1 from

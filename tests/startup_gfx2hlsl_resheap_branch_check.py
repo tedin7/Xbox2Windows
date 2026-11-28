@@ -530,7 +530,9 @@ def integer_image_control():
 def warp_integer_image(offscreen, dxc):
     """Heap slots 0..2 hold 1D views of R32_UINT, R32_SINT and R32_FLOAT whose first texel is 1.25f, 2.5f and 4.0f as
     bits; the info table at heap_count carries the view class the runtime writes. Each record is read through its own
-    integer or float view."""
+    integer or float view. The mutant is the translator with integer views off, which refuses the load
+    (integer_image_control); a desktop adapter returns the raw texel through a mismatched view too, so a wrong class
+    word cannot be told apart in a 32-bit readback."""
     pipe, source, ps_source = integer_image_control()
     count = len(pipe.uds)
     mode = '--startup-dynamic-heap-integer'
@@ -540,9 +542,7 @@ def warp_integer_image(offscreen, dxc):
         ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
         for offset, word in ((0, 0x3fa00000), (32, 0x40200000), (64, 0x40800000)):
             draw(offscreen, vs, ps, offset, word, count, heap_count=3, mode=mode)
-        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, ').y;', ').x;'))
-        draw(offscreen, wrong, ps, 0, 0x3fa00000, count, negative=True, heap_count=3, mode=mode)
-    print('heap integer image: readback and mutant matched')
+    print('heap integer image: readback matched; integer views off is refused (integer_image_control)')
 
 
 def vertex_image_loop_control():
