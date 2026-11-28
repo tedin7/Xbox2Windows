@@ -81,7 +81,7 @@ def run(dxc, renderer, adapter, publisher):
 
         def explain(lines):
             text = log.read_text(errors='replace').splitlines() if log.exists() else []
-            return '%s\nlog:\n%s' % (lines, '\n'.join(line[:240] for line in text if 'oracle' in line or 'slot57' in line))
+            return '%s\nlog:\n%s' % (lines, '\n'.join(line[:240] for line in text if any(word in line for word in ('oracle', 'slot57', 'mesh', 'ExecuteIndirect'))))
 
         # 1. both translations right
         image, lines = draw('mesh')

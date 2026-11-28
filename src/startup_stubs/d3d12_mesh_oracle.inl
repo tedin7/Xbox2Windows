@@ -173,6 +173,7 @@ inline void unavailable(State& s, KeyState& k, u64 key, UINT key_draw, const std
 {
     if (std::find(k.reported.begin(), k.reported.end(), reason) != k.reported.end()) return;
     k.reported.push_back(reason);
+    log("x2w-oracle mesh %016llx draw %u: unavailable: %s", key, key_draw, reason.c_str());
     write_line(s, sample_head(key, key_draw, s.mesh_draws, frame_number) +
                       ",\"verdict\":\"oracle_unavailable\",\"reason\":\"" + json_text(reason) + "\"}");
 }
@@ -445,6 +446,8 @@ bool mesh_oracle_draw(Wrapper* self, ID3D12GraphicsCommandList* list, const Tran
                       ID3D12PipelineState* pipeline, const Issue& issue)
 {
     if (!tr.mesh || !mesh_oracle::selected(tr.key)) return false;
+    static LONG reached;
+    if (first_calls(reached, 8)) log("x2w-oracle mesh %016llx: draw reached the oracle", tr.key);
     auto& s = mesh_oracle::state();
     Pass& pass = pass_of(self);
     ID3D12PipelineState* serial = nullptr;
@@ -546,6 +549,9 @@ bool mesh_oracle_draw(Wrapper* self, ID3D12GraphicsCommandList* list, const Tran
     pending.mesh_draw = mesh_draw;
     for (auto& p : prepared) pending.targets.push_back(std::move(p.target));
     std::lock_guard<std::mutex> lock(s.mutex);
+    static LONG logged;
+    if (first_calls(logged, 32))
+        log("x2w-oracle mesh %016llx draw %u: sample %u recorded (%zu targets)", tr.key, key_draw, sample, pending.targets.size());
     s.pending.push_back(std::move(pending));
     return true;
 }
@@ -566,6 +572,9 @@ void mesh_oracle_executed(ID3D12CommandQueue* queue, UINT count, ID3D12CommandLi
             ran.push_back(std::move(*it));
             it = s.pending.erase(it);
         }
+        static LONG waiting;
+        if (ran.empty() && !s.pending.empty() && first_calls(waiting, 8))
+            log("x2w-oracle mesh: %zu samples wait for another submission", s.pending.size());
     }
     if (ran.empty()) return;
     x2w_startup::ComPtr<ID3D12Device> device;

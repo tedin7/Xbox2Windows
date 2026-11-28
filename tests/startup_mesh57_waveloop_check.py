@@ -75,7 +75,9 @@ def run(mesh, mode=None, pixel=(), *, artifacts=False, root_blob=None, stubs=Fal
             output = {}
             if artifacts:
                 for path in Path(tmp).glob('%016x.*' % key):
-                    output[path.name.split('.', 1)[1]] = path.read_bytes()
+                    data = path.read_bytes()
+                    # Text outputs are compared with LF endings; a Windows run writes CRLF.
+                    output[path.name.split('.', 1)[1]] = data.replace(b'\r\n', b'\n') if path.suffix in ('.hlsl', '.txt') else data
             return result, output
 
 
