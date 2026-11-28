@@ -65,6 +65,8 @@ struct Scene {
     void* indirect_count = nullptr;
     D3D12_DRAW_ARGUMENTS* late_arguments = nullptr;
     UINT* late_count = nullptr;
+    void* gpu_source = nullptr;  // X2W_TEST_REPLAY_INDIRECT=gpu: persistently mapped upload buffer the list copies from
+    unsigned char* gpu_mapped = nullptr;
     void* upload = nullptr;  // X2W_TEST_REPLAY_PREFIX_LIVE
 };
 
@@ -299,6 +301,21 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
+bool create_gpu_source(void* device, Scene& s)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&upload_heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+            D3D12_RESOURCE_STATE_GENERIC_READ, 0, arg(&__uuidof(ID3D12Resource)), arg(&s.gpu_source)))) || !s.gpu_source)
+        return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{0, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(s.gpu_source, 8, 0, arg(&no_reads), arg(&mapped)))) || !mapped) return false;
+    s.gpu_mapped = static_cast<unsigned char*>(mapped);  // stays mapped: the CPU rewrites it every frame
+    return true;
+}
+
 int create_indirect_arguments(void* device, Scene& s, bool late)
 {
     const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
@@ -528,8 +545,19 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         if (s.late_arguments) {
             invoke(s.list, 34, arg(stream_root_signature()));
             // Block one frame with the count word and another with the draw arguments.
-            *s.late_arguments = {frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
-            *s.late_count = frame % 4 == 1 ? 0u : 1u;
+            if (s.gpu_mapped) {
+                // The CPU rewrites the mapped upload words every frame. The copies run on the GPU timeline: title
+                // memory keeps its old words, so only the copies write the arguments and the count.
+                const D3D12_DRAW_ARGUMENTS words{frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
+                const UINT count = frame % 4 == 1 ? 0u : 1u;
+                std::memcpy(s.gpu_mapped, &words, sizeof(words));
+                std::memcpy(s.gpu_mapped + 32, &count, sizeof(count));
+                invoke(s.list, 15, arg(s.arguments), indirect_argument_offset, arg(s.gpu_source), 0, sizeof(D3D12_DRAW_ARGUMENTS));
+                invoke(s.list, 15, arg(s.indirect_count), indirect_count_offset, arg(s.gpu_source), 32, sizeof(UINT));
+            } else {
+                *s.late_arguments = {frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
+                *s.late_count = frame % 4 == 1 ? 0u : 1u;
+            }
             invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), indirect_argument_offset,
                    arg(s.indirect_count), indirect_count_offset);
         } else if (s.signature) {
@@ -611,7 +639,8 @@ int main(int argc, char** argv)
     Scene scene;
     char indirect_mode[16]{};
     const DWORD indirect_size = GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", indirect_mode, sizeof(indirect_mode));
-    const bool late = indirect_size == 4 && std::strcmp(indirect_mode, "late") == 0;
+    const bool gpu = indirect_size == 3 && std::strcmp(indirect_mode, "gpu") == 0;
+    const bool late = gpu || (indirect_size == 4 && std::strcmp(indirect_mode, "late") == 0);
     char mode[16]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_TITLE_RANGE", mode, sizeof(mode))) {
         if (!std::strcmp(mode, "root")) scene.title_range = TitleRange::root;
@@ -633,6 +662,7 @@ int main(int argc, char** argv)
     if (indirect_size) {
         if (!late && frames != 3) return 2;
         if (const int rc = create_indirect_arguments(device, scene, late)) return rc;
+        if (gpu && !create_gpu_source(device, scene)) return 29;
     }
     char recorder_case[16]{};
     GetEnvironmentVariableA("X2W_TEST_REPLAY_RECORDER", recorder_case, sizeof(recorder_case));
