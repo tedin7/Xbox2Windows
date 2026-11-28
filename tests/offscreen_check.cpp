@@ -1404,7 +1404,6 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
-    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
         char* end = nullptr;
