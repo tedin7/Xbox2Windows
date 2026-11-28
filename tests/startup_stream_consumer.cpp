@@ -1006,7 +1006,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             if (keep_closed && FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0,
                     word(&__uuidof(ID3D12GraphicsCommandList)), word(&list))))) return 72;
             if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
-            bind();
+            bind(list);
             invoke(list, 37, 0, constants[0], 0);
             invoke(list, 40, 0, 2, word(graphics), 0);
             invoke(list, 39, 0, 1, word(&constants[1]), 1);

@@ -41,7 +41,6 @@ struct ComputeTranslation {
         bool root = false;
         bool atomic_uint_texture = false;
         unsigned channels = 4;
-        D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
         unsigned half_buffer_bytes = 0;
     };
     u64 key = 0;
@@ -1214,7 +1213,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     if (entries_now) list->SetComputeRoot32BitConstants(0, entries_now, values, 0);
     if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, heap_count, static_cast<UINT>(tr->uds.size()) + twins);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
-    pass_stats_translated_dispatch(self, list, key, views, inputs, count);
+    pass_stats_translated_dispatch(self, list, key, views.data(), inputs, count);
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);

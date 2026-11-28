@@ -3753,20 +3753,20 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource, bool snapshot = false)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(list, bytes, snapshot);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, bool snapshot = false)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
 {
-    auto* dest = reserve_upload_ring(list, bytes, offset, resource, snapshot);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;

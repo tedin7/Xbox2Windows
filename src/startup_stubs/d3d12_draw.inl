@@ -6122,7 +6122,6 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::ViewTable heap_records;
     UINT heap_entries = 0;
     x2w_startup::ViewHeapSelection view_heaps;
-    UINT heap_entries = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         note_lock_acquire(false);
         for (UINT i = 0; i < count; ++i) {
