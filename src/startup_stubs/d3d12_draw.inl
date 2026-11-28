@@ -995,7 +995,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             const bool placeholder_on = GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) == 1 && enabled[0] == '1';
             const bool placeholder_off = GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) == 1 && enabled[0] == '0';
             const bool magenta_on = GetEnvironmentVariableA("X2W_MAGENTA_REFUSED", magenta, sizeof(magenta)) == 1 && magenta[0] == '1';
-            if (!placeholder_on && !(magenta_on && !placeholder_off))
+            // X2W_REPLAY_WHATIF=<key>:const publishes a placeholder for one key only, so any placeholder line is honoured then.
+            const bool whatif_on = GetEnvironmentVariableA("X2W_REPLAY_WHATIF", nullptr, 0) != 0;
+            if (!placeholder_on && !(magenta_on && !placeholder_off) && !whatif_on)
                 return;
             tr.placeholder_ps = line.substr(15);
         } else if (line.compare(0, 3, "ud ") == 0) {

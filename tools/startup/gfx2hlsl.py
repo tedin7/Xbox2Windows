@@ -20880,13 +20880,28 @@ PLACEHOLDER_DRAWN = ' (placeholder drawn)'
 PLACEHOLDER_ATTEMPT = 'x2w-placeholder-attempt'
 
 
+def whatif_const_key():
+    """The request key of X2W_REPLAY_WHATIF=<key>:const (a refused pixel shader stood in by a flat mid-grey), or None."""
+    key, _, mode = os.environ.get('X2W_REPLAY_WHATIF', '').partition(':')
+    if mode == 'const' and re.fullmatch(r'[0-9a-fA-F]{1,16}', key):
+        return int(key, 16)
+    return None
+
+
+def whatif_applies():
+    return whatif_const_key() is not None and whatif_const_key() == _REQUEST_KEY
+
+
 def placeholder_ps_enabled():
     # X2W_MAGENTA_REFUSED=1 is the short switch: the same placeholder (magenta unless X2W_PLACEHOLDER_RGB says otherwise).
-    return os.environ.get('X2W_PLACEHOLDER_PS') == '1' or (
+    # X2W_REPLAY_WHATIF=<key>:const turns it on for that one request only.
+    return os.environ.get('X2W_PLACEHOLDER_PS') == '1' or whatif_applies() or (
         os.environ.get('X2W_PLACEHOLDER_PS') != '0' and os.environ.get('X2W_MAGENTA_REFUSED') == '1')
 
 
 def placeholder_rgb():
+    if whatif_applies():
+        return 128, 128, 128
     rgb = os.environ.get('X2W_PLACEHOLDER_RGB', '255,0,255').split(',')
     if len(rgb) == 3 and all(re.fullmatch(r'[0-9]{1,3}', c.strip()) and int(c) <= 255 for c in rgb):
         return tuple(int(c) for c in rgb)
