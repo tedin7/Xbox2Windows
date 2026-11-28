@@ -2753,10 +2753,6 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool desktop_array = tiled_address && original && slot70_desktop_arrays_enabled() &&
                                x2w_startup::desktop_address_array(original->console);
     const bool console = tiled_address && original && console_layout_srv(original->console);
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
-        static LONG called;
-        if (first_calls(called, 4)) log("x2w-draw upload_texture 1D: tiled_address_srv %d original %d console %d placed_1d %d memory %p list %p", int(resource->own().tiled_address_srv), int(original != nullptr), int(console), int(placed_1d), static_cast<const void*>(memory), static_cast<void*>(list));
-    }
     const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
     const bool single = tiled_address && x2w_startup::single_element_bytes(desc) != 0;
@@ -2772,13 +2768,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 desc.Width, desc.Height, desc.Format, desc.Flags, desc.Dimension, static_cast<const void*>(memory));
         }
     }
-    // Diagnostic: why a console texture is not uploaded (first few per reason).
-    const auto bail = [&](const char* why) {
-        static LONG bails;
-        if (console && first_calls(bails, 12))
-            log("x2w-draw console texture upload skipped (%s): %llux%u dim %d format %d", why, desc.Width, desc.Height, desc.Dimension, desc.Format);
-        return !console;
-    };
+    const auto bail = [&](const char*) { return !console; };
     if (!memory || !list || !uploadable) return bail(!memory ? "no title memory" : !list ? "no recording" : "not uploadable");
     if (list_wrote(self, texture)) return bail("list wrote");  // this recording's own copy; not yet submitted
     if (const auto written_by_gpu = texture_uploads().find(texture); written_by_gpu != texture_uploads().end() && written_by_gpu->second.gpu_written) return bail("gpu written");
@@ -2872,7 +2862,6 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
-        if (console) bail("title memory not readable");
         if (console || placed_1d || desktop_array) return false;
         state.done = true;
         state.staged = false;
@@ -4933,7 +4922,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 draw_lock_release_exclusive();
                 return not_drawn(pass, list, not_drawn_key, 9);
             }
-            if (srv.kind == 4) { static LONG k4; if (first_calls(k4, 6)) log("x2w-draw 1D srv: texture %p resource %p", static_cast<void*>(texture), static_cast<void*>(resource)); }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             auto* const sampled = texture;
             const bool had_texture = sampled != nullptr;

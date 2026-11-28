@@ -1091,7 +1091,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
-    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !console_layout_srv(sampled.desc))
         return static_cast<ID3D12Resource*>(resource->own().real);
     // An already-published token can outlive a write in a different layout.
     if ((partial_tiled_bc(sampled.desc) || console_layout_srv(sampled.desc)) &&
