@@ -7,8 +7,10 @@
 // --mutate unplaced-covers: expect a buffer range past the end of the cached page to be accepted as covered.
 // --mutate unplaced-heap-limit: expect a 2 GiB allocation to be wrapped as an existing heap for an unplaced buffer.
 // --mutate exact-start: expect a page-start base to be kept for a view address that is not a whole number of elements in.
+// --mutate all-a: record every buffer refusal under reason A.
 // Each mutated run is a negative control and must fail.
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/srv_refusal_cache.h"
 
 #include <cstdio>
 #include <cstring>
@@ -79,6 +81,77 @@ D3D12_SHADER_RESOURCE_VIEW_DESC typed_view(DXGI_FORMAT format, UINT64 first_elem
     return v;
 }
 
+void check_refusal_split()
+{
+    using namespace x2w_startup;
+    using Backing = BufferSrvBacking;
+    using Reason = BufferRefusalReason;
+    static BufferSrvRefusalCensus census;
+    char line[640]{};
+    unsigned examples = 0;
+    const auto note = [&](BufferRefusalDetail detail, UINT64 address, UINT64 size, UINT64 stride) {
+        if (mutated("all-a")) detail.reason = Reason::page_copy_stride;
+        return census.note(detail, address, size, stride, [&](const char* text) {
+            ++examples;
+            std::snprintf(line, sizeof(line), "%s", text);
+        });
+    };
+
+    constexpr UINT64 page = 0x10000;
+    constexpr UINT64 stride = 12;
+    const auto view = structured_view(0, 1, static_cast<UINT>(stride));
+    D3D12_SHADER_RESOURCE_VIEW_DESC resolved{};
+    check("page copy stride fit fails", !resolve_buffer_srv_desc(page, 65536, page + 4, view, resolved));
+    const auto a = buffer_view_fit_refusal(page + 4, stride, page, 65536, Backing::page_copy);
+    const auto b = buffer_overlap_refusal(page + 16, stride, page + 64, 4096);
+    const auto c = buffer_view_fit_refusal(page + 8, stride, page, 65536, Backing::placed);
+    const auto d = buffer_overlap_refusal(page + 8, stride, page, 65536);
+
+    check("report at one refusal", note(a, page + 4, stride, stride));
+    check("first example includes conflicting page",
+          std::strcmp(line, "x2w-slot70 buffer_unavailable example: reason=A address=0x10004 size=12 stride=12 "
+                           "page_base=0x10000 conflict_base=0x10000 conflict_size=65536") == 0);
+    check("report at two refusals", note(b, page + 16, stride, stride));
+    check("rounded overlap example includes neighbouring range",
+          std::strstr(line, "page_base=0x10000 conflict_base=0x10040 conflict_size=4096") != nullptr);
+    check("three refusals skip report", !note(c, page + 8, stride, stride));
+    check("report at four refusals", note(d, page + 8, stride, stride));
+
+    SrvRefusalCache cache;
+    const SrvRefusalKey key{};
+    const SrvRefusalStamp stamp{};
+    cache.note(key, stamp, 0, {SrvRefusalKind::independent, 0, 0, true, b});
+    BufferRefusalDetail cached;
+    check("cache supplies original reason and conflict",
+          cache.hit(key, stamp, 1, [](const SrvRefusalProof&) { return false; }, &cached) &&
+          cached.reason == Reason::rounded_overlap && cached.base == page + 64 && cached.bytes == 4096);
+    note(cached, page + 16, stride, stride);
+
+    note({Reason::extent}, page + 8, stride, stride);
+    note({Reason::not_covered}, page + 8, stride, stride);
+    note({Reason::no_device}, page + 8, stride, stride);
+    note({Reason::backing_failed}, page + 8, stride, stride);
+    note({Reason::wrap_failed}, page + 8, stride, stride);
+    note(buffer_view_fit_refusal(page, stride, page, 4, Backing::placed), page, stride, stride);
+    note(buffer_view_fit_refusal(page + 8, stride, page, 65536, Backing::committed), page + 8, stride, stride);
+    note(buffer_view_fit_refusal(page + 8, stride, page, 65536, Backing::page_alias), page + 8, stride, stride);
+    note(buffer_view_fit_refusal(page + 8, stride, page, 65536, Backing::exact_copy), page + 8, stride, stride);
+
+    // A larger span at a repeated address increases the cost without increasing either distinct count.
+    note(a, page + 4, 65537, stride);
+    check("report at sixteen refusals", note(a, page + 4, stride, stride));
+    note(a, page + 4, stride, stride);
+    note(a, page + 4, stride, stride);
+    check("examples stop after four for a reason", examples == 17);
+    census.report([&](const char* text) { std::snprintf(line, sizeof(line), "%s", text); });
+    check("split counters, same-page key deduplication, and exact-copy estimate",
+          std::strcmp(line,
+              "x2w-slot70 buffer_unavailable split: A=5 B=2 C=1 D=1 E_extent=1 F_not_covered=1 G_no_device=1 "
+              "H_backing_failed=1 I_wrap_failed=1 J_view_fit=1 K_committed_stride=1 L_page_alias_stride=1 "
+              "M_exact_copy_stride=1 distinct_addresses=4 distinct_keys=3 exact_copy_cost_mib=0.3125 "
+              "addresses_truncated=0 keys_truncated=0") == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -87,10 +160,11 @@ int main(int argc, char** argv)
         (std::strcmp(argv[2], "height") == 0 || std::strcmp(argv[2], "exact-fit") == 0 ||
          std::strcmp(argv[2], "first-32") == 0 ||
          std::strcmp(argv[2], "unplaced-extent") == 0 || std::strcmp(argv[2], "unplaced-covers") == 0 ||
-         std::strcmp(argv[2], "unplaced-heap-limit") == 0 || std::strcmp(argv[2], "exact-start") == 0)) {
+         std::strcmp(argv[2], "unplaced-heap-limit") == 0 || std::strcmp(argv[2], "exact-start") == 0 ||
+         std::strcmp(argv[2], "raw-exact") == 0 || std::strcmp(argv[2], "all-a") == 0)) {
         mutation = argv[2];
     } else if (argc != 1) {
-        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32|unplaced-extent|unplaced-covers|unplaced-heap-limit|exact-start]\n");
+        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32|unplaced-extent|unplaced-covers|unplaced-heap-limit|exact-start|raw-exact|all-a]\n");
         return 2;
     }
     const auto buf = buffer_desc(1024);
@@ -335,6 +409,7 @@ int main(int argc, char** argv)
           x2w_startup::unplaced_existing_heap_allowed(2ull << 30) == mutated("unplaced-heap-limit"));
     check("unplaced heap unknown allocation size", !x2w_startup::unplaced_existing_heap_allowed(0));
 
+    check_refusal_split();
     if (failures) return 1;
     std::printf("slot 70 buffer memory SRV validation: all checks passed\n");
     return 0;

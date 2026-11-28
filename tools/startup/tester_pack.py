@@ -357,6 +357,9 @@ RESULTS_NAME = "shader_results.txt"
 KEY_RE = re.compile(r"(?:^|[^0-9a-f])([0-9a-f]{16})(?:[^0-9a-f]|$)")
 # request file extension -> kind; result marker: ready file suffix per kind, `.fail` for a refusal
 REQUEST_KINDS = {".a": "graphics", ".rtv": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
+APPROX_LOG_RE = re.compile(
+    r"x2w-gfx approx: key ([0-9a-f]{16}) stage (?:vs|ms|ps|cs)(?:\+(?:vs|ms|ps|cs))*"
+    r" lifted [0-9]+ readfirstlane, [0-9]+ reductions")
 READY_SUFFIXES = {"graphics": (".txt",), "compute": (".txt",), "mesh57": (".ms57.txt",), "mesh86": (".mesh86.txt",)}
 REASON_CHARS = 200         # per key; the translator's own message, first line only
 COMPILER_CODE_RE = re.compile(r"\b(?:error|warning)\s+[A-Z]\d{3,5}\b")
@@ -387,7 +390,8 @@ def normal_reason(reason):
 
 def cache_results(cache_dir):
     """[(key, kind, status, reason)] for every request key in a shader cache folder, sorted by kind and key. Status is
-    `ok` (the ready marker is published), `refused` (a `.fail` file: its first line is the reason) or `pending`."""
+    `ok` (published manifest), `approximated` (published diagnostic result), `refused` (first line of its `.fail`),
+    or `pending`."""
     found, by_key = {}, {}
     if not os.path.isdir(cache_dir):
         return []
@@ -402,12 +406,23 @@ def cache_results(cache_dir):
     rows = []
     for key, kind in found.items():
         status, reason = "pending", ""
+        if key + ".approx.txt" in by_key[key]:
+            try:
+                with open(os.path.join(cache_dir, key + ".approx.txt"), encoding="ascii") as handle:
+                    marker = handle.readline().strip()
+                match = APPROX_LOG_RE.fullmatch(marker)
+                if match and any(os.path.isfile(os.path.join(cache_dir, match[1] + suffix))
+                                 for suffix in READY_SUFFIXES[kind]):
+                    rows.append((key, kind, "approximated", marker))
+                    continue
+            except (OSError, UnicodeError):
+                pass
         for name in by_key[key]:
             if name.endswith(".fail"):
                 with open(os.path.join(cache_dir, name), "r", encoding="utf-8", errors="replace") as handle:
                     status, reason = "refused", clean_reason(handle.read(4096))
                 break
-            if name.endswith(READY_SUFFIXES[kind]) and not name.endswith(".fail"):
+            if not name.endswith(".approx.txt") and name.endswith(READY_SUFFIXES[kind]):
                 status = "ok"
         rows.append((key, kind, status, reason))
     return sorted(rows, key=lambda row: (row[1], row[0]))
@@ -436,7 +451,22 @@ def key_use(logdir):
     return found
 
 
-def format_results(rows, use=None, dispatches=None):
+def loaded_approximations(logdir):
+    """The runtime can encounter a cached diagnostic result more than once."""
+    found = {}
+    try:
+        with open(os.path.join(logdir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                marker = line.rstrip()
+                match = APPROX_LOG_RE.fullmatch(marker)
+                if match:
+                    found[match[1]] = marker
+    except OSError:
+        pass
+    return found
+
+
+def format_results(rows, use=None, loaded=None, dispatches=None):
     """Text for the zip: totals, the refusals ranked by normalized reason, the refused keys used latest, then one line per
     key. use is key_use(): a key a draw or Dispatch used carries first=, last= (seconds since the process started) and uses=."""
     use = use or {}
@@ -446,10 +476,13 @@ def format_results(rows, use=None, dispatches=None):
         kinds[kind] = kinds.get(kind, 0) + 1
     count = lambda status: sum(1 for row in rows if row[2] == status)
     lines = ["# shader cache results: the translator's own messages, first line of each .fail, no shader code",
-             "keys %d (%s): ok %d, refused %d, pending %d" % (
+             "keys %d (%s): ok %d, refused %d, pending %d, approximated %d" % (
                  len(rows), ", ".join("%s %d" % item for item in sorted(kinds.items())) or "none",
-                 count("ok"), count("refused"), count("pending")),
-             "", "## refusals by reason (registers and numbers normalized)"]
+                 count("ok"), count("refused"), count("pending"), count("approximated"))]
+    if loaded:
+        lines.append("approximated shaders loaded %d" % len(loaded))
+        lines.extend(loaded[key] for key in sorted(loaded))
+    lines += ["", "## refusals by reason (registers and numbers normalized)"]
     ranked = {}
     for _, kind, status, reason in rows:
         if status == "refused":
@@ -594,9 +627,29 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
 
 
 PHASES_NAME = "phases.txt"
+MOVIE_AFTER_S = 250      # Run O's credits movie showed at 384 and 446 s; before this the loading art and intros are on screen
+MOVIE_MIN_MEAN = 20.0    # a picture with at least this mean level is content, not black
 PHASE_WINDOW_S = 30
 HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
+
+
+def movie_note(timeline_text, after=MOVIE_AFTER_S):
+    """One line for the end of phases.txt: did OUR window captures show content (mean >= 20) after 250 s, when the credits movie
+    plays in the tester's own captures? Says how many pictures, when, and that a movie shorter than the capture interval can be
+    missed, so 'not seen' means 'not in our pictures', not 'did not play'."""
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    late = [(t, m) for t, m in pictures if t > after]
+    if not late:
+        return "# credits movie: no window pictures after %d s, cannot tell" % after
+    gaps = [b[0] - a[0] for a, b in zip(late, late[1:])]
+    step = "%.0f s" % (sum(gaps) / len(gaps)) if gaps else "one picture"
+    seen = [(t, m) for t, m in late if m >= MOVIE_MIN_MEAN]
+    if seen:
+        return "# credits movie: content in %d of %d of OUR pictures after %d s (%s); capture interval %s" % (
+            len(seen), len(late), after, ", ".join("%.0f s mean %.0f" % tm for tm in seen[:8]), step)
+    return ("# credits movie: NOT seen in our %d pictures after %d s (all mean < %d); capture interval %s, a movie shorter than that can be "
+            "missed: compare with the tester's own captures" % (len(late), after, MOVIE_MIN_MEAN, step))
 
 
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
@@ -621,6 +674,7 @@ def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
             presents, fps = "-", "-"
         lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
         start = stop
+    lines.append(movie_note(timeline_text))
     return "\n".join(lines) + "\n"
 
 
@@ -876,6 +930,8 @@ def end_cause(logdir):
         code, at = int(found.group(1), 16), found.group(2)
         if code == 0:
             cause = "title exited by itself (code 0x0) at %s s" % at
+        elif code == 0xE2571455:
+            cause = "xmem lazy commit failed (exit code %s) at %s s" % (found.group(1), at)
         elif code >= 0xC0000000 and code != 0xFFFFFFFF:
             cause = "title crashed (exit code %s) at %s s" % (found.group(1), at)
         else:
@@ -942,7 +998,7 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                 stderr_text = handle.read()
         dispatches = refused_dispatch_keys(stderr_text)
         uses = key_use(logdir)
-        add(RESULTS_NAME, format_results(rows, uses, dispatches).encode("utf-8"))
+        add(RESULTS_NAME, format_results(rows, uses, loaded_approximations(logdir), dispatches).encode("utf-8"))
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             symbol_rows = parse_symbols(handle.read())
@@ -986,6 +1042,67 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                 z.writestr("manifest.json", json.dumps(body, indent=2, sort_keys=True))
         parts.append((path, os.path.getsize(path)))
     return parts
+
+
+RECORD_DEFAULT_SPEC = "slow"         # `-Record auto` = the runtime trigger (c25): a 10 s window opening at the first present after 120 s with a >= 500 ms gap, fallback at 180 s.
+                                     # The tester's clock runs ~200 s later than ours, so a trigger on the slowdown beats a fixed time
+RECORD_DEFAULT_MAX_MIB = 400         # ... capped at 400 MiB so the upload stays small (c25 may change both here, one place)
+RECORD_EXPLICIT_MAX_MIB = 2048       # an explicit -Record spec keeps the old cap unless -RecordMaxMiB says otherwise
+RECORD_RE = re.compile(r"^([fd])?(\d+),(\d+)$")
+RECORD_MAX_SECONDS = 120
+RECORD_MAX_FRAMES = 2000
+RECORD_BY = {"f": "frame", "d": "draws", None: "time"}
+
+
+def parse_record_spec(spec):
+    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60), `f<first frame>,<frames>`
+    or `d<draws>,<seconds>` (the window opens after that many translated draws in total, as X2W_DEBUG_PRESENT_FROM_DRAWS: play, not a loading screen).
+    Returns {"spec": normalized text, "by": "time"|"frame"|"draws", "start", "length"}. Raises ValueError for anything else, a window longer
+    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder), an empty window or a draw count of 0."""
+    if spec.strip().lower() in ("auto", "default", "slow"):
+        return {"spec": "slow", "by": "slow", "start": 120, "length": 10}   # the runtime decides the window; these are its documented defaults
+    match = RECORD_RE.match(spec.strip().lower())
+    if not match:
+        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60), f<first frame>,<frames> (e.g. f4000,24) or "
+                         "d<translated draws in total>,<seconds> (e.g. d200,10), got %r" % spec)
+    by = RECORD_BY[match.group(1)]
+    start, length = int(match.group(2)), int(match.group(3))
+    limit = RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS
+    if length < 1 or length > limit:
+        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds", limit))
+    if by == "draws" and start < 1:
+        raise ValueError("-Record d<draws>,<seconds> wants at least 1 draw, got %r" % spec)
+    return {"spec": (match.group(1) or "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
+
+
+PREFIX_ONLY_LINE = "the cap stopped the recording BEFORE the window opened"
+
+
+def recording_unusable(log_dir):
+    """"prefix only" when the run's stderr.txt says the cap stopped the recording before its window opened (the file holds only the
+    state-making prefix: nothing to replay), else None."""
+    try:
+        with open(os.path.join(log_dir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            return "prefix only" if any(PREFIX_ONLY_LINE in line for line in handle) else None
+    except OSError:
+        return None
+
+
+def folder_report(folder, log_dir=None):
+    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console);
+    with log_dir, "unusable": "prefix only" when the run's log says the recording never reached its window."""
+    sizes = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                sizes.append((os.path.relpath(path, folder).replace(os.sep, "/"), os.path.getsize(path)))
+    sizes.sort(key=lambda item: -item[1])
+    report = {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+    unusable = recording_unusable(log_dir) if log_dir and sizes else None
+    if unusable:
+        report["unusable"] = unusable
+    return report
 
 
 def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
@@ -1071,6 +1188,12 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    rs = sub.add_parser("record-spec")
+    rs.add_argument("spec")
+    sub.add_parser("record-defaults")
+    rr = sub.add_parser("record-report")
+    rr.add_argument("folder")
+    rr.add_argument("--logs", default=None)
     cb = sub.add_parser("combine")
     cb.add_argument("zip")
     cb.add_argument("--matrix", default="matrix")
@@ -1079,6 +1202,19 @@ def main(argv):
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
+    if args.cmd == "record-spec":
+        try:
+            print(parse_record_spec(args.spec)["spec"])
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
+        return 0
+    if args.cmd == "record-defaults":
+        print("%s %d %d" % (RECORD_DEFAULT_SPEC, RECORD_DEFAULT_MAX_MIB, RECORD_EXPLICIT_MAX_MIB))
+        return 0
+    if args.cmd == "record-report":
+        print(json.dumps(folder_report(args.folder, args.logs)))
+        return 0
     if args.cmd == "combine":
         runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]
         for path, size in combine(args.zip, runs, int(args.limit_mb * 1024 * 1024), args.matrix):

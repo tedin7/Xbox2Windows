@@ -1,6 +1,6 @@
 // X2W_D3D12_LAZY_TEXTURES=1 (Refs #2764, #2379, #1199): slot 133 read-only textures defer desktop
 // CreateCommittedResource until first real GPU/copy/CPU-real use.
-//   startup_slot133_lazy_textures_check <warp|hardware> [off|no-retire]
+//   startup_slot133_lazy_textures_check <warp|hardware> [off|no-retire|evict]
 //
 // Checks:
 //   1 Creating 16 MiB of read-only 2D textures via slot 133 + slot 18 SRVs (and CopyDescriptorsSimple) leaves
@@ -14,6 +14,9 @@
 //   5 Releasing all textures and overwriting/dropping views retires cleanly (x2w-budget texture and
 //     x2w_d3d12_lazy_texture_count() return to 0 with X2W_D3D12_RELEASE_RETIRED=1).
 //   6 Control (X2W_D3D12_LAZY_TEXTURES=0): all 16 MiB textures are committed immediately.
+//   7 evict (X2W_D3D12_LAZY_EVICT=1): two lazy textures placed on the same title memory. Using the second evicts the
+//     first (no desktop object, its pre-made SRV reads null, one texture left in the budget after the drain); using
+//     the first again materializes it from the title memory as it is now and refreshes its SRV, evicting the second.
 #include "startup_stubs/resource_budget.h"
 
 #include <d3d12sdklayers.h>
@@ -325,14 +328,83 @@ bool verify_texel00(const float (&got)[4], UINT seed, const char* label)
 
 }  // namespace
 
+// 7: X2W_D3D12_LAZY_EVICT=1. Returns 0 on success, 5 on a failed check, 4 on a setup failure.
+int check_evict(Context& c, IUnknown* guest, ID3D12Device* device, GuestHeap& cpu_heap, GuestHeap& vis_heap,
+                IUnknown* guest_rb, ID3D12Resource* guest_rb_real)
+{
+    char value[2]{};
+    if (GetEnvironmentVariableA("X2W_D3D12_LAZY_EVICT", value, sizeof(value)) != 1 || value[0] != '1') return 2;
+    auto* memory = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, tex_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!memory) return 4;
+    const auto fail = [&](const char* what) {
+        std::printf("FAIL: evict: %s\n", what);
+        VirtualFree(memory, 0, MEM_RELEASE);
+        return 5;
+    };
+    const D3D12_RESOURCE_DESC tex_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, tex_side, tex_side, 1, 1,
+                                       DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                       D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = texture_srv_desc();
+    Snapshot base{}, snap{};
+    if (!x2w_d3d12_budget_snapshot(&base, sizeof(base))) return 4;
+    ComPtr<IUnknown> first, second;
+    fill_pattern(memory, 31);
+    if (!require(invoke(guest, 133, memory, &tex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &__uuidof(ID3D12Resource),
+                        first.GetAddressOf()), "evict: first texture"))
+        return fail("first slot 133");
+    // The first texture's SRV, copied into the shader-visible heap before it is used.
+    invoke<void>(guest, 18, first.Get(), &srv_desc, cpu_heap.cpu);
+    invoke<void>(guest, 24, 1u, vis_heap.cpu, cpu_heap.cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    float texel[4]{};
+    if (!c.copy_texture_to_readback(first.Get(), guest_rb) || !verify_readback_bytes(guest_rb_real, 31, "evict: first") ||
+        !c.read_slot(vis_heap, 0, texel) || !verify_texel00(texel, 31, "evict: first SRV"))
+        return fail("first use");
+
+    // The title places a second texture on the same memory and writes it: using it evicts the first.
+    fill_pattern(memory, 32);
+    if (!require(invoke(guest, 133, memory, &tex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &__uuidof(ID3D12Resource),
+                        second.GetAddressOf()), "evict: second texture"))
+        return fail("second slot 133");
+    if (!c.copy_texture_to_readback(second.Get(), guest_rb) || !verify_readback_bytes(guest_rb_real, 32, "evict: second"))
+        return fail("second use");
+    if (desktop_object<ID3D12Resource>(guest, device, first.Get())) return fail("the first texture kept its desktop object");
+    if (!c.read_slot(vis_heap, 0, texel) || texel[0] || texel[1] || texel[2] || texel[3])
+        return fail("the evicted texture's SRV does not read null");
+    for (int i = 0; i < 8; ++i) c.drain_once();
+    if (!x2w_d3d12_budget_snapshot(&snap, sizeof(snap))) return 4;
+    if (snap.live[texture].objects != base.live[texture].objects + 1) {
+        std::printf("FAIL: evict: expected one live texture after the drain, got %llu\n",
+                    snap.live[texture].objects - base.live[texture].objects);
+        VirtualFree(memory, 0, MEM_RELEASE);
+        return 5;
+    }
+
+    // The title writes the first texture again and uses it: it materializes from the memory as it is now, its SRV is
+    // refreshed, and the second texture is evicted.
+    fill_pattern(memory, 33);
+    if (!c.copy_texture_to_readback(first.Get(), guest_rb) || !verify_readback_bytes(guest_rb_real, 33, "evict: first again"))
+        return fail("first use again");
+    if (!c.read_slot(vis_heap, 0, texel) || !verify_texel00(texel, 33, "evict: first SRV again"))
+        return fail("the first texture's SRV was not refreshed");
+    if (desktop_object<ID3D12Resource>(guest, device, second.Get())) return fail("the second texture kept its desktop object");
+    std::puts("evict: the second texture evicted the first, the first came back with new texels and evicted the second");
+    first.Reset();
+    second.Reset();
+    for (int i = 0; i < 8; ++i) c.drain_once();
+    VirtualFree(memory, 0, MEM_RELEASE);
+    CloseHandle(c.event);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
-        (argc == 3 && std::strcmp(argv[2], "off") && std::strcmp(argv[2], "no-retire")))
+        (argc == 3 && std::strcmp(argv[2], "off") && std::strcmp(argv[2], "no-retire") && std::strcmp(argv[2], "evict")))
         return 2;
     const bool is_warp = std::strcmp(argv[1], "warp") == 0;
     const bool expect_off = argc == 3 && std::strcmp(argv[2], "off") == 0;
     const bool expect_no_retire = argc == 3 && std::strcmp(argv[2], "no-retire") == 0;
+    const bool evict_mode = argc == 3 && std::strcmp(argv[2], "evict") == 0;
 
     char env_buf[2]{};
     const bool lazy_on = GetEnvironmentVariableA("X2W_D3D12_LAZY_TEXTURES", env_buf, sizeof(env_buf)) == 1 && env_buf[0] == '1';
@@ -450,6 +522,7 @@ int main(int argc, char** argv)
 
     GuestHeap cpu_heap, vis_heap;
     if (!c.make_heap(cpu_heap, tex_count + 4, false) || !c.make_heap(vis_heap, 8, true)) return 4;
+    if (evict_mode) return check_evict(c, guest.Get(), device.Get(), cpu_heap, vis_heap, guest_rb.Get(), guest_rb_real.Get());
 
     // Pre-commit guest VirtualAlloc backing for 16 x 1 MiB = 16 MiB textures before measuring slot-133 commit delta.
     std::vector<void*> title_mem(tex_count, nullptr);

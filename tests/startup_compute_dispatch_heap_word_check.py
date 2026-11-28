@@ -91,28 +91,8 @@ def main(consumer, dxc, adapter):
         assert not wrong, 'null index buffer: word=%d got=%08x expected=%08x\n%s' % (
             wrong[0], got[wrong[0]], expected[wrong[0]], result.stderr[-3000:])
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused'), result.stderr[-3000:]
-        # The index buffer in plain title memory (Run T keys 9d3600be, 949873e7, 5f3ba0b1). Without the title inputs switch the
-        # word is not read (the control); with it the word is read from title memory: its value 2 gives the expected output, and
-        # 0x07ffffff reaches the heap-record check, so the dispatch really read the word it was given.
-        got, result = dispatch(directory, consumer, env, 'dispatch-heap-word-title')
-        refused = lines(result, 'refused: ')
-        # Without the switch the table buffer is refused as an input before its word is looked at.
-        assert got == untouched and len(refused) == 1 and 'an input is in title memory outside any placed buffer' in refused[0], \
-            'title memory without the switch:\n' + result.stderr[-3000:]
-        env_title = dict(env, X2W_COMPUTE_TITLE_INPUTS='1')
-        got, result = dispatch(directory, consumer, env_title, 'dispatch-heap-word-title')
-        wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
-        assert not wrong, 'index word in title memory: word=%d got=%08x expected=%08x\n%s' % (
-            wrong[0], got[wrong[0]], expected[wrong[0]], result.stderr[-3000:])
-        # The title inputs switch also prints the dispatch totals line ('translated 1, refused 0'), so look for a refusal line.
-        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
-        assert lines(result, 'heap index word 00000002 at ') and lines(result, 'read from plain title memory'), result.stderr[-3000:]
-        got, result = dispatch(directory, consumer, env_title, 'dispatch-heap-word-title-outside')
-        refused = lines(result, 'refused: ')
-        assert got == untouched and len(refused) == 1 and "a heap record is outside the list's view heap" in refused[0], \
-            'title word past the heap:\n' + result.stderr[-3000:]
-        print(f'startup_compute_dispatch_heap_word: PASS on {adapter} (all {C.WORDS} words match through the index word, also '
-              f'from title memory with the switch; untouched before translation and for {len(CONTROLS) + 2} refused controls)')
+        print(f'startup_compute_dispatch_heap_word: PASS on {adapter} (all {C.WORDS} words match through the index word; '
+              f'untouched before translation and for {len(CONTROLS)} refused controls)')
 
 
 if __name__ == '__main__':

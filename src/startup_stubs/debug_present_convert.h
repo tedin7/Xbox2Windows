@@ -154,6 +154,7 @@ struct DepthStats {
     bool valid = false, reversed = false;
     float low = 0, high = 0;
     std::size_t geometry = 0, sampled = 0;
+    std::size_t zeros = 0, ones = 0;  // sampled pixels exactly 0.0 / exactly 1.0
     double covered_percent() const { return sampled ? 100.0 * static_cast<double>(geometry) / static_cast<double>(sampled) : 0.0; }
 };
 
@@ -195,6 +196,7 @@ inline void depth_to_rgba(const unsigned char* data, std::size_t pitch, unsigned
             out[0] = out[1] = out[2] = static_cast<unsigned char>(grey);
         }
     if (stats) *stats = {true, reversed, geometry ? low : 0.0f, geometry ? high : 0.0f, geometry, static_cast<std::size_t>(ow) * oh};
+    if (stats) { stats->zeros = zeros; stats->ones = ones; }
 }
 
 inline void color_pixel(const unsigned char* in, int format, unsigned char* out)

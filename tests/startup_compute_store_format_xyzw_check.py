@@ -49,6 +49,9 @@ s_endpgm
 LOAD_X = '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '84000834' '001038e004040380' '703f8cbf'
 WORDS_X = bytes.fromhex(LOAD_X + STORE_X + '000081bf')
 
+SOURCE_O = SOURCE_X.replace('buffer_store', 'v_add_nc_u32_e32 v0, 0x0ffffff8, v0\nbuffer_store')
+WORDS_O = bytes.fromhex(LOAD_X + 'ff00004af8ffff0f' + STORE_X + '000081bf')
+
 SOURCE_R = SOURCE_X.replace('0 idxen\n', '4 idxen offset:12\n')
 WORDS_R = bytes.fromhex(LOAD_X + '0c201ce000040484' '000081bf')
 
@@ -75,6 +78,7 @@ VERIFIED_SNIPPETS = {
 }
 
 PROGRAMS = {
+    'O': (SOURCE_O, WORDS_O, USER7, (16, 1, 1), (1, 1, 1)),
     'X': (SOURCE_X, WORDS_X, USER7, (16, 1, 1), (1, 1, 1)),
     'R': (SOURCE_R, WORDS_R, USER7, (16, 1, 1), (1, 1, 1)),
     'E': (SOURCE_E, WORDS_E, USER7, (16, 1, 1), (1, 1, 1)),
@@ -245,7 +249,7 @@ X_VARIANTS = {
     'X-swizzle-en': (desc_word3(77), 16 | 0x8000, 12, 'raw', False),
     'X-stride8': (desc_word3(77), 8, 12, 'raw', False),                      # element larger than the stride
 }
-DISPATCH_CASES = (*X_VARIANTS, 'R-raw', 'R-raw-oob', 'R-struct', 'E')
+DISPATCH_CASES = (*X_VARIANTS, 'R-raw', 'R-raw-oob', 'R-struct', 'E', 'O')
 
 
 def case_inputs(name):
@@ -272,6 +276,14 @@ def case_inputs(name):
             if name == 'R-raw':
                 out[16:32] = pack_element(77, lanes[0])
         prog = 'R'
+    elif name == 'O':
+        lanes = lane_words('raw')
+        word3, stride, num_records = desc_word3(77), 16, 0xffffffff
+        for lane in range(16):
+            addr = (lane + 0x0ffffff8) * stride
+            if addr <= 0xffffffff and addr + 16 <= len(out):
+                out[addr:addr + 16] = pack_element(77, lanes[lane])
+        prog = 'O'
     elif name == 'E':
         lanes = lane_words('raw')
         word3, stride, num_records = desc_word3(75), 16, 16
@@ -441,7 +453,7 @@ def check_controls():
     # 7. Dispatch inputs are self-consistent: writing cases change words, no-op cases keep every sentinel.
     for name in DISPATCH_CASES:
         _, _, _, expected = case_inputs(name)
-        writes = X_VARIANTS[name][4] if name in X_VARIANTS else name != 'R-raw-oob'
+        writes = X_VARIANTS[name][4] if name in X_VARIANTS else name not in ('R-raw-oob', 'O')
         assert (expected != [SENTINEL] * WORDS) == writes, name
 
     print('buffer_store_format_xyzw reference, format, bounds, provenance, refusal and mutation checks pass')
@@ -460,6 +472,10 @@ def check_binary(llvm_mc):
 
 
 CONTROLS = {
+    'o-drop-high-product': ('O',
+        'if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u\n'
+        '            || idx * stride > 0xffffffffu - rec_off) return;',
+        'if (idx * stride > 0xffffffffu - rec_off) return;'),
     'x-drop-store': ('X-f32', '    store_format_xyzw(u0, ud2, ud3, ud4, v0, 0u, 0u, 0u, uint4(v4, v5, v6, v7));\n', ''),
     'x-swap-xy': ('X-f32', 'buf.Store4(addr, v);', 'buf.Store4(addr, v.yxzw);'),
     'x-drop-index-oob': ('X-f32',

@@ -140,6 +140,12 @@ inline DXGI_FORMAT typed_choice(DXGI_FORMAT typeless)
     }
 }
 
+inline bool is_planar_depth_stencil(DXGI_FORMAT format)
+{
+    const auto family = format_family(format);
+    return family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
 inline bool is_typeless(DXGI_FORMAT format)
 {
     switch (format) {
@@ -218,6 +224,9 @@ inline ResolvePlan plan_resolve(const D3D12_RESOURCE_DESC* destination, std::uin
     if (same) return {CopyRefusal::same_resource, {}};
     if (destination->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || source->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
         return {CopyRefusal::not_texture, {}};
+    // The legacy resolve path has no depth/stencil resolve mode.
+    if (is_planar_depth_stencil(destination->Format) || is_planar_depth_stencil(source->Format))
+        return {CopyRefusal::bad_format, {}};
     if (source->SampleDesc.Count <= 1) return {CopyRefusal::source_not_multisampled, {}};
     if (destination->SampleDesc.Count != 1) return {CopyRefusal::destination_multisampled, {}};
     const std::uint32_t destination_mips = destination->MipLevels ? destination->MipLevels : 1;

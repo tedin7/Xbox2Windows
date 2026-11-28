@@ -66,12 +66,12 @@ int main()
     const auto bounded = x2w_startup::decode_statics(limits);
     expect(bounded.size() == 4, "four limit samplers", int(bounded.size()));
     if (bounded.size() == 4) {
-        expect(bounded[0].MinLOD == 2.0f && bounded[0].MaxLOD == 1.0f, "smpl MIN_LOD 2.0 and MAX_LOD 1.0",
+        expect(bounded[0].MinLOD == 1.0f && bounded[0].MaxLOD == 1.0f, "smpl MIN_LOD 2.0 above MAX_LOD 1.0 is clamped to the maximum",
                int(bounded[0].MinLOD * 256), int(bounded[0].MaxLOD * 256));
         expect(bounded[1].MinLOD == 0.0f && bounded[1].MaxLOD == D3D12_FLOAT32_MAX, "smp keeps unbounded limits",
                int(bounded[1].MinLOD), 0);
         expect(bounded[2].MaxLOD == 4095.0f / 256.0f, "smpl MAX_LOD 15.996", int(bounded[2].MaxLOD * 256), 0);
-        expect(bounded[3].MinLOD == 1.5f && bounded[3].MaxLOD == 0.0f, "smpl MIN_LOD 1.5 and MAX_LOD 0",
+        expect(bounded[3].MinLOD == 0.0f && bounded[3].MaxLOD == 0.0f, "smpl MIN_LOD 1.5 above MAX_LOD 0 is clamped to the maximum",
                int(bounded[3].MinLOD * 256), int(bounded[3].MaxLOD * 256));
         expect(bounded[0].Filter == bounded[1].Filter && bounded[0].AddressU == bounded[1].AddressU,
                "smpl decodes the other fields like smp", bounded[0].Filter, bounded[1].Filter);

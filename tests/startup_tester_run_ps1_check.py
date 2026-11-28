@@ -38,6 +38,7 @@ $record = [ordered]@{
     Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; Sysmem = $env:X2W_D3D12_SYSMEM_FALLBACK; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
+if ($env:X2W_REPLAY_DIR) { [System.IO.File]::WriteAllBytes((Join-Path $env:X2W_REPLAY_DIR "replay.x2wr"), (New-Object byte[] 70000)); Set-Content -LiteralPath (Join-Path $env:X2W_REPLAY_DIR "creation.log") -Value "stub" }
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
 foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log", "threads.txt",
                   "translate.txt", "translate_err.txt") {
@@ -48,6 +49,7 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 }
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window.png"), [byte[]](1, 2, 3))
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
+if ($env:STUB_PREFIX_ONLY) { Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, 20 calls, 1000 bytes" }
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_KILL_SELF) { Stop-Process -Id $PID -Force }   # the tester pressed Ctrl-C / closed the window: nothing after this runs
@@ -102,7 +104,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py", "tester_janitor.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py", "record_transfer.py", "tester_janitor.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -301,7 +303,8 @@ def check_shell(shell):
             raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
         assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
-                         "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
+                         "-MemoryStopPercent", "0", "-PresentDumpSeconds", "0",
+                         extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
         assert "STALL STOP" not in off.stdout, off.stdout
         nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
         assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)
@@ -454,6 +457,54 @@ def check_shell(shell):
         (fresh_cache / "dddddddddddddddd.fail").unlink()
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
+        # -Record: spec validated, disk guard, env for the runtime, size report in the manifest, chunked upload list without a synced Drive folder
+        bad = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "soon")
+        assert bad.returncode != 0 and "-Record" in (bad.stdout + bad.stderr), (bad.stdout[-500:], bad.stderr[-500:])
+        huge = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "900000000")
+        assert huge.returncode != 0 and "needs twice the cap free" in (huge.stdout + huge.stderr), (huge.stdout[-500:], huge.stderr[-500:])
+        both = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-Matrix", "gray")
+        assert both.returncode != 0 and "own run" in (both.stdout + both.stderr), (both.stdout[-500:], both.stderr[-500:])
+        auto = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "auto", "-NoUpload")
+        assert auto.returncode == 0 and "recording slow into" in auto.stdout and "(cap 400 MiB" in auto.stdout, (auto.stdout[-1500:], auto.stderr[-500:])
+        auto_zip = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(auto_zip) as z:
+            auto_env = json.loads(z.read("manifest.json").decode("utf-8-sig"))["env"]
+        assert auto_env["X2W_REPLAY_RECORD"] == "slow" and auto_env["X2W_REPLAY_MAX_MIB"] == "400" \
+                and auto_env["X2W_REPLAY_SHADERS"] == "0" and auto_env["X2W_REPLAY_PREFIX_MAX_MIB"] == "512", auto_env
+        assert "uploaded" not in auto.stdout and "UPLOAD_THESE_FILES" not in auto.stdout, "-NoUpload keeps the recording local"
+        pages = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64",
+                           "-RecordPagesMaxMiB", "64")
+        assert pages.returncode != 0 and "must be below -RecordMaxMiB" in (pages.stdout + pages.stderr), (pages.stdout[-500:], pages.stderr[-500:])
+        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64", "-RecordPrefixMaxMiB", "96",
+                         "-RecordPagesMaxMiB", "48", "-RecordPageRangeMiB", "32")
+        assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])
+        assert "recording: 2 files" in rec.stdout and "(cap 64 MiB)" in rec.stdout, rec.stdout[-1500:]
+        newest_rec = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_rec) as z:
+            rec_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+            rec_names = z.namelist()
+        assert rec_manifest["env"]["X2W_REPLAY_RECORD"] == "140,60" and rec_manifest["env"]["X2W_REPLAY_MAX_MIB"] == "64" \
+                and rec_manifest["env"]["X2W_REPLAY_PREFIX_MAX_MIB"] == "96" and rec_manifest["env"]["X2W_REPLAY_PAGES_MAX_MIB"] == "48" \
+                and rec_manifest["env"]["X2W_REPLAY_PAGES_MAX_RANGE_MIB"] == "32", rec_manifest["env"]
+        assert rec_manifest["record"]["files"] == 2 and rec_manifest["record"]["bytes"] >= 70000 and rec_manifest["record"]["spec"] == "140,60", rec_manifest["record"]
+        assert not [n for n in rec_names if "replay.x2wr" in n], "the recording never travels inside the mail zip"
+        uploads = list((tree / "out" / "tester").glob("record_*_upload"))
+        assert uploads and list(uploads[-1].glob("record_*_0001.part")) and (uploads[-1] / ("record_%s.json" % uploads[-1].name.split("_")[1])).is_file(), (uploads, rec.stdout[-1800:], rec.stderr[-600:])
+        assert ("recording" in rec.stdout and ("uploaded to the shared Drive folder" in rec.stdout or "UPLOAD_THESE_FILES.txt" in rec.stdout)), rec.stdout[-1500:]
+        # A prefix-only recording (the cap stopped it before the window opened) is flagged, not uploaded.
+        before_uploads = set((tree / "out" / "tester").glob("record_*_upload"))
+        prefix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64",
+                            extra_env={"STUB_PREFIX_ONLY": "1"})
+        assert prefix.returncode == 0, (prefix.stdout[-2000:], prefix.stderr[-1000:])
+        assert "recording UNUSABLE: prefix only" in prefix.stdout and "uploaded" not in prefix.stdout and "UPLOAD_THESE_FILES" not in prefix.stdout, prefix.stdout[-1500:]
+        assert set((tree / "out" / "tester").glob("record_*_upload")) == before_uploads, "an unusable recording is not staged for upload"
+        newest_prefix = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_prefix) as z:
+            assert json.loads(z.read("manifest.json").decode("utf-8-sig"))["record"]["unusable"] == "prefix only"
+        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        newest_plain2 = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_plain2) as z:
+            assert "X2W_REPLAY_RECORD" not in json.loads(z.read("manifest.json").decode("utf-8-sig"))["env"], "a run without -Record carries no recorder switch"
         assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
         # -Matrix gray: three runs back to back (child processes), one combined report, each leg with its own env switch
         matrix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "gray", "-Seconds", "200")
@@ -472,6 +523,17 @@ def check_shell(shell):
         assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "1" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
         assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
         assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
+        # -Matrix indirect: two legs, the second with translated indirect draws on
+        ind = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "indirect", "-Seconds", "200")
+        assert ind.returncode == 0, (ind.stdout[-1500:], ind.stderr[-800:])
+        ind_zip = sorted((tree / "out" / "tester").glob("report_matrix_indirect_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(ind_zip) as z:
+            ind_top = json.loads(z.read("matrix_manifest.json").decode("utf-8-sig"))
+            ind_names = z.namelist()
+        assert sorted(ind_top["runs"]) == ["a", "b"] and "run_c/manifest.json" not in ind_names, ind_top["runs"].keys()
+        assert "X2W_TRANSLATED_INDIRECT_DRAW" not in ind_top["runs"]["a"]["env"] and ind_top["runs"]["b"]["env"].get("X2W_TRANSLATED_INDIRECT_DRAW") == "1", ind_top["runs"]
+        assert not os.environ.get("X2W_TRANSLATED_INDIRECT_DRAW"), "the matrix must not leave its switch in this environment"
+        assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 

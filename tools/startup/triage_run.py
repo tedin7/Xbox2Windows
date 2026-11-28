@@ -75,6 +75,7 @@ DSTORAGE_FAIL_OUTCOMES = {
 }
 TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
 INDIRECT_PREFIX = "x2w-render indirect: "
+INDIRECT_EXIT_PREFIX = "x2w-render indirect at exit: "
 # Ordered fields emitted by the slot-61 census in d3d12_xs_device.cpp.
 INDIRECT_OUTCOMES = (
     "forwarded", "refused graphics-pipeline", "compute-pipeline", "placeholder-signature", "other",
@@ -408,8 +409,9 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
             gpu_budget.observe(budget_match)
             continue
 
-        if line.startswith(INDIRECT_PREFIX):
-            snapshot = parse_indirect_snapshot(line.removeprefix(INDIRECT_PREFIX))
+        prefix = next((p for p in (INDIRECT_PREFIX, INDIRECT_EXIT_PREFIX) if line.startswith(p)), None)
+        if prefix is not None:
+            snapshot = parse_indirect_snapshot(line.removeprefix(prefix))
             if snapshot is not None:
                 if indirect_peaks is None:
                     indirect_peaks = Counter()

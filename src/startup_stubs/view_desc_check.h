@@ -1,0 +1,399 @@
+// Device-independent validation of desktop SRVs.
+#pragma once
+
+#include "startup_stubs/list_copy.h"
+#include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/texture_drop_mips.h"
+
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+
+namespace x2w_startup::view_desc {
+
+enum class Refusal {
+    none, dimension, mip_range, array_range, format, plane, lod, denied, dropped_mips, buffer_range, count
+};
+
+enum class Field { mip_levels, array_size, num_cubes, mapping, format, plane_slice, count };
+
+inline const char* field_name(Field field)
+{
+    switch (field) {
+    case Field::mip_levels: return "MipLevels";
+    case Field::array_size: return "ArraySize";
+    case Field::num_cubes: return "NumCubes";
+    case Field::mapping: return "Shader4ComponentMapping";
+    case Field::format: return "Format";
+    case Field::plane_slice: return "PlaneSlice";
+    default: return "Unknown";
+    }
+}
+
+inline const char* refusal_field_name(Refusal refusal)
+{
+    switch (refusal) {
+    case Refusal::dimension: return "ViewDimension/SampleDesc.Count";
+    case Refusal::mip_range: return "MostDetailedMip/MipLevels";
+    case Refusal::array_range: return "FirstArraySlice/ArraySize/First2DArrayFace/NumCubes";
+    case Refusal::format: return "Format";
+    case Refusal::plane: return "PlaneSlice";
+    case Refusal::lod: return "ResourceMinLODClamp";
+    case Refusal::denied: return "Flags (DENY_SHADER_RESOURCE)";
+    case Refusal::dropped_mips: return "MostDetailedMip/ResourceMinLODClamp (dropped mips)";
+    case Refusal::buffer_range: return "FirstElement/NumElements";
+    default: return "Unknown";
+    }
+}
+
+inline bool stencil_srv_format(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+}
+
+inline bool valid_mapping(UINT mapping)
+{
+    constexpr UINT required = D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+    if ((mapping & required) == 0 || (mapping & ~(required | 0xfffu)) != 0) return false;
+    for (unsigned component = 0; component < 4; ++component)
+        if (((mapping >> (3 * component)) & 7u) > 5) return false;
+    return true;
+}
+
+inline bool depth_format(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_D16_UNORM || format == DXGI_FORMAT_D32_FLOAT ||
+        format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+}
+
+enum class NumericFormat { other, floating, snorm, unorm };
+
+inline NumericFormat numeric_format(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+        return NumericFormat::floating;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_BC4_SNORM: case DXGI_FORMAT_BC5_SNORM:
+        return NumericFormat::snorm;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC5_UNORM:
+        return NumericFormat::unorm;
+    default:
+        return NumericFormat::other;
+    }
+}
+
+inline bool format_cast_fits(DXGI_FORMAT resource, DXGI_FORMAT view, bool fully_typed_casting)
+{
+    if (resource == view) return true;
+    if (!compatible_formats(resource, view)) return false;
+    if (is_typeless(resource)) return true;
+    if (!fully_typed_casting || depth_format(resource)) return false;
+    const auto from = numeric_format(resource);
+    const auto to = numeric_format(view);
+    if ((from == NumericFormat::floating) != (to == NumericFormat::floating)) return false;
+    return !((from == NumericFormat::snorm && to == NumericFormat::unorm) ||
+             (from == NumericFormat::unorm && to == NumericFormat::snorm));
+}
+
+inline D3D12_SRV_DIMENSION default_dimension(const D3D12_RESOURCE_DESC& resource)
+{
+    const bool array = resource.DepthOrArraySize > 1;
+    switch (resource.Dimension) {
+    case D3D12_RESOURCE_DIMENSION_BUFFER: return D3D12_SRV_DIMENSION_BUFFER;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+        return array ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+        if (resource.SampleDesc.Count > 1)
+            return array ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        return array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+        return D3D12_SRV_DIMENSION_TEXTURE3D;
+    default:
+        return D3D12_SRV_DIMENSION_UNKNOWN;
+    }
+}
+
+inline Refusal check_default(const D3D12_RESOURCE_DESC& resource)
+{
+    if (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return Refusal::denied;
+    if (default_dimension(resource) == D3D12_SRV_DIMENSION_UNKNOWN) return Refusal::dimension;
+    const auto format = resource.Format;
+    if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
+        is_planar_depth_stencil(format) ||
+        format == DXGI_FORMAT_NV12 || format == DXGI_FORMAT_P010 || format == DXGI_FORMAT_P016 ||
+        format == DXGI_FORMAT_420_OPAQUE)
+        return Refusal::format;
+    return Refusal::none;
+}
+
+// Validate first, then update individual fields so valid descriptors retain their original bytes.
+// The callback receives each changed field and its original and replacement values.
+template<class Repair>
+Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& resource,
+              unsigned dropped_levels, Repair repair, bool fully_typed_casting = false)
+{
+    if (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return Refusal::denied;
+
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER ||
+        resource.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER ||
+            resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            return Refusal::dimension;
+        const UINT stride = buffer_srv_element_bytes(view, false);
+        if (!stride) return view.Buffer.NumElements ? Refusal::format : Refusal::buffer_range;
+        const UINT64 total = resource.Width / stride;
+        if (view.Buffer.FirstElement >= total || view.Buffer.NumElements > total - view.Buffer.FirstElement ||
+            (view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW &&
+             view.Buffer.FirstElement % (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / 4) != 0))
+            return Refusal::buffer_range;
+        if (!valid_mapping(view.Shader4ComponentMapping)) {
+            repair(Field::mapping, view.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+        return Refusal::none;
+    }
+
+    const bool tex1d = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    const bool tex2d = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const bool tex3d = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool single_sample = resource.SampleDesc.Count == 1;
+    const bool multi_sample = resource.SampleDesc.Count > 1;
+    const UINT slices = resource.DepthOrArraySize;
+    bool fits = false;
+    bool cube = false;
+    UINT first_slice = 0;
+    UINT first_mip = 0;
+    UINT* plane_slice = nullptr;
+    float min_lod = 0.0f;
+    UINT* mip_count = nullptr;
+    UINT* array_count = nullptr;
+
+    const auto mips = [&](auto& desc) {
+        first_mip = desc.MostDetailedMip;
+        mip_count = &desc.MipLevels;
+        min_lod = desc.ResourceMinLODClamp;
+    };
+    switch (view.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+        fits = tex1d && single_sample && slices == 1;
+        mips(view.Texture1D);
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+        fits = tex1d && single_sample;
+        mips(view.Texture1DArray);
+        first_slice = view.Texture1DArray.FirstArraySlice;
+        array_count = &view.Texture1DArray.ArraySize;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+        fits = tex2d && single_sample && slices == 1;
+        mips(view.Texture2D);
+        plane_slice = &view.Texture2D.PlaneSlice;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        fits = tex2d && single_sample;
+        mips(view.Texture2DArray);
+        first_slice = view.Texture2DArray.FirstArraySlice;
+        array_count = &view.Texture2DArray.ArraySize;
+        plane_slice = &view.Texture2DArray.PlaneSlice;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+        fits = tex2d && multi_sample && slices == 1;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        fits = tex2d && multi_sample;
+        first_slice = view.Texture2DMSArray.FirstArraySlice;
+        array_count = &view.Texture2DMSArray.ArraySize;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+        fits = tex3d && single_sample;
+        mips(view.Texture3D);
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+        fits = tex2d && single_sample && slices >= 6 && resource.Width == resource.Height;
+        mips(view.TextureCube);
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+        fits = tex2d && single_sample && resource.Width == resource.Height;
+        mips(view.TextureCubeArray);
+        cube = true;
+        first_slice = view.TextureCubeArray.First2DArrayFace;
+        array_count = &view.TextureCubeArray.NumCubes;
+        break;
+    default:
+        break;
+    }
+    if (!fits) return Refusal::dimension;
+    if (!mip_count && !resource.MipLevels) return Refusal::mip_range;
+
+    // MipLevels 0 is invalid in D3D12, where -1 means every level from MostDetailedMip down: it is repaired to -1 below.
+    if (mip_count && first_mip >= resource.MipLevels)
+        return Refusal::mip_range;
+    if (!std::isfinite(min_lod) || min_lod < 0.0f) return Refusal::lod;
+    if (dropped_levels && ((view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D &&
+                           view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY) ||
+                          first_mip != 0 || min_lod != 0.0f))
+        return Refusal::dropped_mips;
+
+    UINT remaining_slices = 0;
+    if (array_count) {
+        if (first_slice >= slices || *array_count == 0) return Refusal::array_range;
+        remaining_slices = (slices - first_slice) / (cube ? 6u : 1u);
+        if (!remaining_slices) return Refusal::array_range;
+    }
+
+    DXGI_FORMAT format = view.Format;
+    UINT plane = plane_slice ? *plane_slice : 0;
+    // Planar video resources use a different format family for each plane.
+    if (resource.Format == DXGI_FORMAT_NV12 || resource.Format == DXGI_FORMAT_P010 ||
+        resource.Format == DXGI_FORMAT_P016) {
+        if (plane > 1) return Refusal::plane;
+        if (resource.Format == DXGI_FORMAT_NV12)
+            format = plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+        else
+            format = plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
+        if (view.Format != format) return Refusal::format;
+    } else if (is_planar_depth_stencil(resource.Format)) {
+        const bool stencil = stencil_srv_format(format);
+        const bool multisampled = view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
+                                  view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        if (stencil && !plane_slice && !multisampled) return Refusal::plane;
+        if (!stencil && format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS &&
+            format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
+            return Refusal::format;
+        const bool d24 = format_family(resource.Format) == DXGI_FORMAT_R24G8_TYPELESS;
+        if (d24)
+            format = stencil ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        else
+            format = stencil ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        // MSAA descriptors have no PlaneSlice member. Their format selects the aspect.
+        plane = stencil ? 1u : 0u;
+    } else {
+        if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
+            !format_cast_fits(resource.Format, format, fully_typed_casting))
+            format = resource.Format;
+        if (format == DXGI_FORMAT_UNKNOWN || is_typeless(format) || depth_format(format) ||
+            format == DXGI_FORMAT_420_OPAQUE)
+            return Refusal::format;
+        plane = 0;
+    }
+
+    const auto update = [&](Field field, auto& value, auto replacement) {
+        if (value == replacement) return;
+        repair(field, static_cast<UINT>(value), static_cast<UINT>(replacement));
+        value = replacement;
+    };
+    if (mip_count && *mip_count == 0) {
+        update(Field::mip_levels, *mip_count, ~0u);
+    } else if (mip_count && *mip_count != ~0u) {
+        // Match the lazy texture policy: subtract dropped top levels, keeping one level.
+        const UINT count = drop_mips::view_mip_levels(*mip_count, dropped_levels);
+        update(Field::mip_levels, *mip_count, (std::min)(count, UINT{resource.MipLevels} - first_mip));
+    }
+    if (array_count)
+        update(cube ? Field::num_cubes : Field::array_size, *array_count,
+               (std::min)(*array_count, remaining_slices));
+    if (!valid_mapping(view.Shader4ComponentMapping))
+        update(Field::mapping, view.Shader4ComponentMapping, UINT{D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING});
+    update(Field::format, view.Format, format);
+    if (plane_slice) update(Field::plane_slice, *plane_slice, plane);
+    return Refusal::none;
+}
+
+// The shader resource view equivalent of a texture unordered access view: the same resource window at the UAV's one mip.
+// A console image descriptor serves loads and samples alike, so a title can sample through a descriptor it wrote as a
+// UAV. Read as an SRV description, a UAV description's union lands one field early (MipLevels reads as zero).
+// False for buffer views and dimensions with no SRV form.
+inline bool srv_from_uav(const D3D12_UNORDERED_ACCESS_VIEW_DESC& uav, D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = uav.Format;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    switch (uav.ViewDimension) {
+    case D3D12_UAV_DIMENSION_TEXTURE1D:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.Texture1D = {uav.Texture1D.MipSlice, 1, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        view.Texture1DArray = {uav.Texture1DArray.MipSlice, 1, uav.Texture1DArray.FirstArraySlice,
+                               uav.Texture1DArray.ArraySize, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE2D:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Texture2D = {uav.Texture2D.MipSlice, 1, uav.Texture2D.PlaneSlice, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {uav.Texture2DArray.MipSlice, 1, uav.Texture2DArray.FirstArraySlice,
+                               uav.Texture2DArray.ArraySize, uav.Texture2DArray.PlaneSlice, 0.0f};
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D:
+        // An SRV has no depth window: it reads the whole depth of the UAV's mip.
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Texture3D = {uav.Texture3D.MipSlice, 1, 0.0f};
+        break;
+    default:
+        return false;
+    }
+    out = view;
+    return true;
+}
+
+// The SRV description of a recorded view (slot 18 SRV or slot 19 UAV, `bytes` of title description). False when the
+// record has no full description; a UAV with no SRV form keeps only its format and an unknown dimension.
+inline bool recorded_srv(unsigned slot, const void* desc, std::size_t bytes, D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    if (bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) return false;
+    if (slot != 19) {
+        std::memcpy(&out, desc, sizeof(out));
+        return true;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    std::memcpy(&uav, desc, sizeof(uav));
+    if (!srv_from_uav(uav, out)) {
+        out = {};
+        out.Format = uav.Format;
+    }
+    return true;
+}
+
+// `view` re-expressed as the texture type the shader declares, where both name the same texels: a single-slice array
+// at slice 0 and its plain form. False when no such form exists (cube, multisample, several slices).
+inline bool as_dimension(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, D3D12_SRV_DIMENSION wanted,
+                         D3D12_SHADER_RESOURCE_VIEW_DESC& out)
+{
+    if (view.ViewDimension == wanted) {
+        out = view;
+        return true;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC shaped{};
+    shaped.Format = view.Format;
+    shaped.ViewDimension = wanted;
+    shaped.Shader4ComponentMapping = view.Shader4ComponentMapping;
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && wanted == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        const auto t = view.Texture2D;
+        shaped.Texture2DArray = {t.MostDetailedMip, t.MipLevels, 0, 1, t.PlaneSlice, t.ResourceMinLODClamp};
+    } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY && wanted == D3D12_SRV_DIMENSION_TEXTURE2D &&
+               view.Texture2DArray.FirstArraySlice == 0 && view.Texture2DArray.ArraySize == 1) {
+        const auto t = view.Texture2DArray;
+        shaped.Texture2D = {t.MostDetailedMip, t.MipLevels, t.PlaneSlice, t.ResourceMinLODClamp};
+    } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY && wanted == D3D12_SRV_DIMENSION_TEXTURE1D &&
+               view.Texture1DArray.FirstArraySlice == 0 && view.Texture1DArray.ArraySize == 1) {
+        const auto t = view.Texture1DArray;
+        shaped.Texture1D = {t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp};
+    } else {
+        return false;
+    }
+    out = shaped;
+    return true;
+}
+
+} // namespace x2w_startup::view_desc

@@ -35,9 +35,11 @@
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/pso_recipe.h"
 #include "startup_stubs/depth_state_apply.h"
+#include "startup_stubs/viewport_check.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/integer_texture_srvs.h"
 #include "startup_stubs/pixel_uav_support.h"
+#include "startup_stubs/compute_output_view_check.h"
 #include "startup_stubs/formatted_buffer.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
@@ -47,11 +49,14 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
+#include "startup_stubs/d3d12_replay_slots.h"
 #include "startup_stubs/list_upload_pages.h"
+#include "startup_stubs/descriptor_ring_segments.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
 #include <optional>
+#include "startup_stubs/depth_clear_census.h"
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/resource_address_index.h"
@@ -64,16 +69,19 @@
 #include "startup_stubs/target_draw_census.h"
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
-#include "startup_stubs/dsv_planes.h"
+#include "startup_stubs/subresource_states.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/buffer_input_addressing.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/locked_open_retry.h"
 #include "startup_stubs/manifest_prefetch.h"
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
+#include "startup_stubs/create_srv.h"
+#include "startup_stubs/target_view_check.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/refused_dispatch_census.h"
@@ -84,6 +92,8 @@
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/presenter_fence_win.h"
+#include "startup_stubs/png_write.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
@@ -97,7 +107,11 @@
 #include "key_use.h"
 #include "root_constant_store.h"
 #include "null_texture_view.h"
-#include "packed_target_format.h"
+#include "clear_value_format.h"
+#include "debug_drain_budget.h"
+#include "debug_level.h"
+#include "resource_map_counts.h"
+#include "descriptor_heap_rules.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
@@ -114,6 +128,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cctype>
 #include <cstdarg>
@@ -121,6 +136,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <new>
 #include <map>
@@ -141,7 +157,7 @@ extern "C" std::uint32_t x2w_no_stripped_root_flags(const void*, std::size_t) { 
 namespace {
 
 using u64 = std::uint64_t;
-constexpr int slot_count = 512;
+constexpr int slot_count = x2w_replay_slots::slot_count;
 // Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
@@ -157,6 +173,7 @@ x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
 x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};
+x2w_startup::PerReasonRefusalCensus indirect_pipeline_refusal_census{"indirect-pipeline"};
 
 enum Kind : int {
     device_kind, queue_kind, fence_kind, allocator_kind, list_kind, descriptor_heap_kind, root_signature_kind,
@@ -177,6 +194,16 @@ const char* const kind_names[kind_count] = {
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
 struct RootParameter;
+namespace replay_dump { struct Target; }
+bool replay_dump_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_REPLAY_DUMP", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+void replay_dump_tag(Wrapper* wrapper, ID3D12Resource* resource);
 enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
 struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
@@ -211,6 +238,7 @@ struct alignas(16) WrapperOwn {
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
+    UINT descriptor_run_heap, descriptor_run_next, descriptor_run_remaining; // allocator_lock
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
@@ -246,6 +274,8 @@ struct alignas(16) WrapperOwn {
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
+    u64 replay_resource_id;
+    std::vector<replay_dump::Target>* replay_writes;
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
     Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
@@ -275,8 +305,7 @@ void fence_reached(Wrapper* fence, std::uint64_t value) noexcept
 }
 
 // Descriptor heaps created over title memory: title CPU handles in [title, title + bytes) map to
-// desktop CPU handles at the same offset (the title's increments come from the forwarded desktop
-// GetDescriptorHandleIncrementSize, so offsets agree). Descriptors the title writes or copies into
+// desktop CPU handles by descriptor index. Descriptors the title writes or copies into
 // that memory itself are not seen by the desktop heap.
 struct DescriptorRange {
     std::uint64_t title;
@@ -287,14 +316,23 @@ struct DescriptorRange {
     // How many title descriptors the desktop heap covers. Normally the whole heap; shorter only when
     // the console heap was larger than the driver accepts and the stand-in emulated the remainder.
     std::uint64_t desktop_descriptors;
-    std::uint64_t tail_cpu; // CPU-only heap for view records outside the shader-visible prefix.
+    std::uint64_t tail_cpu; // CPU-only heap for descriptor records outside the shader-visible prefix.
 };
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
+// Title descriptor memory a heap creation offered but the layer did not take (its size does not match the title
+// stride). The title still makes handles inside it; none of them names a desktop descriptor, so they are refused
+// instead of reaching D3D12 (debug layer #646; without the layer the driver writes the descriptor into title memory).
+// Handles outside every known range pass unchanged, as before: a caller may use a heap made on the desktop device.
+struct RefusedTitleBlock { u64 start, bytes; };
+std::vector<RefusedTitleBlock> refused_title_blocks;
+// Descriptor increments the recorded title was given, per heap type (x2w_d3d12_replay_title_increment); 0 = this
+// device's own increment.
+static LONG replay_title_increments[4];
 
-// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
-// API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
-// the accepted maximum is measured once and cached rather than assumed.
+// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: Resource
+// Binding documents 1,000,000 on every tier (descriptor_heap_rules.h clamps to it before the first call),
+// but a driver may accept fewer, so the accepted maximum is measured once and cached rather than assumed.
 constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
@@ -308,17 +346,18 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullpt
 {
     std::uint64_t result = handle;
     UINT room = UINT_MAX, remaining = UINT_MAX;
-    bool past_end = false;
+    bool past_end = false, matched = false;
     AcquireSRWLockShared(&descriptor_lock);
     for (const auto& r : descriptor_ranges) {
         if (handle < r.title) continue;
         const u64 offset = handle - r.title;
         if (offset == r.bytes && r.tail_cpu) past_end = true;
         if (offset >= r.bytes) continue;
+        matched = true;
         const u64 index = offset / r.title_stride;
         const u64 limit = r.bytes / r.title_stride;
         remaining = static_cast<UINT>(limit - index);
-        if (r.tail_cpu && offset % r.title_stride) {
+        if ((r.tail_cpu || r.title_stride != r.desktop_stride) && offset % r.title_stride) {
             result = 0;
             room = 0;
         } else if (index >= r.desktop_descriptors) {
@@ -331,6 +370,18 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullpt
         past_end = false;
         break;
     }
+    if (!matched && handle && !past_end) {
+        for (const auto& block : refused_title_blocks) {
+            if (handle < block.start || handle - block.start >= block.bytes) continue;
+            static LONG refused;
+            if (first_calls(refused, 8))
+                log("x2w-d3d12 CPU descriptor handle 0x%llx is in title memory no desktop heap backs: refused", handle);
+            result = 0;
+            room = 0;
+            remaining = 0;
+            break;
+        }
+    }
     ReleaseSRWLockShared(&descriptor_lock);
     if (past_end) { result = 0; room = 0; }
     if (contiguous) *contiguous = room;
@@ -339,7 +390,7 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullpt
 }
 
 // Measure, once per process, the largest shader-visible CBV/SRV/UAV heap this driver creates. The
-// documented ceiling is 1,048,576 descriptors, but drivers may accept fewer, so halve from the
+// documented ceiling is 1,000,000 descriptors, but drivers may accept fewer, so halve from the
 // ceiling until a create succeeds and then bisect upward. Each probe heap is released before the next
 // one, so at most one probe holds memory at a time.
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask)
@@ -368,7 +419,7 @@ std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mas
     // Halve from the documented ceiling, testing the floor too: a driver whose maximum is below the
     // floor must not be recorded as accepting it, or the retry would ask for a size it rejects again.
     std::uint64_t accepted = 0;
-    for (std::uint64_t size = 1048576; size >= view_heap_probe_floor; size /= 2) {
+    for (std::uint64_t size = 1000000; size >= view_heap_probe_floor; size /= 2) {
         if (probe(size)) {
             accepted = size;
             break;
@@ -381,7 +432,7 @@ std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mas
         return 0;
     }
     std::uint64_t low = accepted, high = accepted * 2;
-    while (low + 1 < high && high <= 1048576) {
+    while (low + 1 < high && high <= 1000000) {
         const std::uint64_t mid = low + (high - low) / 2;
         if (probe(mid)) low = mid; else high = mid;
     }
@@ -476,12 +527,27 @@ void log_sysmem_fallback(const void* address, const D3D12_RESOURCE_DESC& desc, c
         desc.MipLevels, desc.Format, desc.SampleDesc.Count);
 }
 
-// X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
+// X2W_D3D12_DEBUG=1 or 2: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
 ID3D12InfoQueue* info_queue;
 ID3D12Device* removal_device;
-LONG removal_reported, debug_lines;
+LONG removal_reported;
+x2w_startup::DebugDrainBudget debug_budget;
 SRWLOCK debug_lock = SRWLOCK_INIT;
+bool debug_srv_history_reported;
+
+void log_debug_srv(const char* label, const x2w_startup::SrvCreation& srv)
+{
+    char bytes[3 * sizeof(srv.desc) + 2] = {};
+    if (srv.described) hex_text(srv.desc, sizeof(srv.desc), bytes, sizeof(bytes));
+    const auto& r = srv.resource;
+    log("x2w-d3d12-debug %s: site=%s desc=%s resource dim=%d %llux%u depth/array=%u mips=%u fmt=%d flags=0x%x",
+        label, srv.site ? srv.site : "(none on this thread)", srv.described ? bytes : "(null)",
+        r.Dimension, static_cast<unsigned long long>(r.Width), r.Height, static_cast<UINT>(r.DepthOrArraySize),
+        static_cast<UINT>(r.MipLevels), r.Format, static_cast<UINT>(r.Flags));
+}
+
+void drain_debug_messages(const char* context, int slot);
 
 void check_device(const char* context, int slot)
 {
@@ -493,21 +559,65 @@ void check_device(const char* context, int slot)
     }
     if (!info_queue) return;
     AcquireSRWLockExclusive(&debug_lock);
+    drain_debug_messages(context, slot);
+    ReleaseSRWLockExclusive(&debug_lock);
+}
+
+void drain_debug_messages(const char* context, int slot)
+{
     const UINT64 count = info_queue->GetNumStoredMessages();
-    for (UINT64 i = 0; i < count && debug_lines < 400; ++i) {
+    for (UINT64 i = 0; i < count; ++i) {
         SIZE_T size = 0;
         info_queue->GetMessage(i, nullptr, &size);
         if (!size || size > 8192) continue;
         alignas(16) char storage[8192];
         auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage);
         if (SUCCEEDED(info_queue->GetMessage(i, message, &size))) {
-            ++debug_lines;
-            log("x2w-d3d12-debug [%s %d] sev=%d id=%d %.900s", context, slot, message->Severity, message->ID,
+            const auto decision = debug_budget.record(message->Severity, message->ID);
+            if (decision == x2w_startup::DebugDrainBudget::Decision::repeat) {
+                log("x2w-d3d12-debug id=%u repeated %llu times", static_cast<unsigned>(message->ID),
+                    static_cast<unsigned long long>(debug_budget.count(message->ID)));
+            }
+            if (decision == x2w_startup::DebugDrainBudget::Decision::message) log("x2w-d3d12-debug [%s %d] sev=%d id=%d %.900s", context, slot, message->Severity, message->ID,
                 message->pDescription);
+            if (decision == x2w_startup::DebugDrainBudget::Decision::message &&
+                (message->ID == 27 || message->ID == 31 ||
+                 (message->pDescription && std::strstr(message->pDescription, "CreateShaderResourceView")))) {
+                log_debug_srv("last SRV", x2w_startup::last_srv);
+                if (!debug_srv_history_reported) {
+                    debug_srv_history_reported = true;
+                    for (const auto& srv : x2w_startup::recent_srvs())
+                        if (srv.site) log_debug_srv("SRV history", srv);
+                }
+            }
         }
     }
     info_queue->ClearStoredMessages();
-    ReleaseSRWLockExclusive(&debug_lock);
+}
+
+// The debug layer raises this after an error it cannot continue from, such as #646.
+constexpr DWORD debug_layer_exception = 0x87d;
+LONG CALLBACK debug_exception_handler(EXCEPTION_POINTERS* exception)
+{
+    if (exception->ExceptionRecord->ExceptionCode == debug_layer_exception) {
+        log("x2w-d3d12-debug: the debug layer raised 0x87d; stored messages follow");
+        if (info_queue && TryAcquireSRWLockExclusive(&debug_lock)) {
+            drain_debug_messages("exception", 0);
+            ReleaseSRWLockExclusive(&debug_lock);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+const D3D12_CLEAR_VALUE* safe_clear(const D3D12_CLEAR_VALUE* mapped, const D3D12_RESOURCE_DESC& desc,
+                                    D3D12_CLEAR_VALUE& copy)
+{
+    x2w_startup::ClearDrop reason = x2w_startup::ClearDrop::none;
+    const auto* result = x2w_startup::optimized_clear_value(mapped, desc, copy, &reason);
+    static LONG drops[5]{};
+    const auto index = static_cast<unsigned>(reason);
+    if (index && first_calls(drops[index], 1)) log("x2w-d3d12 optimized clear dropped reason=%u", index);
+    return result;
 }
 
 // Wrapper detection is a registry lookup: no argument is ever dereferenced to find out what it is.
@@ -569,7 +679,12 @@ Wrapper* wrap(IUnknown* real, Kind kind)
         _aligned_free(block);
         return nullptr;
     }
+    if (kind == resource_kind && replay_dump_enabled()) {
+        static volatile LONG64 next_id = 0;
+        w->own().replay_resource_id = InterlockedIncrement64(&next_id);
+    }
     ReleaseSRWLockExclusive(&registry_lock);
+    if (kind == resource_kind && real) replay_dump_tag(w, static_cast<ID3D12Resource*>(real));
     return w;
 }
 
@@ -833,24 +948,9 @@ __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d,
 // Resource descriptions: the title sets flag bits desktop D3D12 rejects (0x20000 on buffers,
 // 0x100000 and 0x200000 on render-target textures). Desktop receives only the bits it defines
 // up to ALLOW_SIMULTANEOUS_ACCESS (0x3f); dropped bits are logged once per value.
-// Console-only DXGI format values (116-120 in the console's format extensions: two 10-bit float
-// formats, D16_UNORM_S8_UINT and its two typed views) mapped to the nearest desktop formats. The
-// bit layouts differ, so contents are not interchangeable; this only lets the resources exist.
 DXGI_FORMAT desktop_format(DXGI_FORMAT format)
 {
-    DXGI_FORMAT mapped = format;
-    switch (static_cast<UINT>(format)) {
-    case 116: case 117: mapped = DXGI_FORMAT_R10G10B10A2_UNORM; break;
-    case 118: mapped = DXGI_FORMAT_D24_UNORM_S8_UINT; break;
-    case 119: mapped = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
-    case 120: mapped = DXGI_FORMAT_X24_TYPELESS_G8_UINT; break;
-    default: break;
-    }
-    if (mapped != format) {
-        static LONG calls;
-        if (first_calls(calls, 6)) log("x2w-d3d12 console format %u -> desktop format %u", format, mapped);
-    }
-    return mapped;
+    return x2w_startup::desktop_format(format);
 }
 
 constexpr UINT desktop_resource_flags = 0x3f;
@@ -898,19 +998,6 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
         }
     }
     return copy;
-}
-
-// An optimized clear belongs to the actual texture format, including when the
-// wrapper substitutes it. Preserve the caller's clear colour.
-const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI_FORMAT requested,
-                                          DXGI_FORMAT created, D3D12_CLEAR_VALUE& copy)
-{
-    const auto* mapping = x2w_startup::packed_target_mapping(requested);
-    if (!clear || !mapping || created != mapping->replacement || desktop_format(clear->Format) != requested)
-        return clear;
-    copy = *clear;
-    copy.Format = created;
-    return &copy;
 }
 
 bool legacy_retire_view_stats()
@@ -969,15 +1056,23 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     u64 args[8] = {a, b, c, d, e, f, g, h};
     for (int i = 0; i < R; ++i) args[i] = unwrap(args[i]);
     D3D12_RESOURCE_DESC desc_copy{};
-    D3D12_CLEAR_VALUE clear_copy{};
+    D3D12_CLEAR_VALUE clear_copy{}, safe_clear_copy{};
     DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT original_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
-        requested_format = desktop_format(reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc])->Format);
-        desc_copy = sanitized(*reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]));
+        const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]);
+        original_format = desc.Format;
+        requested_format = desktop_format(original_format);
+        desc_copy = sanitized(desc);
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
-        if constexpr (K == device_kind && (N == 27 || N == 29))
-            args[4] = reinterpret_cast<u64>(packed_clear_value(reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[4]),
-                                                               requested_format, desc_copy.Format, clear_copy));
+        if constexpr (K == device_kind && (N == 27 || N == 29 || N == 30)) {
+            constexpr int clear_index = N == 30 ? 2 : 4;
+            const auto* clear = reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[clear_index]);
+            const auto* mapped_clear = x2w_startup::desktop_clear_value(clear, desc.Format, desc_copy.Format, clear_copy);
+            args[clear_index] = reinterpret_cast<u64>(safe_clear(mapped_clear, desc_copy, safe_clear_copy));
+            constexpr const char* path = N == 27 ? "committed" : N == 29 ? "placed" : "reserved";
+            x2w_startup::log_console_format(path, N, desc, clear, mapped_clear, log);
+        }
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], args[4], args[5],
                                                 args[6], args[7]);
@@ -987,8 +1082,11 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
-        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
-            x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
+        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN) {
+            auto* resource = static_cast<ID3D12Resource*>(*out);
+            x2w_startup::mark_packed_stand_in(resource, requested_format);
+            x2w_startup::mark_console_format(resource, original_format);
+        }
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
         if (!child) {
             static_cast<IUnknown*>(*out)->Release();
@@ -1131,6 +1229,14 @@ bool lazy_textures_enabled()
     static const bool on = x2w_local::env_on("X2W_D3D12_LAZY_TEXTURES");
     return on;
 }
+// X2W_D3D12_LAZY_EVICT=1 (with X2W_D3D12_LAZY_TEXTURES=1 and X2W_D3D12_RELEASE_RETIRED=1, else off): a lazy slot-133
+// texture that materializes over at least half of another materialized one's title memory evicts it. On the console the
+// newer texture took that memory, so the older one's contents are gone there too; its next use materializes it again.
+bool lazy_evict_enabled()
+{
+    static const bool on = lazy_textures_enabled() && release_retired_enabled() && x2w_local::env_on("X2W_D3D12_LAZY_EVICT");
+    return on;
+}
 // X2W_D3D12_TEXTURE_DROP_MIPS=<levels> (1 to 4, default off), X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES (default 4 MiB).
 const x2w_startup::drop_mips::Config& drop_mips_config()
 {
@@ -1146,6 +1252,7 @@ struct LazyTextureRecord {
     Wrapper* device{};
     D3D12_RESOURCE_DESC desc{};
     DXGI_FORMAT desktop_format{};
+    DXGI_FORMAT original_format{};
 };
 std::mutex lazy_texture_mutex;  // lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock
 // Publications of a lazy texture in progress and finished, so a guest descriptor copy can tell whether its native copy may
@@ -1155,6 +1262,28 @@ std::unordered_map<const Wrapper*, LazyTextureRecord>& lazy_textures()
 {
     static std::unordered_map<const Wrapper*, LazyTextureRecord> m;
     return m;
+}
+// X2W_D3D12_LAZY_EVICT: materialized lazy textures by title address (lazy_texture_mutex). end: the address plus the
+// desktop allocation size of the recorded description.
+struct LazyRange {
+    u64 end;
+    Wrapper* texture;
+};
+std::multimap<u64, LazyRange>& lazy_ranges()
+{
+    static std::multimap<u64, LazyRange> m;
+    return m;
+}
+LONG64 lazy_evicted, lazy_evict_kept, lazy_evict_freed;
+void forget_lazy_range(const Wrapper* w)  // lazy_texture_mutex held
+{
+    auto& ranges = lazy_ranges();
+    for (auto [at, end] = ranges.equal_range(reinterpret_cast<u64>(w->own().title_memory)); at != end; ++at) {
+        if (at->second.texture == w) {
+            ranges.erase(at);
+            return;
+        }
+    }
 }
 bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 {
@@ -1167,9 +1296,23 @@ bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 }
 ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 bool retire_unmaterialized_lazy_texture(Wrapper* w);
+
+SRWLOCK resource_map_lock = SRWLOCK_INIT;
+x2w_startup::ResourceMapCounts<Wrapper*> resource_maps;
+
+void forget_resource_maps(Wrapper* w)
+{
+    AcquireSRWLockExclusive(&resource_map_lock);
+    resource_maps.forget(w);
+    ReleaseSRWLockExclusive(&resource_map_lock);
+}
+
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
+    // A resource may be released while mapped (persistent mapping): its map counts end with it, with no Unmap.
+    // Only the last release takes the lock, so the hot Release path stays lock-free.
+    if (!refs && self->own().kind == resource_kind) forget_resource_maps(self);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
@@ -1603,6 +1746,21 @@ struct ComputeInputSnapshot {
     std::vector<std::pair<ID3D12Fence*, UINT64>> submits;
 };
 
+constexpr UINT draw_heap_size = 1u << 18;
+constexpr UINT draw_segment_size = 512;
+constexpr UINT draw_heap_limit = 4;
+using DrawSegments = x2w_startup::DescriptorRingSegments<draw_heap_size / draw_segment_size>;
+struct DrawHeap {
+    ID3D12DescriptorHeap* heap = nullptr;
+    DrawSegments segments;
+};
+struct DrawSegmentHold {
+    UINT heap;
+    DrawSegments::Run run;
+};
+std::array<DrawHeap, draw_heap_limit> draw_heaps;
+UINT draw_heap_count; // Growth under draw_lock, then allocator_lock.
+
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
 // stands for a pool of desktop allocators. A list records on the pool's current one. In render
@@ -1626,6 +1784,7 @@ struct DesktopAllocator {
     // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
     // queue that ran it has passed its fence (the allocator is reused only when idle).
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
+    std::vector<DrawSegmentHold> descriptor_runs; // Released on idle Reset, like scratches.
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1769,7 +1928,7 @@ void release_upload_recording(Wrapper* list)
     retire_list_arena(list);
     detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
+    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
         if (found->second) --found->second->lists;
         list_recordings.erase(found);
     }
@@ -1794,6 +1953,13 @@ bool allocator_idle(const DesktopAllocator* allocator)
     for (const auto& submit : allocator->submits)
         if (submit.first->GetCompletedValue() < submit.second) return false;
     return true;
+}
+
+// allocator_lock held, after successful Reset of an idle desktop allocator.
+void release_draw_segments(DesktopAllocator& allocator)
+{
+    for (const auto& hold : allocator.descriptor_runs) draw_heaps[hold.heap].segments.release(hold.run);
+    allocator.descriptor_runs.clear();
 }
 
 // allocator_lock held. A recording retains its descriptor snapshots behind the same fences as its upload pages.
@@ -1983,6 +2149,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             recycle_arenas(*next);
             next->indexed_validation.clear();
             next->scratches.clear();
+            release_draw_segments(*next);
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -2233,6 +2400,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                     recycle_arenas(*spare);
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
+                    release_draw_segments(*spare);
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -2280,6 +2448,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (compute_title_inputs_enabled()) compute_input_recordings.erase(self);
             retire_list_arena(self);
             state.list_scratch = nullptr;
+            state.descriptor_run_remaining = 0;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -2461,6 +2630,25 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
+std::uint64_t process_ms();  // d3d12_draw.inl
+
+// Which translated draw last wrote each render target, for the `x2w-render present source` line: direct-mapped by resource pointer,
+// written under the draw lock, read without a lock by the present thread (a torn read only blurs a diagnostic).
+struct TargetWriter {
+    const void* resource;
+    u64 key, draws;
+    unsigned slot, format;
+};
+TargetWriter target_writers[256];
+void note_target_writer(const void* resource, u64 key, unsigned slot, unsigned format)
+{
+    TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(resource) >> 6) & 255];
+    if (w.resource != resource) w = TargetWriter{resource, 0, 0, 0, 0};
+    w.key = key;
+    w.slot = slot;
+    w.format = format;
+    ++w.draws;
+}
 // raw_plane < 0: the baseline capture of the presented surface (plane 0), reduced for the window and
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
@@ -2720,6 +2908,19 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     }
     was_flat = flat_now;
     if (periodic || moved || timed) {
+        {
+            // What produced this picture: the translated draw that last wrote this surface (key, target slot, format, draws into it
+            // since it was first seen as a target), or "no translated draw", then the picture is a copy/clear/other writer.
+            const TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(surface) >> 6) & 255];
+            if (!raw && (periodic || moved)) {
+                if (w.resource == surface)
+                    log("x2w-render present source at %.1f s: last translated draw into the presented surface key %016llx (target %u, format %u, %llu draws into it); mean level %.2f/255",
+                        process_ms() / 1000.0, static_cast<unsigned long long>(w.key), w.slot, w.format, static_cast<unsigned long long>(w.draws), sum / (3.0 * shown_width * shown_height));
+                else
+                    log("x2w-render present source at %.1f s: no translated draw wrote the presented surface (copy, clear or untranslated writer); mean level %.2f/255",
+                        process_ms() / 1000.0, sum / (3.0 * shown_width * shown_height));
+            }
+        }
         if (moved && !periodic) {
             ++change_lines;
             log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
@@ -2735,7 +2936,12 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 //
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
+std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
+u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc);  // d3d12_memory_srv.inl
+extern LONG translated_draws;  // d3d12_draw.inl: the recorder's "d" window counts them per frame
+#include "startup_stubs/d3d12_record.inl"
+#include "startup_stubs/d3d12_present_pictures.inl"
 #include "startup_stubs/d3d12_debug_present.inl"
 
 struct RootParameter {
@@ -3592,7 +3798,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
-    std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
+    std::vector<x2w_substates::Split> split;
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
@@ -3628,8 +3834,10 @@ struct Pass {
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
+    x2w_substates::Range bound_target_ranges[8]{};
     ID3D12Resource* bound_depth = nullptr;
-    bool heap_set = false;
+    x2w_substates::DepthBinding bound_depth_view;
+    ID3D12DescriptorHeap* bound_view_heap = nullptr;
     x2w_startup::SamplerSource title_samplers;
     u64 sampler_heap_wrapper = 0;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -3637,7 +3845,9 @@ struct Pass {
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
     // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
     bool viewport_set = false;
+    D3D12_VIEWPORT viewport0{};  // the title's first viewport, when viewport_set (depth_clear_census.h)
     bool scissor_set = false;
+    D3D12_RECT scissor0{};  // the title's first scissor rect, when scissor_set (depth_clear_census.h)
     // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
     // the title flags above so a later render target 0 of another size gets a fresh default.
     UINT64 default_viewport_w = 0, default_scissor_w = 0;
@@ -3948,22 +4158,40 @@ bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
     ReleaseSRWLockShared(&placed_gpu_writes_lock);
     return written;
 }
+auto find_split(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.split.begin(), pass.split.end(),
+                        [resource](const auto& known) { return known.resource == resource; });
+}
+
+auto find_state(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.states.begin(), pass.states.end(),
+                        [resource](const auto& known) { return known.first == resource; });
+}
+
+x2w_substates::Split& split_state(Pass& pass, ID3D12Resource* resource)
+{
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) return *split;
+    const auto known = find_state(pass, resource);
+    const auto state = known == pass.states.end() ? D3D12_RESOURCE_STATE_COMMON : known->second;
+    pass.split.push_back(x2w_substates::make_split(resource, x2w_substates::whole(resource->GetDesc()), state));
+    if (known != pass.states.end()) pass.states.erase(known);
+    return pass.split.back();
+}
+
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
-    for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
-        if (it->resource != resource) continue;
-        // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
-        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
-            x2w_dsv::move_plane(list, *it, 0, state);
-            return;
-        }
-        // Anything else wants one state for the whole resource: bring both planes back to COMMON first.
-        x2w_dsv::release(list, *it);
-        pass.mixed.erase(it);
-        break;
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) {
+        x2w_substates::move_all(list, *split, state);
+        pass.split.erase(split);
+        pass.states.emplace_back(resource, state);
+        return;
     }
     for (auto& known : pass.states) {
         if (known.first != resource) continue;
@@ -3976,18 +4204,104 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
     transition(list, resource, D3D12_RESOURCE_STATE_COMMON, state);
     pass.states.emplace_back(resource, state);
 }
-// State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
+// Preserve the whole-resource read state for a depth resource no longer bound as a DSV.
 D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 {
-    for (const auto& planes : pass_of(self).mixed)
-        if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
+    auto& pass = pass_of(self);
+    if (pass.bound_depth != resource) {
+        const auto known = find_state(pass, resource);
+        const auto split = find_split(pass, resource);
+        if ((known != pass.states.end() && (known->second & D3D12_RESOURCE_STATE_DEPTH_READ)) ||
+            (split != pass.split.end() && split->planes == 2 && (split->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)))
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    for (const auto& known : pass_of(self).states)
-        if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
     return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
+bool require_read(Wrapper* self, ID3D12Resource* resource, const x2w_substates::Range& read,
+                  D3D12_RESOURCE_STATES read_state)
+{
+    auto& pass = pass_of(self);
+    bool bound = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        if (pass.bound_targets[i] != resource) continue;
+        bound = true;
+        // Enhanced Barriers, No Self Copy: one subresource cannot combine read and write access.
+        if (x2w_substates::overlaps(read, pass.bound_target_ranges[i])) return false;
+    }
+    if (pass.bound_depth == resource) {
+        if (x2w_substates::writable_overlap(pass.bound_depth_view, read)) return false;
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        const auto known = find_state(pass, resource);
+        const auto full = x2w_substates::whole(resource->GetDesc());
+        // Keep the existing whole-resource barrier for a single fully covered read-only plane.
+        if (full.mips == 1 && full.slices == 1 && full.planes == 1 && known != pass.states.end()) {
+            require_state(self, resource, D3D12_RESOURCE_STATE_DEPTH_READ | read_state);
+        } else {
+            auto& split = split_state(pass, resource);
+            x2w_substates::move_each(list, split, read, [&](UINT index, D3D12_RESOURCE_STATES) {
+                return x2w_substates::sampled_state(split, index, pass.bound_depth_view, read_state);
+            });
+        }
+    } else if (bound) {
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        x2w_substates::move(list, split_state(pass, resource), read, read_state);
+    } else {
+        require_state(self, resource, read_state);
+    }
+    return true;
+}
+
+void restore_bound_targets(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pass)
+{
+    bool moved = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        auto* resource = pass.bound_targets[i];
+        const auto known = find_state(pass, resource);
+        if (known != pass.states.end() && known->second == D3D12_RESOURCE_STATE_RENDER_TARGET) continue;
+        if (resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            moved = true;
+        } else {
+            moved |= x2w_substates::move(list, split_state(pass, resource), pass.bound_target_ranges[i],
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
+    if (auto* resource = pass.bound_depth) {
+        const auto& depth = pass.bound_depth_view;
+        const auto known = find_state(pass, resource);
+        using x2w_substates::attachment_state;
+        if (known == pass.states.end() ||
+            attachment_state(depth.states[0], known->second) != known->second ||
+            (depth.range.planes == 2 && attachment_state(depth.states[1], known->second) != known->second)) {
+            auto& split = split_state(pass, resource);
+            for (UINT p = 0; p < depth.range.planes; ++p)
+                moved |= x2w_substates::move_each(list, split, x2w_substates::plane(depth.range, p),
+                    [&](UINT, D3D12_RESOURCE_STATES from) { return attachment_state(depth.states[p], from); });
+        }
+    }
+    static LONG restored;
+    if (moved && first_calls(restored, 6))
+        log("x2w-draw bound target moved back to its bind state before the draw");
+}
+
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
+
+#include "startup_stubs/d3d12_replay_dump.inl"
+
+void replay_dump_tag(Wrapper* wrapper, ID3D12Resource* resource)
+{
+    const u64 id = wrapper->own().replay_resource_id;
+    if (id && FAILED(resource->SetPrivateData(replay_dump::resource_id, sizeof(id), &id)))
+        log("x2w-replay dump: cannot set creation id %llu", id);
+}
+
+void replay_dump_draw(Wrapper* list)
+{
+    if (!replay_dump_enabled()) return;
+    const auto& pass = pass_of(list);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        replay_dump::note(list, pass.bound_targets[i], pass.target_formats[i]);
+}
 
 #include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
@@ -3999,9 +4313,18 @@ void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().dis
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     for (const auto& known : pass.states)
-        transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
-    for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
+        transition(list, known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& split : pass.split) {
+        if (split.planes == 2) {
+            // Keep the two barrier batches used to close a mixed DSV.
+            for (UINT plane = 0; plane < split.planes; ++plane)
+                x2w_substates::move(list, split, {0, split.mips, 0, split.slices, plane, 1}, D3D12_RESOURCE_STATE_COMMON);
+        } else {
+            x2w_substates::move_all(list, split, D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
     pass = Pass{};
 }
 
@@ -4010,11 +4333,13 @@ void release_targets(Wrapper* self)
 // nothing changes.
 void retire_drop_recording(Wrapper* list)
 {
+    delete list->own().replay_writes;
+    list->own().replay_writes = nullptr;
     residency_discard_list(list);
     if (!release_retired_enabled()) return;
     if (list->own().pass) {
         pass_of(list).states.clear();
-        pass_of(list).mixed.clear();
+        pass_of(list).split.clear();
     }
     retire_discard_holds(list);
 }
@@ -4308,6 +4633,30 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
+// Read each counter once so the formatted line and optional snapshot agree.
+bool indirect_totals_line(char* line, std::size_t size, LONG64 (*snapshot)[5] = nullptr)
+{
+    static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
+                                           "placeholder-signature", "other"};
+    static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
+    bool any = false;
+    int n = std::snprintf(line, size, "x2w-render indirect:");
+    for (int o = 0; o < indirect_outcomes; ++o) {
+        n += std::snprintf(line + n, size - n, "%s %s:", o ? ";" : "", outcomes[o]);
+        const int start = n;
+        for (int k = 0; k < 5; ++k) {
+            const LONG64 calls = InterlockedCompareExchange64(&indirect_calls[o][k], 0, 0);
+            if (snapshot) snapshot[o][k] = calls;
+            if (calls) {
+                any = true;
+                n += std::snprintf(line + n, size - n, " %s %lld", kinds[k], static_cast<long long>(calls));
+            }
+        }
+        if (n == start) n += std::snprintf(line + n, size - n, " 0");
+    }
+    return any;
+}
+
 struct IndirectAddressAlias {
     ID3D12Resource* resource = nullptr;
     u64 offset = 0;
@@ -4485,7 +4834,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 log("x2w-render ExecuteIndirect refused, key %016llx [%s]: %s", key, reason_code, reason);
             return;
         }
-        if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
+        const char* label = outcome == indirect_graphics_pipeline ? "graphics-pipeline" :
+                            outcome == indirect_compute_pipeline ? "compute-pipeline" : "placeholder-signature";
+        char census_reason[64];
+        std::snprintf(census_reason, sizeof(census_reason), "%s: %s", label, reason);
+        const bool first_pair = indirect_pipeline_refusal_census.note(known_pipeline_key(refusal_pipeline), census_reason);
+        if (first_pair || first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
@@ -4843,6 +5197,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
+    if (graphics) replay_dump_draw(self);
     red_producer_draw_after(self, red_samples);
     if (graphics) note_target_draw(pass, InterlockedCompareExchange(&frame_number, 0, 0));
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
@@ -4900,6 +5255,7 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 // other kind is wrong_kind; a handle with no record falls back to the creation-time map (render targets only).
 struct ResolvedView {
     ID3D12Resource* resource = nullptr;
+    x2w_substates::Range range{};
     UINT dsv_flags = 0;
     bool wrong_kind = false;
     bool skipped = false;
@@ -4921,6 +5277,7 @@ ResolvedView resolve_view(u64 handle, int slot)
     }
     if (!known) {
         if (slot == 20 || slot == 21) out.resource = view_target(handle, slot);
+        if (out.resource) out.range = x2w_substates::whole(out.resource->GetDesc());
         return out;
     }
     if (static_cast<int>(record.slot) != slot) {
@@ -4932,13 +5289,28 @@ ResolvedView resolve_view(u64 handle, int slot)
         return out;
     }
     out.resource = record.resource ? reinterpret_cast<ID3D12Resource*>(unwrap(record.resource)) : nullptr;
-    if (slot == 21 && record.desc_bytes >= 12) std::memcpy(&out.dsv_flags, record.desc + 8, 4);
+    if (slot == 20 && out.resource) {
+        D3D12_RENDER_TARGET_VIEW_DESC desc{};
+        if (record.desc_bytes == sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+        out.range = x2w_substates::rtv(out.resource->GetDesc(), record.desc_bytes ? &desc : nullptr);
+    }
+    if (slot == 21 && out.resource) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC desc{};
+        if (record.desc_bytes == sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+        out.dsv_flags = desc.Flags;
+        out.range = x2w_substates::dsv(out.resource->GetDesc(), record.desc_bytes ? &desc : nullptr);
+    }
     return out;
 }
 bool format_has_stencil(DXGI_FORMAT format)
 {
-    return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
-           format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
+    return x2w_substates::plane_count(format) == 2;
+}
+// Every depth clear's value and fate, and what a decoded GREATER depth test meets (depth_clear_census.h).
+x2w_depth_census::DepthClearCensus& depth_clear_census()
+{
+    static x2w_depth_census::DepthClearCensus census([](const char* line) { log("%s", line); });
+    return census;
 }
 // List slot 51 (desktop 47 + 4), ClearDepthStencilView(view, flags, depth, stencil, rect count, rects). Desktop
 // resources rest in COMMON here, so the target is moved to DEPTH_WRITE around the clear. The view is
@@ -4965,7 +5337,9 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     if (first_calls(logged, 4))
         log("x2w-render ClearDepthStencilView view=0x%llx target=%p flags=0x%x depth=%.3f stencil=%u rects=%u", handle,
             static_cast<void*>(target), static_cast<unsigned>(flags), depth, static_cast<unsigned>(stencil), rect_count);
+    depth_clear_census().requested(depth, static_cast<unsigned>(flags));
     if (!target) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::unresolved_view);
         InterlockedIncrement(&render_target_unresolved);
         static LONG refused;
         if (first_calls(refused, 6))
@@ -4975,18 +5349,21 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
         return;
     }
     if (!(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL))) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::zero_flags);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: zero clear flags 0x%x", static_cast<unsigned>(flags));
         return;
     }
     if ((flags & D3D12_CLEAR_FLAG_DEPTH) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH)) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::read_only_depth);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: depth clear requested on read-only depth view 0x%llx", handle);
         return;
     }
     if ((flags & D3D12_CLEAR_FLAG_STENCIL) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::read_only_stencil);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: stencil clear requested on read-only stencil view 0x%llx", handle);
@@ -4995,9 +5372,13 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     const DXGI_FORMAT format = view_format_of(desktop, target);
     if ((flags & D3D12_CLEAR_FLAG_STENCIL) && !format_has_stencil(format)) {
         flags = static_cast<D3D12_CLEAR_FLAGS>(flags & ~D3D12_CLEAR_FLAG_STENCIL);
-        if (!flags) return;
+        if (!flags) {
+            depth_clear_census().skipped(x2w_depth_census::Skip::stencil_without_stencil_format);
+            return;
+        }
     }
     if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) {
+        depth_clear_census().skipped(x2w_depth_census::Skip::unreadable_rects);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearDepthStencilView skipped: unreadable rects array (%u rects at %p)", rect_count, static_cast<const void*>(rects));
@@ -5006,6 +5387,8 @@ void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_F
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
+    depth_clear_census().executed(target, depth, static_cast<unsigned>(flags));
+    if (flags & D3D12_CLEAR_FLAG_DEPTH) debug_present::note_clear(target, depth, rect_count);
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
                                 rect_count, rect_count ? rects : nullptr);
     red_producers().after(self, red_sample);
@@ -5036,6 +5419,7 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
+    if (replay_dump_enabled()) replay_dump::note(self, target, view_format_of(desktop, target));
     const auto red_sample = red_producers().before(self, list, target, "clear-rtv", 0, 0);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
@@ -5043,14 +5427,15 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     InterlockedIncrement(&render_clears);
 }
 // The desktop shader-visible CBV/SRV/UAV heap that owns the GPU handle's descriptor, or null.
-ID3D12DescriptorHeap* owning_view_heap(u64 gpu)
+ID3D12DescriptorHeap* owning_view_heap(u64 gpu, u64& desktop_gpu)
 {
     u64 owner = 0;
     note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
         const u64 offset = gpu - heap.desktop_gpu;
-        if (heap.increment && offset < u64{heap.count} * heap.increment && offset % heap.increment == 0) {
+        if (heap.title_increment && offset < u64{heap.count} * heap.title_increment && offset % heap.title_increment == 0) {
+            desktop_gpu = heap.desktop_gpu + (offset / heap.title_increment) * heap.increment;
             owner = heap.wrapper;
             break;
         }
@@ -5082,12 +5467,13 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     const ResolvedView view = desktop ? resolve_view(desktop, 19) : ResolvedView{};
     ID3D12Resource* target = view.resource;
     ID3D12DescriptorHeap* view_heap = nullptr;
+    u64 desktop_gpu = 0;
     const char* why = nullptr;
     if (!x2w_local::readable(values, 4 * sizeof(UINT))) why = "no clear values";
     else if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) why = "unreadable rects";
     else if (!target) why = view.wrong_kind ? "view is not an unordered-access view"
                             : view.skipped ? "view was skipped at creation" : "view holds no known resource";
-    else if (!(view_heap = owning_view_heap(gpu_handle))) why = "GPU handle is on no known descriptor heap";
+    else if (!(view_heap = owning_view_heap(gpu_handle, desktop_gpu))) why = "GPU handle is on no known descriptor heap";
     else if (!(target->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) why = "resource lacks unordered access";
     else if (!tracked_from_common(title_resource)) why = "resource does not use COMMON state tracking";
     if (why) {
@@ -5101,9 +5487,10 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     // The clear needs the GPU descriptor's own heap bound; the next translated draw binds its heaps again.
     ID3D12DescriptorHeap* bound[] = {view_heap};
     list->SetDescriptorHeaps(1, bound);
-    pass_of(self).heap_set = false;
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
+    pass_of(self).bound_view_heap = nullptr;
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{desktop_gpu};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
+    replay_dump::note(self, target);
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
     InterlockedIncrement(&render_clears);
@@ -5151,7 +5538,9 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     std::fill_n(pass.bound_targets, 8, nullptr);
+    std::fill_n(pass.bound_target_ranges, 8, x2w_substates::Range{});
     pass.bound_depth = nullptr;
+    pass.bound_depth_view = {};
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list) return;
     static LONG refused, unresolved_logged;
@@ -5173,6 +5562,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
+    x2w_substates::Range ranges[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
         const u64 step = u64{i} * stride;
@@ -5195,15 +5585,15 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                     view.skipped ? "holds a skipped view" : "holds no view");
             return;
         }
+        ranges[i] = view.range;
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    bool mixed_planes = false;  // a view with one read-only plane: dsv_state is the depth plane's, the stencil plane gets the other
-    D3D12_RESOURCE_STATES stencil_plane_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    x2w_substates::DepthBinding depth_view;
+    bool mixed_planes = false;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
         if (!resolved) {
@@ -5223,17 +5613,12 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                 return;
             }
             dsv_format = view_format_of(resolved, dsv_target);
-            const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
-            // A format without a stencil plane has no second plane to disagree with.
-            const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
-            if (read_depth != read_stencil) {
-                // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
-                mixed_planes = true;
+            depth_view = x2w_substates::bind_depth(view.range, view.dsv_flags);
+            mixed_planes = view.range.planes == 2 && depth_view.states[0] != depth_view.states[1];
+            if (mixed_planes) {
                 InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets: depth stencil view with one read-only plane (flags 0x%x) bound with per-plane states", view.dsv_flags);
-                stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
-            if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
         }
@@ -5249,26 +5634,24 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         if (i == 0) pass.target0 = targets[i];
     }
     if (dsv_target && mixed_planes) {
-        // A whole-resource state it was in is dropped to COMMON first; then each plane moves to its own state.
-        for (auto it = pass.states.begin(); it != pass.states.end(); ++it)
-            if (it->first == dsv_target) {
-                transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), dsv_target, it->second, D3D12_RESOURCE_STATE_COMMON);
-                pass.states.erase(it);
-                break;
-            }
-        auto found = std::find_if(pass.mixed.begin(), pass.mixed.end(), [&](const x2w_dsv::Planes& p) { return p.resource == dsv_target; });
-        if (found == pass.mixed.end()) {
-            pass.mixed.push_back(x2w_dsv::planes_of(dsv_target));
-            found = pass.mixed.end() - 1;
+        // Retain the existing COMMON-to-plane transitions on a mixed bind.
+        const auto known = find_state(pass, dsv_target);
+        if (known != pass.states.end()) {
+            transition(list, dsv_target, known->second, D3D12_RESOURCE_STATE_COMMON);
+            known->second = D3D12_RESOURCE_STATE_COMMON;
         }
-        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
-        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
+        auto& split = split_state(pass, dsv_target);
+        const auto full = x2w_substates::whole(dsv_target->GetDesc());
+        for (UINT p = 0; p < full.planes; ++p)
+            x2w_substates::move(list, split, x2w_substates::plane(full, p), depth_view.states[p]);
     } else if (dsv_target) {
-        require_state(self, dsv_target, dsv_state);
+        require_state(self, dsv_target, depth_view.states[0]);
     }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
+    std::copy_n(ranges, 8, pass.bound_target_ranges);
     pass.bound_depth = dsv_target;
+    pass.bound_depth_view = depth_view;
     pass.dsv_format = dsv_format;
     const auto inspect = [](ID3D12Resource* resource, DXGI_FORMAT format, auto& surface) {
         const auto desc = resource->GetDesc();
@@ -5281,7 +5664,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.depth_surface = {};
     if (dsv_target) pass.targets_single_sample &= inspect(dsv_target, dsv_format, pass.depth_surface);
     debug_present::note_bound(targets, pass.target_surfaces, count, dsv_target, pass.depth_surface);
-    pass.depth_view_writable = dsv_target && dsv_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    pass.depth_view_writable = dsv_target && depth_view.states[0] == D3D12_RESOURCE_STATE_DEPTH_WRITE;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
     InterlockedIncrement(&render_target_binds);
@@ -5291,15 +5674,29 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
 {
     // Only a viewport that is forwarded counts as set; a call with no viewports leaves the state as it was.
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
-        list->RSSetViewports(count, viewports);
+        std::array<D3D12_VIEWPORT, 16> copy;
+        std::copy_n(viewports, count, copy.begin());
+        static LONG repairs = 0;
+        for (UINT i = 0; i < count; ++i)
+            if (x2w_startup::sanitize_viewport(copy[i]) && first_calls(repairs, 6))
+                log("x2w-d3d12 RSSetViewports: repaired invalid viewport");
+        list->RSSetViewports(count, copy.data());
         pass_of(self).viewport_set = true;
+        pass_of(self).viewport0 = copy[0];
     }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
-        list->RSSetScissorRects(count, rects);
+        std::array<D3D12_RECT, 16> copy;
+        std::copy_n(rects, count, copy.begin());
+        static LONG repairs = 0;
+        for (UINT i = 0; i < count; ++i)
+            if (x2w_startup::sanitize_scissor(copy[i]) && first_calls(repairs, 6))
+                log("x2w-d3d12 RSSetScissorRects: repaired invalid scissor");
+        list->RSSetScissorRects(count, copy.data());
         pass_of(self).scissor_set = true;
+        pass_of(self).scissor0 = copy[0];
     }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
@@ -5485,6 +5882,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
+        if (vertices && instances) replay_dump_draw(self);
         red_producer_draw_after(self, red_samples);
         note_target_draw(pass, InterlockedCompareExchange(&frame_number, 0, 0));
         const LONG n = InterlockedIncrement(&render_draws);
@@ -5503,6 +5901,25 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
+D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension);
+
+namespace srv_check = x2w_startup::view_desc;
+using x2w_startup::x2w_create_srv;
+
+void log_srv_refusal(srv_check::Refusal refusal)
+{
+    static LONG counts[static_cast<unsigned>(srv_check::Refusal::count)]{};
+    static constexpr const char* reasons[] = {
+        "", "dimension or sample count", "mip range", "array range", "format",
+        "plane slice", "minimum LOD", "resource denies shader resource views", "view addresses dropped mips",
+        "buffer element range"
+    };
+    const auto index = static_cast<unsigned>(refusal);
+    const auto count = static_cast<unsigned>(InterlockedIncrement(&counts[index]));
+    if (count <= 6 || (count & (count - 1)) == 0)
+        log("x2w-d3d12 view refused: %s (count %u)", reasons[index], count);
+}
+
 bool slot70_desktop_arrays_enabled()
 {
     static const bool enabled = x2w_local::env_on("X2W_SLOT70_DESKTOP_ARRAYS");
@@ -5568,7 +5985,10 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 submitted.push_back(w);
             }
         }
+        std::unique_lock<std::mutex> dump_order(replay_dump::queue_mutex, std::defer_lock);
+        if (replay_dump_enabled()) dump_order.lock();
         bool split = false;
+        std::vector<Wrapper*> dump_lists;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             const int gpu_slot = gpu_time_on() ? gpu_time_probe().before(queue, static_cast<std::uint64_t>(gpu_time_frame)) : -1;
@@ -5580,6 +6000,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            if (split && replay_dump_enabled()) dump_lists.insert(dump_lists.end(), wrappers.begin(), wrappers.end());
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
@@ -5608,6 +6029,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         } else if (!ready.empty()) {
             submit(ready, submitted);
         }
+        replay_dump::submit(queue, split ? dump_lists : submitted);
+        if (dump_order.owns_lock()) dump_order.unlock();
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
         draw_lock_release_exclusive();
@@ -5695,7 +6118,8 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     static LONG calls;
     const bool log_it = first_calls(calls, 2);
     if (Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx)); fence && fence->own().kind == fence_kind) {
-        const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Signal(static_cast<ID3D12Fence*>(fence->own().real), r8);
+        const HRESULT hr = replay_dump::signal(static_cast<ID3D12CommandQueue*>(self->own().real),
+                                              static_cast<ID3D12Fence*>(fence->own().real), r8);
         if (SUCCEEDED(hr)) {
             if (render_mode() || InterlockedCompareExchange(&self->own().queue_wait_seen, 0, 0))
                 complete_when_reached(fence, r8);
@@ -5786,7 +6210,16 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
     void* mapped = self->own().title_memory;
     if (!mapped) {
         ID3D12Resource* real = materialize_lazy_texture(self);
-        hr = real ? real->Map(subresource, range, &mapped) : E_FAIL;
+        // Map needs a CPU-visible heap (DirectX-Specs "Resource Heaps", Map and Unmap): a DEFAULT heap, or a CUSTOM
+        // heap with no CPU pages, answers E_INVALIDARG and a debug-layer error, so it is answered here without the call.
+        D3D12_HEAP_PROPERTIES heap{};
+        const bool cpu_hidden = real && SUCCEEDED(real->GetHeapProperties(&heap, nullptr)) &&
+            (heap.Type == D3D12_HEAP_TYPE_DEFAULT ||
+             (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
+        AcquireSRWLockExclusive(&resource_map_lock);
+        hr = !real ? E_FAIL : cpu_hidden ? E_INVALIDARG : real->Map(subresource, range, &mapped);
+        if (SUCCEEDED(hr)) resource_maps.record_map(self, subresource);
+        ReleaseSRWLockExclusive(&resource_map_lock);
     }
     if (data) *data = SUCCEEDED(hr) ? mapped : nullptr;
     if (FAILED(hr)) check_device("Resource::Map", 8);
@@ -5798,8 +6231,10 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
 }
 void __stdcall resource_unmap(Wrapper* self, UINT subresource, const D3D12_RANGE* range)
 {
-    if (!self->own().title_memory && self->own().real)
+    AcquireSRWLockExclusive(&resource_map_lock);
+    if (!self->own().title_memory && self->own().real && resource_maps.consume_map(self, subresource))
         static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
+    ReleaseSRWLockExclusive(&resource_map_lock);
 }
 
 // Resource slot 11, desktop GetGPUVirtualAddress() (called with no arguments). On the console a
@@ -5898,31 +6333,27 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     *out = nullptr;
     const auto* extra = reinterpret_cast<const std::uint64_t*>(desc + 1);
     ID3D12DescriptorHeap* heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC clamped = x2w_startup::safe_heap_desc(*desc);
+    bool did_clamp = clamped.NumDescriptors != desc->NumDescriptors;
+    const bool changed = did_clamp || clamped.Flags != desc->Flags;
     HRESULT hr = kind_for(*iid) == descriptor_heap_kind
-        ? device_of(self)->CreateDescriptorHeap(desc, IID_PPV_ARGS(&heap)) : E_NOINTERFACE;
-    // A console view heap can be larger than the driver accepts. Measure the accepted maximum, create
-    // the desktop heap at it, and keep the title's full-size descriptor memory. Desktop view writes
-    // and copies past the physical prefix use a companion CPU-only heap.
-    // The refusal code differs between drivers (E_INVALIDARG on a GTX 1660 SUPER, E_OUTOFMEMORY on an
-    // RTX 3060). Preserve errors unrelated to capacity, including unsupported interface IDs.
-    D3D12_DESCRIPTOR_HEAP_DESC clamped = *desc;
-    bool did_clamp = false;
-    if ((hr == E_INVALIDARG || hr == E_OUTOFMEMORY) && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
-        && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
-        && desc->NumDescriptors > view_heap_probe_floor) {
+        ? device_of(self)->CreateDescriptorHeap(changed ? &clamped : desc, IID_PPV_ARGS(&heap)) : E_NOINTERFACE;
+    // Drivers can accept fewer than the documented shader-visible view limit.
+    if ((hr == E_INVALIDARG || hr == E_OUTOFMEMORY) && (clamped.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+        && clamped.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        && clamped.NumDescriptors > view_heap_probe_floor) {
         const std::uint64_t limit = accepted_view_heap_descriptors(device_of(self), desc->NodeMask);
-        if (limit && limit < desc->NumDescriptors) {
+        if (limit && limit < clamped.NumDescriptors) {
             clamped.NumDescriptors = static_cast<UINT>(limit);
             did_clamp = true;
             hr = device_of(self)->CreateDescriptorHeap(&clamped, IID_PPV_ARGS(&heap));
-            static LONG shortcuts;
-            if (SUCCEEDED(hr) && first_calls(shortcuts, 1))
-                log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
-                    "view descriptors, this driver accepts %u; the rest stay in title memory",
-                    desc->NumDescriptors, clamped.NumDescriptors);
         }
     }
-    const D3D12_DESCRIPTOR_HEAP_DESC* request = did_clamp ? &clamped : desc;
+    static LONG heap_repairs;
+    if ((changed || did_clamp) && first_calls(heap_repairs, 4))
+        log("x2w-d3d12 descriptor heap repaired type=%d count=%u -> %u flags=0x%x -> 0x%x", desc->Type,
+            desc->NumDescriptors, clamped.NumDescriptors, desc->Flags, clamped.Flags);
+    const D3D12_DESCRIPTOR_HEAP_DESC* request = changed || did_clamp ? &clamped : desc;
     const std::uint64_t desktop = heap ? heap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
     static LONG calls;
     if (first_calls(calls, 16))
@@ -5944,19 +6375,34 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     const UINT desktop_stride = device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
     const bool raw_samplers = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
         extra[1] == u64{desc->NumDescriptors} * x2w_startup::title_sampler_stride;
-    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : desktop_stride;
+    // A replay played on a device whose increments differ from the recording device's declares the recorded ones: the
+    // title's handles and descriptor memory use them, and are mapped to this device's descriptors by index.
+    const UINT declared = static_cast<UINT>(desc->Type) < 4
+        ? static_cast<UINT>(InterlockedCompareExchange(&replay_title_increments[desc->Type], 0, 0)) : 0;
+    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : (declared ? declared : desktop_stride);
     const u64 bytes = u64{desc->NumDescriptors} * title_stride;
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
     std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
+    // Offered descriptor memory of another stride (a power of two from 16 to 256 bytes per descriptor) is title memory
+    // the layer does not back: its handles are refused (refused_title_blocks). Other values are unrelated stack words.
+    const u64 offered_stride = desc->NumDescriptors && extra[1] % desc->NumDescriptors == 0 ? extra[1] / desc->NumDescriptors : 0;
+    const bool refused_block = !title_memory && extra[0] >= 0x10000 && offered_stride >= 16 && offered_stride <= 256 &&
+                               (offered_stride & (offered_stride - 1)) == 0;
+    static LONG mismatches;
+    if (refused_block && first_calls(mismatches, 4))
+        log("x2w-d3d12 CreateDescriptorHeap: title memory 0x%llx of %llu bytes is %llu bytes per descriptor, not %u: not used",
+            extra[0], extra[1], offered_stride, title_stride);
     const std::uint64_t supplied_memory = title_memory;
     // The title copies descriptors between heaps with its own memory copies. A view heap without
     // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
     // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
     // of another type gets the same when its desktop start is not an address (title_heap_memory.h).
-    if (!x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, [](u64 size) {
+    if (did_clamp && !title_memory)
+        title_memory = reinterpret_cast<u64>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if ((did_clamp && !title_memory) || !x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, [](u64 size) {
         return reinterpret_cast<u64>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    })) {
+    }, title_stride != desktop_stride)) {
         heap->Release();
         return E_OUTOFMEMORY;
     }
@@ -5966,43 +6412,30 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
         heap->Release();
         return E_OUTOFMEMORY;
     }
+    AcquireSRWLockExclusive(&descriptor_lock);
+    if (refused_block) refused_title_blocks.push_back({extra[0], extra[1]});
     if (title_memory) {
         w->own().title_cpu = title_memory;
-        AcquireSRWLockExclusive(&descriptor_lock);
         descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride,
                                      static_cast<std::uint64_t>(request->NumDescriptors),
                                      tail ? tail->GetCPUDescriptorHandleForHeapStart().ptr : 0});
-        ReleaseSRWLockExclusive(&descriptor_lock);
     }
+    ReleaseSRWLockExclusive(&descriptor_lock);
+    if (supplied_memory) replay_record::remember_heap_pages(supplied_memory, bytes);
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;
-    note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
+    note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride, title_stride,
               title_memory, desktop,
-              (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
+              (request->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
               sampler_cpu);
     *out = w;
     return S_OK;
 }
 
-// A null R8G8B8A8_UNORM SRV of a texture dimension (2 to 10; any other value gives texture 2D). A null resource
-// reads no more of the description than its format and dimension.
 D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension)
 {
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension));
-    switch (desc.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-    default: desc.Texture2D.MipLevels = 1; break;
-    }
-    return desc;
+    return x2w_startup::safe_null_srv(
+        static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension)),
+        DXGI_FORMAT_R8G8B8A8_UNORM);
 }
 
 // X2W_D3D12_VIEW_DEFAULTS (view_dimension.h): which slots give an unknown-dimension view the resource's default view.
@@ -6021,30 +6454,8 @@ x2w_view_dimension::DefaultViews view_defaults_mode()
 D3D12_SHADER_RESOURCE_VIEW_DESC lazy_null_srv_desc(const D3D12_RESOURCE_DESC& res_desc,
                                                   const D3D12_SHADER_RESOURCE_VIEW_DESC* requested)
 {
-    unsigned dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (requested && requested->ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) {
-        dimension = static_cast<unsigned>(requested->ViewDimension);
-    } else {
-        switch (res_desc.Dimension) {
-        case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-            dimension = res_desc.DepthOrArraySize > 1
-                ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
-            break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-            dimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-            break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
-        default:
-            if (res_desc.SampleDesc.Count > 1) {
-                dimension = res_desc.DepthOrArraySize > 1
-                    ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY : D3D12_SRV_DIMENSION_TEXTURE2DMS;
-            } else {
-                dimension = res_desc.DepthOrArraySize > 1
-                    ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
-            }
-            break;
-        }
-    }
+    const auto dimension = requested && requested->ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN
+        ? requested->ViewDimension : srv_check::default_dimension(res_desc);
     return null_srv_desc(dimension);
 }
 
@@ -6085,9 +6496,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? ViewRecord::srv_desc_bytes :
-            N == 19 ? ViewRecord::uav_desc_bytes : N == 20 ? 20 : 16;
-        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? ViewRecord::srv_desc_bytes : N == 19 ? ViewRecord::uav_desc_bytes :
+            N == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC);
+        const u64 description = N == 20 || N == 21 ? args[1] : raw[described];
+        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(description),
                   described_bytes, title_dest, args[D], materialized);
     };
     Wrapper* const lazy_wrapper = (N >= 18 && N <= 21) ? as_wrapper(reinterpret_cast<const void*>(a)) : nullptr;
@@ -6149,7 +6561,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                     log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
                         *reinterpret_cast<const UINT*>(described), dimension, resource_desc_for_check.Format,
                         default_view ? "default view" : "skipped");
-            } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
+            } else if ((N != 18 || dimension == D3D12_RESOURCE_DIMENSION_BUFFER) &&
+                       !x2w_view_dimension::fits(N, view_dimension, dimension)) {
                 skip = "view dimension does not suit the resource";
                 static LONG mismatched;
                 if (first_calls(mismatched, 6))
@@ -6180,7 +6593,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
                 std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
             const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
-            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            x2w_create_srv(device_of(self), nullptr, &null_view,
+                           D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])}, "slot18-refused", log);
             record_view(false);
         } else if constexpr (N == 17) {
             record_view(false);  // Translated constant-buffer views use only the descriptor record.
@@ -6191,6 +6605,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         }
     };
     if (skip) {
+        if constexpr (N == 18) {
+            if (resource_desc_for_check.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+                log_srv_refusal(srv_check::Refusal::denied);
+        }
         refuse_view();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
@@ -6216,6 +6634,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 : x2w_startup::packed_stand_in_of(reinterpret_cast<ID3D12Resource*>(args[0]));
             const auto verdict = x2w_startup::packed_view(mapped, actual, stand_in_for);
             if (verdict == x2w_startup::PackedView::refused) {
+                if constexpr (N == 18) log_srv_refusal(srv_check::Refusal::format);
                 refuse_view();
                 static LONG refused;
                 if (first_calls(refused, 6))
@@ -6260,8 +6679,9 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                         ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(args[1])
                         : nullptr;
                     const D3D12_SHADER_RESOURCE_VIEW_DESC placeholder = lazy_null_srv_desc(lazy_rec.desc, requested);
-                    device_of(self)->CreateShaderResourceView(
-                        nullptr, &placeholder, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+                    x2w_create_srv(device_of(self), nullptr, &placeholder,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])},
+                                   "slot18-lazy-placeholder", log);
                     removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
                     created = SUCCEEDED(removed);
                     record_view(created);
@@ -6286,15 +6706,104 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[0] = reinterpret_cast<u64>(materialize_lazy_texture(lazy_wrapper));
         }
     }
+    if constexpr (N >= 19 && N <= 21) {
+        using namespace x2w_startup::target_view;
+        auto* resource = reinterpret_cast<ID3D12Resource*>(args[0]);
+        if (is_unmaterialized_lazy && !resource) {
+            refuse_view();
+            return 0;
+        }
+        D3D12_RESOURCE_DESC backing{};
+        if (resource) backing = resource->GetDesc();
+        D3D12_RESOURCE_DESC counter_desc{};
+        auto* counter = N == 19 ? reinterpret_cast<ID3D12Resource*>(args[1]) : nullptr;
+        if (counter) counter_desc = counter->GetDesc();
+        using Desc = std::conditional_t<N == 19, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+            std::conditional_t<N == 20, D3D12_RENDER_TARGET_VIEW_DESC, D3D12_DEPTH_STENCIL_VIEW_DESC>>;
+        Desc checked{};
+        Desc* view = nullptr;
+        if (args[desc_index]) {
+            auto* input = reinterpret_cast<const Desc*>(args[desc_index]);
+            if (!x2w_local::readable(input, sizeof(*input))) {
+                refuse_view();
+                return 0;
+            }
+            std::memcpy(&checked, input, sizeof(checked));
+            view = &checked;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+        if (resource && view && view->Format != backing.Format && !x2w_startup::is_typeless(backing.Format))
+            device_of(self)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
+        const auto repair = [&](const char* field, UINT64 old_value, UINT64 new_value) {
+            static LONG counts[6]{};
+            const unsigned index = !std::strcmp(field, "ArraySize") ? 0 : !std::strcmp(field, "WSize") ? 1 :
+                !std::strcmp(field, "PlaneSlice") ? 2 : !std::strcmp(field, "Flags") ? 3 :
+                !std::strcmp(field, "Format") ? 4 : 5;
+            if (first_calls(counts[index], 6))
+                log("x2w-d3d12 view repaired: slot%d %s %llu -> %llu (resource %llux%u mips %u fmt %u)",
+                    N, field, old_value, new_value, backing.Width, backing.Height, backing.MipLevels, backing.Format);
+        };
+        const unsigned dropped = lazy_wrapper ? lazy_wrapper->own().drop_levels : 0;
+        Refusal refusal;
+        if constexpr (N == 19)
+            refusal = check_uav(view, resource ? &backing : nullptr, counter ? &counter_desc : nullptr,
+                                repair, options.CastingFullyTypedFormatSupported != FALSE, dropped);
+        else
+            refusal = check(view, resource ? &backing : nullptr, repair,
+                            options.CastingFullyTypedFormatSupported != FALSE, dropped);
+        if (refusal != Refusal::none) {
+            static LONG counts[static_cast<unsigned>(Refusal::plane) + 1]{};
+            if (first_calls(counts[static_cast<unsigned>(refusal)], 6))
+                log("x2w-d3d12 view refused: slot%d %s", N, reason(refusal));
+            refuse_view();
+            return 0;
+        }
+        if (view) {
+            std::memcpy(desc_copy, view, sizeof(*view));
+            args[desc_index] = reinterpret_cast<u64>(desc_copy);
+        }
+    }
     const LONG removed_before = removal_reported;
-    const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
-    // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
-    // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
-    // reference and adds none.
+    u64 result = 0;
+    bool srv_written = true;
+    D3D12_SAMPLER_DESC repaired_sampler{};
+    if constexpr (N == 22) {
+        const auto* sampler = reinterpret_cast<const D3D12_SAMPLER_DESC*>(args[0]);
+        if (!sampler || !x2w_local::readable(sampler, sizeof(*sampler))) {
+            static LONG unreadable;
+            if (first_calls(unreadable, 8)) log("x2w-d3d12 sampler refused: unreadable description");
+            refuse_view();
+            return 0;
+        }
+        std::memcpy(&repaired_sampler, sampler, sizeof(repaired_sampler));
+        const unsigned repairs = x2w_startup::sanitize_sampler(repaired_sampler);
+        if (repairs) {
+            static LONG counts[7];
+            static constexpr const char* names[] = {"filter", "anisotropy", "lod", "bias", "comparison", "address", "border"};
+            for (unsigned i = 0; i < 7; ++i)
+                if ((repairs & (1u << i)) && first_calls(counts[i], 8))
+                    log("x2w-d3d12 sampler repaired: %s", names[i]);
+            args[0] = reinterpret_cast<u64>(&repaired_sampler);
+        }
+    }
+    if constexpr (N == 18) {
+        const auto* view = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(args[1]);
+        if (view && !x2w_local::readable(view, sizeof(*view))) {
+            log_srv_refusal(srv_check::Refusal::dimension);
+            refuse_view();
+            return 0;
+        }
+        srv_written = x2w_create_srv(device_of(self), reinterpret_cast<ID3D12Resource*>(args[0]), view,
+                                     D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])}, "slot18", log,
+                                     lazy_wrapper ? lazy_wrapper->own().drop_levels : 0);
+    } else {
+        result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    }
+    // A refused SRV or a removed device leaves the slot unmaterialized and releases its old view reference.
     const HRESULT removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
-    const bool created = SUCCEEDED(removed);
+    const bool created = srv_written && SUCCEEDED(removed);
     record_view(created);
-    if (!created) {
+    if (FAILED(removed)) {
         static LONG failed;
         if (first_calls(failed, 6))
             log("x2w-d3d12 Device::slot%d view not created: device removed, reason 0x%08lx", N,
@@ -6329,38 +6838,34 @@ void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_
                      x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest,
                      unsigned dropped_levels = 0)
 {
-    if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-        device->CreateShaderResourceView(created, nullptr, dest);
-        return;
-    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-    std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
-    if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
-        if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
-                static_cast<unsigned>(created_desc.Format), view_mode)) {
-            device->CreateShaderResourceView(created, nullptr, dest);
+    const bool described = vr.desc_bytes >= sizeof(srv_desc);
+    if (described) std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
+    const auto bind_null = [&] {
+        const auto null_view = lazy_null_srv_desc(created_desc, described ? &srv_desc : nullptr);
+        x2w_create_srv(device, nullptr, &null_view, dest, "lazy-refresh-null", log);
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr;
+    if (described && srv_desc.ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN) {
+        srv_desc.Format = desktop_format(srv_desc.Format);
+        if (x2w_startup::packed_target_format(srv_desc.Format)) {
+            const auto verdict = x2w_startup::packed_view(
+                srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
+            if (verdict == x2w_startup::PackedView::refused) {
+                log_srv_refusal(srv_check::Refusal::format);
+                bind_null();
+                return;
+            }
+            if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
         }
+        view = &srv_desc;
+    } else if (described && !x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
+                   static_cast<unsigned>(created_desc.Format), view_mode)) {
+        log_srv_refusal(srv_check::Refusal::dimension);
+        bind_null();
         return;
     }
-    srv_desc.Format = desktop_format(srv_desc.Format);
-    if (dropped_levels) {
-        // A view that starts below the top level or clamps the LOD names levels that are gone: leave it unbound.
-        // The others lose the same count of levels the texture lost.
-        const bool array = srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        if ((srv_desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D && !array) ||
-            srv_desc.Texture2D.MostDetailedMip != 0 || (!array && srv_desc.Texture2D.ResourceMinLODClamp != 0.0f)) {
-            x2w_startup::drop_mips::counters.keep(x2w_startup::drop_mips::Reason::view_clamp);
-            return;
-        }
-        srv_desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(srv_desc.Texture2D.MipLevels, dropped_levels);
-    }
-    if (x2w_startup::packed_target_format(srv_desc.Format)) {
-        const auto verdict = x2w_startup::packed_view(
-            srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
-        if (verdict == x2w_startup::PackedView::refused) return;
-        if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
-    }
-    device->CreateShaderResourceView(created, &srv_desc, dest);
+    x2w_create_srv(device, created, view, dest, "lazy-refresh", log, dropped_levels);
 }
 
 // After a guest descriptor copy: a destination slot that now names a lazy texture which already has its real resource got
@@ -6787,6 +7292,14 @@ void note_slot133_texture(Wrapper* device, Wrapper* texture, const D3D12_RESOURC
     if (span) ++memory_srv_switch_census.alias_registered;
 }
 
+D3D12_RESOURCE_DESC existing_heap_buffer_desc(const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_RESOURCE_DESC copy = desc;
+    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return copy;
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -6818,7 +7331,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             bool stored = false;
             try {
                 std::lock_guard lock(lazy_texture_mutex);
-                lazy_textures().emplace(w, LazyTextureRecord{self, texture, requested_format});
+                lazy_textures().emplace(w, LazyTextureRecord{self, texture, requested_format, desc->Format});
                 stored = true;
             } catch (const std::bad_alloc&) {
                 stored = false;
@@ -6832,6 +7345,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             }
             w->own().title_memory = address;
             w->own().lazy_slot133_texture = true;
+            x2w_startup::log_console_format("placed-title-memory-lazy", 133, *desc,
+                                            static_cast<const D3D12_CLEAR_VALUE*>(clear), nullptr, log);
             note_slot133_texture(self, w, desc);
             retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
             static LONG lazy_created;
@@ -6845,8 +7360,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             return S_OK;
         }
         D3D12_CLEAR_VALUE clear_copy{};
-        const auto* clear_value = packed_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
-                                                    desktop_format(desc->Format), texture.Format, clear_copy);
+        const auto* requested_clear = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        const auto* clear_value = x2w_startup::desktop_clear_value(requested_clear, desc->Format, texture.Format, clear_copy);
+        x2w_startup::log_console_format("placed-title-memory", 133, *desc, requested_clear, clear_value, log);
+        D3D12_CLEAR_VALUE safe_copy{};
+        clear_value = safe_clear(clear_value, texture, safe_copy);
         ID3D12Resource* created = nullptr;
         // On E_OUTOFMEMORY of the default heap, X2W_D3D12_SYSMEM_FALLBACK=1 creates the texture once more in system memory.
         bool in_system_memory = false;
@@ -6871,6 +7389,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         }
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
+        x2w_startup::mark_console_format(created, desc->Format);
         Wrapper* w = wrap(created, resource_kind);
         if (!w) {
             created->Release();
@@ -6937,6 +7456,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                           static_cast<unsigned long>(linear.feature_hr), static_cast<unsigned long>(linear.share_hr));
     }
     ID3D12Heap* heap = nullptr;
+    u64 heap_id = 0;
     x2w_budget::Ticket* backing_budget = nullptr;
     HRESULT hr = S_OK;
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
@@ -6970,10 +7490,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
-        for (const auto& [known, h] : existing_heaps) {
+        for (std::size_t i = 0; i < existing_heaps.size(); ++i) {
+            const auto& [known, h] = existing_heaps[i];
             if (known == base) {
                 heap = h.real;
                 backing_budget = h.budget;
+                heap_id = i + 1;
             }
         }
         if (!heap) {
@@ -6987,12 +7509,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             if (SUCCEEDED(hr)) {
                 backing_budget = x2w_budget::backing_heap(heap, 0);
                 existing_heaps.emplace_back(base, ExistingHeap{heap, backing_budget});
+                heap_id = existing_heaps.size();
             }
         }
     }
-    D3D12_RESOURCE_DESC copy = *desc;
-    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
-                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
         hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
@@ -7012,6 +7533,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx%s", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull, linear_note);
     if (FAILED(hr)) return hr;
+    if (aliased && replay_record::active_placement) {
+        const auto bytes = heap->GetDesc().SizeInBytes;
+        *replay_record::active_placement = {heap_id, reinterpret_cast<u64>(base), bytes, offset};
+    }
     if (linear.path == x2w_startup::LinearBuffers::kept_default_path) linear_buffers().kept_default(resource, linear);
     return publish_placed_buffer(self, address, desc, initial_state, resource, aliased, backing_budget, out);
 }
@@ -7062,6 +7587,118 @@ extern "C" __declspec(dllexport) void x2w_d3d12_set_lazy_refresh_hook(LazyRefres
 
 // Thread-safe, idempotent materialization for slot-133 read-only textures created under X2W_D3D12_LAZY_TEXTURES=1.
 // Lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock.
+// X2W_D3D12_LAZY_EVICT: a desktop object taken from an evicted texture, released once every queue passed `targets`.
+struct EvictedTexture {
+    ID3D12Resource* resource;
+    std::vector<UINT64> targets;  // per RetireQueue at the eviction
+};
+std::vector<EvictedTexture> evicted_textures;  // retire_lock
+
+// Registers `w` (just materialized) under its title range and returns the materialized lazy textures it overlaps by at
+// least half of the smaller range; they leave the registry. lazy_texture_mutex held.
+std::vector<Wrapper*> take_overlapped_lazy(Wrapper* w, ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
+{
+    std::vector<Wrapper*> victims;
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    const u64 bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    if (!base || !bytes || bytes == ~0ull) return victims;
+    const u64 end = base + bytes;
+    auto& ranges = lazy_ranges();
+    try {
+        for (auto at = ranges.begin(); at != ranges.end() && at->first < end;) {
+            const u64 other_base = at->first, other_end = at->second.end;
+            const u64 overlap = other_end > base ? (std::min)(other_end, end) - (std::max)(other_base, base) : 0;
+            const u64 smaller = (std::min)(other_end - other_base, bytes);
+            if (at->second.texture != w && other_end > base && overlap * 2 >= smaller) {
+                victims.push_back(at->second.texture);
+                at = ranges.erase(at);
+            } else {
+                ++at;
+            }
+        }
+        ranges.emplace(base, LazyRange{end, w});
+    } catch (const std::bad_alloc&) {
+    }
+    return victims;
+}
+
+// Every CBV_SRV_UAV slot whose recorded view is an SRV of `w` gets a NULL view of the same dimension: the GPU never reads
+// the evicted object through a descriptor written before the eviction. The records stay, so the next materialize
+// refreshes the same slots.
+void null_lazy_views(Wrapper* w, ID3D12Device* device)
+{
+    const u64 target = reinterpret_cast<u64>(w);
+    note_lock_acquire(false);
+    for (const HeapInfo& h : heap_infos()) {
+        if (!h.shadow || !h.desktop_cpu || h.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
+        for (std::uint32_t i = 0; i < h.count; ++i) {
+            const std::uint32_t id = h.shadow[i];
+            if (!id || id - 1 >= view_records().size() || !view_materialized()[id - 1]) continue;
+            const ViewRecord& vr = view_records()[id - 1];
+            if (vr.slot != 18 || vr.resource != target) continue;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            if (vr.desc_bytes >= sizeof(view)) std::memcpy(&view, vr.desc, sizeof(view));
+            if (view.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN || view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                view = {};
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Texture2D.MipLevels = 1;
+            }
+            view.Format = desktop_format(view.Format);
+            if (view.Format == DXGI_FORMAT_UNKNOWN) view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (!view.Shader4ComponentMapping) view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            x2w_create_srv(device, nullptr, &view,
+                           D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)},
+                           "lazy-eviction", log);
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+}
+
+// Takes the desktop object from `v` (a materialized lazy texture whose title memory a newer one took). Only a texture
+// the retire machinery tracks is evicted: every list use of it holds its own desktop reference (retire_hold), and every
+// queue gets a fence signalled now, behind the work that may still read its old descriptors.
+void evict_lazy_texture(Wrapper* v, Wrapper* by, ID3D12Device* device)
+{
+    EvictedTexture item{nullptr, {}};
+    AcquireSRWLockExclusive(&retire_lock);
+    bool ok = v->own().lazy_slot133_texture && v->own().real && v->own().retire_when_idle && !v->own().retire_hold_missed &&
+              InterlockedCompareExchange(&v->own().refs, 0, 0) > 0 && !retire_queues.empty();
+    for (const RetireQueue& q : retire_queues) ok = ok && q.fence;
+    try {
+        if (ok) {
+            item.targets.reserve(retire_queues.size());
+            evicted_textures.reserve(evicted_textures.size() + 1);
+        }
+    } catch (const std::bad_alloc&) {
+        ok = false;
+    }
+    for (std::size_t q = 0; ok && q < retire_queues.size(); ++q) {
+        RetireQueue& queue = retire_queues[q];
+        if (FAILED(queue.queue->Signal(queue.fence, queue.signaled + 1))) ok = false;
+        else item.targets.push_back(++queue.signaled);
+    }
+    if (ok) {
+        item.resource = static_cast<ID3D12Resource*>(v->own().real);
+        v->own().real = nullptr;
+        v->own().budget = nullptr;  // the ticket is the desktop object's private data and goes with it
+        v->own().drop_levels = 0;
+        evicted_textures.push_back(std::move(item));
+        InterlockedIncrement(&retire_pending);
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    if (!ok) {
+        InterlockedIncrement64(&lazy_evict_kept);
+        return;
+    }
+    // Slot 133 textures map title memory even if the desktop backing is recreated.
+    forget_resource_maps(v);
+    null_lazy_views(v, device);
+    const LONG64 total = InterlockedIncrement64(&lazy_evicted);
+    if (total <= 8 || total % 1000 == 0)
+        log("x2w-d3d12 lazy evict %lld: texture %p at %p by %p", total, static_cast<void*>(v), v->own().title_memory,
+            static_cast<void*>(by));
+}
+
 ID3D12Resource* materialize_lazy_texture(Wrapper* w)
 {
     if (!w || w->own().kind != resource_kind) return nullptr;
@@ -7081,6 +7718,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     } publish;
     ID3D12Device* device = nullptr;
     ID3D12Resource* created = nullptr;
+    std::vector<Wrapper*> evicted;
     {
         std::lock_guard lock(lazy_texture_mutex);
         if (auto* existing = static_cast<ID3D12Resource*>(w->own().real)) return existing;
@@ -7136,6 +7774,8 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                     create_desc.MipLevels, dropped);
         }
 
+        x2w_startup::mark_console_format(created, record.original_format);
+        replay_dump_tag(w, created);
         publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
             AcquireSRWLockExclusive(&retire_lock);
@@ -7157,7 +7797,9 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         if (ticket && InterlockedCompareExchange(&w->own().refs, 0, 0) <= 0) {
             ticket->end_use();
         }
+        if (lazy_evict_enabled()) evicted = take_overlapped_lazy(w, device, record.desc);
     }
+    for (Wrapper* v : evicted) evict_lazy_texture(v, w, device);
 
     struct PendingSrvRefresh {
         u64 heap_wrapper;
@@ -7539,8 +8181,35 @@ void drain_retired_resources()
         retire_flights.pop_back();
         InterlockedDecrement(&retire_pending);
     }
+    std::vector<ID3D12Resource*> evicted_done;
+    for (std::size_t i = 0; i < evicted_textures.size() && evicted_done.size() < batch;) {
+        EvictedTexture& item = evicted_textures[i];
+        bool reached = item.targets.size() <= retire_queues.size();
+        for (std::size_t q = 0; q < item.targets.size() && reached; ++q)
+            reached = retire_queues[q].fence->GetCompletedValue() >= item.targets[q];
+        if (!reached) {
+            ++i;
+            continue;
+        }
+        try {
+            evicted_done.push_back(item.resource);
+        } catch (const std::bad_alloc&) {
+            break;
+        }
+        if (i + 1 != evicted_textures.size()) item = std::move(evicted_textures.back());
+        evicted_textures.pop_back();
+        InterlockedDecrement(&retire_pending);
+    }
     ReleaseSRWLockExclusive(&retire_lock);
+    for (ID3D12Resource* resource : evicted_done) {
+        draw_lock_acquire_exclusive();
+        texture_uploads().erase(resource);
+        draw_lock_release_exclusive();
+        resource->Release();
+        InterlockedIncrement64(&lazy_evict_freed);
+    }
     for (const RetiredDrop& drop : dropped) {
+        forget_resource_maps(drop.wrapper);
         if (drop.wrapper->own().title_memory) {
             const u64 address = reinterpret_cast<u64>(drop.wrapper->own().title_memory);
             {
@@ -7559,6 +8228,7 @@ void drain_retired_resources()
         if (drop.wrapper->own().lazy_slot133_texture) {
             std::lock_guard lock(lazy_texture_mutex);
             lazy_textures().erase(drop.wrapper);
+            forget_lazy_range(drop.wrapper);
         }
         if (drop.resource) {
             draw_lock_acquire_exclusive();
@@ -7863,7 +8533,10 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
         }
     }
     if (Wrapper* l = as_wrapper(list); l && l->own().kind == list_kind) {
-        if (l->own().pass) out->list_states = static_cast<unsigned>(pass_of(l).states.size());
+        if (l->own().pass) {
+            const auto& pass = pass_of(l);
+            out->list_states = static_cast<unsigned>(pass.states.size() + pass.split.size());
+        }
         AcquireSRWLockShared(&retire_lock);
         if (const auto found = retire_list_holds.find(l); found != retire_list_holds.end())
             out->list_holds = static_cast<unsigned>(found->second.size());
@@ -7876,6 +8549,14 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_lazy_texture_count()
 {
     std::lock_guard lock(lazy_texture_mutex);
     return static_cast<unsigned>(lazy_textures().size());
+}
+
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_resource_map_count()
+{
+    AcquireSRWLockShared(&resource_map_lock);
+    const auto count = resource_maps.size();
+    ReleaseSRWLockShared(&resource_map_lock);
+    return count;
 }
 
 // Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a
@@ -8424,12 +9105,15 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
                                           : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                                     : D3D12_RESOURCE_STATE_COMMON;
     D3D12_CLEAR_VALUE clear_copy{};
-    const auto* clear_value = packed_clear_value(clear, desktop_format(desc->Format), copy.Format, clear_copy);
+    const auto* clear_value = x2w_startup::desktop_clear_value(clear, desc->Format, copy.Format, clear_copy);
+    x2w_startup::log_console_format("committed", slot, *desc, clear, clear_value, log);
+    D3D12_CLEAR_VALUE safe_copy{};
+    clear_value = safe_clear(clear_value, copy, safe_copy);
     HRESULT hr = kind_for(*iid) == resource_kind
         ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear_value, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
     bool cleared = clear != nullptr;
-    if (FAILED(hr) && clear && kind_for(*iid) == resource_kind) {
+    if (FAILED(hr) && clear_value && kind_for(*iid) == resource_kind) {
         hr = device_of(self)->CreateCommittedResource(props, flags, &copy, initial, nullptr, IID_PPV_ARGS(&resource));
         cleared = false;
     }
@@ -8442,6 +9126,7 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
+    x2w_startup::mark_console_format(resource, desc->Format);
     Wrapper* w = wrap(resource, resource_kind);
     if (!w) {
         // The title-memory block is not returned here. __XMemAllocationHooks__ is documented as
@@ -8708,6 +9393,16 @@ void report_budget(ID3D12CommandQueue* queue)
         }
     }
     sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
+    if (lazy_evict_enabled()) {
+        std::size_t ranges = 0;
+        {
+            std::lock_guard lock(lazy_texture_mutex);
+            ranges = lazy_ranges().size();
+        }
+        log("x2w-d3d12 lazy evict: evicted %lld, kept %lld, freed %lld, materialized ranges %zu",
+            InterlockedCompareExchange64(&lazy_evicted, 0, 0), InterlockedCompareExchange64(&lazy_evict_kept, 0, 0),
+            InterlockedCompareExchange64(&lazy_evict_freed, 0, 0), ranges);
+    }
     const auto counts = x2w_budget::snapshot();
     char text[640]{};
     std::size_t used = 0;
@@ -8894,6 +9589,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // X2W_DEBUG_PRESENT_TARGET: before anything reads the surface. A timed picture is due about 5 s after the last one.
         debug_present::present(self, surface, frame, static_cast<LONG64>(GetTickCount64() - gray_t0) - gray_last_readback_ms >= 4000);
         capture::present(frame, surface);
+        replay_record::present();
+        present_pictures::present(self, surface, frame);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
@@ -8965,10 +9662,21 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
+    // The render totals and the censuses print every 300 frames AND at least every 10 s of wall time: after the cliff (0.3 fps in Run S)
+    // 300 frames take 17 minutes and nothing printed while the dispatch storm ran.
+    static ULONGLONG last_wall_census;
+    if (!last_wall_census) last_wall_census = now;   // the first wall tick comes 10 s after the first present
+    const bool census_frames = render_mode() && frame % 300 == 0;
+    const bool census_wall = render_mode() && !census_frames && now - last_wall_census >= 10000;
+    const bool census_due = census_frames || census_wall;
+    if (census_due) {
+        last_wall_census = now;
+        log("x2w-render census tick at %.1f s, frame %ld (%s)", process_ms() / 1000.0, frame, census_frames ? "every 300 frames" : "10 s of wall time");
+    }
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     x2w_startup::NullInputCensus::Batch null_report;
-    const bool totals_due = render_mode() && frame % 300 == 0;
+    const bool totals_due = census_due;  // every 300 frames and every 10 s of wall time (259356f52), as the censuses below
     const bool null_report_due = render_mode() && now - last_null_report >= 10000;
     if (totals_due || null_report_due) {
         if (null_report_due) last_null_report = now;
@@ -8993,12 +9701,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         char null_totals[200];
         x2w_startup::format_null_binding_totals(null_totals, sizeof(null_totals), null_total, null_causes);
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, approximated shaders %ld, "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
             "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals, approximated_translations,
             formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
@@ -9030,7 +9738,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         std::memcpy(last, now_values, sizeof(last));
         log("%s", text);
     }
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
@@ -9059,20 +9767,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     if (render_mode() && frame % 300 == 0) {
-        // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
-        static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
-                                               "placeholder-signature", "other"};
-        static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
-        char line[1024];  // fits every outcome with five 19-digit counts
-        int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
-        for (int o = 0; o < indirect_outcomes; ++o) {
-            n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);
-            const int start = n;
-            for (int k = 0; k < 5; ++k)
-                if (const LONG64 calls = indirect_calls[o][k])
-                    n += std::snprintf(line + n, sizeof(line) - n, " %s %lld", kinds[k], static_cast<long long>(calls));
-            if (n == start) n += std::snprintf(line + n, sizeof(line) - n, " 0");
-        }
+        char line[1024];
+        indirect_totals_line(line, sizeof(line));
         log("%s", line);
     }
     if (render_mode() && frame % 300 == 0) {
@@ -9087,6 +9783,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
+        if (render_mode()) {
+            static LONG64 previous[indirect_outcomes][5]{};
+            LONG64 current[indirect_outcomes][5]{};
+            char line[1024];
+            indirect_totals_line(line, sizeof(line), current);
+            if (std::memcmp(previous, current, sizeof(current)) != 0) {
+                std::memcpy(previous, current, sizeof(current));
+                log("%s", line);
+            }
+        }
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
@@ -9149,6 +9855,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        indirect_pipeline_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -9172,6 +9879,9 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
         for (std::size_t i = 0; i <= bytes; ++i, ++length)
             if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
     };
+    char indirect_line[1024];
+    indirect_totals_line(indirect_line, sizeof(indirect_line));
+    emit(indirect_line);
     memory_srv_census.report(emit, false);
     if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.report(emit, false, true);
     memory_srv_switch_census.report(emit, false);
@@ -9189,6 +9899,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     report_placeholder_draws(emit);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
+    if (indirect_pipeline_refusal_census.total()) indirect_pipeline_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;
 }
@@ -9376,6 +10087,7 @@ void build_tables()
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
+    replay_record::install();  // last: it wraps the slots installed above
 }
 
 SRWLOCK written_lock = SRWLOCK_INIT;
@@ -9393,6 +10105,71 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 
+extern "C" __declspec(dllexport) std::uint64_t x2w_d3d12_take_view_id()
+{
+    return take_view_id();
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment)
+{
+    if (type >= 4) return;
+    const UINT minimum = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 16 : 32;
+    if (increment < minimum || increment > 256 || (increment & (increment - 1))) {
+        log("x2w-d3d12 replay: invalid heap type %u title increment %u: ignored", type, increment);
+        return;
+    }
+    InterlockedExchange(&replay_title_increments[type], static_cast<LONG>(increment));
+    static LONG logged[4];
+    if (InterlockedExchange(&logged[type], 1) == 0)
+        log("x2w-d3d12 replay: heap type %u title increment %u (this device %u)", type, increment,
+            removal_device ? removal_device->GetDescriptorHandleIncrementSize(static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type)) : 0);
+}
+
+extern "C" void x2w_d3d12_exit_report()
+{
+    char line[1024];
+    if (indirect_totals_line(line, sizeof(line)))
+        log("x2w-render indirect at exit:%s", line + sizeof("x2w-render indirect:") - 1);
+}
+
+// The offline player owns these heap references and keys them by recorded creation ID.
+extern "C" __declspec(dllexport) HRESULT x2w_d3d12_replay_place(
+    void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state,
+    ID3D12Heap** heap, void** out)
+{
+    auto* self = static_cast<Wrapper*>(device);
+    if (!desc || !out || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;
+    *out = nullptr;
+    x2w_budget::Ticket* backing_budget = nullptr;
+    if (!*heap) {
+        Microsoft::WRL::ComPtr<ID3D12Device3> device3;
+        HRESULT hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
+        if (FAILED(hr)) return hr;
+        Microsoft::WRL::ComPtr<ID3D12Heap> opened;
+        hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&opened));
+        if (FAILED(hr)) return hr;
+        // Keep the page-alias resolver and resource budgeting on the ordinary slot 133 heap registry.
+        std::lock_guard lock(placed_mutex);
+        backing_budget = x2w_budget::backing_heap(opened.Get(), 0);
+        existing_heaps.emplace_back(base, ExistingHeap{opened.Get(), backing_budget});
+        opened->AddRef();  // registry lifetime, independent of the player's cache
+        *heap = opened.Detach();
+    } else {
+        std::lock_guard lock(placed_mutex);
+        const auto known = std::find_if(existing_heaps.begin(), existing_heaps.end(),
+            [&](const auto& entry) { return entry.second.real == *heap; });
+        if (known != existing_heaps.end()) backing_budget = known->second.budget;
+    }
+    const auto initial_state = state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
+    const HRESULT hr = device_of(self)->CreatePlacedResource(*heap, offset, &copy, initial_state, nullptr,
+                                                             IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return hr;
+    return publish_placed_buffer(self, static_cast<char*>(base) + offset, desc, initial_state, resource, true, backing_budget, out);
+}
+
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
     static const bool ready = (build_tables(), true);
@@ -9405,6 +10182,7 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     }
     the_device = candidate;
     removal_device = device;
+    x2w_d3d12_replay_record_object(device_kind, candidate);
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
@@ -9514,16 +10292,37 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     hex_text(parameters, 0x40, block, sizeof(block));
     if (!out) return E_POINTER;
     *out = nullptr;
-    const bool debug = [] {
-        char value[4]{};
-        return GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value)) && value[0] == '1';
-    }();
-    if (debug) {
+    using x2w_startup::DebugLevel;
+    char value[4]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value));
+    const auto debug_level = x2w_startup::d3d12_debug_level(length < sizeof(value) ? value[0] : '\0');
+    const bool debug = debug_level != DebugLevel::off;
+    const auto enable_debug_layer = [](bool gpu_validation) {
         ID3D12Debug* layer = nullptr;
         const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&layer));
         if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
+        if (gpu_validation) {
+            ID3D12Debug1* layer1 = nullptr;
+            const HRESULT gbv_hr = layer ? layer->QueryInterface(IID_PPV_ARGS(&layer1)) : debug_hr;
+            if (SUCCEEDED(gbv_hr)) {
+                layer1->SetEnableGPUBasedValidation(TRUE);
+                layer1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+                layer1->Release();
+                log("x2w-d3d12 GPU-based validation: enabled");
+            } else {
+                log("x2w-d3d12 GPU-based validation: unavailable (0x%08lx)", static_cast<unsigned long>(gbv_hr));
+            }
+        }
+        if (layer) layer->Release();
+    };
+    if (debug_level == DebugLevel::gpu_validation) {
+        // Changing GBV after creating the desktop device causes device removal.
+        static const bool configured = (enable_debug_layer(true), true);
+        (void)configured;
+    } else if (debug) {
+        enable_debug_layer(false);
     }
     ID3D12Device* device = nullptr;
     const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)
@@ -9535,6 +10334,12 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     if (FAILED(hr)) return hr;
     x2w_startup::attach_device(device, out);
     if (!*out) return E_OUTOFMEMORY;
-    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
+    if (debug) {
+        device->QueryInterface(IID_PPV_ARGS(&info_queue));
+        if (info_queue) {
+            static LONG installed;
+            if (InterlockedExchange(&installed, 1) == 0) AddVectoredExceptionHandler(1, debug_exception_handler);
+        }
+    }
     return S_OK;
 }

@@ -37,6 +37,9 @@ from pathlib import Path
 DEFAULT_STALL_SECONDS = 90
 DEFAULT_MIN_SECONDS = 150
 DEFAULT_MEMORY_PERCENT = 95
+DEFAULT_PRESENT_DUMP_SECONDS = 15
+DEFAULT_PRESENT_DUMP_MIN_SECONDS = 30
+MAX_PRESENT_DUMPS = 3
 MEMORY_SAMPLES = 2          # consecutive samples at or above the percent
 SAMPLE_SECONDS = 5.0
 DEADLOCK_CPU_SECONDS = 1.0   # the title used less CPU than this over the stall window while presenting nothing
@@ -52,7 +55,9 @@ class Watch:
     """The state of the decision: when each signal last moved, how many memory samples in a row were too high."""
 
     def __init__(self, stall_seconds=DEFAULT_STALL_SECONDS, min_seconds=DEFAULT_MIN_SECONDS,
-                 memory_percent=DEFAULT_MEMORY_PERCENT, max_seconds=0):
+                 memory_percent=DEFAULT_MEMORY_PERCENT, max_seconds=0,
+                 present_dump_seconds=DEFAULT_PRESENT_DUMP_SECONDS,
+                 present_dump_min_seconds=DEFAULT_PRESENT_DUMP_MIN_SECONDS):
         self.stall_seconds, self.min_seconds = stall_seconds, min_seconds
         self.memory_percent, self.max_seconds = memory_percent, max_seconds
         self.last = {}        # signal -> last value seen
@@ -60,6 +65,11 @@ class Watch:
         self.high = 0
         self.present_value, self.present_at = None, None
         self.cpu_history = []   # (run second, title CPU seconds)
+        self.present_dump_seconds = present_dump_seconds
+        self.present_dump_min_seconds = present_dump_min_seconds
+        self.present_dump_count = 0
+        self.last_frame_at = None
+        self.present_dumped = False
 
     def decide(self, t, sample):
         """sample: dict with commit_percent (float or None) and the SIGNALS (value or None = unknown). Returns the reason
@@ -71,6 +81,9 @@ class Watch:
                 continue
             if name not in self.last or value != self.last[name]:
                 moved = True
+                if name == "present":
+                    self.last_frame_at = t
+                    self.present_dumped = False
             self.last[name] = value
         if moved:
             self.moved_at = t
@@ -96,6 +109,16 @@ class Watch:
             return "frozen: no change in frames presented, storage read, translator output or window picture for %d s" % (
                 t - self.moved_at)
         return None
+
+    def wants_present_dump(self, t):
+        """After decide(), claim at most one diagnostic for the current stall."""
+        if (not self.present_dump_seconds or t < self.present_dump_min_seconds
+                or self.last_frame_at is None or t - self.last_frame_at < self.present_dump_seconds
+                or self.present_dumped or self.present_dump_count >= MAX_PRESENT_DUMPS):
+            return False
+        self.present_dumped = True
+        self.present_dump_count += 1
+        return True
 
 
 def read_tail(path):
@@ -310,11 +333,21 @@ def hard_end(logdir, run_second, say=print, wait_seconds=10.0):
     return note
 
 
+def dump_request_filename(content):
+    name = content.strip()
+    return name if re.fullmatch(r"threads_[a-z_0-9]+\.txt", name) else "threads_stall.txt"
+
+
+def write_dump_request(logdir, content):
+    pending = Path(logdir, "dump_request.tmp")
+    pending.write_text(content, encoding="utf-8")
+    pending.replace(Path(logdir, "dump_request"))
+
+
 def request_dump(logdir, say=print):
     """Ask debug_launch.py for a threads dump (threads_stall.txt) and wait for it a little."""
     target = os.path.join(logdir, "threads_stall.txt")
-    with open(os.path.join(logdir, "dump_request"), "w", encoding="utf-8") as out:
-        out.write("threads\n")
+    write_dump_request(logdir, "threads\n")
     deadline = time.time() + DUMP_WAIT_SECONDS
     while time.time() < deadline and not os.path.exists(target):
         time.sleep(0.2)
@@ -329,13 +362,17 @@ def main(argv):
     parser.add_argument("--stall-seconds", type=int, default=DEFAULT_STALL_SECONDS)
     parser.add_argument("--min-seconds", type=int, default=DEFAULT_MIN_SECONDS)
     parser.add_argument("--memory-percent", type=int, default=DEFAULT_MEMORY_PERCENT)
+    parser.add_argument("--present-dump-seconds", type=int, default=DEFAULT_PRESENT_DUMP_SECONDS)
+    parser.add_argument("--present-dump-min-seconds", type=int, default=DEFAULT_PRESENT_DUMP_MIN_SECONDS)
     parser.add_argument("--hard-grace", type=int, default=HARD_GRACE_SECONDS)
     parser.add_argument("--every", type=float, default=SAMPLE_SECONDS)
     args = parser.parse_args(argv)
-    if min(args.stall_seconds, args.min_seconds, args.memory_percent, args.seconds, args.hard_grace) < 0 or args.memory_percent > 100:
+    if min(args.stall_seconds, args.min_seconds, args.memory_percent, args.seconds, args.hard_grace,
+           args.present_dump_seconds, args.present_dump_min_seconds) < 0 or args.memory_percent > 100:
         print("stall_watchdog: expected whole numbers of 0 or more (memory percent at most 100)")
         return 2
-    watch = Watch(args.stall_seconds, args.min_seconds, args.memory_percent, args.seconds)
+    watch = Watch(args.stall_seconds, args.min_seconds, args.memory_percent, args.seconds,
+                  args.present_dump_seconds, args.present_dump_min_seconds)
     events = os.path.join(args.logdir, "events.txt")
     finished = os.path.join(args.logdir, "finished.txt")
     started = None
@@ -349,6 +386,17 @@ def main(argv):
                 return 0
             if ending_at is None:
                 reason = watch.decide(t, take_sample(args.logdir))
+                if watch.wants_present_dump(t):
+                    name = "threads_present_stall_%d.txt" % watch.present_dump_count
+                    write_dump_request(args.logdir, name)
+                    print("tester_run: threads dump at %d s: no frame presented for %d s (%s)" %
+                          (t, t - watch.last_frame_at, name), flush=True)
+                    if reason and reason.startswith("deadlock"):
+                        # Give the debugger time to claim this request before the stop dump replaces it.
+                        deadline = time.monotonic() + 2
+                        pending = Path(args.logdir, "dump_request")
+                        while pending.exists() and (remaining := deadline - time.monotonic()) > 0:
+                            time.sleep(min(0.1, remaining))
                 if reason:
                     if reason.startswith("deadlock"):
                         request_dump(args.logdir)

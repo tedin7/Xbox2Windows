@@ -587,6 +587,10 @@ def check_indirect_outcomes(failures: list[str]) -> None:
             if secret in report:
                 failures.append(f"indirect summary copied private text: {secret!r}")
         log = root / "stderr.txt"
+        exit_line = later.replace("x2w-render indirect:", "x2w-render indirect at exit:").replace("dispatchmesh 12", "dispatchmesh 19")
+        log.write_text(initial + "\n" + exit_line + "\n", encoding="utf-8")
+        if "| refused graphics-pipeline | 0 | 0 | 0 | 0 | 19 |" not in triage_run.triage_run(log):
+            failures.append("exit indirect snapshot was not reported")
         log.write_text(zero + "\n", encoding="utf-8")
         if "| forwarded | 0 | 0 | 0 | 0 | 0 |" not in triage_run.triage_run(log):
             failures.append("a complete zero snapshot was not reported")

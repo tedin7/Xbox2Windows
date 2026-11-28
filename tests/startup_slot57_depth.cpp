@@ -10,10 +10,12 @@
 //
 // Register layouts: Mesa src/amd/registers/gfx10.json (MIT), as pipeline_state_decode.h documents them.
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,12 @@ using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
 namespace {
+std::atomic<unsigned long long> debug_errors{0};
+void WINAPI debug_callback(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID, LPCSTR text, void*)
+{
+    if (severity <= D3D12_MESSAGE_SEVERITY_ERROR && ++debug_errors <= 12)
+        std::printf("debug layer: %.300s\n", text);
+}
 using Word = std::uint64_t;
 template<class T> Word ptr_arg(T* p) { return reinterpret_cast<Word>(p); }
 
@@ -249,6 +257,7 @@ int main(int argc, char** argv)
             {near_red(st_equal_5b), create_stream_pso(guest, root, vs_far, ps_green)}, 0x5a},
         {"st_ref_reset", 1.0f, 0, true,
             {near_red(st_equal_5b), create_stream_pso(guest, root, vs_far, ps_green)}},
+        {"stream_no_dsv", 1.0f, 0, false, {create_stream_pso(guest, root, vs_far, ps_green)}},
         {"st_refused", 1.0f, 0x5a, true, {far_green(st_ones)}},                    // ONES has no D3D12 form: desktop default, drawn
     };
     for (const auto& c : cases)
@@ -256,6 +265,13 @@ int main(int argc, char** argv)
 
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    ComPtr<ID3D12InfoQueue1> debug_queue;
+    DWORD debug_cookie = 0;
+    if (FAILED(desktop.As(&debug_queue)) || FAILED(debug_queue->RegisterMessageCallback(
+            debug_callback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &debug_cookie))) {
+        std::printf("no debug layer\n");
+        return 20;
+    }
     constexpr UINT width = 8, height = 4;
     StreamTarget state{};
     state.count = 1;
@@ -304,6 +320,7 @@ int main(int argc, char** argv)
         invoke(guest, 21, ptr_arg(depth_tex.Get()), ptr_arg(&dsv_view), dsv.ptr);
         if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
         if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
+        const auto errors_before = debug_errors.load();
         invoke(state.list, 52, rtv.ptr, ptr_arg(clear_color));
         invoke(state.list, 21, 1, ptr_arg(&viewport));
         invoke(state.list, 22, 1, ptr_arg(&rect));
@@ -317,7 +334,10 @@ int main(int argc, char** argv)
         if (const int rc = execute_guest_list(state.queue, state.list, state.fence, ++fence_value)) return rc;
         const std::string path = out_dir.empty() ? std::string(argv[5]) + ".request" : out_dir + "\\" + c.name + ".bin";
         if (const int rc = read_stream_target(desktop.Get(), state, path.c_str())) return rc;
+        if (std::strcmp(c.name, "stream_no_dsv") == 0 &&
+            (debug_errors.load() != errors_before || desktop->GetDeviceRemovedReason() != S_OK)) return 70;
         std::printf("case %s done\n", c.name);
     }
-    return 0;
+    debug_queue->UnregisterMessageCallback(debug_cookie);
+    return desktop->GetDeviceRemovedReason() == S_OK ? 0 : 70;
 }

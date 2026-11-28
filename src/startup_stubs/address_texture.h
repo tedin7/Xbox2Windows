@@ -82,6 +82,22 @@ inline bool address_component_mapping(UINT mapping)
     return true;
 }
 
+// Convert a mip window relative to an alias into one relative to its desktop backing.
+template<class MipView>
+inline bool remap_alias_mips(MipView& view, UINT alias_mips, UINT offset, UINT backing_mips)
+{
+    if (view.MostDetailedMip >= alias_mips || offset >= backing_mips ||
+        view.MostDetailedMip >= backing_mips - offset)
+        return false;
+    const UINT first = view.MostDetailedMip + offset;
+    const UINT count = view.MipLevels == ~0u ? alias_mips - view.MostDetailedMip : view.MipLevels;
+    if (!count || count > alias_mips - view.MostDetailedMip || count > backing_mips - first)
+        return false;
+    view.MostDetailedMip = first;
+    view.MipLevels = count;
+    return true;
+}
+
 inline bool desktop_address_array(const D3D12_RESOURCE_DESC& r)
 {
     const auto element = gfx10::element_of(r.Format);

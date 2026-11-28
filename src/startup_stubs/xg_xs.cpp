@@ -5,6 +5,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/bc7_4k_s.h"
+#include "startup_stubs/clear_value_format.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -41,22 +42,11 @@ ID3D12Device* layout_device()
     return device;
 }
 
-DXGI_FORMAT desktop_format(DXGI_FORMAT format)
-{
-    switch (static_cast<UINT>(format)) {
-    case 116: case 117: return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
-    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
-    default: return format;
-    }
-}
-
 D3D12_RESOURCE_DESC desktop_desc(const D3D12_RESOURCE_DESC& desc)
 {
     D3D12_RESOURCE_DESC copy = desc;
     copy.Alignment = 0;
-    copy.Format = desktop_format(desc.Format);
+    copy.Format = x2w_startup::desktop_format(desc.Format);
     copy.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(desc.Flags) & 0x3f);
     if (copy.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)

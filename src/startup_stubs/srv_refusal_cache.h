@@ -1,5 +1,7 @@
 #pragma once
 
+#include "memory_srv_buffer_census.h"
+
 // A bounded negative cache for refused buffer memory SRVs (device slot 70, reason buffer_unavailable).
 //
 // A refused SRV used to repeat the whole resolution on every call: the placement scans, the resource index
@@ -79,6 +81,7 @@ struct SrvRefusalProof {
     std::uint64_t witness = 0;  // witness_page: an address of the page that is not committed
     std::uint64_t base = 0;     // witness_page: the allocation base the walk started from
     bool proven = false;        // false: nothing proves this refusal, it is not cached
+    BufferRefusalDetail detail{};
 };
 
 struct SrvRefusalStamp {
@@ -104,7 +107,8 @@ public:
     // True when this request was refused under the same stand-in and memory state a moment ago.
     // still_refuses(proof) answers a witness_page entry: the page is still not committed in the allocation.
     template <class StillRefuses>
-    bool hit(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms, StillRefuses&& still_refuses)
+    bool hit(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms, StillRefuses&& still_refuses,
+             BufferRefusalDetail* detail = nullptr)
     {
         SrvRefusalProof proof;
         {
@@ -125,6 +129,7 @@ public:
         Entry& e = entries_[slot(key)];
         if (!e.used || !(e.key == key) || e.hits >= kMaxHits || e.stamp.generation != stamp.generation) return false;
         ++e.hits;
+        if (detail) *detail = e.proof.detail;
         return true;
     }
 

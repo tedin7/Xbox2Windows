@@ -169,8 +169,16 @@ def dispatch(directory, dxc, runner, adapter):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--llvm-mc')
-    parser.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RUNNER', 'ADAPTER'))
+    dispatch_mode = parser.add_mutually_exclusive_group()
+    dispatch_mode.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RUNNER', 'ADAPTER'))
+    dispatch_mode.add_argument('--approx-dispatch', nargs=3, metavar=('DXC', 'RUNNER', 'ADAPTER'))
     args = parser.parse_args()
+    if args.approx_dispatch:
+        from startup_gfx2hlsl_approx_check import dispatch as approx_dispatch
+        output = Path(__file__).resolve().parents[1] / 'out'
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output) as tmp:
+            return approx_dispatch(Path(tmp), *args.approx_dispatch)
     controls(args.llvm_mc)
     if args.dispatch:
         output = Path(__file__).resolve().parent.parent / 'out'

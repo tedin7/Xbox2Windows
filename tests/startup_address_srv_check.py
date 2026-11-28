@@ -94,6 +94,9 @@ def check(directory, consumer, backend):
     check_refusal_lines(trap_log.read_text(errors="replace"))
     print(f"{backend}: ordinary view, alternating addresses, zero/interior/mismatched updates; all 32 RGBA pixels exact")
     if backend == "warp":
+        linear = directory / "linear"
+        linear.mkdir()
+        check_linear(linear, consumer, backend)
         one_d = directory / "texture1d"
         one_d.mkdir()
         check_1d(one_d, consumer, backend)
@@ -101,6 +104,32 @@ def check(directory, consumer, backend):
         placed.mkdir()
         check_unregistered_1d(placed, consumer, backend)
     return 0
+
+
+def check_linear(directory, consumer, backend):
+    hlsl = """Texture2D<float> t : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    return float4(t.Load(int3(0, 0, uint(p.y) % 2)), 0, 0, 1);
+}
+"""
+    trap_log = directory / "trap.log"
+    actual = draw_texture(directory, consumer, backend, hlsl,
+                          {"X2W_TEST_ADDRESS_SRV_LINEAR": "1", "X2W_TRAP_LOG": str(trap_log)})
+    if actual is None:
+        raise AssertionError("linear WARP fixture unexpectedly skipped")
+    # Literal UNORM8 reference for A and B, alternating mip 0 and mip 1.
+    samples = ((51, 102), (153, 204), (51, 102), (51, 102))
+    expected = bytes(c for y in range(4) for x in range(8)
+                     for c in (samples[x // 2][y % 2], 0, 0, 255))
+    if actual != expected:
+        raise AssertionError(f"linear actual {actual.hex()} expected {expected.hex()}")
+    lines = [line for line in trap_log.read_text(errors="replace").splitlines()
+             if "Device::slot70" in line and "layout=0x100" in line]
+    if any("reason=unsupported_description" in line for line in lines):
+        raise AssertionError(f"linear description refused: {lines}")
+    if sum("reason=texture_no_resource" in line for line in lines) != 1:
+        raise AssertionError(f"expected one missing-resource refusal: {lines}")
+    print(f"{backend}: linear placed mip views; all 32 RGBA pixels exact")
 
 
 RAMP_SHADER = """Texture1D<float> ramp : register(t0);
@@ -265,7 +294,7 @@ def check_cube(directory, consumer, backend):
             assert rgba == expected, f"{case} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
     # Slot 18 records the title view. These diagnostics must come from the
     # real draw binder, including for the cube view whose dimension matches.
-    mismatches = re.findall(r"srv 0: view dimension (\d+) does not match the shader; binding null", result.stderr)
+    mismatches = re.findall(r"srv 0: the shader declares view dimension \d+; the slot \d+ view has (\d+) ", result.stderr)
     assert mismatches == ["5", "9"], f"expected array then cube mismatch, got {mismatches}\n{result.stderr[-5000:]}"
     print(f"{backend}: six cube faces, array-view null and twelve-slice null match the CPU reference")
     return 0

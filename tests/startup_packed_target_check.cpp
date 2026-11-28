@@ -5,9 +5,10 @@
 // before, B5G6R5_UNORM left alone as before, R9G9B9E5_SHAREDEXP left alone as before, a UAV-only
 // R9G9B9E5_SHAREDEXP texture left alone as under a render-target-only trigger, the view format of the
 // stand-in kept packed, the stand-in's tag read back as no tag);
-// each must fail on the rows it concerns.
-#include "startup_stubs/packed_target_format.h"
+// each must fail on the rows it concerns. --mutate raw-clear forwards console depth format 118 unchanged.
+#include "startup_stubs/clear_value_format.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -165,15 +166,70 @@ void view(const char* name, x2w_startup::PackedView got, x2w_startup::PackedView
         ++failures;
     }
 }
+void check_clear(const char* name, const D3D12_CLEAR_VALUE& clear, DXGI_FORMAT requested, DXGI_FORMAT created,
+                 DXGI_FORMAT expected_format, bool rewritten)
+{
+    D3D12_CLEAR_VALUE original;
+    std::memcpy(&original, &clear, sizeof(original));
+    D3D12_CLEAR_VALUE copy{};
+    const auto* forwarded = x2w_startup::desktop_clear_value(&clear, requested, created, copy);
+    if (!std::strcmp(mutation, "raw-clear") && clear.Format == static_cast<DXGI_FORMAT>(118))
+        forwarded = &clear;
+    const auto payload = [](const D3D12_CLEAR_VALUE& value) {
+        return reinterpret_cast<const unsigned char*>(&value) + offsetof(D3D12_CLEAR_VALUE, Color);
+    };
+    ++checks;
+    if (forwarded != (rewritten ? &copy : &clear) || forwarded->Format != expected_format ||
+        std::memcmp(payload(*forwarded), payload(original), sizeof(original.Color)) != 0 ||
+        std::memcmp(&clear, &original, sizeof(original)) != 0) {
+        std::printf("FAIL %s: incorrect clear format, copy, or payload\n", name);
+        ++failures;
+    }
+}
+
+void check_clear_values()
+{
+    D3D12_CLEAR_VALUE depth{};
+    depth.Format = static_cast<DXGI_FORMAT>(118);
+    depth.DepthStencil = {0.375f, 0xa5};
+    check_clear("console depth/stencil", depth, depth.Format, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                DXGI_FORMAT_D24_UNORM_S8_UINT, true);
+
+    depth.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    depth.DepthStencil = {0.0f, 0};
+    check_clear("desktop zero depth", depth, depth.Format, depth.Format, depth.Format, false);
+
+    D3D12_CLEAR_VALUE colour{DXGI_FORMAT_UNKNOWN, {0.125f, 0.25f, 0.5f, 1.0f}};
+    for (const auto raw : {116, 117}) {
+        colour.Format = static_cast<DXGI_FORMAT>(raw);
+        check_clear("console 10-bit colour", colour, colour.Format, DXGI_FORMAT_R10G10B10A2_UNORM,
+                    DXGI_FORMAT_R10G10B10A2_UNORM, true);
+    }
+
+    colour.Format = DXGI_FORMAT_B5G6R5_UNORM;
+    check_clear("packed stand-in colour", colour, colour.Format, DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_UNORM, true);
+    check_clear("packed format retained", colour, colour.Format, colour.Format, colour.Format, false);
+    check_clear("unrelated clear format", colour, DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                colour.Format, false);
+
+    D3D12_CLEAR_VALUE copy{};
+    ++checks;
+    if (x2w_startup::desktop_clear_value(nullptr, depth.Format, depth.Format, copy)) {
+        std::puts("FAIL null clear: expected nullptr");
+        ++failures;
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     if (argc == 3 && !std::strcmp(argv[1], "--mutate")) mutation = argv[2];
     else if (argc != 1) {
-        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|sharedexp|sharedexp-uav|view|tag]\n");
+        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|sharedexp|sharedexp-uav|view|tag|raw-clear]\n");
         return 2;
     }
+    check_clear_values();
     const auto packed_target_stand_in = stand_in;
     constexpr UINT RT = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, UA = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr DXGI_FORMAT b5 = DXGI_FORMAT_B5G5R5A1_UNORM, b4 = DXGI_FORMAT_B4G4R4A4_UNORM, rgba = DXGI_FORMAT_R8G8B8A8_UNORM;

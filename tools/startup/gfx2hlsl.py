@@ -9,6 +9,7 @@ import bisect
 import copy
 from collections import Counter, deque
 from contextlib import suppress
+from contextvars import ContextVar
 from copy import deepcopy
 import functools
 import hashlib
@@ -46,6 +47,59 @@ CONST_EXEC_BINARY = {
     'and': lambda a, b: a & b, 'or': lambda a, b: a | b, 'xor': lambda a, b: a ^ b,
     'andn2': lambda a, b: a & ~b, 'orn2': lambda a, b: a | ~b,
 }
+
+
+_APPROX_RETRY = ContextVar('gfx_approx_retry', default=False)
+APPROX_REFUSALS = (READFIRSTLANE_UNIFORM, WAVE_REDUCTION_ENTRY)
+APPROX_ATTEMPT = 'x2w-approx-attempt'
+APPROX_MARKER = re.compile(
+    r'x2w-gfx approx: key ([0-9a-f]{16}) stage (?:vs|ms|ps|cs)(?:\+(?:vs|ms|ps|cs))*'
+    r' lifted [0-9]+ readfirstlane, [0-9]+ reductions')
+
+
+def approx_enabled():
+    return os.environ.get('X2W_GFX_APPROX') == '1'
+
+
+def approximate_translation(lower):
+    """Run the normal proofs first. Retry only the two diagnostic refusal classes."""
+    try:
+        result = lower()
+    except Unsupported as reason:
+        if not approx_enabled() or str(reason) not in APPROX_REFUSALS:
+            raise
+    else:
+        pixel = getattr(result[0], 'ps', None)
+        if not (approx_enabled() and isinstance(pixel, PlaceholderPixelStage)
+                and pixel.reason in APPROX_REFUSALS):
+            return result
+    token = _APPROX_RETRY.set(True)
+    try:
+        return lower()
+    finally:
+        _APPROX_RETRY.reset(token)
+
+
+def approx_result(key, pipe):
+    stages, reads, reductions = [], 0, 0
+    for kind in ('vs', 'ps', 'cs'):
+        stage = getattr(pipe, kind, None)
+        r = len(getattr(stage, 'approx_reads', ()))
+        w = len(getattr(stage, 'approx_reductions', ()))
+        if r or w:
+            stages.append(stage.kind)
+            reads += r
+            reductions += w
+    if not stages:
+        return key, ''
+    key = fnv(b'approx1', key)
+    return key, 'x2w-gfx approx: key %016x stage %s lifted %d readfirstlane, %d reductions' % (
+        key, '+'.join(stages), reads, reductions)
+
+
+def publish_approx(base, marker):
+    if marker:
+        atomic_retry_text(base + '.approx.txt', marker + '\n')
 
 
 class Unsupported(Exception):
@@ -8896,6 +8950,7 @@ class Stage:
         self.firstlane_ps_full_exec = (self.entry_exec_sites(self.spill_cfg, pixel_full=True)
                                        if self.firstlane_ps_exec is not None else set())
         for _ in range(max(4, len(self.ins) + 2)):
+            self.approx_reads, self.approx_reductions = set(), set()
             self.odd_d16_events = {} if getattr(self, 'retry_odd_d16_paths', False) else None
             scc_effects = {}
             self.scc_data_reads = {}
@@ -17343,6 +17398,10 @@ class Stage:
                     self.set_s(dst[1], 'WaveActiveBitOr(value)', uniform=True)
                     self.emit('}')
                     return
+            if _APPROX_RETRY.get() and (self.kind not in ('ps', 'cs') or self.pipe.retry_firstlane):
+                self.set_s(dst[1], self.u(ops[1]), uniform=True)
+                self.approx_reads.add(self.pc)
+                return
             raise Unsupported(READFIRSTLANE_UNIFORM)
         if past_entry and not direct:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
@@ -20075,7 +20134,9 @@ class Stage:
             if pc not in self.masked_reduction_sites:
                 raise Unsupported(WAVE_REDUCTION_MASKED)
         elif retry_wave and pc not in self.reduction_entry_exec:
-            raise Unsupported(WAVE_REDUCTION_ENTRY)
+            if not (self.retry_paired_exec and _APPROX_RETRY.get()):
+                raise Unsupported(WAVE_REDUCTION_ENTRY)
+            self.approx_reductions.add(pc)
         if not getattr(self, 'wave_exec', False):
             branch_reason = self.wave_reduce_branch_reason(pc, end)
             if branch_reason:
@@ -20113,7 +20174,8 @@ class Stage:
             if k in (first + 7, first + 8) and later:
                 continue   # the v_cndmask_b32_sdwa keeps its handler; the max chain's saveexec starts that chain
             plan.setdefault(items[k][0], None)
-        plan[items[first + 6][0]] = lambda: self.lower_wave_reduction(op, vt, vp, ss, source)
+        approximate = pc in getattr(self, 'approx_reductions', ())
+        plan[items[first + 6][0]] = lambda: self.lower_wave_reduction(op, vt, vp, ss, source, approximate)
         claim = [False]
         if later:
             self.reduce_pending = {**pending, items[read][0]: claim}
@@ -20216,10 +20278,10 @@ class Stage:
                     pending.extend(bounds[b][0] for b in succ[block])
         return None
 
-    def lower_wave_reduction(self, op, vt, vp, ss, source):
+    def lower_wave_reduction(self, op, vt, vp, ss, source, approximate=False):
         operand = self.u(source)
-        if (getattr(self, 'retry_paired_exec', False)
-                or not self.exec_known and not getattr(self, 'retry_wave_reduction', False)):
+        if not approximate and (getattr(self, 'retry_paired_exec', False)
+                                or not self.exec_known and not getattr(self, 'retry_wave_reduction', False)):
             # RDNA 2 ISA 3.3, SOP1 saveexec and 6.9 DPP16: the chain fills
             # disabled guest lanes with the identity before reducing. LLVM
             # Convergence And Uniformity: voted branches bring the wave together.
@@ -21274,6 +21336,8 @@ class Pipeline:
                 raise pixel_refusal
             return self._pixel_stage(code)
         except Unsupported as reason:
+            if _APPROX_RETRY.get():
+                raise
             self.__dict__.clear()
             self.__dict__.update(state)
             try:
@@ -21745,7 +21809,13 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Drop a store whose idx * stride + rec_off needs more than 32 bits. With idx = h * 65536 + l
+                # the high half of idx * stride is (h * stride + ((l * stride) >> 16)) >> 16, exact because
+                # stride <= 0x3fff (checked above); when it is zero the 32-bit product is the whole product.
+                # No integer division: one GPU vendor's Vulkan compiler rejects a pipeline that divides by a
+                # runtime value here.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
@@ -21964,7 +22034,9 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Same 32-bit overflow test as store_format_d16_x, without an integer division.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
@@ -22783,12 +22855,19 @@ def translate_compute(out_dir, key):
     with suppress(FileNotFoundError):
         os.remove(name + '.txt')  # the result is unpublished until validation and compilation finish
     try:
-        pipe = load_compute_request(out_dir, key)
-        hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
+        def lower():
+            pipe = load_compute_request(out_dir, key)
+            return pipe, pipe.hlsl_cs(), pipe.manifest()
+        pipe, hlsl, manifest = approximate_translation(lower)
     except Unsupported as reason:
         reason = fail_reason(reason)
         write_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
+    base = name
+    output_key, marker = approx_result(key, pipe)
+    name = os.path.join(out_dir, '%016x' % output_key)
+    if marker:
+        manifest += '# ' + marker + '\n'
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
     if os.environ.get('X2W_FXC') != '':
@@ -22797,7 +22876,7 @@ def translate_compute(out_dir, key):
         if compiler is None:
             message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model %s' % (
                 os.environ.get('X2W_DXC', '<unset>'), model)
-            write_failure(name + '.fail', message)
+            write_failure(base + '.fail', message)
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
@@ -22809,7 +22888,7 @@ def translate_compute(out_dir, key):
                 # DXC names the source path; keep only the diagnostic after it.
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                 detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
-                write_failure(name + '.fail', 'dxc cs: %s' % detail[:500])
+                write_failure(base + '.fail', 'dxc cs: %s' % detail[:500])
                 return 'dxc cs failed: %s' % detail[:500]
             os.replace(bytecode, name + '.cs.cso')
     temporary = '%s.txt.%d.tmp' % (name, os.getpid())
@@ -22818,6 +22897,7 @@ def translate_compute(out_dir, key):
     os.replace(temporary, name + '.txt')
     with suppress(FileNotFoundError):
         os.remove(name + '.fail')
+    publish_approx(base, marker)
     return 'ok'
 
 
@@ -22934,15 +23014,22 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     name = os.path.join(out_dir, '%016x' % key)
     discard_stale_placeholder(name + '.txt')
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
-                        ps_hw_inputs=ps_hw_inputs)
-        vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
+        def lower():
+            pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch,
+                            ps_attr_map=ps_attr_map, ps_hw_inputs=ps_hw_inputs)
+            return pipe, pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
+        pipe, vs, ps, manifest = approximate_translation(lower)
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
         reason = fail_reason(reason)
         write_graphics_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
+    base = name
+    output_key, marker = approx_result(key, pipe)
+    name = os.path.join(out_dir, '%016x' % output_key)
+    if marker:
+        manifest += '# ' + marker + '\n'
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
@@ -22955,7 +23042,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         compile_enabled = bool(fxc)
     if fxc is None:
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
-        write_graphics_failure(name + '.fail', message)
+        write_graphics_failure(base + '.fail', message)
         return message
     manifest_path = name + '.txt'
     write_manifest = True
@@ -22966,7 +23053,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         if compiler is None:
             feature = 'resource heap indexing needs shader model 6.6' if dynamic_heap else 'a DPP quad read needs shader model 6.0'
             message = 'dxc not found (X2W_DXC=%s): %s' % (os.environ.get('X2W_DXC', '<unset>'), feature)
-            write_graphics_failure(name + '.fail', message)
+            write_graphics_failure(base + '.fail', message)
             return message
         model = '6_6' if dynamic_heap else '6_0'
         profiles = (('vs', 'vs_' + model), ('ps', 'ps_' + model))
@@ -22985,7 +23072,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
-                    write_graphics_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
+                    write_graphics_failure(base + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
                     return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
             with suppress(FileNotFoundError, UnicodeError):
                 with open(manifest_path) as existing:
@@ -23011,6 +23098,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     if not placeholder and (fxc or is_placeholder_failure(name + '.fail')):
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
+    publish_approx(base, marker)
     return 'ok'
 
 
@@ -23259,12 +23347,19 @@ def translate_mesh57(out_dir, key):
             if not placeholder_ps_enabled():
                 raise
             pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
-    pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
-    mesh_hlsl = pipe.hlsl_ms()
-    sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
-    if ps:
-        sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
-    manifest = pipe.manifest()
+    def lower():
+        pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
+        mesh_hlsl = pipe.hlsl_ms()
+        sources = [('ms', pipe.mesh_profile(), mesh_hlsl)]
+        if ps:
+            sources.append(('ps', 'ps_6_6' if pipe.uses_dynamic_heap else 'ps_6_0', pipe.hlsl_ps()))
+        return pipe, sources, pipe.manifest()
+    pipe, sources, manifest = approximate_translation(lower)
+    base = name
+    output_key, marker = approx_result(key, pipe)
+    name = os.path.join(out_dir, '%016x' % output_key)
+    if marker:
+        manifest += '# ' + marker + '\n'
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
     compile_enabled = os.environ.get('X2W_FXC') != ''
@@ -23295,6 +23390,7 @@ def translate_mesh57(out_dir, key):
     if not placeholder:
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
+    publish_approx(base, marker)
     return 'ok'
 
 
@@ -23302,6 +23398,9 @@ def translate_request(out_dir, key):
     """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
     global _REQUEST_KEY
     _REQUEST_KEY = key
+    if approx_enabled():
+        with suppress(FileNotFoundError):
+            os.remove(os.path.join(out_dir, '%016x.approx.txt' % key))
     if is_compute_request(out_dir, key):
         return translate_compute(out_dir, key)
     if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):
@@ -23321,8 +23420,9 @@ def translate_request(out_dir, key):
                 record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
         except Unsupported:
             # A result published earlier was translated from sources or masks this request no longer confirms.
-            with suppress(FileNotFoundError):
-                os.remove(os.path.join(out_dir, '%016x.txt' % key))
+            for suffix in ('.txt', '.approx.txt'):
+                with suppress(FileNotFoundError):
+                    os.remove(os.path.join(out_dir, '%016x%s' % (key, suffix)))
             raise
     except (Unsupported, OSError, UnicodeError) as reason:
         write_graphics_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
@@ -23824,6 +23924,8 @@ FAILURE_METADATA = re.compile(r'x2w-refusal-v1 ([0-9a-f]{64}) ([a-z0-9-]+)')
 
 def write_failure(path, reason, *, version=None, context=None):
     detail = reason + '\n' + (context + '\n' if context else '')
+    if approx_enabled() and reason.removesuffix(PLACEHOLDER_DRAWN) in APPROX_REFUSALS:
+        detail += APPROX_ATTEMPT + '\n'
     if not family_retry_enabled():
         with open(path, 'w') as handle:
             handle.write(detail)
@@ -24405,6 +24507,7 @@ def pending_keys(out_dir, skip_failed, since_translator=None, completed=None):
     nameset = set(names)
     failures = {name for name in names if name.endswith('.fail')}
     rgb = placeholder_rgb_text()
+    diagnostic = approx_enabled()
     for name in names:
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
         if not m:
@@ -24438,6 +24541,23 @@ def pending_keys(out_dir, skip_failed, since_translator=None, completed=None):
             lost = described is None and os.path.isfile(result + '.psdep')
         fail = os.path.join(out_dir, failure_name)
         placeholder = not compute and failure_name in failures and is_placeholder_failure(fail)
+        if diagnostic and (not os.path.isfile(manifest) or placeholder):
+            alias = result + '.approx.txt'
+            with suppress(OSError, UnicodeError):
+                marker = APPROX_MARKER.fullmatch(Path(alias).read_text(encoding='utf-8').strip())
+                derived = os.path.join(out_dir, marker[1]) if (
+                    marker and int(marker[1], 16) == fnv(b'approx1', key)) else None
+                if derived and not lost and os.path.getmtime(alias) >= max(
+                        os.path.getmtime(os.path.join(out_dir, name)), described or 0):
+                    derived_manifest = derived + ('.ms57.txt' if mesh else '.txt')
+                    if os.path.isfile(derived_manifest) and (manifest_only or all(
+                            ready_bytecode(derived + suffix) for suffix in stages)):
+                        continue
+            with suppress(OSError), open(fail, encoding='utf-8', errors='replace') as failure:
+                reason = failure.readline().rstrip().removesuffix(PLACEHOLDER_DRAWN)
+                if reason in APPROX_REFUSALS and APPROX_ATTEMPT not in failure.read().splitlines():
+                    keys.append(key)
+                    continue
         if placeholder and placeholder_manifest_rgb(manifest) != rgb:
             keys.append(key)
             continue

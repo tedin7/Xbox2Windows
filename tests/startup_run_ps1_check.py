@@ -7,6 +7,7 @@ is a stub, so no process is ever started under a debugger. On other hosts,
 without a PowerShell, or with --text-only, the launcher statements are checked
 as text. Mutated copies of the script must fail the same checks.
 """
+import io
 import json
 import os
 import re
@@ -14,7 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 RUN_PS1 = Path(__file__).resolve().parent.parent / "tools" / "startup" / "run.ps1"
@@ -183,7 +186,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     if real_log_error:
         for name in ("debug_launch.py", "launch.py", "host_cpu.py", "window_capture.py", "commit_headroom.py", "hook_window.py",
-                     "log_tail.py"):
+                     "log_tail.py", "stall_watchdog.py"):
             shutil.copyfile(RUN_PS1.parent / name, startup / name)
     else:
         (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit, emit_stderr=emit_stderr), encoding="utf-8")
@@ -515,9 +518,92 @@ def unwrap_problems():
             if (got := unwrap_first_line(printed, want)) != expected]
 
 
+@contextmanager
+def scratch_dir(*, attempts=40, delay=0.25, remove=shutil.rmtree):
+    path = tempfile.mkdtemp()
+    body_failed = False
+    try:
+        yield path
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        try:
+            for attempt in range(1, attempts + 1):
+                try:
+                    remove(path)
+                    break
+                except OSError as error:
+                    winerror = getattr(error, "winerror", None)
+                    if not isinstance(error, PermissionError) and winerror not in (32, 5):
+                        raise
+                    if attempt == attempts:
+                        raise
+                    print(f"startup run.ps1: temp dir busy ({winerror}) {path}, retry {attempt}/{attempts}")
+                    time.sleep(delay)
+        except BaseException:
+            if not body_failed:
+                raise
+
+
+def scratch_dir_problems(no_retry):
+    busy = PermissionError("synthetic sharing violation")
+    busy.winerror = 32
+    missing = FileNotFoundError("synthetic missing directory")
+    body_error = RuntimeError("synthetic body failure")
+    cases = [
+        ("transient lock", [busy] * 3, 40, None, None, 4),
+        ("persistent lock", [busy] * 3, 3, None, busy, 3),
+        ("other error", [missing], 3, None, missing, 1),
+        ("body failure", [busy] * 3, 3, body_error, body_error, 3),
+    ]
+    failures = []
+    for name, errors, attempts, body, expected_error, expected_calls in cases:
+        calls = []
+
+        def remove(path):
+            calls.append(path)
+            if len(calls) <= len(errors):
+                raise errors[len(calls) - 1]
+            shutil.rmtree(path)
+
+        output = io.StringIO()
+        caught = None
+        path = None
+        try:
+            with redirect_stdout(output), scratch_dir(
+                attempts=1 if no_retry else attempts, delay=0, remove=remove,
+            ) as path:
+                if body is not None:
+                    raise body
+        except Exception as error:
+            caught = error
+        finally:
+            if path is not None and Path(path).exists():
+                shutil.rmtree(path)
+        if caught is not expected_error:
+            failures.append(f"scratch_dir {name}: got {caught!r}, expected {expected_error!r}")
+        if len(calls) != expected_calls:
+            failures.append(f"scratch_dir {name}: removal calls {len(calls)}, expected {expected_calls}")
+        expected_logs = [
+            f"startup run.ps1: temp dir busy (32) {path}, retry {retry}/{attempts}"
+            for retry in range(1, expected_calls)
+        ]
+        if output.getvalue().splitlines() != expected_logs:
+            failures.append(f"scratch_dir {name}: unexpected retry output {output.getvalue()!r}")
+    return failures
+
+
 def main():
-    if sys.argv[1:] not in ([], ["--text-only"]):
-        sys.exit("usage: startup_run_ps1_check.py [--text-only]")
+    args = sys.argv[1:]
+    no_retry = args == ["--mutate", "no-cleanup-retry"]
+    if args not in ([], ["--text-only"]) and not no_retry:
+        sys.exit("usage: startup_run_ps1_check.py [--text-only | --mutate no-cleanup-retry]")
+    failures = scratch_dir_problems(no_retry)
+    if no_retry:
+        for item in failures:
+            print("FAIL", item)
+        return 1 if failures else 0
     script = RUN_PS1.read_bytes().decode("utf-8")
     shells = []
     if sys.argv[1:]:
@@ -529,8 +615,8 @@ def main():
         mode = "executed with " + ", ".join(Path(shell).stem.lower() for shell in shells)
         if not shells:
             mode = "text only: no PowerShell found"
-    failures = unwrap_problems()
-    with tempfile.TemporaryDirectory() as tmp:
+    failures += unwrap_problems()
+    with scratch_dir() as tmp:
         # Each shell works in its own scratch dirs, so PowerShell 5.1 and 7 run side by side.
         with ThreadPoolExecutor(max_workers=len(shells) or 1) as pool:
             jobs = [pool.submit(shell_failures, shell, script, tmp) for shell in shells or [None]]
