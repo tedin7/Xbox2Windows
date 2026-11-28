@@ -2479,7 +2479,6 @@ def publish_request(directory, publisher, adapter, mesh=MESH, heap=None):
 
 
 # The runtime refusal of a slot 57 draw whose data table sits at a non-zero slot of the indexed heap (known limit).
-TABLE_SLOT_REFUSAL = 'the table descriptor entry is not readable'
 
 
 def runtime_mismatch_report(actual, expected, correct, group_zero, clear, log):
@@ -2602,9 +2601,7 @@ def runtime(dxc, renderer, adapter, publisher):
             if actual != want:
                 raise AssertionError(f'formatted heap record {index}: image differs\n' +
                                      runtime_mismatch_report(actual, want, images[1], images[2], clear, log))
-        # KNOWN LIMIT: a data table at a non-zero slot of the indexed heap (here slot 3) is not resolved by the runtime
-        # yet; the draw is refused with this logged reason and nothing is drawn. When the runtime resolves it, this case
-        # must draw record 1 instead: replace the expectation, do not delete the case.
+        # A table at slot 3 must still draw the selected record from the indexed heap.
         pixels.unlink(missing_ok=True)
         log.unlink(missing_ok=True)
         result = subprocess.run([publisher, adapter, 'mesh'], capture_output=True, text=True,
@@ -2614,14 +2611,10 @@ def runtime(dxc, renderer, adapter, publisher):
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)
         actual = pixels.read_bytes()
-        logged = log.read_text(errors='replace') if log.exists() else ''
-        if actual == images[1]:
-            raise AssertionError('table at heap slot 3 now draws: the known limit is lifted, update this case')
-        if actual != clear or TABLE_SLOT_REFUSAL not in logged:
-            raise AssertionError('table at heap slot 3: expected the logged refusal "%s" and a clear image\n%s'
-                                 % (TABLE_SLOT_REFUSAL, runtime_mismatch_report(actual, clear, images[1], images[2],
-                                                                                clear, log)))
-        print('table at heap slot 3: refused as the known limit (%s)' % TABLE_SLOT_REFUSAL)
+        if actual != images[1]:
+            raise AssertionError('table at heap slot 3: image differs\n' +
+                                 runtime_mismatch_report(actual, images[1], images[1], images[2], clear, log))
+        print('table at heap slot 3: drew record 1')
     return 0
 
 

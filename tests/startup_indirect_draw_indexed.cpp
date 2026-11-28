@@ -1040,11 +1040,13 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const bool mesh57_heap = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
     ComPtr<ID3D12DescriptorHeap> indexed_heap;
     UINT64 indexed_cpu = 0, indexed_gpu = 0;
+    alignas(8) std::array<unsigned char, 4 * 32> indexed_backing{};
     if (mesh57_heap) {
         const struct {
             D3D12_DESCRIPTOR_HEAP_DESC desc;
             UINT64 backing, bytes;
-        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                    reinterpret_cast<UINT64>(indexed_backing.data()), indexed_backing.size()};
         using CreateHeap = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
         check(slot<CreateHeap>(guest, 14)(guest, &heap_desc, __uuidof(ID3D12DescriptorHeap),
             reinterpret_cast<void**>(indexed_heap.GetAddressOf())), "create mesh indexed heap");
