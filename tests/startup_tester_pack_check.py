@@ -953,17 +953,32 @@ def check_symbols():
         run.mkdir()
         make_run(run, 1)
         (tmp / "d3d12_xs.map").write_text(MSVC_MAP)
+        (tmp / "XCRDAPI.map").write_text(
+            " Preferred load address is 0000000180000000\n"
+            " 0001:00001200 heartbeat_worker 0000000180001200 f xcrdapi.obj\n"
+            " Static symbols\n"
+            " 0001:00001020 queue_worker     0000000180001020 f xcrdapi.obj\n"
+        )
         (tmp / "m.json").write_text(json.dumps(MANIFEST))
         out = subprocess.run([sys.executable, "-B", T.__file__, "pack", str(run),
-                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map")],
+                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map"),
+                              "--map-xcrdapi", str(tmp / "XCRDAPI.map")],
                              capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
         with zipfile.ZipFile(tmp / "r.zip") as z:
             assert z.read(T.SYMBOLS_NAME).decode() == "1000 DllMain\n1400 ?Draw@Queue@@QEAAXXZ\n2000 ?Present@Queue@@QEAAXXZ\n"
-            assert json.loads(z.read("manifest.json"))["symbols"] == 3
+            assert z.read(T.XCRDAPI_SYMBOLS_NAME).decode() == "1020 queue_worker\n1200 heartbeat_worker\n"
+            manifest = json.loads(z.read("manifest.json"))
+            assert manifest["symbols"] == 3
+            assert manifest["symbols_xcrdapi"] == 2
         T.pack(str(run), MANIFEST, str(tmp / "plain.zip"))
         with zipfile.ZipFile(tmp / "plain.zip") as z:
-            assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
+            assert T.SYMBOLS_NAME not in z.namelist()
+            assert T.XCRDAPI_SYMBOLS_NAME not in z.namelist()
+        T.pack(str(run), MANIFEST, str(tmp / "storage.zip"), map_xcrdapi=tmp / "XCRDAPI.map")
+        with zipfile.ZipFile(tmp / "storage.zip") as z:
+            assert T.SYMBOLS_NAME not in z.namelist()
+            assert T.XCRDAPI_SYMBOLS_NAME in z.namelist()
 
 
 def check_null_inputs():

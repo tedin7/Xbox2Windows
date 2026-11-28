@@ -439,6 +439,15 @@ if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -an
     ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
     $mapArgs = @("--map", $mapFile)
 }
+$d3d12Map = if ($mapArgs.Count) { $mapArgs[1] } else { "" }
+$xcrdapiMap = ""
+$dllFile = Join-Path $buildRoot "XCRDAPI.dll"
+$mapFile = Join-Path $buildRoot "XCRDAPI.map"
+if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -and
+    ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
+    $xcrdapiMap = $mapFile
+    $mapArgs += @("--map-xcrdapi", $mapFile)
+}
 # Janitor (tester_janitor.py), in a window of its own so that closing this console does not end it: if this script is stopped
 # (Ctrl-C) or its window is closed before the report is packed, it ends the run, ends the translator and packs the report from
 # this early manifest (interrupted = true). After a normal pack tester_run writes pack_done and it only sweeps leftovers.
@@ -451,7 +460,7 @@ try {
         lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; shader_cache = (Split-Path -Leaf $cache)
         translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
     }
-    $job = [ordered]@{ manifest = $early; zip = $zip; limit_mb = $LimitMB; cache = $cache; map = $(if ($mapArgs.Count) { $mapArgs[1] } else { "" }) }
+    $job = [ordered]@{ manifest = $early; zip = $zip; limit_mb = $LimitMB; cache = $cache; map = $d3d12Map; map_xcrdapi = $xcrdapiMap }
     [System.IO.File]::WriteAllText($janitorFile, ($job | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     $janitorArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'tester_janitor.py')`"", "`"$logDir`"", "--parent", "$PID", "--pack-json", "`"$janitorFile`"", "--cache", "`"$cache`"")
     Start-Process -FilePath $python -WindowStyle Hidden -ArgumentList $janitorArgs `

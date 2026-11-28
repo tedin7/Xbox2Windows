@@ -619,6 +619,7 @@ if(X2W_WITH_OPUS)
 endif()
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
+target_link_options(startup_stub_xcrdapi PRIVATE "/MAP:$<TARGET_FILE_DIR:startup_stub_xcrdapi>/XCRDAPI.map")
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_build_rev)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
@@ -1081,6 +1082,23 @@ add_test(NAME startup_xcrdapi_lifetime_naive_control
          COMMAND startup_xcrdapi_lifetime "$<TARGET_FILE:startup_stub_xcrdapi>" control)
 set_tests_properties(startup_xcrdapi_lifetime startup_xcrdapi_lifetime_naive_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_xcrdapi_lifetime_naive_control PROPERTIES WILL_FAIL TRUE)
+if(EXISTS "${INTAKE_PYTHON}")
+    add_library(startup_stub_xcrdapi_test_controls SHARED
+        src/startup_stubs/xcrdapi.cpp src/startup_stubs/xcrdapi.def)
+    set_target_properties(startup_stub_xcrdapi_test_controls PROPERTIES OUTPUT_NAME XCRDAPI
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/xcrdapi_test_controls"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/xcrdapi_test_controls"
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(startup_stub_xcrdapi_test_controls PRIVATE src)
+    target_compile_features(startup_stub_xcrdapi_test_controls PRIVATE cxx_std_17)
+    target_compile_definitions(startup_stub_xcrdapi_test_controls PRIVATE X2W_XCRDAPI_TEST_CONTROLS)
+    target_link_libraries(startup_stub_xcrdapi_test_controls PRIVATE psapi)
+    add_dependencies(startup_xcrdapi_lifetime startup_stub_xcrdapi_test_controls)
+    add_test(NAME startup_xcrdapi_worker_exception COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xcrdapi_worker_exception_check.py"
+        "$<TARGET_FILE:startup_xcrdapi_lifetime>" "$<TARGET_FILE:startup_stub_xcrdapi_test_controls>")
+    set_tests_properties(startup_xcrdapi_worker_exception PROPERTIES TIMEOUT 90)
+endif()
 
 # Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
 # symbols. Interleaving with a 7-byte cycle budget is the negative control.
@@ -1924,6 +1942,16 @@ set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_co
 add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_list_queries PRIVATE cxx_std_17)
 target_link_libraries(startup_list_queries PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+add_executable(startup_dred_op_name_check tests/startup_dred_op_name_check.cpp)
+target_compile_features(startup_dred_op_name_check PRIVATE cxx_std_17)
+target_include_directories(startup_dred_op_name_check PRIVATE src)
+target_link_libraries(startup_dred_op_name_check PRIVATE d3d12)
+add_test(NAME startup_dred_op_name COMMAND startup_dred_op_name_check)
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME startup_dred_switch_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_dred_switch_check.py" "$<TARGET_FILE:startup_list_queries>")
+    set_tests_properties(startup_dred_switch_warp PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+endif()
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_queries_${backend} COMMAND startup_list_queries ${backend})
     set_tests_properties(startup_list_queries_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)

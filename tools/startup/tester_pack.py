@@ -7,7 +7,7 @@
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
   tester_pack.py seed-cache <cache root> <new cache> [--jobs N]  copy the old caches' requests under the new keys (pre-translation backlog)
   tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
-  tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR]   write the zip, print its path and size
+  tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR] [--map FILE] [--map-xcrdapi FILE]
 
 The zip holds every file the run wrote in its log folder (stdout, stderr, events, finished, threads, files, trap.log,
 translate, translate_err, window*.png, bink_luma.png ...), the debugger summary (`<logdir>.out`) and manifest.json.
@@ -22,7 +22,8 @@ refused at runtime (compute and mesh57) from stderr.txt, at most 4 MB in all, li
 `null-inputs.txt` includes render-target windows, starved targets, and the most frequent target for each refused
 graphics pipeline when present in the log.
 `d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
-d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
+d3d12_xs.dll+0xNNNN reads as a name. With --map-xcrdapi, `XCRDAPI.symbols.txt` holds the same table for XCRDAPI.dll.
+Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
 """
 import argparse
@@ -699,6 +700,7 @@ def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
 
 
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
+XCRDAPI_SYMBOLS_NAME = "XCRDAPI.symbols.txt"
 MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
 MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
 NM_SYMBOL = re.compile(r"^([0-9a-fA-F]{8,16})\s+[TtWw]\s+(\S+)\s*$")
@@ -985,7 +987,8 @@ def part_note(index, count, groups, sizes_hint=None):
     return "\n".join(lines) + "\n"
 
 
-def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
+def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES,
+         cache_dir=None, map_file=None, map_xcrdapi=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
     manifest = validate_manifest(dict(manifest_in))
@@ -1019,11 +1022,14 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         dispatches = refused_dispatch_keys(stderr_text)
         uses = key_use(logdir)
         add(RESULTS_NAME, format_results(rows, uses, loaded_approximations(logdir), dispatches).encode("utf-8"))
-    if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
-        with open(map_file, encoding="utf-8", errors="replace") as handle:
+    for linker_map, member, count_key in ((map_file, SYMBOLS_NAME, "symbols"),
+                                          (map_xcrdapi, XCRDAPI_SYMBOLS_NAME, "symbols_xcrdapi")):
+        if not linker_map:
+            continue
+        with open(linker_map, encoding="utf-8", errors="replace") as handle:
             symbol_rows = parse_symbols(handle.read())
-        manifest["symbols"] = len(symbol_rows)
-        add(SYMBOLS_NAME, format_symbols(symbol_rows).encode("utf-8"))
+        manifest[count_key] = len(symbol_rows)
+        add(member, format_symbols(symbol_rows).encode("utf-8"))
     if cache_dir:  # the request files of the worst refused keys (select_requests)
         chosen = select_requests(cache_dir, rows, key_weights(stderr_text, dispatches), uses=uses)
         for key, kind, weight, files_of_key, _missing in chosen:
@@ -1208,6 +1214,7 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    q.add_argument("--map-xcrdapi", default=None, help="linker map of our XCRDAPI.dll: add XCRDAPI.symbols.txt")
     rs = sub.add_parser("record-spec")
     rs.add_argument("spec")
     sub.add_parser("record-defaults")
@@ -1279,7 +1286,8 @@ def main(argv):
         return 0
     with open(args.manifest, encoding="utf-8-sig") as handle:
         manifest_in = json.load(handle)
-    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache, map_file=args.map):
+    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024),
+                           cache_dir=args.cache, map_file=args.map, map_xcrdapi=args.map_xcrdapi):
         print("%s %d" % (path, size))
     return 0
 
