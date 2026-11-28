@@ -39,6 +39,7 @@ WQM_MASK = '060afebe'                # s_wqm_b64 exec, s[6:7]
 READ_Y = 'fa040806' '024e00ff'       # v_add_f32_dpp v4, v2, v2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
 EXPORT_ONLY = '0f1800f8' '04040404'  # exp mrt0 v4, v4, v4, v4 done vm
 END = '000081bf'                     # s_endpgm
+AND_VCC_EXEC = '7e6afe87'            # s_and_b64 exec, exec, vcc
 WIDEN = 'exec = x2w_quad_any(s6) ? 1u : 0u;'
 WIDTH = HEIGHT = W.WIDTH
 
@@ -53,6 +54,37 @@ def code(inside='', before=''):
     window = W.program(EXACT, W.WINDOW_WRITE, W.RESTORE)
     return W.program(SAVE_EXACT, WQM, EVEN_X, before, ANDN2_VCC, WQM_MASK, inside, W.SAVE_WHOLE, window.hex(),
                      POSITION, READ_Y, EXACT, EXPORT_ONLY, END)
+
+
+def proofs(program):
+    """The verdicts wqm_widen_site_proof gives while translating `program`."""
+    stage = next(m.Stage for m in sys.modules.values() if hasattr(getattr(m, 'Stage', None), 'wqm_widen_site_proof'))
+    original, seen = stage.wqm_widen_site_proof, []
+
+    def record(self, off):
+        seen.append(original(self, off))
+        return seen[-1]
+    stage.wqm_widen_site_proof = record
+    try:
+        translate(program)
+    finally:
+        stage.wqm_widen_site_proof = original
+    return seen
+
+
+def narrow_effect():
+    """s_and_b64 exec, exec, vcc keeps the helper lanes of the even pixels that the widening added: the scan of the
+    widened region goes through that narrowing and sees the export behind it (it must not stop at the EXEC write)."""
+    def body(*mid):
+        window = W.program(EXACT, W.WINDOW_WRITE, W.RESTORE)
+        return W.program(SAVE_EXACT, WQM, EVEN_X, ANDN2_VCC, WQM_MASK, W.SAVE_WHOLE, *mid, W.SAVE_WHOLE, window.hex(),
+                         POSITION, READ_Y, EXACT, EXPORT_ONLY, END)
+    check('a narrowing of the widened EXEC with no effect behind it keeps the widening',
+          proofs(body(AND_VCC_EXEC, W.RESTORE)) == [True])
+    check('an export behind a narrowing of the widened EXEC refuses the widening',
+          proofs(body(AND_VCC_EXEC, EXPORT_ONLY, W.RESTORE)) == [False])
+    check('an export after the exact mask is restored keeps the widening',
+          proofs(body(EXACT, EXPORT_ONLY, W.RESTORE)) == [True])
 
 
 def live(x, y):
@@ -90,6 +122,8 @@ def controls():
     check('an export inside the widened region is refused', text is None, str(reason))
     text, _, reason = translate(code(before=W.UNIFORM_TEST + W.skip(W.EVEN_X)))
     check('the widening behind a branch is refused', text is None, str(reason))
+    narrow_effect()
+
 
 
 def check_draw(dxc, renderer, adapter):

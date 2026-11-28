@@ -6495,16 +6495,25 @@ class Stage:
         block = next((b for b, (lo, hi) in enumerate(bounds) if lo <= index < hi), None)
         if block is None:
             return False
-        pending, seen = [(block, index + 1)], {block}
+        # An EXEC write ends the widened region only when it restores the mask the widening read (s_mov exec, sN with
+        # the register still holding it: a subset of the guest's entry EXEC). A narrowing of the widened EXEC
+        # (s_and exec, exec, mask; a saveexec; a v_cmpx; a restore of a copy of the widened EXEC) can keep the lanes the
+        # widening added, so the scan goes on through it.
+        pending, seen = [(block, index + 1, False)], {(block, False)}
         while pending:
-            block, start = pending.pop()
+            block, start, changed = pending.pop()
             lo, hi = bounds[block]
             stopped = False
             for i in range(max(lo, start), hi):
                 _o, _n, iname, iasm = self.ins[i]
-                if writes_exec(iname, parse(iasm)[1]):
-                    stopped = True
-                    break
+                iops = parse(iasm)[1]
+                if writes_exec(iname, iops):
+                    if (not changed and iname == 's_mov_b64' and len(iops) == 2 and reg_range(iops[1]) == reg):
+                        stopped = True
+                        break
+                elif iops and (dest := reg_range(iops[0])) and dest[0] == 's' and not (
+                        dest[2] < reg[1] or reg[2] < dest[1]):
+                    changed = True
                 if iname.startswith(self.WIDENED_EFFECT_PREFIXES) or 'atomic' in iname or iname.startswith('s_swappc'):
                     return False
             if not stopped:
@@ -6514,9 +6523,9 @@ class Stage:
                 for target in succ[block]:
                     if skipped is not None and target != block + 1 and self.ins[bounds[target][0]][0] == skipped:
                         continue
-                    if target not in seen:
-                        seen.add(target)
-                        pending.append((target, 0))
+                    if (target, changed) not in seen:
+                        seen.add((target, changed))
+                        pending.append((target, 0, changed))
         return True
 
     def helper_exec_copies(self):
