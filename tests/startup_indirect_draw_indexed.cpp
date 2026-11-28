@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1060,6 +1061,41 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
         slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
     }
+    const bool mesh57_heap = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
+    ComPtr<ID3D12DescriptorHeap> indexed_heap;
+    UINT64 indexed_cpu = 0, indexed_gpu = 0;
+    if (mesh57_heap) {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 backing, bytes;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        using CreateHeap = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+        check(slot<CreateHeap>(guest, 14)(guest, &heap_desc, __uuidof(ID3D12DescriptorHeap),
+            reinterpret_cast<void**>(indexed_heap.GetAddressOf())), "create mesh indexed heap");
+        using Handle = UINT64 (WINAPI*)(IUnknown*, void*);
+        indexed_cpu = slot<Handle>(indexed_heap.Get(), 9)(indexed_heap.Get(), nullptr);
+        indexed_gpu = slot<Handle>(indexed_heap.Get(), 10)(indexed_heap.Get(), nullptr);
+        if (!indexed_cpu || !indexed_gpu) return false;
+        std::memset(reinterpret_cast<void*>(indexed_cpu), 0, 4 * 32);
+        wchar_t path[MAX_PATH]{};
+        if (!GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", path, MAX_PATH)) return false;
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        std::vector<char> data(std::istreambuf_iterator<char>(file), {});
+        if (data.size() != 1024) return false;
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        void* allocation = slot<Allocate>(wrapped, 148)(wrapped, data.size(), 16);
+        if (!allocation) return false;
+        std::memcpy(allocation, data.data(), data.size());
+        for (UINT i = 0; i < 2; ++i) {
+            const UINT64 address = reinterpret_cast<UINT64>(allocation) + i * 512;
+            const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
+                static_cast<std::uint32_t>(address >> 32) | (16u << 16), 32, 0x4dfac};
+            std::memcpy(reinterpret_cast<void*>(indexed_cpu + (i + 1) * 32), view.data(), sizeof(view));
+        }
+        using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+        ID3D12DescriptorHeap* heaps[]{indexed_heap.Get()};
+        slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+    }
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
     if (leased) {
@@ -1087,12 +1123,31 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT64 address = reinterpret_cast<UINT64>(allocation);
         const std::array<std::uint32_t, 4> view{static_cast<std::uint32_t>(address),
             static_cast<std::uint32_t>(address >> 32) | (4u << 16), static_cast<UINT>(data.size() / 4), 0};
-        std::memcpy(reinterpret_cast<void*>(mesh_table->cpu), view.data(), sizeof(view));
+        // X2W_TEST_MESH57_TABLE_SLOT: the indexed-heap slot (0 or 3) that holds the data table view; slot 3 replaces the
+        // empty record. A title may place a table at any slot of the heap it indexes.
+        UINT table_slot = 0;
+        if (mesh57_heap) {
+            char slot_text[8]{};
+            if (GetEnvironmentVariableA("X2W_TEST_MESH57_TABLE_SLOT", slot_text, sizeof(slot_text)))
+                table_slot = static_cast<UINT>(std::strtoul(slot_text, nullptr, 10));
+            if (table_slot != 0 && table_slot != 3) return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(mesh57_heap ? indexed_cpu + table_slot * 32 : mesh_table->cpu), view.data(),
+                    sizeof(view));
         using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
         using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
         ID3D12DescriptorHeap* heaps[]{mesh_table->heap.Get()};
-        slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
-        slot<Table>(wrapped, 36)(wrapped, 1, mesh_table->gpu);
+        if (!mesh57_heap) slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+        slot<Table>(wrapped, 36)(wrapped, 1, mesh57_heap ? indexed_gpu + table_slot * 32 : mesh_table->gpu);
+        if (mesh57_heap) {
+            char selected[8]{};
+            if (!GetEnvironmentVariableA("X2W_TEST_MESH57_HEAP_INDEX", selected, sizeof(selected))) return false;
+            const UINT index = static_cast<UINT>(std::strtoul(selected, nullptr, 10));
+            if (index > 3) return false;  // 0 = the data table view, 1-2 = typed records, 3 = an empty record
+            using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+            const UINT values[]{0, index};
+            slot<Constants>(wrapped, 40)(wrapped, 2, 2, values, 0);
+        }
         if (!GetEnvironmentVariableA("X2W_TEST_MESH57_NO_CONSTANTS", nullptr, 0)) {
             using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
             const UINT values[]{2, 12};
@@ -3196,12 +3251,16 @@ int main(int argc, char** argv) try
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
         const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER params[2]{};
+        D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {1, &srv};
-        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const bool heap_fixture = GetEnvironmentVariableW(L"X2W_TEST_MESH57_HEAP", nullptr, 0) != 0;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[2].Constants = {1, 0, 2};
+        const D3D12_ROOT_SIGNATURE_DESC source_root{heap_fixture ? 3u : 2u, params, 0, nullptr,
+            static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(heap_fixture ? 0x400 : 0)};
         const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
         const auto root = create_root(guest.Get(), desc, &root_blob);

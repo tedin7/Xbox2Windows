@@ -270,6 +270,10 @@ struct alignas(16) WrapperOwn {
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    SRWLOCK mesh57_key_lock;           // PipelineState: guards the following slot 57 cache fields
+    const std::vector<RootParameter>* mesh57_key_root;
+    u64 mesh57_key;
+    bool mesh57_key_valid, mesh57_key_pixel;
     ComputeManifest* compute_manifest; // PipelineState: shared manifest state for its request key
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
@@ -4898,7 +4902,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (translated_mesh && (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
         pass.requested_mesh_pipeline = pass.pipeline;
         pass.requested_mesh_root = pass.root;
-        request_slot57_mesh(pass.pipeline, pass.root);
+        pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root);
     }
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
