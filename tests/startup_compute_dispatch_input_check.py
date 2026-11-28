@@ -212,7 +212,7 @@ void main() {
             assert not refused and len(lines(log, 'Dispatch(1, 1, 1) translated')) == 1, log.stderr[-3000:]
         return readback
 
-    run(enabled=False, refusal='an output is a view token, not a buffer descriptor')
+    run(enabled=False, refusal='an output buffer descriptor is a view token')
     run('-wrong-kind', refusal='an output shader resource view token cannot supply unordered access')
     rgba = (17, 93, 201, 45)
     value = [rgba[0] + 257 * rgba[1], rgba[2] + 257 * rgba[3]]
