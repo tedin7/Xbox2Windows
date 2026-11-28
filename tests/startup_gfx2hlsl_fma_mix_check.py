@@ -281,6 +281,33 @@ expect_refused('unverified high half of inline constant',
                'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]')
 
 
+def compile_dispatcher_shape(fxc):
+    """FXC 10.0 ps_5_1 failed with 'internal error: invalid access of unbound variable' on the nested helper form
+    f16rn(mix32(...)) inside the translator's [loop] pc dispatcher, in a guarded block followed by discard: the
+    smallest shape found by reducing two real pixel shaders. The binary16 mix line the translator emits for a -0.0
+    addend is placed in that shape and must compile."""
+    line = next(l for l in translated if '(-0.0)' in l and '0xffff0000u' in l)
+    regs = sorted({int(n) for n in re.findall(r'\bv(\d+)\b', line)})
+    destination = int(re.search(r'\bv(\d+) = ', line).group(1))
+    body = ['#define F asfloat', '#define U asuint', G.MIX32, G.F16RN,
+            'struct PSOut { float4 mrt0 : SV_Target0; };',
+            'PSOut main(nointerpolation uint4 p : TEXCOORD0) {', '    PSOut o = (PSOut)0;',
+            '    uint %s; uint exec = 1; uint pc = 0;' % ', '.join('v%d = 0' % r for r in regs),
+            '    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {']
+    body += ['    %sif (pc == %d) {\n    }' % ('else ' if k else '', k) for k in range(10)]
+    body += ['    else if (pc == 10) {', '        if (exec & 1) ' + line, '        if (!(exec & 1)) discard;',
+             '        pc = 0xffffu;', '    }', '    }',
+             '    o.mrt0 = float4(f16tof32(v%d), f16tof32(v%d >> 16), 0, 1);' % (destination, destination),
+             '    return o;', '}']
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'fma_mix_dispatcher.hlsl')
+        with open(src, 'w') as fh:
+            fh.write('\n'.join(body) + '\n')
+        run = subprocess.run([fxc, '/nologo', '/T', 'ps_5_1', '/E', 'main', '/Fo', os.path.join(d, 'shape.cso'), src],
+                             capture_output=True, text=True)
+    return run.returncode, (run.stdout + run.stderr).strip()
+
+
 def compile_translated(fxc):
     """Compile every translated line in one ps_5_1 entry point; returns FXC's exit status and output."""
     regs = sorted({int(n) for line in translated for n in re.findall(r'\bv(\d+)\b', line)})
@@ -596,6 +623,8 @@ loop_vs, loop_ps, loop_expected = loop_shaders()
 if len(sys.argv) == 3 and sys.argv[1] == 'fxc':
     status, output = compile_translated(sys.argv[2])
     check(f'fxc ps_5_1 compiles all {len(translated)} translated lines', status == 0, output)
+    status, output = compile_dispatcher_shape(sys.argv[2])
+    check('fxc ps_5_1 compiles a binary16 mix in a guarded dispatcher block before discard', status == 0, output)
     from startup_flat_param_check import compile_hlsl
 
     with tempfile.TemporaryDirectory() as tmp:
