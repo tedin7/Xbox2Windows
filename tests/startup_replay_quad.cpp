@@ -273,18 +273,18 @@ int create_scene(void* device, Scene& s)
                                            arg(&s.list)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&s.fence)))))
         return 23;
-    // A list built and closed before the recorder's window, submitted again every frame: a green corner over the frame.
+    // A list built and closed before the recorder's window, submitted again every frame: a magenta corner over the frame.
     char static_list[2]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_LIST", static_list, sizeof(static_list)) == 1 && static_list[0] == '1') {
         void* allocator = nullptr;
-        const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+        const float magenta[] = {1.0f, 0.0f, 1.0f, 1.0f};
         const D3D12_RECT corner{0, 0, 12, 10};
         if (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
                                                arg(&allocator)))) ||
             FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(allocator), 0,
                                                arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&s.static_list)))))
             return 23;
-        invoke(s.static_list, 52, s.rtv, arg(green), 1, arg(&corner));
+        invoke(s.static_list, 52, s.rtv, arg(magenta), 1, arg(&corner));
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
     }
     return 0;
