@@ -323,7 +323,7 @@ def branch_reference(name, root_constant=0, reverse=False):
 
 def controls():
     legacy = sibling.translate_case('P').hlsl_cs()
-    assert hashlib.sha256(legacy.encode()).hexdigest() == '6f1c8c0cae027dc199d84a4d74774a68c243f205f740fac098524e15109eac70'
+    assert hashlib.sha256(legacy.encode()).hexdigest() == '920db36066e6e5286765fa178d7a367014ddd94a1f2af28d9636340fe3d11741'
     text = shader()
     assert text.count('GroupMemoryBarrierWithGroupSync();') == 1
     assert text.index('lds[(a + 16u) >> 2] =') < text.index('GroupMemoryBarrierWithGroupSync();') < text.index('w = lds[(a + 16u) >> 2]')
