@@ -282,7 +282,11 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             return token in MASK_WORDS | {'exec', 'vcc', 'm0'} or super().uniform_source(token)
 
         def translate(self):
-            self.real = self.ins
+            # The stage retries translate() after a refusal it can repair; self.ins then already holds the pseudo
+            # program of the previous attempt, so the guest instructions are kept from the first call.
+            if getattr(self, 'serial_guest', None) is None:
+                self.serial_guest = self.ins
+            self.real = self.serial_guest
             self.cfg = ControlFlow(G, self.real)
             self.before = self.cfg.definedness(self.defined_entry)
             pseudo = []
