@@ -2190,7 +2190,8 @@ rescans the ranges from the smallest (descriptor rings, constants) within `X2W_R
 the rest. The base image counts toward the window's cap, not the prefix's.
 
 In render mode, the recorder captures desktop resource contents by default when the recording window opens,
-after the base image. Set `X2W_REPLAY_GPU_STATE=0` to disable capture. The recorder waits for the stand-in queues
+after the base image. The recorder moves both boundaries of a timed window forward by the GPU snapshot duration.
+Set `X2W_REPLAY_GPU_STATE=0` to disable capture. The recorder waits for the stand-in queues
 to finish, then reads back eligible live resources in increasing footprint size. Candidates include resources
 with render-target, depth-stencil or unordered-access flags, and buffers and textures on desktop DEFAULT heaps
 with no title memory.

@@ -155,6 +155,14 @@ void update_window(bool open)
     window_open = open;
     if (window_open) {
         if (!window_base_set) {
+            if (!slow_mode && !draw_mode) {
+                if (end_s < 1e300)
+                    log("x2w-replay record: window open at %.3f s, present %ld, ends at %.3f s",
+                        seconds_now(), presents, end_s);
+                else if (last_present != 0x7fffffff)
+                    log("x2w-replay record: window open at %.3f s, present %ld, ends after present %ld",
+                        seconds_now(), presents, last_present - 1);
+            }
             window_base_bytes = prefix_open ? bytes_written - base_prefix_bytes : 0;
             window_base_set = true;
         }
@@ -1032,7 +1040,19 @@ void present()
     // Serialize the boundary and the readback with the render submission path.
     if (gpu_lock) draw_lock_acquire_exclusive();
     const bool gpu_snapshot = gpu_lock && !window_open;
-    const u64 gpu_seq = gpu_snapshot ? gpu_state_at_window_open(b) : 0;
+    u64 gpu_seq = 0;
+    if (gpu_snapshot) {
+        const double before = seconds_now();
+        gpu_seq = gpu_state_at_window_open(b);
+        const double took = seconds_now() - before;
+        if (end_s < 1e300) {
+            const double was = end_s;
+            start_s += took;
+            end_s += took;
+            log("x2w-replay record: the GPU state took %.3f s: the window now ends at %.6f s (was %.6f s)",
+                took, end_s, was);
+        }
+    }
     if (!base_pending && !gpu_snapshot) update_window(open);
     if (window_open || (present == first_present && !base_warming)) {
         const u64 seq = gpu_seq ? gpu_seq : static_cast<u64>(InterlockedIncrement64(&next_seq));
