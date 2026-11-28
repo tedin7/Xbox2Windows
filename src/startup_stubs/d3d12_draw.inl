@@ -2737,6 +2737,7 @@ bool upload_staging_fault()
     }();
     return remaining > 0 && InterlockedDecrement(&remaining) >= 0;
 }
+bool placed_1d_texture_enabled();  // d3d12_memory_srv.inl
 bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
