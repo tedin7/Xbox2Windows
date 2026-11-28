@@ -1241,7 +1241,6 @@ class TestRdna2Disasm(unittest.TestCase):
         # VOPC DPP16, DPP8 and DPP8 FI extension dwords are consumed with the instruction, so the
         # following s_endpgm stays at offset 8 (the operands are not decoded).
         for raw_hex, opcode, form in (
-            ("fa02087c00010000", "vopc_dpp16", "DPP16"),
             ("e902087c00010000", "vopc_dpp8", "DPP8"),
             ("ea02087c00010000", "vopc_dpp8", "DPP8"),
         ):
@@ -1251,6 +1250,17 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(insns[0]["length"], 8, raw_hex)
             self.assertEqual(insns[0]["assembly"], f"v_cmp_gt_f32_dpp <unsupported {form}>", raw_hex)
         self.assertEqual(disasm_rdna2(bytes.fromhex("fa02087c"))[0]["opcode"], "vopc_truncated")
+
+        # VOPC DPP16 is decoded: the compare reads src0 through the lane exchange, src1 is the own lane.
+        # w0: v_cmp_gt_f32 (op 4) v4 vs src1 v4; w1: src0 v4, quad_perm [1,0,3,2], bound_ctrl, fi, all masks, src1 neg.
+        raw = struct.pack("<2I", 0x7c000000 | 4 << 17 | 4 << 9 | 250, 4 | 0xb1 << 8 | 1 << 18 | 1 << 19 | 1 << 22 | 0xff << 24)
+        insns = disasm_rdna2(raw + bytes.fromhex("000081bf"))
+        self.assertEqual([i["opcode"] for i in insns], ["v_cmp_gt_f32_dpp", "s_endpgm"])
+        self.assertEqual(insns[0]["length"], 8)
+        self.assertEqual(insns[0]["assembly"], "v_cmp_gt_f32_dpp vcc_lo, v4, -v4 quad_perm:[1,0,3,2] "
+                         "row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1")
+        raw = struct.pack("<2I", 0x7c000000 | 0x04 << 17 | 4 << 9 | 250, 4 | 0x100 << 8)
+        self.assertIn("<unsupported DPP16>", disasm_rdna2(raw)[0]["assembly"])  # 0x100 is no GFX10 DPP control
 
         # Truncated VOPC literal
         w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255

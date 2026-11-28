@@ -7,6 +7,8 @@
                                        draw the EXEC coverage and explicit-LOD sample fixtures and their mutants
   draw_helper_taint <dxc> <offscreen_check> <warp>
                                        compare a partial-coverage triangle and its mutants against a CPU reference
+  draw_dpp <dxc> <offscreen_check> <warp|hardware>
+                                       draw f16 interpolants next to DPP quad exchanges (VOPC DPP16 included) vs a CPU reference
   draw_flow <dxc> <offscreen_check> <warp|hardware>
                                        draw the varying, branching pair and mixed-FMA fixture and its mutants
   draw <dxc> <offscreen_check> <warp|hardware>
@@ -379,6 +381,7 @@ def controls():
     barycentric_controls(expected)
     flow_controls()
     extended_flow_controls()
+    dpp_controls()
     half_source_controls()
     monotone_exec_controls()
     cfg_exec_and_memory_controls()
@@ -1599,6 +1602,78 @@ def check_helper_taint_draw(dxc, renderer, adapter):
                 print(name, diagnostic, flush=True)
 
 
+def dpp_ctrl(perm):
+    return perm[0] | perm[1] << 2 | perm[2] << 4 | perm[3] << 6
+
+
+def dpp_tail(src0, perm, *, neg1=False):
+    # bound_ctrl, fi, bank_mask and row_mask all set, as the compiler emits them
+    return src0 | dpp_ctrl(perm) << 8 | 1 << 18 | 1 << 19 | int(neg1) << 22 | 0xff << 24
+
+
+def dpp_fixture():
+    """f16 interpolation next to quad exchanges: the p1ll register is reused as a DPP destination and read by another
+    DPP, and a VOPC DPP16 compares the exchanged interpolant with the own one.
+    v4 = f32 of the interpolated binary16 (high half of attr0.x); v2 = v4 - v4[lane 0] (v_subrev_f32_dpp over the
+    register of the omitted p1ll); v5 = v2 of lane 1; v6 = 1.0 where the x-neighbour is greater, else 0."""
+    p1, p2 = interp_words(2, 3, 0, high=True)
+    cvt = words(0x7e000000 | 4 << 17 | 0x0b << 9 | 256 + 3)               # v_cvt_f32_f16 v4, v3
+    subrev = words(0x05 << 25 | 2 << 17 | 4 << 9 | 250, dpp_tail(4, (0, 0, 0, 0)))  # v_subrev_f32_dpp v2, v4, v4
+    mov_dpp = words(0x7e000000 | 5 << 17 | 1 << 9 | 250, dpp_tail(2, (1, 1, 1, 1)))  # v_mov_b32_dpp v5, v2
+    cmp_dpp = words(0x7c000000 | 0x04 << 17 | 4 << 9 | 250, dpp_tail(4, (1, 0, 3, 2)))  # v_cmp_gt_f32_dpp vcc, v4, v4
+    select = words(0x02000000 | 6 << 17 | 8 << 9 | 128)                    # v_cndmask_b32 v6, 0, v8, vcc
+    return (wqm() + p1 + p2 + cvt + mov(8, 0x3f800000) + subrev + mov_dpp + cmp_dpp + select
+            + export_words(4, 5, 6, 2) + END)
+
+
+def dpp_reference(width, height):
+    out = []
+    for _ in range(height):
+        for x in range(width):
+            value = f32_bits(1 + (x + 0.5) / width)
+            own = f32_bits(0.125) if x & 1 else 0
+            out.extend((value, f32_bits(0.125), f32_bits(1.0) if not x & 1 else 0, own))
+    return out
+
+
+def dpp_controls():
+    pipe = translate(dpp_fixture(), varying_vertex_words())
+    ps = pipe.hlsl_ps()
+    assert 'QuadReadAcrossX(v4)' in ps and 'F(v256) > F(v4)' in ps, ps
+    assert pipe.ps.needs_sm6
+
+
+def check_dpp_draw(dxc, renderer, adapter):
+    width, height = 8, 4
+    pipe = translate(dpp_fixture(), varying_vertex_words())
+    ps = pipe.hlsl_ps()
+    cases = {
+        'dpp': ps,
+        'wrong_half': ps.replace('f16rn(i.param0.y)', 'f16rn(i.param0.x)'),
+        'wrong_neighbour': ps.replace('QuadReadAcrossX(v4)', 'QuadReadAcrossY(v4)'),
+        'wrong_lane': ps.replace('QuadReadLaneAt(v4, 0u)', 'QuadReadLaneAt(v4, 1u)'),
+    }
+    assert all(mutant != ps for name, mutant in cases.items() if name != 'dpp'), 'mutants must change the text'
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        reference_path = directory / 'dpp.bin'
+        reference_path.write_bytes(words(*dpp_reference(width, height)))
+        vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), 'dpp_vs', 'vs_6_0', directory)
+        for name, source in cases.items():
+            pixel = compile_hlsl(dxc, 'dxc', source, name, 'ps_6_0', directory)
+            run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-words', vs, pixel,
+                                                           width, height, reference_path])
+            diagnostic = run.stdout + run.stderr
+            if run.returncode == 77 and name == 'dpp':
+                print(diagnostic, flush=True)
+                raise SystemExit(77)
+            if name == 'dpp':
+                assert run.returncode == 0 and 'all 32 pixels matched' in diagnostic, diagnostic
+            else:
+                assert run.returncode == 1 and 'pixel mismatch' in diagnostic, (name, diagnostic)
+            print(name, diagnostic, flush=True)
+
+
 def main():
     if len(sys.argv) == 1:
         controls()
@@ -1613,6 +1688,9 @@ def main():
         controls()
         check_draw(*args)
         check_flow_draw(*args)
+    elif mode == 'draw_dpp':
+        dpp_controls()
+        check_dpp_draw(*args)
     elif mode == 'draw_flow':
         check_flow_draw(*args)
     elif mode == 'draw_exec_halves':

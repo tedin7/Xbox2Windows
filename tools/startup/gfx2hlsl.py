@@ -118,6 +118,8 @@ DPP_COARSE = frozenset(((1, 0, 1, 0), (3, 2, 3, 2), (2, 2, 0, 0), (3, 3, 1, 1)))
 WHOLE_QUAD_DPP_OPS = frozenset(('v_add_f32_dpp', 'v_subrev_f32_dpp'))
 DPP_DERIVATIVE_OPS = frozenset(('v_mov_b32', 'v_sub_f32', 'v_subrev_f32'))
 DPP_SCRATCH = 256
+# 32-bit compares (not cmpx) that may read src0 through a quad swap.
+DPP_COMPARE = re.compile(r'v_cmp_(?:[lg][te]|eq|lg|neq|nlt|nle|ngt|nge|o|u|ne)_[fiu]32')
 
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
 # selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
@@ -4668,7 +4670,9 @@ def mesh_mask_scc_votes(ins, source, target, candidates, mask_ops):
     # Some scalar handlers write SCC even when scalar_effects only reports a
     # possible write. Keep those definitions as alternatives at the reader.
     preserves_scc = {'s_mov_b32', 's_mov_b64', 's_movk_i32', 's_cmovk_i32',
-                     's_cmov_b32', 's_cmov_b64', 's_cselect_b32', 's_cselect_b64'}
+                     's_cmov_b32', 's_cmov_b64', 's_cselect_b32', 's_cselect_b64',
+                   's_mul_i32', 's_mul_hi_u32', 's_mul_hi_i32', 's_bfm_b32', 's_bfm_b64', 's_pack_ll_b32_b16',
+                   's_pack_lh_b32_b16', 's_pack_hl_b32_b16', 's_pack_hh_b32_b16'}  # SOP2 forms that leave SCC unchanged
     possible = [may - must if name not in preserves_scc and name not in SCALAR_LOADS else set()
                 for (_, _, name, _), (_, must, may) in zip(ins, effects)]
     incoming = reaching_mask_words(successors, [writes for _, writes, _ in effects], possible, {'scc'})
@@ -12778,7 +12782,10 @@ class Stage:
         if not intrinsic and not indexed:
             raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
                               % (base, perm))
-        if base == 'v_mov_b32':
+        compare = DPP_COMPARE.fullmatch(base) is not None and intrinsic is not None and not row_ror8 and self.kind != 'cs'
+        if compare:
+            arity, text, kind = 2, '', 'c'
+        elif base == 'v_mov_b32':
             arity, text, kind = 1, '{0}', 'u'
         elif base in VEC_U:
             (arity, text), kind = self.vec_u_text(base), 'u'
@@ -12801,6 +12808,9 @@ class Stage:
                 if not re.fullmatch(r'v\d+', base_tok):
                     raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
                 src_neg_abs.append((neg, absolute, base_tok))
+        elif kind == 'c':
+            if len(ops) != 3 or ops[0] not in ('vcc', 'vcc_lo') or not re.fullmatch(r'v\d+', ops[1]):
+                raise Unsupported('%s_dpp needs a VCC result and a VGPR src0' % base)
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         compute = getattr(self, 'kind', None) == 'cs'
@@ -12823,6 +12833,8 @@ class Stage:
             self.note_quad_flow(base, allow_late_wqm=base in DPP_DERIVATIVE_OPS
                                 and intrinsic in ('QuadReadAcrossX', 'QuadReadAcrossY'))
             self.needs_sm6 = True
+        if kind == 'c':
+            return self.dpp_compare(base, ops, intrinsic)
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         valid = None
         if kind == 'f':
@@ -12856,6 +12868,18 @@ class Stage:
         self.set_v(dst, value)
         if compute:
             self.emit('GroupMemoryBarrierWithGroupSync();')  # the next exchange may rewrite the array
+
+    def dpp_compare(self, base, ops, intrinsic):
+        """v_cmp_*_dpp with a quad swap on src0 (VOPC DPP16, RDNA 2 ISA 12.19): the exchanged value goes to the hidden
+        temp register and the plain compare reads it; src1 stays this lane's own register. The caller proved whole-quad
+        EXEC, so no source lane is disabled."""
+        self.used_v.add(self.DPP_TEMP)
+        self.uniform_v.discard(self.DPP_TEMP)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(self.DPP_TEMP)
+        self.set_v(self.DPP_TEMP, self.quad_source(intrinsic, self.u(ops[1]), False))
+        operands = [ops[0], 'v%d' % self.DPP_TEMP, ops[2]]
+        return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
 
     def compute_dpp_source(self, source, perm, row):
         """Stage source words and select a lane within the same logical quad or row."""
@@ -18927,6 +18951,10 @@ class Stage:
     @staticmethod
     def interp_write_halves(name, mods):
         # The f32 p1 lowering emits no value. Its p2 is the modeled whole write.
+        if (name.endswith('_dpp') and 'row_mask:0xf' in mods and 'bank_mask:0xf' in mods
+                and 'bound_ctrl:1' in mods):
+            # A DPP with every row and bank enabled and bound_ctrl writes every active lane, like its plain op.
+            name = name[:-4]
         if name.endswith('_dpp') or name.startswith(('v_mac', 'v_fmac', 'v_writelane', 'v_movrel',
                                                      'v_swap', 'v_pk_', 'v_interp_p1_f32',
                                                      'v_readlane', 'v_readfirstlane', 'v_cmp')):

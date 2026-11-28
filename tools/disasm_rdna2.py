@@ -1640,6 +1640,27 @@ def _decode_vop1_dpp(w1: int, vdst: int, src0: int, op_name: str, comment: str) 
     return (8, dpp_name, f"{dpp_name} v{vdst}, {src0_str} {suffix}", comment)
 
 
+def _decode_vopc_dpp16(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOPC DPP16 8-byte instruction (32-bit float/integer compares; VCC or EXEC result)."""
+    dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+    if (op_name.startswith("v_vopc_") or op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
+            or "_class_" in op_name):
+        return (8, "vopc_dpp16", f"{dpp_name} <unsupported DPP16>", "VOPC DPP16 is not decoded for this opcode")
+    dpp_ctrl_str = _format_dpp16_ctrl((w1 >> 8) & 0x1ff)
+    if dpp_ctrl_str is None:
+        return (8, "vopc_dpp16", f"{dpp_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+    is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
+    src0_neg, src0_abs, src1_neg, src1_abs = ((w1 >> 20) & 1, (w1 >> 21) & 1, (w1 >> 22) & 1, (w1 >> 23) & 1)
+    if not is_float and (src0_neg or src0_abs or src1_neg or src1_abs):
+        return (8, "vopc_dpp16", f"{dpp_name} <unsupported DPP16>", "Invalid VOPC DPP16 modifier")
+    src0_str = _format_operand_modifiers(f"v{w1 & 0xff}", src0_abs, src0_neg)
+    src1_str = _format_operand_modifiers(f"v{vsrc1}", src1_abs, src1_neg)
+    ctrl = (f"{dpp_ctrl_str} row_mask:0x{(w1 >> 28) & 0xf:x} bank_mask:0x{(w1 >> 24) & 0xf:x}"
+            f"{' bound_ctrl:1' if (w1 >> 19) & 1 else ''}{' fi:1' if (w1 >> 18) & 1 else ''}")
+    dst = "" if op_name.startswith("v_cmpx_") else "vcc_lo, "
+    return (8, dpp_name, f"{dpp_name} {dst}{src0_str}, {src1_str} {ctrl}", comment)
+
+
 def _decode_vop2_dpp(w1: int, vdst: int, vsrc1: int, src0: int, op: int, op_name: str,
                      comment: str) -> tuple[int, str, str, str]:
     """Decode a GFX10 VOP2 DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction."""
@@ -2556,6 +2577,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 == 250 and offset + 8 <= len(data):
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vopc_dpp16(w1, vsrc1, op_name, comment)
         if src0 in (233, 234, 250):
             return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
