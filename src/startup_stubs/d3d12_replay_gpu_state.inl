@@ -8,9 +8,18 @@ constexpr UINT writable = UINT(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
 
 bool copyable(const D3D12_RESOURCE_DESC& desc)
 {
-    return (desc.Flags & writable) && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+    return !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
         desc.SampleDesc.Count == 1 && desc.Dimension >= D3D12_RESOURCE_DIMENSION_BUFFER &&
         desc.Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+}
+
+bool snapshot_candidate(const WrapperOwn& own, ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc)
+{
+    if (desc.Flags & writable) return true;
+    D3D12_HEAP_PROPERTIES heap{};
+    D3D12_HEAP_FLAGS flags{};
+    return !own.title_memory && SUCCEEDED(resource->GetHeapProperties(&heap, &flags)) &&
+        heap.Type == D3D12_HEAP_TYPE_DEFAULT;
 }
 
 bool common_resource(u64 object, ID3D12Resource* resource)
@@ -105,7 +114,8 @@ bool restore(void* object, UINT subresource, const void* footprint_header, const
     auto* resource = static_cast<ID3D12Resource*>(wrapper->own().real);
     const auto desc = resource->GetDesc();
     const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
-    if (!copyable(desc) || !common_resource(reinterpret_cast<u64>(object), resource)) return false;
+    if (!copyable(desc) || !snapshot_candidate(wrapper->own(), resource, desc) ||
+        !common_resource(reinterpret_cast<u64>(object), resource)) return false;
     ComPtr<ID3D12Device> device;
     if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device)))) return false;
 
@@ -211,7 +221,7 @@ bool write_gpu_resource(ThreadBuffer& b, const replay_dump::Readback& readback, 
     return ok;
 }
 
-void gpu_state_at_window_open(ThreadBuffer& b)
+u64 gpu_state_at_window_open(ThreadBuffer& b)
 {
     using namespace replay_gpu_state;
     const auto start = GetTickCount64();
@@ -225,11 +235,15 @@ void gpu_state_at_window_open(ThreadBuffer& b)
     }
     u64 written = 0, payload_bytes = 0, used = 0, over_budget = 0, msaa = 0, depth = 0, unsupported = 0, failed = 0;
     bool idle_ok = false;
+    u64 seq = 0;
     try {
         // Present holds draw_lock. New render submissions wait until the snapshot is complete.
         std::vector<ComPtr<ID3D12CommandQueue>> queues;
         std::vector<replay_dump::Readback> candidates;
         AcquireSRWLockShared(&registry_lock);
+        // A resource registered during the window cannot enter this candidate list.
+        seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+        update_window(true);
         AcquireSRWLockShared(&retire_lock);
         try {
             for (const void* entry : registry()) {
@@ -240,7 +254,7 @@ void gpu_state_at_window_open(ThreadBuffer& b)
                 } else if (own.kind == resource_kind && InterlockedCompareExchange(&own.refs, 0, 0) > 0) {
                     auto* real = static_cast<ID3D12Resource*>(own.real);
                     const auto desc = real->GetDesc();
-                    if (!(desc.Flags & writable)) continue;
+                    if (!snapshot_candidate(own, real, desc)) continue;
                     if (desc.SampleDesc.Count != 1) ++msaa;
                     else if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ++depth;
                     else if (own.gpu_state_unsupported) ++unsupported;
@@ -340,5 +354,6 @@ void gpu_state_at_window_open(ThreadBuffer& b)
         "took %llu ms; %llu skipped (depth-stencil), %llu skipped (unsupported), %llu failed, queues %s",
         written, static_cast<double>(payload_bytes) / (1ull << 20), over_budget, msaa, GetTickCount64() - start,
         depth, unsupported, failed, idle_ok ? "idle" : "idle/copy wait incomplete");
+    return seq;
 }
 }  // namespace replay_record

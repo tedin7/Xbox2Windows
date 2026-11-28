@@ -28,14 +28,16 @@ namespace {
 
 constexpr UINT width = 64, height = 32;
 constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
-// X2W_TEST_REPLAY_TITLE_RANGE=ring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
+// X2W_TEST_REPLAY_TITLE_RANGE=ring or plainring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
 // recorder's 64 KiB root window, so each binding's capture is needed on its own), and clears both before its Present.
 constexpr UINT ring_slice_bytes = 0x20000, ring_vb_offset = 0x10000;
-enum class TitleRange { none, root, generated, supplied, ring, table };
+enum class TitleRange { none, root, generated, supplied, ring, plainring, table };
 
 struct Scene {
     void* target = nullptr;
     void* offscreen = nullptr;
+    void* history = nullptr;
+    void* window_copy = nullptr;
     void* title_buffer = nullptr;
     void* rtv_heap = nullptr;
     void* queue = nullptr;
@@ -116,6 +118,17 @@ bool record_memory_cases(void* device)
     if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
     std::printf("replay quad: recorder access exceptions %ld\n", access_exceptions);
     return ok;
+}
+
+bool create_copy_texture(void* device, void*& texture)
+{
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+                                   DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                   D3D12_RESOURCE_FLAG_NONE};
+    return SUCCEEDED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc),
+                                                 D3D12_RESOURCE_STATE_COMMON, 0,
+                                                 arg(&__uuidof(ID3D12Resource)), arg(&texture)))) && texture;
 }
 
 int create_scene(void* device, Scene& s)
@@ -245,6 +258,7 @@ int create_scene(void* device, Scene& s)
                                                arg(&s.offscreen)))) || !s.offscreen)
             return 28;
         invoke(device, 20, arg(s.offscreen), arg(&view), s.rtv);
+        if (!create_copy_texture(device, s.history)) return 28;
     }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -283,17 +297,21 @@ int create_indirect_arguments(void* device, Scene& s)
 int create_title_range(void* device, Scene& s)
 {
     if (s.title_range == TitleRange::none) return 0;
-    if (s.title_range == TitleRange::ring) {
+    if (s.title_range == TitleRange::ring || s.title_range == TitleRange::plainring) {
         constexpr SIZE_T bytes = 1u << 20;
+        const bool plain = s.title_range == TitleRange::plainring;
+        const Word address = plain ? 0x10000000ull : 0x21200000000ull;
         s.ring = static_cast<unsigned char*>(
-            VirtualAlloc(reinterpret_cast<void*>(0x21200000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            VirtualAlloc(reinterpret_cast<void*>(address), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!s.ring) return 46;
-        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-                                         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
-        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.ring), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
-                                               arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
-            !s.title_buffer)
-            return 46;
+        if (!plain) {
+            const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.ring), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                                   arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) ||
+                !s.title_buffer)
+                return 46;
+        }
         std::printf("title ranges: %llx 0\n", arg(s.ring));
         return 0;
     }
@@ -367,6 +385,7 @@ int wait_for_frame(const Scene& s, UINT frame)
 
 int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool slot_layouts)
 {
+    if (s.history && frame == 2 && !create_copy_texture(device, s.window_copy)) return 28;
     unsigned char* slice = nullptr;
     if (s.ring) {
         if (frame >= 8) return 47;
@@ -422,8 +441,13 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     }
     if (s.offscreen) {
         constexpr float history[]{1.0f, 0.0f, 1.0f, 1.0f};
-        if (frame < 2) invoke(s.list, 52, s.rtv, arg(history));
-        else invoke(s.list, 17, arg(s.target), arg(s.offscreen));
+        if (frame < 2) {
+            invoke(s.list, 52, s.rtv, arg(history));
+            invoke(s.list, 17, arg(s.history), arg(s.offscreen));
+        } else {
+            invoke(s.list, 17, arg(s.window_copy), arg(s.history));
+            invoke(s.list, 17, arg(s.target), arg(s.window_copy));
+        }
     } else if (!s.signature || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
     if (!s.offscreen && (!s.signature || frame == 1)) {
         invoke(s.list, 50, 1, arg(&s.rtv));
@@ -492,6 +516,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(mode, "generated")) scene.title_range = TitleRange::generated;
         else if (!std::strcmp(mode, "supplied")) scene.title_range = TitleRange::supplied;
         else if (!std::strcmp(mode, "ring")) scene.title_range = TitleRange::ring;
+        else if (!std::strcmp(mode, "plainring")) scene.title_range = TitleRange::plainring;
         else if (!std::strcmp(mode, "table")) scene.title_range = TitleRange::table;
         else return 2;
     }

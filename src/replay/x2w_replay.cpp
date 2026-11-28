@@ -133,10 +133,10 @@ struct Player {
     u64 page_target(u64 address, u64& bytes) const
     {
         auto above = handles.upper_bound(address);
-        if (above == handles.begin()) return address;
+        if (above == handles.begin()) return 0;
         --above;
         const u64 offset = address - above->first;
-        if (offset >= above->second.span) return address;
+        if (offset >= above->second.span) return 0;
         if (bytes > above->second.span - offset) bytes = above->second.span - offset;
         ++page_translated;
         return above->second.to + offset;
@@ -230,7 +230,9 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
         // Descriptor writes rebuild the backing in place. Other arguments on the same allocation granule still need their blobs.
-        if (p.descriptor_backing(m.address) || span_contains(page_replay().map_spans, m.address)) {
+        const auto& pages = page_replay();
+        if (p.descriptor_backing(m.address) ||
+            (span_contains(pages.map_spans, m.address) && pages.reserved(m.address, m.bytes))) {
             copies[i] = reinterpret_cast<unsigned char*>(m.address);
             ++p.title_memory_args;
             continue;
@@ -848,9 +850,10 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         std::fprintf(f, "\"view_tokens\": {\"rewritten\": %llu, \"unmapped\": %llu}, ",
                      pages.view_tokens_rewritten, pages.view_tokens_unmapped);
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
-                        "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
+                        "\"bad_maps\": %llu, \"unreserved_spans\": %llu, \"left_out\": %llu, "
+                        "\"title_memory_args\": %llu}, \"ranges\": [",
                      r.maps.size(), pages.maps_applied, pages.pages_written, pages.zero_pages, pages.missing_pages, pages.bad_maps,
-                     p.title_memory_args);
+                     pages.unreserved_spans, pages.left_out, p.title_memory_args);
         for (std::size_t i = 0; i < pages.spans.size(); ++i)
             std::fprintf(f, "%s{\"address\": \"0x%llx\", \"bytes\": %llu, \"hash\": \"%016llx\"}", i ? ", " : "", pages.spans[i].base,
                          pages.spans[i].end - pages.spans[i].base, span_hash(pages.spans[i]));
@@ -981,7 +984,7 @@ int run(const Options& o)
         return 2;
     }
     // Reserve title ranges before the stand-in can allocate at those addresses.
-    if (std::string problem; !reserve_page_ranges(r, problem)) {
+    if (std::string problem; !reserve_page_ranges(r, problem, say)) {
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
@@ -1165,6 +1168,7 @@ int run(const Options& o)
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
     say("x2w-replay: view tokens: rewritten %llu, unmapped %llu", pages.view_tokens_rewritten, pages.view_tokens_unmapped);
+    say("x2w-replay: title ranges unreserved %llu, pages left out (unreserved) %llu", pages.unreserved_spans, pages.left_out);
     say("x2w-replay: frame waits not paced: %llu of %llu (%.3f s inside them)%s", static_cast<unsigned long long>(p.unpaced_waits),
         static_cast<unsigned long long>(p.event_waits), p.event_wait_seconds, p.pace ? ", --pace on" : "");
     say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",

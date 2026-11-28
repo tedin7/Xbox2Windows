@@ -2151,16 +2151,21 @@ its seconds or presents from there (`the base image took X s and N presents befo
 rescans the ranges from the smallest (descriptor rings, constants) within `X2W_REPLAY_SCAN_MS`, and later presents catch
 the rest. The base image counts toward the window's cap, not the prefix's.
 
-In render mode, set `X2W_REPLAY_GPU_STATE=1` to capture desktop resource contents when the recording window opens,
-after the base image. The recorder waits for the stand-in queues to finish, then reads back live
-render-target and unordered-access buffers and single-sample textures in increasing footprint size.
+In render mode, the recorder captures desktop resource contents by default when the recording window opens,
+after the base image. Set `X2W_REPLAY_GPU_STATE=0` to disable capture. The recorder waits for the stand-in queues
+to finish, then reads back eligible live resources in increasing footprint size. Candidates include resources
+with render-target, depth-stencil or unordered-access flags, and buffers and textures on desktop DEFAULT heaps
+with no title memory.
 `X2W_REPLAY_GPU_STATE_MAX_MIB` limits the readback footprints to 1024 MiB by default.
 The log counts resources skipped for budget, multisampling, depth-stencil, or unsupported backing or
 state, including reserved resources and resources outside the shim's COMMON state tracking. The recorder
-skips depth-stencil resources in full. Capture is off by default.
+skips depth-stencil resources in full. Resources created during the window get their contents from replayed calls.
 
 Each captured subresource becomes a global `GPUR` chunk. The player uploads its bytes after the prefix
 and before the first window call, so the window can read results produced by earlier GPU work.
+The `startup_replay_gpu_state_warp` fixture reads a DEFAULT texture populated by a prefix copy and uses a new
+intermediate texture created during the window. It compares the replay with live pictures and checks the
+`X2W_REPLAY_GPU_STATE=0` control.
 Older players ignore the chunks. The queue waits, synchronous readback and file writes add a pause
 at the window boundary. The chunks increase the recording size, and the player waits for the uploads
 before it continues. The `gpu_state` summary counts restored, failed and untranslated subresources.
@@ -2183,24 +2188,28 @@ image can stay zero in the file, and the replay then draws from zero bytes. Draw
 recorder captures up to 64 KiB at each root descriptor setter (list slots 41 to 46; slot 44 copies its bytes then),
 and captures those root spans again with the bound vertex and index views (slots 47 and 48) before the list's next
 draw, dispatch or indirect execution. Only changed pages are written, stamped just before the call, so the player
-applies them before the call that reads them. Only spans inside the title ranges the page scans cover are captured
-(resources with title memory, and the named ranges of `X2W_REPLAY_TITLE_RANGES=1`). The recorder clips each span to
-4 MiB and to its containing title range. `X2W_REPLAY_DRAW_PAGES_MS` sets the time budget per Present (default 100 ms).
-The `x2w-replay draw pages` counters report captures, spans outside title memory, time skips, pending drops and
-time used. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+applies them before the call that reads them. The recorder accepts known title ranges and descriptor backings.
+An address outside those ranges can also name plain title memory if it starts in readable, committed
+`MEM_PRIVATE` or `MEM_IMAGE` memory outside the current thread's stack. The recorder clips each span to 4 MiB
+and to its containing range or allocation, then skips holes in the span. `X2W_REPLAY_DRAW_PAGES_MS` sets the
+time budget per Present (default 100 ms). The `x2w-replay draw pages` counters report captures, accepted plain
+memory spans, spans refused as outside title memory, time skips, pending drops and time used.
+Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
 Draw captures reuse title ranges across Presents and gather them at most once per Present on a lookup miss. The counters report gather count and time outside the capture budget.
 The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
 
 The player applies MAP chunks in stamp order, and a Present rescan is stamped at the previous Present, before the draws
 captured since. So the page writer compares each page with the MAP of the newest stamp for it: a rescan with an older
 stamp is written when it differs but does not change that reference, and two different MAPs with the same stamp (two
-threads, file order unknown) make the next later capture write the page again. `startup_replay_draw_pages_warp` compares four live and replayed ring colours
-and checks that disabling draw pages changes the replay while leaving the live pictures identical.
+threads, file order unknown) make the next later capture write the page again. `startup_replay_draw_pages_warp` compares
+four live and replayed ring colours for both a placed ring and a plain allocation below 4 GiB. Disabling draw pages
+must change the replay while leaving the live pictures identical.
 
 Draw pages also capture up to 64 KiB of title descriptor memory at the graphics and compute table setters (list slots
 36 and 35). They capture that span again at the next draw, dispatch or indirect execution on the same list. An entry
 beyond the captured span is captured when read. Buffers read through table descriptors are captured at the consuming
-call, up to 4 MiB per range. The lookup includes caller-supplied descriptor heap CPU backings (DHPM).
+call, using the same range lookup, plain memory checks and 4 MiB cap. The lookup includes caller-supplied
+descriptor heap CPU backings (DHPM).
 The draw pages log reports table spans and descriptor buffers. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures.
 
 Each call that stores a view can write a `VIDS` chunk after its `CALL`. The chunk contains the call sequence number
@@ -2265,7 +2274,7 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 `SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
 (the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
 `replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
-recording, 3 a title range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+recording, 3 a required title range could not be reserved, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
 The prefix is every call before the recording's first `PRES` chunk (the recorder writes `PRES` only inside the window).
@@ -2297,10 +2306,13 @@ heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor co
 completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
 map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
 with a buffer of the replayer's. Title memory recorded as pages (`PAGE`/`MAP`, src/startup_stubs/replay_pages.h) is
-reserved and committed at its recorded addresses before the stand-in loads (merged into 64 KiB spans; a span that cannot
-be had stops the replay with exit 3 and its address), and every `MAP` is written before the first call with a larger
-sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
-span's final image hash. Set `X2W_REPLAY_DUMP_MAP_RANGES=1` in the player environment to write
+reserved and committed at its recorded addresses before the stand-in loads, in spans aligned to 64 KiB. A failed
+reservation for a span covering a recorded heap placement (HPLC) or descriptor backing (DHPM) stops replay with exit 3.
+For other spans, the player logs the first 16 reservation failures and continues. Before the first call with a larger
+sequence number, each `MAP` writes pages to reserved addresses or to translated addresses when available.
+Argument memory inside reserved MAP spans is passed in place. `replay_summary.json` includes each reserved span's
+final image hash and counts failed reservations in `pages.unreserved_spans` and skipped MAP writes in `pages.left_out`.
+Set `X2W_REPLAY_DUMP_MAP_RANGES=1` in the player environment to write
 `map_<sequence>.bin` for an explicit, nonempty buffer Map read range, when the call succeeds and writes its
 output. For an output buffer that aliases title memory, record with
 `X2W_REPLAY_TITLE_RANGES=1` and `X2W_REPLAY_PAGES_AT_SUBMIT=1` to capture raw heap descriptors and placed buffers.

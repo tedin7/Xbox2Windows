@@ -977,7 +977,16 @@ void stop(bool at_exit, bool from_present)
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
 #include "startup_stubs/d3d12_record_pages.inl"
 
-void gpu_state_at_window_open(ThreadBuffer& b);
+u64 gpu_state_at_window_open(ThreadBuffer& b);
+
+bool gpu_state_enabled()
+{
+    const DWORD saved = GetLastError();
+    char value[2]{};
+    const bool enabled = GetEnvironmentVariableA("X2W_REPLAY_GPU_STATE", value, sizeof(value)) != 1 || value[0] != '0';
+    SetLastError(saved);
+    return enabled;
+}
 
 void present()
 {
@@ -1019,21 +1028,17 @@ void present()
     }
     const bool base_pending = base_image_holds_window(b, present);
     const bool open = base_pending ? was_open : in_window();
-    const bool gpu_lock = !was_open && open && x2w_local::env_on("X2W_REPLAY_GPU_STATE");
+    const bool gpu_lock = !was_open && open && render_mode() && gpu_state_enabled();
     // Serialize the boundary and the readback with the render submission path.
     if (gpu_lock) draw_lock_acquire_exclusive();
     const bool gpu_snapshot = gpu_lock && !window_open;
-    // Reserve the boundary before another thread can observe the open window.
-    const u64 gpu_seq = gpu_snapshot ? static_cast<u64>(InterlockedIncrement64(&next_seq)) : 0;
-    if (!base_pending) update_window(open);
+    const u64 gpu_seq = gpu_snapshot ? gpu_state_at_window_open(b) : 0;
+    if (!base_pending && !gpu_snapshot) update_window(open);
     if (window_open || (present == first_present && !base_warming)) {
         const u64 seq = gpu_seq ? gpu_seq : static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (window_open && !was_open) {
-            if (!extra_title_pages) pages_at_window_open(b, seq, present);
-            if (gpu_snapshot) gpu_state_at_window_open(b);
-        }
+        if (window_open && !was_open && !extra_title_pages) pages_at_window_open(b, seq, present);
         if (window_open && (draw_pages || (!extra_title_pages && was_open)))
             pages_at_present(b, seq, present, !extra_title_pages && was_open);
     }
