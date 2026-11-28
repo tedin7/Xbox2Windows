@@ -29,6 +29,7 @@ namespace {
 
 constexpr UINT width = 64, height = 32;
 constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
+constexpr UINT indirect_argument_offset = 4096, indirect_count_offset = 8192;
 // X2W_TEST_REPLAY_TITLE_RANGE=ring or plainring: frame f binds a root SRV at slice f and a vertex buffer 64 KiB into it (past the
 // recorder's 64 KiB root window, so each binding's capture is needed on its own), and clears both before its Present.
 constexpr UINT ring_slice_bytes = 0x20000, ring_vb_offset = 0x10000;
@@ -63,6 +64,9 @@ struct Scene {
     alignas(64) unsigned char title_rtvs[512]{};
     void* signature = nullptr;
     void* arguments = nullptr;
+    void* indirect_count = nullptr;
+    D3D12_DRAW_ARGUMENTS* late_arguments = nullptr;
+    UINT* late_count = nullptr;
     void* upload = nullptr;  // X2W_TEST_REPLAY_PREFIX_LIVE
 };
 
@@ -304,7 +308,7 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
-int create_indirect_arguments(void* device, Scene& s)
+int create_indirect_arguments(void* device, Scene& s, bool late)
 {
     const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
     const D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
@@ -321,8 +325,20 @@ int create_indirect_arguments(void* device, Scene& s)
     if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(words), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
                                            arg(&__uuidof(ID3D12Resource)), arg(&s.arguments)))))
         return 28;
-    // Written after creation, so replay must obtain the arguments from PAGE/MAP, not the creation call's ARGM.
-    *words = {3, 1, 0, 0};
+    if (late) {
+        auto* counts = static_cast<unsigned char*>(
+            VirtualAlloc(reinterpret_cast<void*>(0x20000010000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!counts) return 27;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(counts), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                               arg(&__uuidof(ID3D12Resource)), arg(&s.indirect_count)))))
+            return 28;
+        s.late_arguments = reinterpret_cast<D3D12_DRAW_ARGUMENTS*>(reinterpret_cast<unsigned char*>(words) +
+                                                                 indirect_argument_offset);
+        s.late_count = reinterpret_cast<UINT*>(counts + indirect_count_offset);
+    } else {
+        // Written after creation, so replay must obtain the arguments from PAGE/MAP.
+        *words = {3, 1, 0, 0};
+    }
     return 0;
 }
 
@@ -511,14 +527,21 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
             invoke(s.list, 17, arg(s.window_copy), arg(s.history));
             invoke(s.list, 17, arg(s.target), arg(s.window_copy));
         }
-    } else if (!s.signature || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
-    if (!s.offscreen && (!s.signature || frame == 1)) {
+    } else if (!s.signature || s.late_arguments || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
+    if (!s.offscreen && (!s.signature || s.late_arguments || frame == 1)) {
         invoke(s.list, 50, 1, arg(&s.rtv));
         invoke(s.list, 21, 1, arg(&viewport));
         invoke(s.list, 22, 1, arg(&scissor));
         invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         invoke(s.list, 25, arg(pso));
-        if (s.signature) {
+        if (s.late_arguments) {
+            invoke(s.list, 34, arg(stream_root_signature()));
+            // Block one frame with the count word and another with the draw arguments.
+            *s.late_arguments = {frame % 4 == 3 ? 0u : 3u, 1, 0, 0};
+            *s.late_count = frame % 4 == 1 ? 0u : 1u;
+            invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), indirect_argument_offset,
+                   arg(s.indirect_count), indirect_count_offset);
+        } else if (s.signature) {
             invoke(s.list, 34, arg(stream_root_signature()));
             invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), 0, 0, 0);
         } else {
@@ -576,7 +599,13 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         if (const int rc = wait_for_frame(s, frame)) return rc;
         std::memset(slice, 0, ring_vb_offset + 0x1000);  // the GPU is done: the title recycles its ring
     }
-    if (!s.signature) {
+    if (s.late_arguments) {
+        if (const int rc = wait_for_frame(s, frame)) return rc;
+        // Recycle both words before the Present scan so only the draw stamps carry the submitted values.
+        *s.late_arguments = {};
+        *s.late_count = 0;
+    }
+    if (!s.signature || s.late_arguments) {
         // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
         alignas(8) unsigned char plane[0x48]{};
         const Word resources[1]{arg(s.target)};
@@ -586,11 +615,11 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         std::memcpy(plane + 0x10, &resources_at, 8);
         invoke(s.queue, 32, 1, arg(plane), 0);
     }
-    if (s.signature) {
+    if (s.signature && !s.late_arguments) {
         std::fprintf(stderr, "replay quad: about to signal submit %u\n", frame + 1);
         std::fflush(stderr);
     }
-    return slice ? 0 : wait_for_frame(s, frame);
+    return slice || s.late_arguments ? 0 : wait_for_frame(s, frame);
 }
 
 }  // namespace
@@ -604,6 +633,9 @@ int main(int argc, char** argv)
     void* device = nullptr;
     void* pso = nullptr;
     Scene scene;
+    char indirect_mode[16]{};
+    const DWORD indirect_size = GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", indirect_mode, sizeof(indirect_mode));
+    const bool late = indirect_size == 4 && std::strcmp(indirect_mode, "late") == 0;
     char mode[16]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_TITLE_RANGE", mode, sizeof(mode))) {
         if (!std::strcmp(mode, "root")) scene.title_range = TitleRange::root;
@@ -617,14 +649,14 @@ int main(int argc, char** argv)
     const bool table = scene.title_range == TitleRange::generated || scene.title_range == TitleRange::supplied ||
                        scene.title_range == TitleRange::table;
     if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], std::strcmp(argv[4], "hardware") == 0, table, adapter,
-                                               device, pso))
+                                               device, pso, late))
         return rc;
     if (const int rc = create_scene(device, scene)) return rc;
     if (!create_snapshot_buffer(device, scene)) return 28;
     if (const int rc = create_title_range(device, scene)) return rc;
-    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", nullptr, 0)) {
-        if (frames != 3) return 2;
-        if (const int rc = create_indirect_arguments(device, scene)) return rc;
+    if (indirect_size) {
+        if (!late && frames != 3) return 2;
+        if (const int rc = create_indirect_arguments(device, scene, late)) return rc;
     }
     char recorder_case[16]{};
     GetEnvironmentVariableA("X2W_TEST_REPLAY_RECORDER", recorder_case, sizeof(recorder_case));
@@ -666,6 +698,6 @@ int main(int argc, char** argv)
     // Exercise the exit path while the finisher is alive. ExitProcess terminates it before DLL detach.
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_FINISHER_STALL_MS", nullptr, 0))
         x2w_d3d12_replay_record_stop(1);
-    std::printf("replay quad: %u presents drawn\n", scene.signature ? 0 : frames);
+    std::printf("replay quad: %u presents drawn\n", scene.signature && !late ? 0 : frames);
     return 0;
 }

@@ -29,6 +29,7 @@ bool draw_ranges_missed;             // gathered again this Present for a span o
 LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped;
 u64 draw_table_spans, draw_descriptor_buffers;
+u64 draw_indirect_args, draw_indirect_counts;
 u64 draw_ranges_gathered;
 double draw_time_used, draw_ranges_ms;
 bool draw_time_logged;
@@ -530,9 +531,10 @@ const PageRange* draw_find_range(u64 address)
 void draw_log_counters(LONG present, double used)
 {
     log("x2w-replay draw pages: captures %llu, plain memory spans %llu, outside title memory %llu, over the per-present time %llu, "
-        "pending dropped %llu, table spans %llu, descriptor buffers %llu, "
+        "pending dropped %llu, table spans %llu, descriptor buffers %llu, indirect args %llu, counts %llu, "
         "ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
         draw_captures, draw_plain_spans, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
+        draw_indirect_args, draw_indirect_counts,
         draw_ranges_gathered, draw_ranges_ms,
         used, draw_pages_ms, present);
 }
@@ -657,13 +659,31 @@ void draw_end_capture(LONG present, const LARGE_INTEGER& start)
     }
 }
 
-void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
+void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 stamp)
 {
     const LONG present = draw_begin_capture();
     LARGE_INTEGER start{};
     QueryPerformanceCounter(&start);
     if (slot <= 14 || slot == 61) {
         draw_consume_pending(list, present, stamp, start);
+        if (slot == 61) {
+            const auto capture_buffer = [&](u64 object, u64 offset, u64 bytes, u64& counter) {
+                if (!object || !bytes) return;
+                const auto* buffer = as_wrapper(reinterpret_cast<void*>(object));
+                if (!buffer || buffer->own().kind != resource_kind) return;
+                const u64 base = reinterpret_cast<u64>(buffer->own().title_memory);
+                if (!base || offset > ~u64{} - base) return;
+                const u64 before = draw_captures;
+                draw_capture_span({base + offset, (std::min)(bytes, draw_span_limit)}, present, stamp, start);
+                counter += draw_captures - before;
+            };
+            const auto* signature = as_wrapper(reinterpret_cast<void*>(rdx));
+            const UINT stride = signature && signature->own().kind == command_signature_kind
+                ? signature->own().indirect_bytes : 0;
+            const UINT count = static_cast<UINT>(r8);
+            if (count) capture_buffer(r9, s0, stride ? u64{count} * stride : 0x10000u, draw_indirect_args);
+            capture_buffer(s1, s2, sizeof(UINT), draw_indirect_counts);
+        }
     } else if (!draw_time_exhausted(start, 1)) {
         if (slot <= 46) {
             if (r8) draw_capture_span({r8, draw_root_window}, present, stamp, start);  // slot 44 copies it now
@@ -738,7 +758,8 @@ inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present, bool scan)
 }
 
 // Allocate the call sequence with pages_lock held. Present scans may still use older stamps.
-u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool root, bool submit, bool scan)
+u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9,
+                      u64 s0, u64 s1, u64 s2, bool root, bool submit, bool scan)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
@@ -756,7 +777,7 @@ u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool
     // full), so a draw costs no file write.
     if (draw_slot && draw_pages && window_open && page_writer && !page_budget_reached && !stop_requested && active) {
         page_target = &b;
-        draw_pages_at_call(slot, rcx, rdx, r8, r9, seq - 1);
+        draw_pages_at_call(slot, rcx, rdx, r8, r9, s0, s1, s2, seq - 1);
         page_target = nullptr;
     }
     ReleaseSRWLockExclusive(&pages_lock);

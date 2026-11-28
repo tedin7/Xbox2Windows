@@ -2267,6 +2267,7 @@ and to its containing range or allocation, then skips holes in the span. `X2W_RE
 time budget per Present (default 100 ms). The `x2w-replay draw pages` counters report captures, accepted plain
 memory spans, spans refused as outside title memory, time skips, pending drops and time used.
 Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+Before ExecuteIndirect (list slot 61), draw pages capture the title-backed argument range and optional count dword, and the log reports both capture counts.
 Draw captures reuse title ranges across Presents and gather them at most once per Present on a lookup miss. The counters report gather count and time outside the capture budget.
 The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
 

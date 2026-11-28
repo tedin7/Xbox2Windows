@@ -5012,7 +5012,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool translated = translated_mesh || ((command == IndirectCommand::draw || indexed) && pass.pipeline &&
         !pass.pipeline->own().real && (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW"));
     u64 bytes = sig->own().indirect_bytes;
-    if (graphics && (count != 1 || count_buffer))
+    // A plain desktop triangle draw can consume a count word without any argument conversion.
+    const bool counted_triangle = command == IndirectCommand::draw && !translated && pass.indirect_graphics.root &&
+        pass.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (graphics && (count != 1 || (count_buffer && !counted_triangle)))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
     if (translated_mesh && (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
         pass.requested_mesh_pipeline = pass.pipeline;
@@ -5271,8 +5274,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         }
     }
     // Opt-in split of a batched or counted Dispatch for adapters that run only its first command
-    // (split_indirect_dispatch.h). Only a rootless Dispatch signature with a desktop compute pipeline and root reaches
-    // here with a count above one or a count buffer; graphics and mesh signatures are refused above.
+    // (split_indirect_dispatch.h). This applies only to rootless Dispatch with a desktop compute pipeline and root.
     const bool split = command == IndirectCommand::dispatch && pass.compute_pipeline && pass.compute_root &&
         (count > 1 || count_buffer) && split_indirect_dispatch_enabled();
     ID3D12Resource* counts = nullptr;

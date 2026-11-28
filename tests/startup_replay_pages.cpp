@@ -61,7 +61,7 @@ std::uint64_t map_stamp(const Chunk& chunk)
     return header.seq;
 }
 
-bool stamp_order_case(bool equal_stamp)
+bool stamp_order_case(bool equal_stamp, bool seen_unchanged = false)
 {
     constexpr std::uint64_t address = 0x10000;
     const std::vector<unsigned char> a(page_bytes, 0x11), b(page_bytes, 0x22);
@@ -69,7 +69,13 @@ bool stamp_order_case(bool equal_stamp)
     PageWriter writer([&](const char* tag, const void* h, std::size_t hb, const void* d, std::size_t db) {
         frame(stream, tag, h, hb, d, db);
     });
-    if (equal_stamp) {
+    if (seen_unchanged) {
+        // A draw reads A (10), a later draw sees A unchanged (30), then a rescan stamped between them arrives with B (20).
+        // The replay applies B@20 after A@10, so A must be written again at 30.
+        writer.capture(address, a.data(), a.size(), 10);
+        writer.capture(address, a.data(), a.size(), 30);
+        writer.capture(address, b.data(), b.size(), 20);
+    } else if (equal_stamp) {
         writer.capture(address, a.data(), a.size(), 40);
         writer.capture(address, b.data(), b.size(), 40);
         writer.capture(address, b.data(), b.size(), 41);
@@ -101,7 +107,7 @@ bool stamp_order_case(bool equal_stamp)
         for (const auto* map : maps)
             if (!apply(*map)) return false;
         std::vector<unsigned char> image(page_bytes);
-        if (!reader.read(address, image.data(), image.size()) || image != b) return false;
+        if (!reader.read(address, image.data(), image.size()) || image != (seen_unchanged ? a : b)) return false;
     }
     return true;
 }
@@ -186,6 +192,7 @@ int main(int argc, char** argv)
         return fail("the final image is not the memory after the second capture");
     if (mode.empty() && !stamp_order_case(false)) return fail("back-stamped MAPs left the wrong image");
     if (mode.empty() && !stamp_order_case(true)) return fail("equal-stamped MAPs left the wrong image");
+    if (mode.empty() && !stamp_order_case(false, true)) return fail("a stale rescan hid a later unchanged read");
     std::printf("startup_replay_pages: ok (first: %llu distinct %llu dup %llu zero; second: %llu unchanged, %llu new)\n",
                 static_cast<unsigned long long>(first.distinct), static_cast<unsigned long long>(first.duplicate),
                 static_cast<unsigned long long>(first.zero), static_cast<unsigned long long>(second.unchanged - first.unchanged),
