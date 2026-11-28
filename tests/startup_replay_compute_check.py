@@ -77,8 +77,9 @@ def record(directory, consumer, env):
     return recording, data, recorded_calls, dump, OUTPUT.pack(*live)
 
 
-def replay(player, recording, out, adapter, dump, groups):
+def replay(player, recording, out, adapter, dump, groups, extra=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_")}
+    env.update(extra or {})
     result = subprocess.run([player, recording, out, "--adapter", adapter, "--dump", dump],
                             cwd=out.parent, env=env, capture_output=True, text=True, timeout=90)
     log_path = out / "stderr.txt"
@@ -87,7 +88,12 @@ def replay(player, recording, out, adapter, dump, groups):
     summary = json.loads((out / "replay_summary.json").read_text())
     assert summary["played"] == summary["calls"] and summary["fence_timeouts"] == 0, summary
     assert summary["pages"]["applied"] > 0 and summary["pages"]["missing"] == 0 and summary["pages"]["bad_maps"] == 0, summary
-    assert f"Dispatch({groups}, 2, 2) translated:" in log, log[-3000:]
+    if groups:
+        assert f"Dispatch({groups}, 2, 2) translated:" in log, log[-3000:]
+    else:
+        assert "translated:" not in log and summary["skipped"]["dispatches"] == 1, (summary, log[-3000:])
+    if groups:
+        assert summary["skipped"] == {"draws": 0, "dispatches": 0}, summary
     content = (out / "dump.bin").read_bytes()
     assert len(content) == OUTPUT.size == 1280, (len(content), OUTPUT.size)
     return content
@@ -110,6 +116,23 @@ def main(consumer, player, dxc, adapter):
         if actual != expected:
             first_byte = next(i for i, (got, want) in enumerate(zip(actual, expected)) if got != want)
             raise AssertionError(f"replay differs at byte {first_byte}: {actual[first_byte]:#04x} vs {expected[first_byte]:#04x}")
+
+        # The bisect switches refuse the dispatch by shader key (full key and a prefix) or by recorded call number.
+        dispatch_seq = [seq for seq, kind, slot, _ in recorded_calls if (kind, slot) == (4, 14)]
+        assert len(dispatch_seq) == 1, dispatch_seq
+        for name, extra in (("by_key", {"X2W_REPLAY_SKIP_KEYS": f"{key:016x}"}),
+                            ("by_prefix", {"X2W_REPLAY_SKIP_KEYS": f"{key:016x}"[:8]}),
+                            ("by_call", {"X2W_REPLAY_SKIP_CALLS": f"{dispatch_seq[0]}-{dispatch_seq[0]}"})):
+            skipped = replay(player, recording, directory / f"replay_skip_{name}", adapter, dump, 0, extra)
+            assert skipped == SENTINELS, f"{name}: the skipped dispatch still wrote output"
+        # Mutant: the switch is ignored when the variable name is wrong, so the dispatch runs and the output is the live one.
+        ignored = replay(player, recording, directory / "replay_skip_ignored", adapter, dump, 3,
+                         {"X2W_REPLAY_SKIP_KEYZ": f"{key:016x}"})
+        assert ignored == expected, "a misspelled switch changed the output"
+        # Another key and another call range leave the dispatch alone.
+        other = replay(player, recording, directory / "replay_skip_other", adapter, dump, 3,
+                       {"X2W_REPLAY_SKIP_KEYS": f"{key ^ (1 << 60):016x}", "X2W_REPLAY_SKIP_CALLS": f"{dispatch_seq[0] + 1}-{dispatch_seq[0] + 9}"})
+        assert other == expected, "skipping an unrelated key or call range changed the output"
 
         dispatch_args = [args for _, kind, slot, args in recorded_calls if (kind, slot) == (4, 14)]
         assert len(dispatch_args) == 1, dispatch_args

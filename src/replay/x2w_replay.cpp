@@ -63,6 +63,8 @@ extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
 extern "C" __declspec(dllimport) void x2w_d3d12_replay_title_increment(UINT type, UINT increment);
 extern "C" __declspec(dllimport) long long x2w_d3d12_magenta_draws();
 extern "C" __declspec(dllimport) void x2w_d3d12_pass_stats_call(unsigned long long call);
+extern "C" __declspec(dllimport) void x2w_d3d12_replay_skip_call(unsigned long long call);
+extern "C" __declspec(dllimport) void x2w_d3d12_replay_skip_totals(long long* draws, long long* dispatches);
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_draw_totals(long long* drawn, long long* not_drawn, char* reasons, unsigned size);
 extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
 
@@ -954,6 +956,9 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, timing ? 9 : 3, wall, fps,
                      p.arena_bytes, p.shared_bytes, peak_private_bytes(), stopped ? "true" : "false", p.event_waits,
                      p.unpaced_waits, p.event_wait_seconds);
+        long long skipped_draws = 0, skipped_dispatches = 0;
+        x2w_d3d12_replay_skip_totals(&skipped_draws, &skipped_dispatches);
+        std::fprintf(f, "\"skipped\": {\"draws\": %lld, \"dispatches\": %lld}, ", skipped_draws, skipped_dispatches);
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"view_tokens\": {\"rewritten\": %llu, \"unmapped\": %llu}, ",
                      pages.view_tokens_rewritten, pages.view_tokens_unmapped);
@@ -1141,6 +1146,7 @@ int run(const Options& o)
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     wchar_t pass_stats_switch[4]{};
+    const bool skip_calls = GetEnvironmentVariableW(L"X2W_REPLAY_SKIP_CALLS", nullptr, 0) != 0;
     const bool pass_stats = GetEnvironmentVariableW(L"X2W_PASS_STATS", pass_stats_switch, 4) == 1 && pass_stats_switch[0] == L'1';
     if (pass_stats && !GetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_PASS_STATS_DIR", o.out.c_str());
@@ -1256,6 +1262,7 @@ int run(const Options& o)
     const auto play_step = [&] {
         const bool learn_view_id = take_view_id && s.has_view_id;
         if (learn_view_id) take_view_id();  // discard any view stored by a previous step
+        if (skip_calls) x2w_d3d12_replay_skip_call(s.call.seq);  // X2W_REPLAY_SKIP_CALLS matches this number
         if (pass_stats) x2w_d3d12_pass_stats_call(s.call.seq);  // the pass thermometer names passes by recorded call
         const bool played = play(p, r, s);
         if (learn_view_id && played)
