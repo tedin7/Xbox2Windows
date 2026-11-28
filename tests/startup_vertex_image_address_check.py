@@ -184,8 +184,8 @@ def translator_controls():
             status, _ = stream_interface.translate(path / 'old', stream_interface.vertex(), stream_interface.pixel())
             assert status == 'ok', status
             want = {
-                '.ps.hlsl': '7b7b2b7161c8df8dc4c526e45618208f29ce0edb99ad46ae0baa839ddaf93173',
-                '.vs.hlsl': '3742286636121f9816ec552bbd0761f4dd2a90356b49dceef3fc30ab3fbbe633',
+                '.ps.hlsl': '4c57d531b69fcddb3ca77daaf108877c40bdae1a08d63f2ab4ea1174fffee565',
+                '.vs.hlsl': '60e48dc3ee0c788bbc054e7b04b09bb9105d331cf06a421bedabdc670a1cb660',
                 '.txt': '5cb778176c0dd11018a6919890a39f6aacaefe6218b728397faf4deca8eaa120',
             }
             for suffix, digest in want.items():

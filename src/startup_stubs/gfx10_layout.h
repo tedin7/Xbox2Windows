@@ -309,7 +309,10 @@ struct Layout {
         for (UINT mip = 0; mip < mips; ++mip) {
             const UINT w = columns(mip), h = rows(mip);
             std::uint64_t end = 0;
-            if (mip >= first_tail) {
+            if (is_linear) {
+                // Rows of row_pitch[mip] elements: the highest element is the last of the last row.
+                end = start[mip] + (std::uint64_t{h - 1} * row_pitch[mip] + (w - 1)) * bytes_per_element;
+            } else if (mip >= first_tail) {
                 for (UINT y = 0; y < h; ++y)
                     for (UINT x = 0; x < w; ++x) end = (std::max)(end, address(mip, x, y, 0));
             } else {
